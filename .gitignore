@@ -1,19 +1,19 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
-**/node_modules
-**/.pnp
+**/node_modules/
+**/.pnp/
 .pnp.js
 
 # testing
-**/coverage
+**/coverage/
 
 # next.js
 **/.next/
 **/out/
 
 # production
-**/build
+**/build/
 
 # misc
 .DS_Store
@@ -31,6 +31,58 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# Azure specific files
 .azure/
 infra/aad_setup.sh
-.vscode
+
+# Visual Studio Code specific
+.vscode/
+
+# Windows system files and directories to ignore
+/AppData/
+/NTUSER.DAT*
+/OneDrive*/
+/Cookies/
+/Documents/
+/Local Settings/
+/My Documents/
+/Recent/
+/SendTo/
+/Start Menu/
+/Templates/
+/Desktop.ini
+/Thumbs.db
+/ehthumbs.db
+
+# System and personal data directories to ignore
+/Application Data/
+/NetHood/
+/PrintHood/
+/スタート メニュー/
+/Contacts/
+/Desktop/
+/Downloads/
+/Favorites/
+/Links/
+/Music/
+/Pictures/
+/Saved Games/
+/Searches/
+/Videos/
+
+# Specific AppData directories to ignore
+/AppData/Local/Application Data/
+/AppData/Local/History/
+/AppData/Local/Microsoft/Windows/INetCache/
+/AppData/Local/Microsoft/Windows/Temporary Internet Files/
+/AppData/Local/Temporary Internet Files/
+/AppData/Roaming/Microsoft/Windows/Start Menu/プログラム/
+
+# Ignore all hidden files at the root level (optional, depending on your project structure)
+/.*
+
+# Ignore system-generated files
+ntuser.dat.*
+ntuser.ini
+*.log
+AppData/Local/Comms/UnistoreDB/USS.jtx

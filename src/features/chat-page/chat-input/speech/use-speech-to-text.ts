@@ -35,10 +35,8 @@ class SpeechToText {
 
     const autoDetectSourceLanguageConfig =
       AutoDetectSourceLanguageConfig.fromLanguages([
-        "en-US",
-        "zh-CN",
-        "it-IT",
-        "pt-BR",
+        
+        "ja-JP",
       ]);
 
     const recognizer = SpeechRecognizer.FromConfig(
@@ -80,3 +78,4 @@ export const speechToTextStore = proxy(new SpeechToText());
 export const useSpeechToText = () => {
   return useSnapshot(speechToTextStore);
 };
+
