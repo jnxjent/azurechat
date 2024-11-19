@@ -1,4 +1,4 @@
-import { BlobServiceClient, RestError } from "@azure/storage-blob";
+import { BlobSASPermissions, BlobServiceClient, generateBlobSASQueryParameters, RestError, StorageSharedKeyCredential } from "@azure/storage-blob";
 import { ServerActionResponse } from "../server-action-response";
 
 // initialize the blobServiceClient
@@ -21,7 +21,8 @@ const InitBlobServiceClient = () => {
 export const UploadBlob = async (
   containerName: string,
   blobName: string,
-  blobData: Buffer
+  blobData: Buffer,
+  returnName: boolean = false
 ): Promise<ServerActionResponse<string>> => {
   const blobServiceClient = InitBlobServiceClient();
 
@@ -41,11 +42,41 @@ export const UploadBlob = async (
       ],
     };
   }
+  if (returnName) {
+    return {
+      status: "OK",
+      response: blockBlobClient.name,
+    };
+  }
   return {
     status: "OK",
     response: blockBlobClient.url,
   };
 };
+
+export const GenerateSasUrl = async (
+  containerName: string,
+  blobPath: string
+): Promise<ServerActionResponse<string>> => {
+  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME as string;
+  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY as string;
+  
+  const sharedKeyCredential = new StorageSharedKeyCredential(acc, key);
+  const blobServiceClient = InitBlobServiceClient();
+  const containerClient = blobServiceClient.getContainerClient(containerName);
+  const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+  const sasToken = generateBlobSASQueryParameters({
+    containerName: containerName,
+    expiresOn: new Date(new Date().valueOf() + 86400),
+    permissions: BlobSASPermissions.parse("racwd")
+  }, sharedKeyCredential);
+  const sasUrl = `${blockBlobClient.url}?${sasToken}`;
+  return {
+    status: "OK",
+    response: sasUrl
+  }
+}
+  
 
 export const GetBlob = async (
   containerName: string,

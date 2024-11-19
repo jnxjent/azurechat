@@ -10,6 +10,7 @@ import { IndexDocuments } from "../../chat-services/azure-ai-search/azure-ai-sea
 import {
   CrackDocument,
   CreateChatDocument,
+  UploadDocument
 } from "../../chat-services/chat-document-service";
 import { chatStore } from "../../chat-store";
 
@@ -29,9 +30,11 @@ class FileStore {
       const file: File | null = formData.get("file") as unknown as File;
 
       this.uploadButtonLabel = "Processing document";
+      formData.append("fileName", file.name)
+      const uploadResponse = await UploadDocument(formData);
       const crackingResponse = await CrackDocument(formData);
 
-      if (crackingResponse.status === "OK") {
+      if (crackingResponse.status === "OK" && uploadResponse.status === "OK") {
         let index = 0;
 
         const documentIndexResponses: Array<ServerActionResponse<boolean>> = [];
@@ -44,8 +47,10 @@ class FileStore {
           // index one document at a time
           const indexResponses = await IndexDocuments(
             file.name,
+            uploadResponse.response,
             [doc],
-            chatThreadId
+            chatThreadId,
+            // LOCAL_INDEX_API_ENDPOINT
           );
 
           documentIndexResponses.push(...indexResponses);
@@ -85,7 +90,7 @@ class FileStore {
           );
         }
       } else {
-        showError(crackingResponse.errors.map((e) => e.message).join("\n"));
+        showError((crackingResponse as any).errors.map((e: any) => e.message).join("\n"));
       }
     } catch (error) {
       showError("" + error);
