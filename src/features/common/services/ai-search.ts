@@ -30,7 +30,8 @@ export const AzureAISearchInstance = <T extends object>() => {
   const searchClient = new SearchClient<T>(
     endpoint,
     indexName,
-    new AzureKeyCredential(apiKey)
+    new AzureKeyCredential(apiKey),
+    {allowInsecureConnection: process.env.NODE_ENV === "development"}
   );
 
   return searchClient;
@@ -41,7 +42,8 @@ export const AzureAISearchIndexClientInstance = () => {
 
   const searchClient = new SearchIndexClient(
     endpoint,
-    new AzureKeyCredential(apiKey)
+    new AzureKeyCredential(apiKey),
+    {allowInsecureConnection: process.env.NODE_ENV === "development"}
   );
 
   return searchClient;

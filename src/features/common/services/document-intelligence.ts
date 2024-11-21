@@ -15,7 +15,8 @@ export const DocumentIntelligenceInstance = () => {
 
   const client = new DocumentAnalysisClient(
     endpoint,
-    new AzureKeyCredential(key)
+    new AzureKeyCredential(key),
+    {allowInsecureConnection: process.env.NODE_ENV === "development"}
   );
 
   return client;

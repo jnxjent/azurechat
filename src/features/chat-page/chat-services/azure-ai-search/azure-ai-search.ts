@@ -136,7 +136,8 @@ export const ExtensionSimilaritySearch = async (props: {
     const searchClient = new SearchClient(
       endpoint,
       indexName,
-      new AzureKeyCredential(apiKey)
+      new AzureKeyCredential(apiKey),
+      {allowInsecureConnection: process.env.NODE_ENV === "development"}
     );
 
     const searchResults = await searchClient.search(searchText, {
