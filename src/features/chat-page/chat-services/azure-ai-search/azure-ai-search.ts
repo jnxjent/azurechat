@@ -22,6 +22,7 @@ export interface AzureSearchDocumentIndex {
   user: string;
   chatThreadId: string;
   metadata: string;
+  fileUrl: string;
 }
 
 export type DocumentSearchResponse = {
@@ -199,6 +200,7 @@ export const ExtensionSimilaritySearch = async (props: {
 
 export const IndexDocuments = async (
   fileName: string,
+  fileUrl: string,
   docs: string[],
   chatThreadId: string
 ): Promise<Array<ServerActionResponse<boolean>>> => {
@@ -212,6 +214,7 @@ export const IndexDocuments = async (
         user: await userHashedId(),
         pageContent: doc,
         metadata: fileName,
+        fileUrl,
         embedding: [],
       };
 

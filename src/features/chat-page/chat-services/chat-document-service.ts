@@ -11,11 +11,43 @@ import { uniqueId } from "@/features/common/util";
 import { SqlQuerySpec } from "@azure/cosmos";
 import { EnsureIndexIsCreated } from "./azure-ai-search/azure-ai-search";
 import { CHAT_DOCUMENT_ATTRIBUTE, ChatDocumentModel } from "./models";
+import { UploadBlob } from "@/features/common/services/azure-storage";
 
 const MAX_UPLOAD_DOCUMENT_SIZE: number = 20000000;
 const CHUNK_SIZE = 2300;
 // 25% overlap
 const CHUNK_OVERLAP = CHUNK_SIZE * 0.25;
+
+
+const DOCUMENT_CONTAINER_NAME = "dl-link"
+
+export const UploadDocumentToStore = async (
+  threadId: string,
+  fileName: string,
+  fileData: Buffer
+): Promise<ServerActionResponse<string>> => {
+  return await UploadBlob(
+    DOCUMENT_CONTAINER_NAME,
+    fileName,
+    // `${threadId}/${fileName}`,
+    fileData,
+    true
+  );
+};
+
+export const UploadDocument = async (formData: FormData) => {
+  const threadId = String(formData.get("id"))
+  const file: File | null = formData.get("file") as unknown as File;
+  const fileName = formData.get("fileName") as string
+  const blob = new Blob([file], { type: file.type });
+  const buff = await blob.arrayBuffer()
+  const uploadResponse = await UploadDocumentToStore(
+    threadId,
+    `${threadId}/${fileName}`,
+    Buffer.from(buff)
+  );
+  return uploadResponse
+}
 
 export const CrackDocument = async (
   formData: FormData
