@@ -42,12 +42,6 @@ export const UploadBlob = async (
       ],
     };
   }
-  if (returnName) {
-    return {
-      status: "OK",
-      response: blockBlobClient.name,
-    };
-  }
   return {
     status: "OK",
     response: blockBlobClient.url,
