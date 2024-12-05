@@ -60,7 +60,7 @@ export const FindCitationByID = async (
   try {
     const querySpec: SqlQuerySpec = {
       query:
-        "SELECT * FROM root r WHERE r.type=@type AND r.id=@id AND r.userId=@userId ",
+        "SELECT * FROM root r WHERE r.type=@type AND r.id=@id",
       parameters: [
         {
           name: "@type",
@@ -69,10 +69,6 @@ export const FindCitationByID = async (
         {
           name: "@id",
           value: id,
-        },
-        {
-          name: "@userId",
-          value: await userHashedId(),
         },
       ],
     };

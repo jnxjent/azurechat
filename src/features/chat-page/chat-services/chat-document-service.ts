@@ -29,9 +29,7 @@ export const UploadDocumentToStore = async (
   return await UploadBlob(
     DOCUMENT_CONTAINER_NAME,
     fileName,
-    // `${threadId}/${fileName}`,
     fileData,
-    true
   );
 };
 
