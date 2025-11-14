@@ -1,0 +1,23 @@
+﻿{
+    "STRICT_Q":  "1",
+    "APP_SECRET":  "change_me_32bytes_min",
+    "SF_DEFAULT_OBJECT":  "Opportunity",
+    "SF_MODE":  "real",
+    "SF_AUTH_BASE":  "https://test.salesforce.com",
+    "SF_LIGHTNING_HOST":  "https://d0o000000t45deas--partial.lightning.force.com",
+    "SF_REFRESH_TOKEN":  "5Aep861gugEdGoN23aiCUzbnbHHEb03crqFpBVTKWXCnMeAjSwy07xUKyegA8iTbuI2g.IzMoMFoTHwzWgPMYxp",
+    "API_VERSION":  "v65.0",
+    "SF_CLIENT_ID":  "3MVG96vIeT8jJWjILd96fb46TVQOR2PyDw7rk9s8q8s3dcwaL_gEbw8aj6OKJfRpxxK3YNByKBOCuKvK79vuU",
+    "INTENT_ENGINE":  "auto",
+    "AZURE_OPENAI_API_DEPLOYMENT_NAME":  "gpt-5localtest",
+    "AZURE_OPENAI_API_INSTANCE_NAME":  "midac19-aidalle-yhggrda5qr5ae",
+    "AZURE_OPENAI_API_KEY":  "3EEVxOvd5b8kZSh0az8ysY91qt94Hk5XIl9GTpeyezhCzNTyk3DCJQQJ99ALACfhMk5XJ3w3AAABACOGuoTu",
+    "AZURE_OPENAI_ENDPOINT":  "https://midac19-aidalle-yhggrda5qr5ae.openai.azure.com",
+    "SF_AUTH_URL":  "https://test.salesforce.com/services/oauth2/token",
+    "SF_CLIENT_SECRET":  "B2E03946487AE6841AA7CEB237F044DF7A78A217D1D6170913591AC35B88C999",
+    "CONTACT_LIST_MAX":  "50",
+    "SCM_DO_BUILD_DURING_DEPLOYMENT":  "1",
+    "AZURE_OPENAI_API_VERSION":  "2024-12-01-preview",
+    "SF_CALLBACK_URL":  "http://localhost:8001/oauth/sf/callback",
+    "SF_INSTANCE_URL":  "https://d0o000000t45deas--partial.sandbox.lightning.force.com"
+}

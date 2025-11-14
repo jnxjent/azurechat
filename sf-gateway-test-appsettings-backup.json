@@ -1,0 +1,107 @@
+[
+  {
+    "name": "API_VERSION",
+    "slotSetting": false,
+    "value": "v65.0"
+  },
+  {
+    "name": "APP_SECRET",
+    "slotSetting": false,
+    "value": "change_me_32bytes_min"
+  },
+  {
+    "name": "AZURE_OPENAI_API_DEPLOYMENT_NAME",
+    "slotSetting": false,
+    "value": "gpt-5localtest"
+  },
+  {
+    "name": "AZURE_OPENAI_API_INSTANCE_NAME",
+    "slotSetting": false,
+    "value": "midac19-aidalle-yhggrda5qr5ae"
+  },
+  {
+    "name": "AZURE_OPENAI_API_KEY",
+    "slotSetting": false,
+    "value": "3EEVxOvd5b8kZSh0az8ysY91qt94Hk5XIl9GTpeyezhCzNTyk3DCJQQJ99ALACfhMk5XJ3w3AAABACOGuoTu"
+  },
+  {
+    "name": "AZURE_OPENAI_API_VERSION",
+    "slotSetting": false,
+    "value": "2024-12-01-preview"
+  },
+  {
+    "name": "AZURE_OPENAI_ENDPOINT",
+    "slotSetting": false,
+    "value": "https://midac19-aidalle-yhggrda5qr5ae.openai.azure.com"
+  },
+  {
+    "name": "CONTACT_LIST_MAX",
+    "slotSetting": false,
+    "value": "50"
+  },
+  {
+    "name": "INTENT_ENGINE",
+    "slotSetting": false,
+    "value": "auto"
+  },
+  {
+    "name": "SCM_DO_BUILD_DURING_DEPLOYMENT",
+    "slotSetting": false,
+    "value": "1"
+  },
+  {
+    "name": "SF_AUTH_BASE",
+    "slotSetting": false,
+    "value": "https://test.salesforce.com"
+  },
+  {
+    "name": "SF_AUTH_URL",
+    "slotSetting": false,
+    "value": "https://test.salesforce.com/services/oauth2/token"
+  },
+  {
+    "name": "SF_CALLBACK_URL",
+    "slotSetting": false,
+    "value": "http://localhost:8001/oauth/sf/callback"
+  },
+  {
+    "name": "SF_CLIENT_ID",
+    "slotSetting": false,
+    "value": "3MVG96vIeT8jJWjILd96fb46TVQOR2PyDw7rk9s8q8s3dcwaL_gEbw8aj6OKJfRpxxK3YNByKBOCuKvK79vuU"
+  },
+  {
+    "name": "SF_CLIENT_SECRET",
+    "slotSetting": false,
+    "value": "B2E03946487AE6841AA7CEB237F044DF7A78A217D1D6170913591AC35B88C999"
+  },
+  {
+    "name": "SF_DEFAULT_OBJECT",
+    "slotSetting": false,
+    "value": "Opportunity"
+  },
+  {
+    "name": "SF_INSTANCE_URL",
+    "slotSetting": false,
+    "value": "https://d0o000000t45deas--partial.sandbox.lightning.force.com"
+  },
+  {
+    "name": "SF_LIGHTNING_HOST",
+    "slotSetting": false,
+    "value": "https://d0o000000t45deas--partial.lightning.force.com"
+  },
+  {
+    "name": "SF_MODE",
+    "slotSetting": false,
+    "value": "real"
+  },
+  {
+    "name": "SF_REFRESH_TOKEN",
+    "slotSetting": false,
+    "value": "5Aep861gugEdGoN23aiCUzbnbHHEb03crqFpBVTKWXCnMeAjSwy07xUKyegA8iTbuI2g.IzMoMFoTHwzWgPMYxp"
+  },
+  {
+    "name": "STRICT_Q",
+    "slotSetting": false,
+    "value": "1"
+  }
+]
