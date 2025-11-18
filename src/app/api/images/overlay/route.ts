@@ -201,7 +201,7 @@ export async function POST(req: NextRequest) {
     await dst.uploadData(outBuf, {
       blobHTTPHeaders: {
         blobContentType: "image/png",
-        blobCacheControl:: "no-cache, no-store, must-revalidate",
+        blobCacheControl: "no-cache, no-store, must-revalidate",
       },
     });
 
