@@ -14,6 +14,22 @@ interface ReportingChatPageProps {
   chatDocuments: Array<ChatDocumentModel>;
 }
 
+// ChatMessageArea が受け取れるロール
+type ChatUiRole = "user" | "system" | "assistant" | "tool";
+
+/**
+ * ChatMessageModel の role (ChatRole) を
+ * UI 用のロールに正規化する。
+ *
+ * - "function" は UI では "assistant" として扱う
+ */
+function toUiRole(role: ChatMessageModel["role"]): ChatUiRole {
+  if (role === "function") {
+    return "assistant";
+  }
+  return role as ChatUiRole;
+}
+
 export default function ReportingChatPage(props: ReportingChatPageProps) {
   return (
     <main className="flex flex-1 relative flex-col">
@@ -24,7 +40,7 @@ export default function ReportingChatPage(props: ReportingChatPageProps) {
               <ChatMessageArea
                 key={message.id}
                 profileName={message.name}
-                role={message.role}
+                role={toUiRole(message.role)}
                 onCopy={() => {
                   navigator.clipboard.writeText(message.content);
                 }}
