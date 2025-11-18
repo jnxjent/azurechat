@@ -42,7 +42,11 @@ function fixOrphanTools(messages: any[]) {
     }
 
     if (m?.role === "tool") {
-      if (lastAssistantToolIds && m.tool_call_id && lastAssistantToolIds.has(m.tool_call_id)) {
+      if (
+        lastAssistantToolIds &&
+        m.tool_call_id &&
+        lastAssistantToolIds.has(m.tool_call_id)
+      ) {
         out.push(m);
       }
       continue; // 孤立toolは落とす
@@ -66,7 +70,9 @@ function hardSanitize(messages: any[]) {
     }
     out.push(m);
   }
-  return out.length ? out : [{ role: "user", content: "（ツール出力を無視して続行）" }];
+  return out.length
+    ? out
+    : [{ role: "user", content: "（ツール出力を無視して続行）" }];
 }
 
 export async function POST(req: Request) {
@@ -79,7 +85,10 @@ export async function POST(req: Request) {
 
   if (typeof content !== "string") {
     return new Response(
-      JSON.stringify({ error: "missing_content", message: "`content` must be a JSON string." }),
+      JSON.stringify({
+        error: "missing_content",
+        message: "`content` must be a JSON string.",
+      }),
       { status: 400, headers: { "content-type": "application/json" } }
     );
   }
@@ -89,7 +98,10 @@ export async function POST(req: Request) {
     parsed = JSON.parse(content);
   } catch {
     return new Response(
-      JSON.stringify({ error: "invalid_json", message: "`content` is not valid JSON." }),
+      JSON.stringify({
+        error: "invalid_json",
+        message: "`content` is not valid JSON.",
+      }),
       { status: 400, headers: { "content-type": "application/json" } }
     );
   }
@@ -98,7 +110,9 @@ export async function POST(req: Request) {
   if (Array.isArray(parsed?.messages)) {
     parsed.messages = fixOrphanTools(parsed.messages);
     if (parsed.messages.length === 0) {
-      parsed.messages = [{ role: "user", content: "（ツール出力を無視して続行）" }];
+      parsed.messages = [
+        { role: "user", content: "（ツール出力を無視して続行）" },
+      ];
     }
   }
 
@@ -117,15 +131,22 @@ export async function POST(req: Request) {
     ...(parsed as UserPromptWithMode),
     thinkingMode: uiThinkingMode ?? "standard",
     apiThinkingMode,
+    // ★ 型エラー対策：必ず string を渡す（なければ空文字）
     multimodalImage:
-      typeof multimodalImage === "string" && multimodalImage.length > 0 ? multimodalImage : undefined,
+      typeof multimodalImage === "string" && multimodalImage.length > 0
+        ? multimodalImage
+        : "",
   };
 
   // 念のためこちら側も整合
   if (Array.isArray((userPrompt as any).messages)) {
-    (userPrompt as any).messages = fixOrphanTools((userPrompt as any).messages);
+    (userPrompt as any).messages = fixOrphanTools(
+      (userPrompt as any).messages
+    );
     if ((userPrompt as any).messages.length === 0) {
-      (userPrompt as any).messages = [{ role: "user", content: "（ツール出力を無視して続行）" }];
+      (userPrompt as any).messages = [
+        { role: "user", content: "（ツール出力を無視して続行）" },
+      ];
     }
   }
 
@@ -134,10 +155,16 @@ export async function POST(req: Request) {
     return await ChatAPIEntry(userPrompt, req.signal);
   } catch (e: any) {
     const msg: string = e?.error?.message || e?.message || "";
-    if (/role 'tool' must be a response to a preceeding message with 'tool_calls'/.test(msg)) {
+    if (
+      /role 'tool' must be a response to a preceeding message with 'tool_calls'/.test(
+        msg
+      )
+    ) {
       // リカバリ：tool をすべて落として再送
       if (Array.isArray((userPrompt as any).messages)) {
-        (userPrompt as any).messages = hardSanitize((userPrompt as any).messages);
+        (userPrompt as any).messages = hardSanitize(
+          (userPrompt as any).messages
+        );
       }
       // parsed 側も同期（ChatAPIEntry がこちらを参照する場合に備える）
       if (Array.isArray(parsed?.messages)) {
