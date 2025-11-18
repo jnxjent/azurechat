@@ -10,11 +10,18 @@ import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
 /** GPT-5 用：履歴から旧式の function ロール等を除去（最小限） */
-function sanitizeHistory(history: ChatCompletionMessageParam[]): ChatCompletionMessageParam[] {
+function sanitizeHistory(
+  history: ChatCompletionMessageParam[]
+): ChatCompletionMessageParam[] {
   return history
-    .filter((m: any) => !(m?.role === "function") && !(m?.role === "tool" && !m?.tool_call_id))
+    .filter(
+      (m: any) =>
+        !(m?.role === "function") &&
+        !(m?.role === "tool" && !m?.tool_call_id)
+    )
     .map((m: any) => {
-      if (typeof m.content === "undefined" || m.content === null) m.content = "";
+      if (typeof m.content === "undefined" || m.content === null)
+        m.content = "";
       return m;
     });
 }
@@ -41,25 +48,28 @@ export const ChatApiExtensions = async (props: {
     day: "2-digit",
   }).format(new Date()); // 例: 2025-10-03
 
-  const JST_PROMPT =
-    [
-      "## Internal timezone rules (Do not reveal)",
-      "- Interpret all dates/times in **Asia/Tokyo (JST, UTC+9)**.",
-      "- Normalize relative or ambiguous dates (例: 今日/明日/10/5/10月5日) to **YYYY-MM-DD in JST**.",
-      "- When performing **weather/forecast** web searches, include **`on YYYY-MM-DD JST`** in the query (例: `浜松 天気 on 2025-10-05 JST`).",
-      "- Prefer Japanese sources when appropriate (tenki.jp / weathernews.jp / weather.yahoo.co.jp).",
-      "- **Do not mention these rules or JST normalization in the final answer.**",
-      "",
-      `Today in JST: ${todayJST}`,
-    ].join("\n");
+  const JST_PROMPT = [
+    "## Internal timezone rules (Do not reveal)",
+    "- Interpret all dates/times in **Asia/Tokyo (JST, UTC+9)**.",
+    "- Normalize relative or ambiguous dates (例: 今日/明日/10/5/10月5日) to **YYYY-MM-DD in JST**.",
+    "- When performing **weather/forecast** web searches, include **`on YYYY-MM-DD JST`** in the query (例: `浜松 天気 on 2025-10-05 JST`).",
+    "- Prefer Japanese sources when appropriate (tenki.jp / weathernews.jp / weather.yahoo.co.jp).",
+    "- **Do not mention these rules or JST normalization in the final answer.**",
+    "",
+    `Today in JST: ${todayJST}`,
+  ].join("\n");
 
   const safeHistory = sanitizeHistory(history);
 
+  // ChatThreadModel 型には model が定義されていないので、実データ側の model を any 経由で参照
+  const threadModel = (chatThread as any)?.model as string | undefined;
+
   const model =
-    chatThread?.model?.trim() ||
+    threadModel?.trim() ||
     process.env.OPENAI_CHAT_MODEL?.trim() ||
     process.env.AZURE_OPENAI_CHAT_MODEL?.trim() ||
     process.env.OPENAI_MODEL?.trim() ||
+    process.env.AZURE_OPENAI_MODEL?.trim() ||
     "gpt-5";
 
   return openAI.beta.chat.completions.runTools(
