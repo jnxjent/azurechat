@@ -25,8 +25,50 @@ export const OpenAIStream = (props: {
 
       let lastMessage = "";
 
+      // 🔹 ツール呼び出し（GPT-5 runTools → functionCall にマッピング）
       runner
-        .on("content", (content) => {
+        .on("functionCall", (fnCall: any) => {
+          try {
+            const fn = (fnCall as any).function ?? {};
+            const name = fn.name ?? "tool";
+            const args =
+              typeof fn.arguments === "string"
+                ? fn.arguments
+                : JSON.stringify(fn.arguments ?? {});
+
+            const response: AzureChatCompletion = {
+              type: "functionCall",
+              response: {
+                name,
+                arguments: args,
+              },
+            };
+
+            streamResponse(response.type, JSON.stringify(response));
+          } catch (e) {
+            console.log("⚠️ functionCall mapping error:", e);
+          }
+        })
+        // 🔹 ツール実行結果 → functionCallResult にマッピング
+        .on("functionCallResult", (fnResult: any) => {
+          try {
+            const payload =
+              typeof fnResult === "string"
+                ? fnResult
+                : JSON.stringify(fnResult);
+
+            const response: AzureChatCompletion = {
+              type: "functionCallResult",
+              response: payload,
+            };
+
+            streamResponse(response.type, JSON.stringify(response));
+          } catch (e) {
+            console.log("⚠️ functionCallResult mapping error:", e);
+          }
+        })
+        // 🔹 通常のコンテンツ delta
+        .on("content", () => {
           const completion = runner.currentChatCompletionSnapshot;
           if (completion) {
             const response: AzureChatCompletion = {
@@ -37,7 +79,7 @@ export const OpenAIStream = (props: {
             streamResponse(response.type, JSON.stringify(response));
           }
         })
-        .on("abort", (error) => {
+        .on("abort", () => {
           const response: AzureChatCompletionAbort = {
             type: "abort",
             response: "Chat aborted",
@@ -45,20 +87,21 @@ export const OpenAIStream = (props: {
           streamResponse(response.type, JSON.stringify(response));
           controller.close();
         })
-        .on("error", async (error) => {
+        .on("error", async (error: any) => {
           console.log("🔴 error", error);
           const response: AzureChatCompletion = {
             type: "error",
-            response: error.message,
+            response: error?.message ?? String(error),
           };
 
-          // if there is an error still save the last message even though it is not complete
-          await CreateChatMessage({
-            name: AI_NAME,
-            content: lastMessage,
-            role: "assistant",
-            chatThreadId: chatThread.id,
-          });
+          if (lastMessage) {
+            await CreateChatMessage({
+              name: AI_NAME,
+              content: lastMessage,
+              role: "assistant",
+              chatThreadId: chatThread.id,
+            });
+          }
 
           streamResponse(response.type, JSON.stringify(response));
           controller.close();

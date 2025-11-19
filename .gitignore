@@ -87,3 +87,5 @@ ntuser.dat.*
 ntuser.ini
 *.log
 AppData/Local/Comms/UnistoreDB/USS.jtx
+.env*
+src/.env azurechat-test src/.env.example src/.env.local
