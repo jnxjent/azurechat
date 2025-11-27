@@ -291,7 +291,10 @@ async function composeTextOnImageBase(
         : "middle";
   }
 
-  const safeFontFamily = normalizeSpaces(fontFamily || "MyJP");
+  // ★ ここを修正：MyJP を先頭に固定しつつ、NL からの fontFamily を後ろにぶら下げる
+  const safeFontFamily = fontFamily
+    ? normalizeSpaces(fontFamily)
+    : "";
 
   const svg = `
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
@@ -304,7 +307,7 @@ async function composeTextOnImageBase(
         font-style: normal;
       }
       .label {
-        font-family: '${escapeXml(safeFontFamily)}', 'MyJP', sans-serif;
+        font-family: 'MyJP'${safeFontFamily ? ", '" + escapeXml(safeFontFamily) + "'" : ""}, sans-serif;
         font-size: ${effectiveFontSize}px;
         fill: ${fill};
         paint-order: stroke;
