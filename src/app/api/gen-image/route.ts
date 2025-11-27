@@ -11,11 +11,21 @@ import sharp from "sharp";
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import {
+  BlobServiceClient,
+  StorageSharedKeyCredential,
+} from "@azure/storage-blob";
 
 const AZ_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT!;
 const AZ_KEY = process.env.AZURE_OPENAI_API_KEY!;
 const DEPLOYMENT = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT!;
-const API_VERSION = process.env.AZURE_OPENAI_API_VERSION || "2024-12-01-preview";
+const API_VERSION =
+  process.env.AZURE_OPENAI_API_VERSION || "2024-12-01-preview";
+
+const STORAGE_ACCOUNT_NAME = process.env.AZURE_STORAGE_ACCOUNT_NAME;
+const STORAGE_ACCOUNT_KEY = process.env.AZURE_STORAGE_ACCOUNT_KEY;
+const STORAGE_CONTAINER_NAME =
+  process.env.AZURE_STORAGE_CONTAINER_NAME || "images";
 
 // ---------- utils ----------
 function normalizeSpaces(input: string) {
@@ -44,13 +54,26 @@ function fallbackPrompt() {
   return "可愛い三毛猫のイラスト。柔らかな水彩で、背景はシンプル。文字は入れない。非政治的。家族向け。ロゴや商標は含まない。";
 }
 async function loadFontAsDataURL() {
-  const fontPath = path.join(process.cwd(), "public", "fonts", "NotoSansJP-Regular.ttf");
+  const fontPath = path.join(
+    process.cwd(),
+    "public",
+    "fonts",
+    "NotoSansJP-Regular.ttf"
+  );
   const fontBuf = await fs.readFile(fontPath);
   return `data:font/ttf;base64,${fontBuf.toString("base64")}`;
 }
 function escapeXml(s: string) {
   return String(s).replace(/[&<>"']/g, (ch) =>
-    ch === "&" ? "&amp;" : ch === "<" ? "&lt;" : ch === ">" ? "&gt;" : ch === '"' ? "&quot;" : "&#39;"
+    ch === "&"
+      ? "&amp;"
+      : ch === "<"
+      ? "&lt;"
+      : ch === ">"
+      ? "&gt;"
+      : ch === '"'
+      ? "&quot;"
+      : "&#39;"
   );
 }
 function pickNumber(v: any, def: number) {
@@ -67,40 +90,37 @@ function decodeB64OrEmpty(b64: any): string {
   }
 }
 function pickAlign(v: any): "left" | "center" | "right" {
-  return (v === "left" || v === "center" || v === "right") ? v : "center";
+  return v === "left" || v === "center" || v === "right" ? v : "center";
 }
 function pickVAlign(v: any): "top" | "middle" | "bottom" {
-  return (v === "top" || v === "middle" || v === "bottom") ? v : "bottom";
+  return v === "top" || v === "middle" ? v : "bottom";
 }
 
 // ---------- プラカード自動認識 ----------
-/**
- * 画像から白い矩形領域（プラカード）を検出
- * RGB値が全て200以上のピクセルを「白」と判定し、それらを囲む矩形を返す
- * ★ メモリ効率化：配列を使わず直接min/maxを計算
- */
-async function detectWhiteRectangle(imageBuffer: Buffer): Promise<{ x: number; y: number; w: number; h: number } | null> {
+async function detectWhiteRectangle(
+  imageBuffer: Buffer
+): Promise<{ x: number; y: number; w: number; h: number } | null> {
   try {
     const image = sharp(imageBuffer);
     const metadata = await image.metadata();
     const { width, height } = metadata;
-    
+
     if (!width || !height) {
-      console.warn('[detectWhiteRectangle] Invalid image dimensions');
+      console.warn("[detectWhiteRectangle] Invalid image dimensions");
       return null;
     }
 
-    // 処理速度のため画像を縮小（最大512px）
     const maxDim = 512;
     const scale = Math.min(1, maxDim / Math.max(width, height));
     const resizedWidth = Math.round(width * scale);
     const resizedHeight = Math.round(height * scale);
 
-    console.log(`[detectWhiteRectangle] Analyzing image: ${width}x${height} -> ${resizedWidth}x${resizedHeight}`);
+    console.log(
+      `[detectWhiteRectangle] Analyzing image: ${width}x${height} -> ${resizedWidth}x${resizedHeight}`
+    );
 
-    // 画像をRGBA配列に変換
     const { data, info } = await image
-      .resize(resizedWidth, resizedHeight, { fit: 'inside' })
+      .resize(resizedWidth, resizedHeight, { fit: "inside" })
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
@@ -108,7 +128,6 @@ async function detectWhiteRectangle(imageBuffer: Buffer): Promise<{ x: number; y
     const w = info.width;
     const h = info.height;
 
-    // 白色ピクセルの境界を直接計算（配列を使わない）
     const threshold = 200;
     let minX = w;
     let maxX = 0;
@@ -122,8 +141,7 @@ async function detectWhiteRectangle(imageBuffer: Buffer): Promise<{ x: number; y
         const r = data[idx];
         const g = data[idx + 1];
         const b = data[idx + 2];
-        
-        // 白っぽいピクセル
+
         if (r > threshold && g > threshold && b > threshold) {
           whitePixelCount++;
           if (x < minX) minX = x;
@@ -135,32 +153,35 @@ async function detectWhiteRectangle(imageBuffer: Buffer): Promise<{ x: number; y
     }
 
     if (whitePixelCount < 100) {
-      console.warn(`[detectWhiteRectangle] Not enough white pixels found: ${whitePixelCount}`);
+      console.warn(
+        `[detectWhiteRectangle] Not enough white pixels found: ${whitePixelCount}`
+      );
       return null;
     }
 
     const rectW = maxX - minX;
     const rectH = maxY - minY;
 
-    // 矩形が小さすぎる場合は無視
     if (rectW < 50 || rectH < 30) {
-      console.warn(`[detectWhiteRectangle] Rectangle too small: ${rectW}x${rectH}`);
+      console.warn(
+        `[detectWhiteRectangle] Rectangle too small: ${rectW}x${rectH}`
+      );
       return null;
     }
 
-    // 元の画像サイズにスケールバック
     const result = {
       x: Math.round(minX / scale),
       y: Math.round(minY / scale),
       w: Math.round(rectW / scale),
-      h: Math.round(rectH / scale)
+      h: Math.round(rectH / scale),
     };
 
-    console.log(`[detectWhiteRectangle] Detected placard: x=${result.x}, y=${result.y}, w=${result.w}, h=${result.h} (${whitePixelCount} white pixels)`);
+    console.log(
+      `[detectWhiteRectangle] Detected placard: x=${result.x}, y=${result.y}, w=${result.w}, h=${result.h} (${whitePixelCount} white pixels)`
+    );
     return result;
-
   } catch (e) {
-    console.error('[detectWhiteRectangle] Detection failed:', e);
+    console.error("[detectWhiteRectangle] Detection failed:", e);
     return null;
   }
 }
@@ -178,7 +199,8 @@ async function composeTextOnImageBase(
     marginBottom: number;
     fill?: string;
     stroke?: string;
-    autoDetectPlacard?: boolean; // ★ 新規パラメータ
+    autoDetectPlacard?: boolean;
+    fontFamily?: string;
   }
 ) {
   const {
@@ -193,52 +215,83 @@ async function composeTextOnImageBase(
     fill = "#ffffff",
     stroke = "rgba(0,0,0,0.4)",
     autoDetectPlacard = false,
+    fontFamily,
   } = opts;
-  
+
   if (!text) return baseImage;
 
   const fontDataURL = await loadFontAsDataURL();
-  
+
   let x: number;
   let y: number;
   let effectiveFontSize = fontSize;
   let anchor: "start" | "middle" | "end";
 
-  // ★ プラカード自動検出
   if (autoDetectPlacard) {
-    console.log('[composeTextOnImageBase] Attempting placard detection...');
+    console.log("[composeTextOnImageBase] Attempting placard detection...");
     const rect = await detectWhiteRectangle(baseImage);
-    
+
     if (rect) {
       console.log(`[composeTextOnImageBase] Using detected placard position`);
-      
-      // プラカードの中央に配置
+
       x = rect.x + rect.w / 2;
       y = rect.y + rect.h / 2;
       anchor = "middle";
-      
-      // フォントサイズを自動調整（矩形に収まるように）
+
       const chars = Math.max(Array.from(text).length, 1);
       const maxFsByWidth = Math.floor((rect.w * 0.8) / chars);
       const maxFsByHeight = Math.floor(rect.h * 0.6);
       effectiveFontSize = Math.min(fontSize, maxFsByWidth, maxFsByHeight);
-      
-      // 最小フォントサイズの保証
       effectiveFontSize = Math.max(effectiveFontSize, 20);
-      
-      console.log(`[composeTextOnImageBase] Font size adjusted: ${fontSize} -> ${effectiveFontSize}`);
+
+      console.log(
+        `[composeTextOnImageBase] Font size adjusted: ${fontSize} -> ${effectiveFontSize}`
+      );
     } else {
-      console.warn('[composeTextOnImageBase] Placard detection failed, using default position');
-      x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
-      y = vAlign === "top" ? 40 + fontSize : vAlign === "middle" ? height / 2 : height - marginBottom;
-      anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
+      console.warn(
+        "[composeTextOnImageBase] Placard detection failed, using default position"
+      );
+      x =
+        align === "left"
+          ? 40
+          : align === "right"
+          ? width - 40
+          : width / 2;
+      y =
+        vAlign === "top"
+          ? 40 + fontSize
+          : vAlign === "middle"
+          ? height / 2
+          : height - marginBottom;
+      anchor =
+        align === "left"
+          ? "start"
+          : align === "right"
+          ? "end"
+          : "middle";
     }
   } else {
-    // 従来の配置ロジック
-    x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
-    y = vAlign === "top" ? 40 + fontSize : vAlign === "middle" ? height / 2 : height - marginBottom;
-    anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
+    x =
+      align === "left"
+        ? 40
+        : align === "right"
+        ? width - 40
+        : width / 2;
+    y =
+      vAlign === "top"
+        ? 40 + fontSize
+        : vAlign === "middle"
+        ? height / 2
+        : height - marginBottom;
+    anchor =
+      align === "left"
+        ? "start"
+        : align === "right"
+        ? "end"
+        : "middle";
   }
+
+  const safeFontFamily = normalizeSpaces(fontFamily || "MyJP");
 
   const svg = `
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
@@ -251,7 +304,7 @@ async function composeTextOnImageBase(
         font-style: normal;
       }
       .label {
-        font-family: 'MyJP', sans-serif;
+        font-family: '${escapeXml(safeFontFamily)}', 'MyJP', sans-serif;
         font-size: ${effectiveFontSize}px;
         fill: ${fill};
         paint-order: stroke;
@@ -265,7 +318,10 @@ async function composeTextOnImageBase(
   <text x="${x}" y="${y}" class="label">${escapeXml(text)}</text>
 </svg>`.trim();
 
-  return await sharp(baseImage).composite([{ input: Buffer.from(svg), left: 0, top: 0 }]).png().toBuffer();
+  return await sharp(baseImage)
+    .composite([{ input: Buffer.from(svg), left: 0, top: 0 }])
+    .png()
+    .toBuffer();
 }
 
 async function saveToPublicGenerated(buf: Buffer) {
@@ -276,36 +332,82 @@ async function saveToPublicGenerated(buf: Buffer) {
   return `/generated/${id}.png`;
 }
 
-// 相対URL・dataURL・絶対URLの全てに対応して Buffer を返す
-async function getBaseImageBufferFromSource(req: NextRequest, imageUrl?: string, imageB64?: string) {
+// ---------- ★ ここが今回の肝：/api/images → Blob SDK で直接読む ----------
+async function getBaseImageBufferFromSource(
+  req: NextRequest,
+  imageUrl?: string,
+  imageB64?: string
+) {
   if (imageB64) {
     const b64 = imageB64.replace(/^data:image\/\w+;base64,/, "");
     return Buffer.from(b64, "base64");
   }
   if (!imageUrl) throw new Error("image source not provided");
 
-  // ★ /api/images?t=xxx&img=yyy の場合、Azure Storageから直接取得
-  if (imageUrl.includes('/api/images?')) {
-    try {
-      const url = new URL(imageUrl, 'http://localhost');
-      const threadId = url.searchParams.get('t');
-      const imgName = url.searchParams.get('img');
-      
-      if (threadId && imgName) {
-        const storageAccount = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-        const containerName = process.env.AZURE_STORAGE_CONTAINER_NAME || "images";
-        const directUrl = `https://${storageAccount}.blob.core.windows.net/${containerName}/${threadId}/${imgName}`;
-        
-        console.log(`[getBaseImageBufferFromSource] Fetching from Azure Storage: ${directUrl}`);
-        const res = await fetch(directUrl, { cache: "no-store" });
-        if (res.ok) {
-          console.log(`[getBaseImageBufferFromSource] Successfully fetched from Azure Storage`);
-          return Buffer.from(await res.arrayBuffer());
+  // /api/images?t=...&img=... → Azure Blob Storage から直接ダウンロード
+  if (imageUrl.includes("/api/images")) {
+    console.log(
+      "[getBaseImageBufferFromSource] imageUrl looks like /api/images; trying Azure Blob SDK..."
+    );
+
+    if (!STORAGE_ACCOUNT_NAME || !STORAGE_ACCOUNT_KEY) {
+      console.error(
+        "[getBaseImageBufferFromSource] STORAGE_ACCOUNT envs missing",
+        {
+          STORAGE_ACCOUNT_NAME,
+          hasKey: !!STORAGE_ACCOUNT_KEY,
         }
-        console.warn(`[getBaseImageBufferFromSource] Azure Storage fetch failed (${res.status}), falling back`);
+      );
+    } else {
+      try {
+        const url = new URL(imageUrl, "http://localhost");
+        const threadId = url.searchParams.get("t");
+        const imgName = url.searchParams.get("img");
+
+        if (threadId && imgName) {
+          const blobPath = `${threadId}/${imgName}`;
+          console.log(
+            `[getBaseImageBufferFromSource] Blob path resolved: container=${STORAGE_CONTAINER_NAME}, blob=${blobPath}`
+          );
+
+          const credential = new StorageSharedKeyCredential(
+            STORAGE_ACCOUNT_NAME,
+            STORAGE_ACCOUNT_KEY
+          );
+          const blobService = new BlobServiceClient(
+            `https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net`,
+            credential
+          );
+          const containerClient = blobService.getContainerClient(
+            STORAGE_CONTAINER_NAME
+          );
+          const blobClient = containerClient.getBlobClient(blobPath);
+
+          const download = await blobClient.download();
+          if (!download.readableStreamBody) {
+            throw new Error("download.readableStreamBody is null");
+          }
+
+          const chunks: Uint8Array[] = [];
+          for await (const chunk of download.readableStreamBody) {
+            chunks.push(chunk as Uint8Array);
+          }
+          const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+          console.log(
+            `[getBaseImageBufferFromSource] Successfully downloaded blob via SDK (size=${buf.length})`
+          );
+          return buf;
+        } else {
+          console.warn(
+            "[getBaseImageBufferFromSource] Missing t or img query params in imageUrl"
+          );
+        }
+      } catch (e) {
+        console.error(
+          "[getBaseImageBufferFromSource] Blob SDK download failed; will fall back to HTTP fetch",
+          e
+        );
       }
-    } catch (e) {
-      console.error('[getBaseImageBufferFromSource] Failed to fetch from Azure Storage:', e);
     }
   }
 
@@ -315,10 +417,48 @@ async function getBaseImageBufferFromSource(req: NextRequest, imageUrl?: string,
     return Buffer.from(b64, "base64");
   }
 
-  // 絶対URL
+  // 絶対URL（http/https）: 最後のフォールバック
   if (/^https?:\/\//i.test(imageUrl)) {
-    const res = await fetch(imageUrl, { cache: "no-store" });
-    if (!res.ok) throw new Error(`fetch imageUrl failed ${res.status}: ${await res.text().catch(() => "")}`);
+    const cookie = req.headers.get("cookie") || "";
+    const headers = cookie ? { cookie } : undefined;
+
+    console.log(
+      "[getBaseImageBufferFromSource] Fetching absolute URL for base image (fallback)",
+      { imageUrl, hasCookie: !!cookie }
+    );
+
+    const res = await fetch(imageUrl, {
+      cache: "no-store",
+      headers,
+      redirect: "follow",
+    });
+
+    const ct = res.headers.get("content-type") || "";
+    const status = res.status;
+
+    if (!res.ok) {
+      const preview = await res.text().catch(() => "");
+      console.error(
+        "[getBaseImageBufferFromSource] fetch imageUrl failed",
+        { status, ct, preview: preview.slice(0, 200) }
+      );
+      throw new Error(
+        `fetch imageUrl failed ${status}: ${preview.slice(0, 200)}`
+      );
+    }
+    if (!ct.startsWith("image/")) {
+      const preview = await res.text().catch(() => "");
+      console.error(
+        "[getBaseImageBufferFromSource] imageUrl did not return image content",
+        { status, ct, preview: preview.slice(0, 200) }
+      );
+      throw new Error(
+        `imageUrl did not return image content (content-type=${ct}): ${preview.slice(
+          0,
+          200
+        )}`
+      );
+    }
     return Buffer.from(await res.arrayBuffer());
   }
 
@@ -340,13 +480,20 @@ async function generateImageWithGuards({
   height: number;
   timeoutMs: number;
 }): Promise<Buffer> {
-  const url = `${AZ_ENDPOINT.replace(/\/+$/, "")}/openai/deployments/${DEPLOYMENT}/images/generations?api-version=${API_VERSION}`;
+  const url = `${AZ_ENDPOINT.replace(
+    /\/+$/,
+    ""
+  )}/openai/deployments/${DEPLOYMENT}/images/generations?api-version=${API_VERSION}`;
 
   async function callOnce(p: string) {
     const controller = new AbortController();
     const tm = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const payload = { prompt: p, size: `${width}x${height}`, response_format: "b64_json" };
+      const payload = {
+        prompt: p,
+        size: `${width}x${height}`,
+        response_format: "b64_json",
+      };
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", "api-key": AZ_KEY },
@@ -360,10 +507,18 @@ async function generateImageWithGuards({
       }
       const json = await res.json();
       const b64 = json?.data?.[0]?.b64_json;
-      if (!b64) return { ok: false as const, status: 502, text: "No image in response" };
+      if (!b64)
+        return {
+          ok: false as const,
+          status: 502,
+          text: "No image in response",
+        };
       return { ok: true as const, buf: Buffer.from(b64, "base64") };
     } catch (e: any) {
-      if (e?.name === "AbortError") throw new Error(`Timeout while generating image (aborted after ${timeoutMs} ms)`);
+      if (e?.name === "AbortError")
+        throw new Error(
+          `Timeout while generating image (aborted after ${timeoutMs} ms)`
+        );
       throw e;
     }
   }
@@ -372,67 +527,107 @@ async function generateImageWithGuards({
   const first = await callOnce(safe);
   if (first.ok) return first.buf;
 
-  const policy = first.status === 400 && /content_policy_violation|ResponsibleAIPolicyViolation/i.test(first.text || "");
+  const policy =
+    first.status === 400 &&
+    /content_policy_violation|ResponsibleAIPolicyViolation/i.test(
+      first.text || ""
+    );
   if (policy) {
     const fb = fallbackPrompt();
     const second = await callOnce(fb);
     if (second.ok) return second.buf;
-    throw new Error(`Images API rejected by policy. detail=${second.text || first.text || "policy_violation"}`);
+    throw new Error(
+      `Images API rejected by policy. detail=${
+        second.text || first.text || "policy_violation"
+      }`
+    );
   }
-  throw new Error(`Images API error ${first.status}: ${first.text || "unknown"}`);
+  throw new Error(
+    `Images API error ${first.status}: ${first.text || "unknown"}`
+  );
 }
 
 // ---------- route ----------
 export async function POST(req: NextRequest) {
   const started = Date.now();
   try {
-    const body = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({} as any));
 
-    // 共通パラメータ
     const width = pickNumber(body.width, 1024);
     const height = pickNumber(body.height, 1024);
-    const fontSize = pickNumber(body.fontSize, 64);
+    const baseFontSize = pickNumber(body.fontSize, 64);
     const strokeWidth = pickNumber(body.strokeWidth, 6);
     const align = pickAlign(body.align);
     const vAlign = pickVAlign(body.vAlign);
 
-    // ✅ 名称の正規化：bottomMargin（新）優先、互換でmarginBottom（旧）
-    const marginBottom = pickNumber(body.bottomMargin ?? body.marginBottom, 80);
+    const marginBottom = pickNumber(
+      body.bottomMargin ?? body.marginBottom,
+      80
+    );
 
-    const fill: string = String(body.fill ?? "#ffffff");
-    const stroke: string = String(body.stroke ?? "rgba(0,0,0,0.4)");
+    const rawFont: string | undefined = body.font
+      ? normalizeSpaces(String(body.font))
+      : undefined;
+    const rawColor: string | undefined = body.color
+      ? normalizeSpaces(String(body.color))
+      : undefined;
+    const rawSize: string | undefined = body.size
+      ? String(body.size).toLowerCase()
+      : undefined;
 
-    // ✅ 日本語対応：textB64（新）優先、互換でtext（旧）
+    const sizeMap: Record<string, number> = {
+      small: 32,
+      medium: 40,
+      large: 48,
+      xlarge: 64,
+    };
+    const sizeFont = rawSize ? sizeMap[rawSize] : undefined;
+    const effectiveFontSize = sizeFont ?? baseFontSize;
+
+    const fill: string = rawColor
+      ? rawColor
+      : String(body.fill ?? "#ffffff");
+    const stroke: string = String(
+      body.stroke ?? "rgba(0,0,0,0.4)"
+    );
+
     const text: string = (() => {
       const t = decodeB64OrEmpty(body.textB64);
       if (t) return t;
       return String(body.text ?? "");
     })();
 
-    // ★ プラカード自動認識フラグ
     const autoDetectPlacard: boolean = body.autoDetectPlacard === true;
 
     const timeoutMs = pickNumber(body.timeoutMs, 90_000);
 
     // --- 分岐A：既存画像に追記 ---
     if (body.imageUrl || body.imageB64) {
-      const baseImage = await getBaseImageBufferFromSource(req, body.imageUrl, body.imageB64);
+      const baseImage = await getBaseImageBufferFromSource(
+        req,
+        body.imageUrl,
+        body.imageB64
+      );
       const out = await composeTextOnImageBase(baseImage, {
         text,
         width,
         height,
-        fontSize,
+        fontSize: effectiveFontSize,
         strokeWidth,
         align,
         vAlign,
         marginBottom,
         fill,
         stroke,
-        autoDetectPlacard, // ★ 追加
+        autoDetectPlacard,
+        fontFamily: rawFont,
       });
       const imageUrl = await saveToPublicGenerated(out);
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
       });
     }
 
@@ -442,18 +637,27 @@ export async function POST(req: NextRequest) {
       return new Response(
         JSON.stringify({
           error: "invalid_request",
-          detail: "Either {prompt} or {imageUrl & text} or {imageB64 & text} is required.",
+          detail:
+            "Either {prompt} or {imageUrl & text} or {imageB64 & text} is required.",
         }),
         { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    const baseImage = await generateImageWithGuards({ prompt, width, height, timeoutMs });
+    const baseImage = await generateImageWithGuards({
+      prompt,
+      width,
+      height,
+      timeoutMs,
+    });
 
     if (!text) {
       const imageUrl = await saveToPublicGenerated(baseImage);
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
       });
     }
 
@@ -461,18 +665,22 @@ export async function POST(req: NextRequest) {
       text,
       width,
       height,
-      fontSize,
+      fontSize: effectiveFontSize,
       strokeWidth,
       align,
       vAlign,
       marginBottom,
       fill,
       stroke,
-      autoDetectPlacard, // ★ 追加
+      autoDetectPlacard,
+      fontFamily: rawFont,
     });
     const imageUrl = await saveToPublicGenerated(out);
     return new Response(JSON.stringify({ imageUrl }), {
-      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      },
     });
   } catch (err: any) {
     const elapsed = Date.now() - started;
