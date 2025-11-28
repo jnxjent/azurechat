@@ -3,7 +3,6 @@
 // 2) 既存画像(imageUrl/imageB64)に日本語テキスト後付け（textB64対応）
 // 3) プラカード自動認識機能（autoDetectPlacard）
 // 4) 生成結果は public/generated に保存し、{ imageUrl } を JSON で返す
-
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -16,7 +15,6 @@ import {
   BlobServiceClient,
   StorageSharedKeyCredential,
 } from "@azure/storage-blob";
-import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
 
 const AZ_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT!;
 const AZ_KEY = process.env.AZURE_OPENAI_API_KEY!;
@@ -28,27 +26,6 @@ const STORAGE_ACCOUNT_NAME = process.env.AZURE_STORAGE_ACCOUNT_NAME;
 const STORAGE_ACCOUNT_KEY = process.env.AZURE_STORAGE_ACCOUNT_KEY;
 const STORAGE_CONTAINER_NAME =
   process.env.AZURE_STORAGE_CONTAINER_NAME || "images";
-
-// ---------- font (NotoSansJP を canvas に登録) ----------
-const FONT_NAME = "MyJP";
-let fontRegistered = false;
-
-function ensureFontRegistered() {
-  if (fontRegistered) return;
-  try {
-    const fontPath = path.join(
-      process.cwd(),
-      "public",
-      "fonts",
-      "NotoSansJP-Regular.ttf"
-    );
-    GlobalFonts.registerFromPath(fontPath, FONT_NAME);
-    fontRegistered = true;
-    console.log("[gen-image] Registered font", FONT_NAME, "from", fontPath);
-  } catch (e) {
-    console.error("[gen-image] Failed to register font", FONT_NAME, e);
-  }
-}
 
 // ---------- utils ----------
 function normalizeSpaces(input: string) {
@@ -77,6 +54,31 @@ function sanitizePrompt(raw: string) {
 
 function fallbackPrompt() {
   return "可愛い三毛猫のイラスト。柔らかな水彩で、背景はシンプル。文字は入れない。非政治的。家族向け。ロゴや商標は含まない。";
+}
+
+async function loadFontAsDataURL() {
+  const fontPath = path.join(
+    process.cwd(),
+    "public",
+    "fonts",
+    "NotoSansJP-Regular.ttf"
+  );
+  const fontBuf = await fs.readFile(fontPath);
+  return `data:font/ttf;base64,${fontBuf.toString("base64")}`;
+}
+
+function escapeXml(s: string) {
+  return String(s).replace(/[&<>"']/g, (ch) =>
+    ch === "&"
+      ? "&amp;"
+      : ch === "<"
+      ? "&lt;"
+      : ch === ">"
+      ? "&gt;"
+      : ch === '"'
+      ? "&quot;"
+      : "&#39;"
+  );
 }
 
 function pickNumber(v: any, def: number) {
@@ -192,7 +194,7 @@ async function detectWhiteRectangle(
   }
 }
 
-// ---------- canvas でテキスト描画 → sharp で合成 ----------
+// ---------- sharp + SVG でテキスト合成 ----------
 async function composeTextOnImageBase(
   baseImage: Buffer,
   opts: {
@@ -211,8 +213,8 @@ async function composeTextOnImageBase(
 ) {
   const {
     text = "",
-    width: requestedWidth,
-    height: requestedHeight,
+    width,
+    height,
     fontSize,
     strokeWidth,
     align,
@@ -225,16 +227,12 @@ async function composeTextOnImageBase(
 
   if (!text) return baseImage;
 
-  ensureFontRegistered();
-
-  // 画像本来のサイズを優先
-  const meta = await sharp(baseImage).metadata();
-  const width = meta.width ?? requestedWidth ?? 1024;
-  const height = meta.height ?? requestedHeight ?? 1024;
+  const fontDataURL = await loadFontAsDataURL();
 
   let x: number;
   let y: number;
   let effectiveFontSize = fontSize;
+  let anchor: "start" | "middle" | "end";
 
   if (autoDetectPlacard) {
     console.log("[composeTextOnImageBase] Attempting placard detection...");
@@ -245,6 +243,7 @@ async function composeTextOnImageBase(
 
       x = rect.x + rect.w / 2;
       y = rect.y + rect.h / 2;
+      anchor = "middle";
 
       const chars = Math.max(Array.from(text).length, 1);
       const maxFsByWidth = Math.floor((rect.w * 0.8) / chars);
@@ -271,6 +270,12 @@ async function composeTextOnImageBase(
           : vAlign === "middle"
           ? height / 2
           : height - marginBottom;
+      anchor =
+        align === "left"
+          ? "start"
+          : align === "right"
+          ? "end"
+          : "middle";
     }
   } else {
     x =
@@ -285,34 +290,41 @@ async function composeTextOnImageBase(
         : vAlign === "middle"
         ? height / 2
         : height - marginBottom;
+    anchor =
+      align === "left"
+        ? "start"
+        : align === "right"
+        ? "end"
+        : "middle";
   }
 
-  // canvas で文字だけ描画（背景は透過） → sharp で baseImage に合成
-  const canvas = createCanvas(width, height);
-  const ctx = canvas.getContext("2d");
+  const svg = `
+<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      @font-face {
+        font-family: 'MyJP';
+        src: url('${fontDataURL}') format('truetype');
+        font-weight: normal;
+        font-style: normal;
+      }
+      .label {
+        font-family: 'MyJP', sans-serif;
+        font-size: ${effectiveFontSize}px;
+        fill: ${fill};
+        paint-order: stroke;
+        stroke: ${stroke};
+        stroke-width: ${strokeWidth}px;
+        dominant-baseline: central;
+        text-anchor: ${anchor};
+      }
+    </style>
+  </defs>
+  <text x="${x}" y="${y}" class="label">${escapeXml(text)}</text>
+</svg>`.trim();
 
-  // 透過キャンバス
-  ctx.clearRect(0, 0, width, height);
-
-  // テキスト設定
-  ctx.textAlign =
-    align === "left" ? "left" : align === "right" ? "right" : "center";
-  ctx.textBaseline = "middle";
-  ctx.font = `${effectiveFontSize}px "${FONT_NAME}"`;
-  ctx.fillStyle = fill;
-  ctx.strokeStyle = stroke;
-  ctx.lineWidth = strokeWidth;
-
-  if (strokeWidth > 0) {
-    ctx.strokeText(text, x, y);
-  }
-  ctx.fillText(text, x, y);
-
-  const textPngBuffer = canvas.toBuffer("image/png");
-
-  // baseImage に文字レイヤーを合成
   return await sharp(baseImage)
-    .composite([{ input: textPngBuffer, left: 0, top: 0 }])
+    .composite([{ input: Buffer.from(svg), left: 0, top: 0 }])
     .png()
     .toBuffer();
 }
@@ -358,7 +370,6 @@ async function getBaseImageBufferFromSource(
         const imgName = url.searchParams.get("img");
 
         if (threadId && imgName) {
-          // 候補を複数試す（素の名前 + ".png"）
           const candidates: string[] = [imgName];
           if (!imgName.includes(".")) {
             candidates.push(`${imgName}.png`);
@@ -409,7 +420,6 @@ async function getBaseImageBufferFromSource(
             }
           }
 
-          // 全候補で失敗した場合
           throw lastErr ?? new Error("Blob not found for any candidate");
         } else {
           console.warn(
@@ -579,7 +589,6 @@ export async function POST(req: NextRequest) {
       80
     );
 
-    // font 指定は受け取るが、描画は常に NotoSansJP(MyJP) を使用
     const rawColor: string | undefined = body.color
       ? normalizeSpaces(String(body.color))
       : undefined;
