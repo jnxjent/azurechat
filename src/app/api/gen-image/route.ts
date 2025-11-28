@@ -34,6 +34,7 @@ function normalizeSpaces(input: string) {
     .replace(/\s+/g, " ")
     .trim();
 }
+
 function sanitizePrompt(raw: string) {
   let s = normalizeSpaces(raw);
   s = s
@@ -50,9 +51,34 @@ function sanitizePrompt(raw: string) {
   if (!/ロゴや商標は含まない/.test(s)) s += " ロゴや商標は含まない。";
   return s;
 }
+
 function fallbackPrompt() {
   return "可愛い三毛猫のイラスト。柔らかな水彩で、背景はシンプル。文字は入れない。非政治的。家族向け。ロゴや商標は含まない。";
 }
+
+function pickNumber(v: any, def: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function decodeB64OrEmpty(b64: any): string {
+  if (b64 == null) return "";
+  try {
+    return Buffer.from(String(b64), "base64").toString("utf8");
+  } catch (e) {
+    console.error("textB64 decode failed:", e);
+    return "";
+  }
+}
+
+function pickAlign(v: any): "left" | "center" | "right" {
+  return v === "left" || v === "center" || v === "right" ? v : "center";
+}
+
+function pickVAlign(v: any): "top" | "middle" | "bottom" {
+  return v === "top" || v === "middle" ? v : "bottom";
+}
+
 async function loadFontAsDataURL() {
   const fontPath = path.join(
     process.cwd(),
@@ -63,6 +89,7 @@ async function loadFontAsDataURL() {
   const fontBuf = await fs.readFile(fontPath);
   return `data:font/ttf;base64,${fontBuf.toString("base64")}`;
 }
+
 function escapeXml(s: string) {
   return String(s).replace(/[&<>"']/g, (ch) =>
     ch === "&"
@@ -75,25 +102,6 @@ function escapeXml(s: string) {
       ? "&quot;"
       : "&#39;"
   );
-}
-function pickNumber(v: any, def: number) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : def;
-}
-function decodeB64OrEmpty(b64: any): string {
-  if (b64 == null) return "";
-  try {
-    return Buffer.from(String(b64), "base64").toString("utf8");
-  } catch (e) {
-    console.error("textB64 decode failed:", e);
-    return "";
-  }
-}
-function pickAlign(v: any): "left" | "center" | "right" {
-  return v === "left" || v === "center" || v === "right" ? v : "center";
-}
-function pickVAlign(v: any): "top" | "middle" | "bottom" {
-  return v === "top" || v === "middle" ? v : "bottom";
 }
 
 // ---------- プラカード自動認識 ----------
@@ -186,6 +194,7 @@ async function detectWhiteRectangle(
   }
 }
 
+// ---------- SVG でテキスト描画 → sharp で合成 ----------
 async function composeTextOnImageBase(
   baseImage: Buffer,
   opts: {
@@ -200,13 +209,12 @@ async function composeTextOnImageBase(
     fill?: string;
     stroke?: string;
     autoDetectPlacard?: boolean;
-    // ★ fontFamily は受け取らず、常に NotoSansJP(MyJP) 固定で描画する
   }
 ) {
   const {
     text = "",
-    width,
-    height,
+    width: requestedWidth,
+    height: requestedHeight,
     fontSize,
     strokeWidth,
     align,
@@ -221,6 +229,11 @@ async function composeTextOnImageBase(
 
   const fontDataURL = await loadFontAsDataURL();
 
+  // 元画像のサイズを優先（なければリクエスト値→デフォルト 1024）
+  const meta = await sharp(baseImage).metadata();
+  const width = meta.width ?? requestedWidth ?? 1024;
+  const height = meta.height ?? requestedHeight ?? 1024;
+
   let x: number;
   let y: number;
   let effectiveFontSize = fontSize;
@@ -231,7 +244,7 @@ async function composeTextOnImageBase(
     const rect = await detectWhiteRectangle(baseImage);
 
     if (rect) {
-      console.log(`[composeTextOnImageBase] Using detected placard position`);
+      console.log("[composeTextOnImageBase] Using detected placard position");
 
       x = rect.x + rect.w / 2;
       y = rect.y + rect.h / 2;
@@ -290,7 +303,6 @@ async function composeTextOnImageBase(
         : "middle";
   }
 
-  // ★ フォントは MyJP(NotoSansJP) 固定
   const svg = `
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -363,7 +375,7 @@ async function getBaseImageBufferFromSource(
         const imgName = url.searchParams.get("img");
 
         if (threadId && imgName) {
-          // ★ 候補を複数試す（素の名前 + ".png"）
+          // 候補を複数試す（素の名前 + ".png"）
           const candidates: string[] = [imgName];
           if (!imgName.includes(".")) {
             candidates.push(`${imgName}.png`);
@@ -557,7 +569,7 @@ async function generateImageWithGuards({
     if (second.ok) return second.buf;
     throw new Error(
       `Images API rejected by policy. detail=${
-        second.text || first.text || "policy_violation"
+        (second as any).text || first.text || "policy_violation"
       }`
     );
   }
@@ -584,7 +596,7 @@ export async function POST(req: NextRequest) {
       80
     );
 
-    // ★ font は受け取るが描画では使わない（NotoSansJP固定）
+    // font 指定は受け取るが、描画は常に NotoSansJP(MyJP) を使用
     const rawColor: string | undefined = body.color
       ? normalizeSpaces(String(body.color))
       : undefined;
