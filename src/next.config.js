@@ -3,7 +3,10 @@ const nextConfig = {
   output: "standalone",
 
   experimental: {
-    serverComponentsExternalPackages: ["@azure/storage-blob"],
+    serverComponentsExternalPackages: [
+      "@azure/storage-blob",
+      "@napi-rs/canvas", // ← 追加
+    ],
   },
 
   images: {
@@ -20,6 +23,16 @@ const nextConfig = {
       //   pathname: "/api/images/**",
       // },
     ],
+  },
+
+  webpack: (config, { isServer }) => {
+    // .node ネイティブバイナリ用のローダーを追加
+    config.module.rules.push({
+      test: /\.node$/,
+      use: "node-loader",
+    });
+
+    return config;
   },
 };
 
