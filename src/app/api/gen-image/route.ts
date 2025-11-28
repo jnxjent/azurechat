@@ -200,7 +200,7 @@ async function composeTextOnImageBase(
     fill?: string;
     stroke?: string;
     autoDetectPlacard?: boolean;
-    fontFamily?: string;
+    // ★ fontFamily は受け取らず、常に NotoSansJP(MyJP) 固定で描画する
   }
 ) {
   const {
@@ -215,7 +215,6 @@ async function composeTextOnImageBase(
     fill = "#ffffff",
     stroke = "rgba(0,0,0,0.4)",
     autoDetectPlacard = false,
-    fontFamily,
   } = opts;
 
   if (!text) return baseImage;
@@ -291,11 +290,7 @@ async function composeTextOnImageBase(
         : "middle";
   }
 
-  // ★ ここを修正：MyJP を先頭に固定しつつ、NL からの fontFamily を後ろにぶら下げる
-  const safeFontFamily = fontFamily
-    ? normalizeSpaces(fontFamily)
-    : "";
-
+  // ★ フォントは MyJP(NotoSansJP) 固定
   const svg = `
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -307,7 +302,7 @@ async function composeTextOnImageBase(
         font-style: normal;
       }
       .label {
-        font-family: 'MyJP'${safeFontFamily ? ", '" + escapeXml(safeFontFamily) + "'" : ""}, sans-serif;
+        font-family: 'MyJP', sans-serif;
         font-size: ${effectiveFontSize}px;
         fill: ${fill};
         paint-order: stroke;
@@ -335,7 +330,7 @@ async function saveToPublicGenerated(buf: Buffer) {
   return `/generated/${id}.png`;
 }
 
-// ---------- ★ ここが今回の肝：/api/images → Blob SDK で直接読む ----------
+// ---------- /api/images → Blob SDK で直接読む ----------
 async function getBaseImageBufferFromSource(
   req: NextRequest,
   imageUrl?: string,
@@ -368,7 +363,7 @@ async function getBaseImageBufferFromSource(
         const imgName = url.searchParams.get("img");
 
         if (threadId && imgName) {
-          // ★ 修正：候補を複数試す（素の名前 + ".png"）
+          // ★ 候補を複数試す（素の名前 + ".png"）
           const candidates: string[] = [imgName];
           if (!imgName.includes(".")) {
             candidates.push(`${imgName}.png`);
@@ -589,9 +584,7 @@ export async function POST(req: NextRequest) {
       80
     );
 
-    const rawFont: string | undefined = body.font
-      ? normalizeSpaces(String(body.font))
-      : undefined;
+    // ★ font は受け取るが描画では使わない（NotoSansJP固定）
     const rawColor: string | undefined = body.color
       ? normalizeSpaces(String(body.color))
       : undefined;
@@ -644,7 +637,6 @@ export async function POST(req: NextRequest) {
         fill,
         stroke,
         autoDetectPlacard,
-        fontFamily: rawFont,
       });
       const imageUrl = await saveToPublicGenerated(out);
       return new Response(JSON.stringify({ imageUrl }), {
@@ -697,7 +689,6 @@ export async function POST(req: NextRequest) {
       fill,
       stroke,
       autoDetectPlacard,
-      fontFamily: rawFont,
     });
     const imageUrl = await saveToPublicGenerated(out);
     return new Response(JSON.stringify({ imageUrl }), {

@@ -528,7 +528,10 @@ async function executeAddTextToExistingImage(
   const size: "small" | "medium" | "large" | "xlarge" =
     (args.size as any) ?? parsed.size ?? "large";
   const color = args.color ?? parsed.color ?? "white";
-  const font = args.font ?? parsed.font;
+
+  // ★ 元々のフォント指定はログ用だけにして、実際の描画用は固定にする
+  const requestedFont = args.font ?? parsed.font;
+  const font = "NotoSansJP"; // ← サーバー側は常に NotoSansJP を使う
 
   // ★ 累積移動：args の offset をベースに、styleHint 由来の増分を足す
   const baseOffsetX =
@@ -554,7 +557,8 @@ async function executeAddTextToExistingImage(
     vAlign,
     size,
     color,
-    font,
+    font,              // ここは "NotoSansJP"
+    requestedFont,     // もともと LLM が選んだフォントはログだけ残す
     offsetX,
     offsetY,
     bottomMargin,
@@ -572,7 +576,7 @@ async function executeAddTextToExistingImage(
         vAlign,
         size, // small/medium/large/xlarge を route.ts 側で fontSize にマップ
         color,
-        font,
+        font, // ← サーバー側描画用として NotoSansJP を渡す
         offsetX,
         offsetY,
         bottomMargin,
