@@ -1,8 +1,12 @@
-// src/app/api/gen-image/route.ts
-// 1) Azure OpenAI Images でベース画像生成（安全ガード＋自動リトライ）
-// 2) 既存画像(imageUrl/imageB64)に日本語テキスト後付け（textB64対応）
-// 3) プラカード自動認識機能（autoDetectPlacard）
-// 4) 生成結果は public/generated に保存し、{ imageUrl } を JSON で返す
+// File: src/app/api/gen-image/route.ts
+// AzureChat GPT5 画像生成・文字入れ統合ルート（完全修正版）
+// - ベース画像生成（Azure OpenAI Images）
+// - 既存画像に日本語テキスト追加（SVG + sharp）
+// - Blob Storage 読込対応
+// - プラカード自動検出対応
+// - 豆腐文字完全排除（file:/// font 読込）
+// ------------------------------------------------------
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -16,6 +20,7 @@ import {
   StorageSharedKeyCredential,
 } from "@azure/storage-blob";
 
+// -------------------- ENV --------------------------
 const AZ_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT!;
 const AZ_KEY = process.env.AZURE_OPENAI_API_KEY!;
 const DEPLOYMENT = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT!;
@@ -27,7 +32,7 @@ const STORAGE_ACCOUNT_KEY = process.env.AZURE_STORAGE_ACCOUNT_KEY;
 const STORAGE_CONTAINER_NAME =
   process.env.AZURE_STORAGE_CONTAINER_NAME || "images";
 
-// ---------- utils ----------
+// -------------------- Utils ------------------------
 function normalizeSpaces(input: string) {
   return String(input || "")
     .replace(/\u3000/g, " ")
@@ -37,6 +42,7 @@ function normalizeSpaces(input: string) {
 
 function sanitizePrompt(raw: string) {
   let s = normalizeSpaces(raw);
+
   s = s
     .replace(/プラカード/g, "無地のボード")
     .replace(/サインボード|サイン・?ボード/g, "無地のボード")
@@ -45,26 +51,17 @@ function sanitizePrompt(raw: string) {
     .replace(/ポスター/g, "無地のフレーム")
     .replace(/持って|掲げ(る|て)/g, "そばにある")
     .replace(/スローガン|抗議|デモ|プロテスト|政治|選挙/g, "ファミリー向け");
+
   if (!/文字は入れない/.test(s)) s += "。文字は入れない。";
   if (!/非政治的/.test(s)) s += " 非政治的。";
   if (!/家族向け|ファミリー向け/.test(s)) s += " 家族向け。";
   if (!/ロゴや商標は含まない/.test(s)) s += " ロゴや商標は含まない。";
+
   return s;
 }
 
 function fallbackPrompt() {
   return "可愛い三毛猫のイラスト。柔らかな水彩で、背景はシンプル。文字は入れない。非政治的。家族向け。ロゴや商標は含まない。";
-}
-
-async function loadFontAsDataURL() {
-  const fontPath = path.join(
-    process.cwd(),
-    "public",
-    "fonts",
-    "NotoSansJP-Regular.ttf"
-  );
-  const fontBuf = await fs.readFile(fontPath);
-  return `data:font/ttf;base64,${fontBuf.toString("base64")}`;
 }
 
 function escapeXml(s: string) {
@@ -104,7 +101,7 @@ function pickVAlign(v: any): "top" | "middle" | "bottom" {
   return v === "top" || v === "middle" ? v : "bottom";
 }
 
-// ---------- プラカード自動認識 ----------
+// -------------------- Placard Detection -------------
 async function detectWhiteRectangle(
   imageBuffer: Buffer
 ): Promise<{ x: number; y: number; w: number; h: number } | null> {
@@ -113,45 +110,38 @@ async function detectWhiteRectangle(
     const metadata = await image.metadata();
     const { width, height } = metadata;
 
-    if (!width || !height) {
-      console.warn("[detectWhiteRectangle] Invalid image dimensions");
-      return null;
-    }
+    if (!width || !height) return null;
 
     const maxDim = 512;
     const scale = Math.min(1, maxDim / Math.max(width, height));
     const resizedWidth = Math.round(width * scale);
     const resizedHeight = Math.round(height * scale);
 
-    console.log(
-      `[detectWhiteRectangle] Analyzing image: ${width}x${height} -> ${resizedWidth}x${resizedHeight}`
-    );
-
     const { data, info } = await image
-      .resize(resizedWidth, resizedHeight, { fit: "inside" })
+      .resize(resizedWidth, resizedHeight)
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
 
     const w = info.width;
     const h = info.height;
-
     const threshold = 200;
-    let minX = w;
-    let maxX = 0;
-    let minY = h;
-    let maxY = 0;
-    let whitePixelCount = 0;
+
+    let minX = w,
+      maxX = 0,
+      minY = h,
+      maxY = 0,
+      white = 0;
 
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const idx = (y * w + x) * 4;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
+        const r = data[idx],
+          g = data[idx + 1],
+          b = data[idx + 2];
 
         if (r > threshold && g > threshold && b > threshold) {
-          whitePixelCount++;
+          white++;
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -160,41 +150,26 @@ async function detectWhiteRectangle(
       }
     }
 
-    if (whitePixelCount < 100) {
-      console.warn(
-        `[detectWhiteRectangle] Not enough white pixels found: ${whitePixelCount}`
-      );
-      return null;
-    }
+    if (white < 100) return null;
 
     const rectW = maxX - minX;
     const rectH = maxY - minY;
 
-    if (rectW < 50 || rectH < 30) {
-      console.warn(
-        `[detectWhiteRectangle] Rectangle too small: ${rectW}x${rectH}`
-      );
-      return null;
-    }
+    if (rectW < 50 || rectH < 30) return null;
 
-    const result = {
+    return {
       x: Math.round(minX / scale),
       y: Math.round(minY / scale),
       w: Math.round(rectW / scale),
       h: Math.round(rectH / scale),
     };
-
-    console.log(
-      `[detectWhiteRectangle] Detected placard: x=${result.x}, y=${result.y}, w=${result.w}, h=${result.h} (${whitePixelCount} white pixels)`
-    );
-    return result;
-  } catch (e) {
-    console.error("[detectWhiteRectangle] Detection failed:", e);
+  } catch {
     return null;
   }
 }
 
-// ---------- sharp + SVG でテキスト合成 ----------
+// -------------------- Text Compose ------------------
+// ★★★ 豆腐文字 ZERO（file:/// フォント読込）
 async function composeTextOnImageBase(
   baseImage: Buffer,
   opts: {
@@ -227,75 +202,47 @@ async function composeTextOnImageBase(
 
   if (!text) return baseImage;
 
-  const fontDataURL = await loadFontAsDataURL();
+  // ------- ★ Azure Linux 本番で絶対に存在するパス ----------
+  const absoluteFontPath =
+    "file:///home/site/wwwroot/public/fonts/NotoSansJP-Regular.ttf";
 
-  let x: number;
-  let y: number;
+  let x, y;
   let effectiveFontSize = fontSize;
   let anchor: "start" | "middle" | "end";
 
   if (autoDetectPlacard) {
-    console.log("[composeTextOnImageBase] Attempting placard detection...");
     const rect = await detectWhiteRectangle(baseImage);
-
     if (rect) {
-      console.log("[composeTextOnImageBase] Using detected placard position");
-
       x = rect.x + rect.w / 2;
       y = rect.y + rect.h / 2;
       anchor = "middle";
 
       const chars = Math.max(Array.from(text).length, 1);
-      const maxFsByWidth = Math.floor((rect.w * 0.8) / chars);
-      const maxFsByHeight = Math.floor(rect.h * 0.6);
-      effectiveFontSize = Math.min(fontSize, maxFsByWidth, maxFsByHeight);
-      effectiveFontSize = Math.max(effectiveFontSize, 20);
-
-      console.log(
-        `[composeTextOnImageBase] Font size adjusted: ${fontSize} -> ${effectiveFontSize}`
+      const maxFsW = Math.floor((rect.w * 0.8) / chars);
+      const maxFsH = Math.floor(rect.h * 0.6);
+      effectiveFontSize = Math.max(
+        Math.min(fontSize, maxFsW, maxFsH),
+        20
       );
     } else {
-      console.warn(
-        "[composeTextOnImageBase] Placard detection failed, using default position"
-      );
-      x =
-        align === "left"
-          ? 40
-          : align === "right"
-          ? width - 40
-          : width / 2;
+      x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
       y =
         vAlign === "top"
           ? 40 + fontSize
           : vAlign === "middle"
           ? height / 2
           : height - marginBottom;
-      anchor =
-        align === "left"
-          ? "start"
-          : align === "right"
-          ? "end"
-          : "middle";
+      anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
     }
   } else {
-    x =
-      align === "left"
-        ? 40
-        : align === "right"
-        ? width - 40
-        : width / 2;
+    x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
     y =
       vAlign === "top"
         ? 40 + fontSize
         : vAlign === "middle"
         ? height / 2
         : height - marginBottom;
-    anchor =
-      align === "left"
-        ? "start"
-        : align === "right"
-        ? "end"
-        : "middle";
+    anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
   }
 
   const svg = `
@@ -304,9 +251,7 @@ async function composeTextOnImageBase(
     <style>
       @font-face {
         font-family: 'MyJP';
-        src: url('${fontDataURL}') format('truetype');
-        font-weight: normal;
-        font-style: normal;
+        src: url("${absoluteFontPath}") format("truetype");
       }
       .label {
         font-family: 'MyJP', sans-serif;
@@ -329,6 +274,7 @@ async function composeTextOnImageBase(
     .toBuffer();
 }
 
+// -------------------- Save to /public/generated -------
 async function saveToPublicGenerated(buf: Buffer) {
   const id = crypto.randomUUID();
   const dir = path.join(process.cwd(), "public", "generated");
@@ -337,119 +283,76 @@ async function saveToPublicGenerated(buf: Buffer) {
   return `/generated/${id}.png`;
 }
 
-// ---------- /api/images → Blob SDK で直接読む ----------
+// -------------------- Base Image Loader ----------------
 async function getBaseImageBufferFromSource(
   req: NextRequest,
   imageUrl?: string,
   imageB64?: string
 ) {
+  // --- base64
   if (imageB64) {
     const b64 = imageB64.replace(/^data:image\/\w+;base64,/, "");
     return Buffer.from(b64, "base64");
   }
+
   if (!imageUrl) throw new Error("image source not provided");
 
-  // /api/images?t=...&img=... → Azure Blob Storage から直接ダウンロード
+  // --- Blob SDK
   if (imageUrl.includes("/api/images")) {
-    console.log(
-      "[getBaseImageBufferFromSource] imageUrl looks like /api/images; trying Azure Blob SDK..."
-    );
+    try {
+      const u = new URL(imageUrl, "http://localhost");
+      const t = u.searchParams.get("t");
+      const img = u.searchParams.get("img");
 
-    if (!STORAGE_ACCOUNT_NAME || !STORAGE_ACCOUNT_KEY) {
-      console.error(
-        "[getBaseImageBufferFromSource] STORAGE_ACCOUNT envs missing",
-        {
+      if (t && img && STORAGE_ACCOUNT_NAME && STORAGE_ACCOUNT_KEY) {
+        const credential = new StorageSharedKeyCredential(
           STORAGE_ACCOUNT_NAME,
-          hasKey: !!STORAGE_ACCOUNT_KEY,
-        }
-      );
-    } else {
-      try {
-        const url = new URL(imageUrl, "http://localhost");
-        const threadId = url.searchParams.get("t");
-        const imgName = url.searchParams.get("img");
-
-        if (threadId && imgName) {
-          const candidates: string[] = [imgName];
-          if (!imgName.includes(".")) {
-            candidates.push(`${imgName}.png`);
-          }
-
-          const credential = new StorageSharedKeyCredential(
-            STORAGE_ACCOUNT_NAME,
-            STORAGE_ACCOUNT_KEY
-          );
-          const blobService = new BlobServiceClient(
-            `https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net`,
-            credential
-          );
-          const containerClient = blobService.getContainerClient(
-            STORAGE_CONTAINER_NAME
-          );
-
-          let lastErr: any = null;
-
-          for (const cand of candidates) {
-            const blobPath = `${threadId}/${cand}`;
-            try {
-              console.log(
-                `[getBaseImageBufferFromSource] Trying blob path: container=${STORAGE_CONTAINER_NAME}, blob=${blobPath}`
-              );
-              const blobClient = containerClient.getBlobClient(blobPath);
-              const download = await blobClient.download();
-
-              if (!download.readableStreamBody) {
-                throw new Error("download.readableStreamBody is null");
-              }
-
-              const chunks: Uint8Array[] = [];
-              for await (const chunk of download.readableStreamBody) {
-                chunks.push(chunk as Uint8Array);
-              }
-              const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
-              console.log(
-                `[getBaseImageBufferFromSource] Successfully downloaded blob via SDK (size=${buf.length})`
-              );
-              return buf;
-            } catch (e) {
-              console.error(
-                `[getBaseImageBufferFromSource] Failed to download blobPath=${blobPath}`,
-                e
-              );
-              lastErr = e;
-            }
-          }
-
-          throw lastErr ?? new Error("Blob not found for any candidate");
-        } else {
-          console.warn(
-            "[getBaseImageBufferFromSource] Missing t or img query params in imageUrl"
-          );
-        }
-      } catch (e) {
-        console.error(
-          "[getBaseImageBufferFromSource] Blob SDK download failed; will fall back to HTTP fetch",
-          e
+          STORAGE_ACCOUNT_KEY
         );
+        const blobService = new BlobServiceClient(
+          `https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net`,
+          credential
+        );
+        const container = blobService.getContainerClient(
+          STORAGE_CONTAINER_NAME
+        );
+
+        const candidates = [img, img.includes(".") ? img : `${img}.png`];
+        let lastErr = null;
+
+        for (const cand of candidates) {
+          try {
+            const blobPath = `${t}/${cand}`;
+            const blob = container.getBlobClient(blobPath);
+
+            const dl = await blob.download();
+            const chunks: Buffer[] = [];
+
+            for await (const ch of dl.readableStreamBody!) {
+              chunks.push(Buffer.from(ch as any));
+            }
+
+            return Buffer.concat(chunks);
+
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        throw lastErr;
       }
-    }
+    } catch {}
   }
 
-  // data URL
+  // --- data URL
   if (imageUrl.startsWith("data:image/")) {
     const b64 = imageUrl.replace(/^data:image\/\w+;base64,/, "");
     return Buffer.from(b64, "base64");
   }
 
-  // 絶対URL（http/https）: 最後のフォールバック
+  // --- absolute URL
   if (/^https?:\/\//i.test(imageUrl)) {
     const cookie = req.headers.get("cookie") || "";
     const headers = cookie ? { cookie } : undefined;
-
-    console.log(
-      "[getBaseImageBufferFromSource] Fetching absolute URL for base image (fallback)",
-      { imageUrl, hasCookie: !!cookie }
-    );
 
     const res = await fetch(imageUrl, {
       cache: "no-store",
@@ -457,42 +360,17 @@ async function getBaseImageBufferFromSource(
       redirect: "follow",
     });
 
-    const ct = res.headers.get("content-type") || "";
-    const status = res.status;
-
-    if (!res.ok) {
-      const preview = await res.text().catch(() => "");
-      console.error(
-        "[getBaseImageBufferFromSource] fetch imageUrl failed",
-        { status, ct, preview: preview.slice(0, 200) }
-      );
-      throw new Error(
-        `fetch imageUrl failed ${status}: ${preview.slice(0, 200)}`
-      );
-    }
-    if (!ct.startsWith("image/")) {
-      const preview = await res.text().catch(() => "");
-      console.error(
-        "[getBaseImageBufferFromSource] imageUrl did not return image content",
-        { status, ct, preview: preview.slice(0, 200) }
-      );
-      throw new Error(
-        `imageUrl did not return image content (content-type=${ct}): ${preview.slice(
-          0,
-          200
-        )}`
-      );
-    }
-    return Buffer.from(await res.arrayBuffer());
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    return buf;
   }
 
-  // 相対パス（例: /generated/xxx.png）→ public 直読み
+  // --- relative (/generated/xxx.png)
   const rel = imageUrl.startsWith("/") ? imageUrl.slice(1) : imageUrl;
-  const abs = path.join(process.cwd(), "public", rel);
-  return await fs.readFile(abs);
+  return await fs.readFile(path.join(process.cwd(), "public", rel));
 }
 
-// ---------- Azure Images 呼び出し（ガード＋フォールバック） ----------
+// -------------------- Azure Images Gen -----------------
 async function generateImageWithGuards({
   prompt,
   width,
@@ -512,68 +390,63 @@ async function generateImageWithGuards({
   async function callOnce(p: string) {
     const controller = new AbortController();
     const tm = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
-      const payload = {
-        prompt: p,
-        size: `${width}x${height}`,
-        response_format: "b64_json",
-      };
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", "api-key": AZ_KEY },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          prompt: p,
+          size: `${width}x${height}`,
+          response_format: "b64_json",
+        }),
         signal: controller.signal,
       }).finally(() => clearTimeout(tm));
 
       if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        return { ok: false as const, status: res.status, text: t };
+        const text = await res.text().catch(() => "");
+        return { ok: false as const, status: res.status, text };
       }
+
       const json = await res.json();
       const b64 = json?.data?.[0]?.b64_json;
       if (!b64)
-        return {
-          ok: false as const,
-          status: 502,
-          text: "No image in response",
-        };
+        return { ok: false as const, status: 502, text: "No image returned" };
+
       return { ok: true as const, buf: Buffer.from(b64, "base64") };
     } catch (e: any) {
       if (e?.name === "AbortError")
-        throw new Error(
-          `Timeout while generating image (aborted after ${timeoutMs} ms)`
-        );
+        throw new Error(`Image generation timeout (${timeoutMs} ms)`);
       throw e;
     }
   }
 
   const safe = sanitizePrompt(prompt);
   const first = await callOnce(safe);
+
   if (first.ok) return first.buf;
 
   const policy =
     first.status === 400 &&
-    /content_policy_violation|ResponsibleAIPolicyViolation/i.test(
-      first.text || ""
-    );
+    /policy/i.test(first.text || "");
+
   if (policy) {
     const fb = fallbackPrompt();
     const second = await callOnce(fb);
     if (second.ok) return second.buf;
-    throw new Error(
-      `Images API rejected by policy. detail=${
-        (second as any).text || first.text || "policy_violation"
-      }`
-    );
+
+    throw new Error(`Images API policy violation: ${second.text || ""}`);
   }
+
   throw new Error(
     `Images API error ${first.status}: ${first.text || "unknown"}`
   );
 }
 
-// ---------- route ----------
+// -------------------- Main Handler ---------------------
 export async function POST(req: NextRequest) {
   const started = Date.now();
+
   try {
     const body = await req.json().catch(() => ({} as any));
 
@@ -583,20 +456,18 @@ export async function POST(req: NextRequest) {
     const strokeWidth = pickNumber(body.strokeWidth, 6);
     const align = pickAlign(body.align);
     const vAlign = pickVAlign(body.vAlign);
-
     const marginBottom = pickNumber(
       body.bottomMargin ?? body.marginBottom,
       80
     );
 
-    const rawColor: string | undefined = body.color
-      ? normalizeSpaces(String(body.color))
-      : undefined;
-    const rawSize: string | undefined = body.size
-      ? String(body.size).toLowerCase()
-      : undefined;
+    const rawColor =
+      body.color != null ? normalizeSpaces(String(body.color)) : undefined;
+    const fill = rawColor ?? String(body.fill ?? "#ffffff");
+    const stroke = String(body.stroke ?? "rgba(0,0,0,0.4)");
 
-    const sizeMap: Record<string, number> = {
+    const rawSize = body.size ? String(body.size).toLowerCase() : undefined;
+    const sizeMap: any = {
       small: 32,
       medium: 40,
       large: 48,
@@ -605,30 +476,23 @@ export async function POST(req: NextRequest) {
     const sizeFont = rawSize ? sizeMap[rawSize] : undefined;
     const effectiveFontSize = sizeFont ?? baseFontSize;
 
-    const fill: string = rawColor
-      ? rawColor
-      : String(body.fill ?? "#ffffff");
-    const stroke: string = String(
-      body.stroke ?? "rgba(0,0,0,0.4)"
-    );
-
     const text: string = (() => {
       const t = decodeB64OrEmpty(body.textB64);
       if (t) return t;
       return String(body.text ?? "");
     })();
 
-    const autoDetectPlacard: boolean = body.autoDetectPlacard === true;
+    const autoDetectPlacard = body.autoDetectPlacard === true;
+    const timeoutMs = pickNumber(body.timeoutMs, 90000);
 
-    const timeoutMs = pickNumber(body.timeoutMs, 90_000);
-
-    // --- 分岐A：既存画像に追記 ---
+    // ---- 既存画像に追記
     if (body.imageUrl || body.imageB64) {
       const baseImage = await getBaseImageBufferFromSource(
         req,
         body.imageUrl,
         body.imageB64
       );
+
       const out = await composeTextOnImageBase(baseImage, {
         text,
         width,
@@ -642,25 +506,26 @@ export async function POST(req: NextRequest) {
         stroke,
         autoDetectPlacard,
       });
+
       const imageUrl = await saveToPublicGenerated(out);
+
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store",
-        },
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
       });
     }
 
-    // --- 分岐B：新規生成 ---
-    const prompt: string = String(body.prompt ?? "");
+    // ---- 新規生成
+    const prompt = String(body.prompt ?? "");
     if (!prompt) {
       return new Response(
         JSON.stringify({
           error: "invalid_request",
-          detail:
-            "Either {prompt} or {imageUrl & text} or {imageB64 & text} is required.",
+          detail: "prompt または imageUrl が必要です。",
         }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
       );
     }
 
@@ -674,10 +539,7 @@ export async function POST(req: NextRequest) {
     if (!text) {
       const imageUrl = await saveToPublicGenerated(baseImage);
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store",
-        },
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
       });
     }
 
@@ -694,18 +556,17 @@ export async function POST(req: NextRequest) {
       stroke,
       autoDetectPlacard,
     });
+
     const imageUrl = await saveToPublicGenerated(out);
+
     return new Response(JSON.stringify({ imageUrl }), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-      },
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
   } catch (err: any) {
     const elapsed = Date.now() - started;
-    const msg = err?.message || "Unknown error";
-    console.error("gen-image route failed:", msg, `(elapsed ${elapsed}ms)`);
-    return new Response(JSON.stringify({ error: msg }), {
+    console.error("gen-image failed:", err?.message, `(elapsed ${elapsed}ms)`);
+
+    return new Response(JSON.stringify({ error: err?.message || "Unknown" }), {
       status: 500,
       headers: { "Content-Type": "application/json" },
     });
