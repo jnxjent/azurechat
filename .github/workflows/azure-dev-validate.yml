@@ -35,10 +35,14 @@ jobs:
         run: cp -R ./src/.next/standalone ./site-deploy
 
       - name: 📂 Copy static into the .next folder
-        run: cp -R ./src/.next/static ./site-deploy/.next/static
+        run: |
+          mkdir -p ./site-deploy/.next/static
+          cp -R ./src/.next/static/* ./site-deploy/.next/static/
 
       - name: 📂 Copy Public folder
-        run: cp -R ./src/public ./site-deploy/public
+        run: |
+          mkdir -p ./site-deploy/public
+          cp -R ./src/public/* ./site-deploy/public/
 
       - name: 📦 Package Next application
         run: |
@@ -47,9 +51,14 @@ jobs:
 
       - name: 🔍 Diagnostics
         run: |
+          echo "=== src ==="
           ls ./src
-          ls ./src/.next
+          echo "=== src/public ==="
+          ls -R ./src/public
+          echo "=== site-deploy ==="
           ls ./site-deploy
+          echo "=== site-deploy/public ==="
+          ls -R ./site-deploy/public
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4
