@@ -234,6 +234,7 @@ export const GetDefaultExtensions = async (props: {
   signal: AbortSignal;
   mode?: ThinkingModeAPI; // "normal" | "thinking" | "fast"
 }): Promise<ServerActionResponse<Array<any>>> => {
+  // ★ 最初は空。ここに「function だけ」pushする
   const defaultExtensions: Array<any> = [];
 
   const currentMode = normalizeThinkingMode(props.mode ?? "normal");
@@ -496,9 +497,7 @@ async function executeAddTextToExistingImage(
   const text = (args?.text || "").trim();
   const styleHint = (args?.styleHint || "").trim();
 
-  // ★ ここが今回の本丸：
-  //   - ベース画像は常に「threadId/__base__.png」を使う
-  //   - explicitUrl（直前に表示していた画像）は参照しない
+  // ★ ベース画像は常に「threadId/__base__.png」
   const baseImageUrl = buildExternalImageUrl(chatThread.id, "__base__.png");
 
   console.log("🖋 add_text_to_existing_image (simple) called:", {
@@ -520,7 +519,7 @@ async function executeAddTextToExistingImage(
   const hintSource = styleHint || userMessage || "";
   const parsed = parseStyleHint(hintSource);
 
-  // 明示指定があればそれを優先しつつ、パース結果をデフォルトとして利用
+  // ---- 位置・サイズ・色 ----
   const align: "left" | "center" | "right" =
     (parsed.align as any) ?? "center";
   const vAlign: "top" | "middle" | "bottom" =
@@ -529,9 +528,40 @@ async function executeAddTextToExistingImage(
     (args.size as any) ?? parsed.size ?? "large";
   const color = args.color ?? parsed.color ?? "white";
 
-  // ★ 元々のフォント指定はログ用だけにして、実際の描画用は固定にする
-  const requestedFont = args.font ?? parsed.font;
-  const font = "NotoSansJP"; // ← サーバー側は常に NotoSansJP を使う
+  // ---- フォント種別（ゴシック / 明朝 / メイリオ） ----
+  const fontHint = (
+    (styleHint || "") +
+    " " +
+    (args.font || "") +
+    " " +
+    (parsed.font || "")
+  ).toLowerCase();
+
+  let fontFamily: "gothic" | "mincho" | "meiryo" = "gothic";
+
+  if (
+    fontHint.includes("明朝") ||
+    fontHint.includes("mincho") ||
+    fontHint.includes("serif")
+  ) {
+    fontFamily = "mincho";
+  } else if (fontHint.includes("メイリオ") || fontHint.includes("meiryo")) {
+    fontFamily = "meiryo";
+  } else {
+    // 特に指定がなければ「ゴシック系」
+    fontFamily = "gothic";
+  }
+
+  // ---- 太字 / イタリック ----
+  const lowerHint = hintSource.toLowerCase();
+  const bold =
+    hintSource.includes("太字") ||
+    hintSource.includes("ボールド") ||
+    lowerHint.includes("bold");
+  const italic =
+    hintSource.includes("イタリック") ||
+    hintSource.includes("斜体") ||
+    lowerHint.includes("italic");
 
   // ★ 累積移動：args の offset をベースに、styleHint 由来の増分を足す
   const baseOffsetX =
@@ -542,7 +572,7 @@ async function executeAddTextToExistingImage(
   const offsetX = baseOffsetX + (parsed.offsetX ?? 0);
   const offsetY = baseOffsetY + (parsed.offsetY ?? 0);
 
-  const bottomMargin = parsed.bottomMargin; // route.ts 側で undefined ならデフォルト 80 が効く
+  const bottomMargin = parsed.bottomMargin; // route.ts 側で undefined ならデフォルト 80
 
   const baseUrl =
     process.env.NEXTAUTH_URL ||
@@ -557,8 +587,9 @@ async function executeAddTextToExistingImage(
     vAlign,
     size,
     color,
-    font,              // ここは "NotoSansJP"
-    requestedFont,     // もともと LLM が選んだフォントはログだけ残す
+    fontFamily,
+    bold,
+    italic,
     offsetX,
     offsetY,
     bottomMargin,
@@ -576,11 +607,14 @@ async function executeAddTextToExistingImage(
         vAlign,
         size, // small/medium/large/xlarge を route.ts 側で fontSize にマップ
         color,
-        font, // ← サーバー側描画用として NotoSansJP を渡す
         offsetX,
         offsetY,
         bottomMargin,
-        autoDetectPlacard: false, // ★ ここで完全に OFF にする
+        autoDetectPlacard: false, // プラカード自動検出はここではOFF
+        // ★ フォント指定（ここが新しく増えた）
+        fontFamily, // "gothic" | "mincho" | "meiryo"
+        bold,
+        italic,
       }),
     });
 
@@ -639,3 +673,4 @@ async function executeAddTextToExistingImage(
     };
   }
 }
+

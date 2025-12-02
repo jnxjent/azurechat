@@ -9,6 +9,9 @@ import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/comple
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
+/** Salesforce 連携 Extension の ID（chat-home.tsx と同じ値に揃える） */
+const SF_EXTENSION_ID = "46b6Cn4aU3Wjq9o0SPvl4h5InX83YH70uRkf";
+
 /** GPT-5 用：履歴から旧式の function ロール等を除去（最小限） */
 function sanitizeHistory(
   history: ChatCompletionMessageParam[]
@@ -24,6 +27,52 @@ function sanitizeHistory(
         m.content = "";
       return m;
     });
+}
+
+/**
+ * モデル解決ロジック
+ * - 通常: これまでどおり thread.model → OPENAI_CHAT_MODEL → AZURE_OPENAI_CHAT_MODEL ...
+ * - ただし、このスレッドに Salesforce 拡張が含まれている場合だけ、
+ *   AZURE_OPENAI_SOQL_CHAT_MODEL / AZURE_OPENAI_SOQL_MODEL を優先して使う
+ */
+function resolveModelForExtensions(chatThread: ChatThreadModel): string {
+  // ChatThreadModel 型には model が定義されていないので、実データ側の model を any 経由で参照
+  const threadModel = (chatThread as any)?.model as string | undefined;
+
+  const defaultModel =
+    threadModel?.trim() ||
+    process.env.OPENAI_CHAT_MODEL?.trim() ||
+    process.env.AZURE_OPENAI_CHAT_MODEL?.trim() ||
+    process.env.OPENAI_MODEL?.trim() ||
+    process.env.AZURE_OPENAI_MODEL?.trim() ||
+    "gpt-5";
+
+  const extensions = Array.isArray(chatThread.extension)
+    ? chatThread.extension
+    : [];
+
+  const hasSfExtension = extensions.includes(SF_EXTENSION_ID);
+
+  if (hasSfExtension) {
+    const sfOrchestratorModel =
+      process.env.AZURE_OPENAI_SOQL_CHAT_MODEL?.trim() ||
+      process.env.AZURE_OPENAI_SOQL_MODEL?.trim();
+
+    if (sfOrchestratorModel) {
+      console.log(
+        "[SF] SF extension detected. Using SOQL orchestrator model:",
+        sfOrchestratorModel
+      );
+      return sfOrchestratorModel;
+    }
+
+    console.log(
+      "[SF] SF extension detected but no AZURE_OPENAI_SOQL_* override. Falling back to default model:",
+      defaultModel
+    );
+  }
+
+  return defaultModel;
 }
 
 export const ChatApiExtensions = async (props: {
@@ -61,16 +110,10 @@ export const ChatApiExtensions = async (props: {
 
   const safeHistory = sanitizeHistory(history);
 
-  // ChatThreadModel 型には model が定義されていないので、実データ側の model を any 経由で参照
-  const threadModel = (chatThread as any)?.model as string | undefined;
+  // ★ ここでモデルを解決（Salesforce拡張のときだけ gpt-4o-mini 等に切替え）
+  const model = resolveModelForExtensions(chatThread);
 
-  const model =
-    threadModel?.trim() ||
-    process.env.OPENAI_CHAT_MODEL?.trim() ||
-    process.env.AZURE_OPENAI_CHAT_MODEL?.trim() ||
-    process.env.OPENAI_MODEL?.trim() ||
-    process.env.AZURE_OPENAI_MODEL?.trim() ||
-    "gpt-5";
+  console.log("[ChatApiExtensions] Using model for tools:", model);
 
   return openAI.beta.chat.completions.runTools(
     {
@@ -93,6 +136,8 @@ export const ChatApiExtensions = async (props: {
         },
       ],
       tools: extensions,
+      // ★ ここでは tool_choice / reasoning_effort は指定しない
+      //   → OpenAI 側のデフォルト挙動（ツール選択 → 最終回答生成）に任せる
     },
     { signal }
   );

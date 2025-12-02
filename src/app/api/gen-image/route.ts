@@ -1,10 +1,11 @@
 // File: src/app/api/gen-image/route.ts
-// AzureChat GPT5 画像生成・文字入れ統合ルート（完全修正版）
+// AzureChat GPT5 画像生成・文字入れ統合ルート（フォント指定対応版）
 // - ベース画像生成（Azure OpenAI Images）
 // - 既存画像に日本語テキスト追加（SVG + sharp）
 // - Blob Storage 読込対応
-// - プラカード自動検出対応
-// - 豆腐文字完全排除（file:/// font 読込）
+// - プラカード自動検出対応（必要に応じて ON）
+// - 豆腐文字完全排除：/public/fonts/*.ttf を file:/// で直指定
+// - fontFamily / bold / italic / offsetX / offsetY をサポート
 // ------------------------------------------------------
 
 export const runtime = "nodejs";
@@ -79,6 +80,7 @@ function escapeXml(s: string) {
 }
 
 function pickNumber(v: any, def: number) {
+  if (v === undefined || v === null) return def;
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
@@ -169,7 +171,8 @@ async function detectWhiteRectangle(
 }
 
 // -------------------- Text Compose ------------------
-// ★★★ 豆腐文字 ZERO（file:/// フォント読込）
+// fontFamily: "gothic" | "mincho" | "meiryo" （チャット側から来る）
+// bold / italic / offsetX / offsetY もここで反映する
 async function composeTextOnImageBase(
   baseImage: Buffer,
   opts: {
@@ -184,6 +187,11 @@ async function composeTextOnImageBase(
     fill?: string;
     stroke?: string;
     autoDetectPlacard?: boolean;
+    fontFamily?: "gothic" | "mincho" | "meiryo";
+    bold?: boolean;
+    italic?: boolean;
+    offsetX?: number;
+    offsetY?: number;
   }
 ) {
   const {
@@ -198,15 +206,45 @@ async function composeTextOnImageBase(
     fill = "#ffffff",
     stroke = "rgba(0,0,0,0.4)",
     autoDetectPlacard = false,
+    fontFamily = "gothic",
+    bold = false,
+    italic = false,
+    offsetX = 0,
+    offsetY = 0,
   } = opts;
 
   if (!text) return baseImage;
 
-  // ------- ★ Azure Linux 本番で絶対に存在するパス ----------
-  const absoluteFontPath =
-    "file:///home/site/wwwroot/public/fonts/NotoSansJP-Regular.ttf";
+  // --- フォントファイルの選択 ---
+  // それぞれ public/fonts に配置しておく想定
+  const fontFileNameProd =
+    fontFamily === "mincho"
+      ? "/home/site/wwwroot/public/fonts/NotoSerifJP-Regular.otf"
+      : "/home/site/wwwroot/public/fonts/NotoSansJP-Regular.ttf";
 
-  let x, y;
+  const fontFileNameLocal =
+    fontFamily === "mincho"
+      ? path.join(process.cwd(), "public", "fonts", "NotoSerifJP-Regular.otf")
+      : path.join(process.cwd(), "public", "fonts", "NotoSansJP-Regular.ttf");
+
+  const fontFilePathProd = fontFileNameProd;
+  const fontFilePathLocal = fontFileNameLocal;
+
+  const absoluteFontPath =
+    process.env.WEBSITE_SITE_NAME || process.env.NODE_ENV === "production"
+      ? `file://${fontFilePathProd}`
+      : `file://${fontFilePathLocal.replace(/\\/g, "/")}`;
+
+  // CSS 用 font-family（ゴシック/明朝/メイリオ風）
+  const cssFontFamily =
+    fontFamily === "mincho"
+      ? "'MyJP', 'Noto Serif JP', 'Yu Mincho', serif"
+      : fontFamily === "meiryo"
+      ? "'MyJP', 'Meiryo', 'Yu Gothic', 'Noto Sans JP', sans-serif"
+      : "'MyJP', 'Noto Sans JP', 'Yu Gothic', sans-serif";
+
+  let x: number;
+  let y: number;
   let effectiveFontSize = fontSize;
   let anchor: "start" | "middle" | "end";
 
@@ -245,6 +283,13 @@ async function composeTextOnImageBase(
     anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
   }
 
+  // オフセット反映（「少し上」「➡で右に」など）
+  x += offsetX;
+  y += offsetY;
+
+  const fontWeight = bold ? "700" : "400";
+  const fontStyle = italic ? "italic" : "normal";
+
   const svg = `
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -254,8 +299,10 @@ async function composeTextOnImageBase(
         src: url("${absoluteFontPath}") format("truetype");
       }
       .label {
-        font-family: 'MyJP', sans-serif;
+        font-family: ${cssFontFamily};
         font-size: ${effectiveFontSize}px;
+        font-weight: ${fontWeight};
+        font-style: ${fontStyle};
         fill: ${fill};
         paint-order: stroke;
         stroke: ${stroke};
@@ -297,7 +344,7 @@ async function getBaseImageBufferFromSource(
 
   if (!imageUrl) throw new Error("image source not provided");
 
-  // --- Blob SDK
+  // --- Blob SDK 経由（/api/images/?t=...&img=...）
   if (imageUrl.includes("/api/images")) {
     try {
       const u = new URL(imageUrl, "http://localhost");
@@ -318,7 +365,7 @@ async function getBaseImageBufferFromSource(
         );
 
         const candidates = [img, img.includes(".") ? img : `${img}.png`];
-        let lastErr = null;
+        let lastErr: any = null;
 
         for (const cand of candidates) {
           try {
@@ -333,14 +380,15 @@ async function getBaseImageBufferFromSource(
             }
 
             return Buffer.concat(chunks);
-
           } catch (e) {
             lastErr = e;
           }
         }
         throw lastErr;
       }
-    } catch {}
+    } catch {
+      // fallthrough
+    }
   }
 
   // --- data URL
@@ -427,8 +475,7 @@ async function generateImageWithGuards({
   if (first.ok) return first.buf;
 
   const policy =
-    first.status === 400 &&
-    /policy/i.test(first.text || "");
+    first.status === 400 && /policy/i.test(first.text || "");
 
   if (policy) {
     const fb = fallbackPrompt();
@@ -467,7 +514,7 @@ export async function POST(req: NextRequest) {
     const stroke = String(body.stroke ?? "rgba(0,0,0,0.4)");
 
     const rawSize = body.size ? String(body.size).toLowerCase() : undefined;
-    const sizeMap: any = {
+    const sizeMap: Record<string, number> = {
       small: 32,
       medium: 40,
       large: 48,
@@ -484,6 +531,13 @@ export async function POST(req: NextRequest) {
 
     const autoDetectPlacard = body.autoDetectPlacard === true;
     const timeoutMs = pickNumber(body.timeoutMs, 90000);
+
+    const fontFamily =
+      body.fontFamily as "gothic" | "mincho" | "meiryo" | undefined;
+    const bold = body.bold === true;
+    const italic = body.italic === true;
+    const offsetX = pickNumber(body.offsetX, 0);
+    const offsetY = pickNumber(body.offsetY, 0);
 
     // ---- 既存画像に追記
     if (body.imageUrl || body.imageB64) {
@@ -505,12 +559,20 @@ export async function POST(req: NextRequest) {
         fill,
         stroke,
         autoDetectPlacard,
+        fontFamily,
+        bold,
+        italic,
+        offsetX,
+        offsetY,
       });
 
       const imageUrl = await saveToPublicGenerated(out);
 
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
       });
     }
 
@@ -539,7 +601,10 @@ export async function POST(req: NextRequest) {
     if (!text) {
       const imageUrl = await saveToPublicGenerated(baseImage);
       return new Response(JSON.stringify({ imageUrl }), {
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
       });
     }
 
@@ -555,12 +620,20 @@ export async function POST(req: NextRequest) {
       fill,
       stroke,
       autoDetectPlacard,
+      fontFamily,
+      bold,
+      italic,
+      offsetX,
+      offsetY,
     });
 
     const imageUrl = await saveToPublicGenerated(out);
 
     return new Response(JSON.stringify({ imageUrl }), {
-      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      },
     });
   } catch (err: any) {
     const elapsed = Date.now() - started;

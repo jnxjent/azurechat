@@ -2,6 +2,9 @@
 "use server";
 import "server-only";
 
+// ★ SF拡張の Extension ID（あなたの環境に合わせている）
+const SF_EXTENSION_ID = "46b6Cn4aU3Wjq9o0SPvl4h5InX83YH70uRkf";
+
 import { getCurrentUser } from "@/features/auth-page/helpers";
 import { CHAT_DEFAULT_SYSTEM_PROMPT } from "@/features/theme/theme-config";
 import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/completions";
@@ -58,7 +61,11 @@ function fixOrphanToolsInline(messages: any[]) {
     }
     if (m?.role === "tool") {
       // 直前 assistant の tool_calls に一致しない tool は落とす
-      if (lastAssistantToolIds && m.tool_call_id && lastAssistantToolIds.has(m.tool_call_id)) {
+      if (
+        lastAssistantToolIds &&
+        m.tool_call_id &&
+        lastAssistantToolIds.has(m.tool_call_id)
+      ) {
         out.push(m);
       }
       continue;
@@ -78,7 +85,8 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   const currentChatThread = currentChatThreadResponse.response;
 
   const p = props as UserPromptWithMode;
-  const resolvedMode: ThinkingModeAPI = p.apiThinkingMode ?? uiToApi(p.thinkingMode) ?? "normal";
+  const resolvedMode: ThinkingModeAPI =
+    p.apiThinkingMode ?? uiToApi(p.thinkingMode) ?? "normal";
 
   if (process.env.NODE_ENV !== "production") {
     console.log("📨 ChatAPIEntry received modes:", {
@@ -157,7 +165,8 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
 };
 
 const _getHistory = async (chatThread: ChatThreadModel) => {
-  const historyResponse = await FindTopChatMessagesForCurrentUser(chatThread.id);
+  const historyResponse =
+    await FindTopChatMessagesForCurrentUser(chatThread.id);
   if (historyResponse.status === "OK") {
     const historyResults = historyResponse.response;
     // DB → OpenAI 形式へ
@@ -186,14 +195,26 @@ const _getExtensions = async (props: {
 }) => {
   const extension: Array<any> = [];
 
-  const response = await GetDefaultExtensions({
-    chatThread: props.chatThread,
-    userMessage: props.userMessage,
-    signal: props.signal,
-    mode: props.mode, // ← ここが“断絶”をつなぐ肝
-  });
-  if (response.status === "OK" && response.response.length > 0) {
-    extension.push(...response.response);
+  // ★ このスレッドが SF 拡張を持っているか？
+  const hasSfExtension =
+    Array.isArray(props.chatThread.extension) &&
+    props.chatThread.extension.includes(SF_EXTENSION_ID);
+
+  // ★ SF スレッドのときは、汎用のデフォルト拡張（画像ツールなど）をスキップして高速化
+  if (!hasSfExtension) {
+    const response = await GetDefaultExtensions({
+      chatThread: props.chatThread,
+      userMessage: props.userMessage,
+      signal: props.signal,
+      mode: props.mode, // ← ここが“断絶”をつなぐ肝
+    });
+    if (response.status === "OK" && response.response.length > 0) {
+      extension.push(...response.response);
+    }
+  } else if (process.env.NODE_ENV !== "production") {
+    console.log(
+      "[SF] SF_EXTENSION_ID detected. Skipping default (image) extensions for speed."
+    );
   }
 
   const dynamicExtensionsResponse = await GetDynamicExtensions({
