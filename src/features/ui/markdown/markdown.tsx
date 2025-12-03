@@ -1,3 +1,4 @@
+// src/features/ui/markdown/markdown.tsx
 import Markdoc from "@markdoc/markdoc";
 import React, { FC } from "react";
 import { Citation } from "./citation";
@@ -16,12 +17,7 @@ interface Props {
 
 /**
  * 1. GPT が吐いた HTML/Markdown リンクを「素の URL 一個」に潰す。
- *
- *   - <a href="https://...">任意のテキスト</a> → https://...
- *   - [任意のテキスト](https://...)         → https://...
- *
- *   テキスト側が URL でも日本語でも、とにかく
- *   「https://...」だけ残す。
+ *    ただし Markdown 画像 `![](URL)` はそのまま残す。
  */
 function simplifyLinks(raw: string): string {
   if (!raw) return "";
@@ -35,8 +31,9 @@ function simplifyLinks(raw: string): string {
   );
 
   // (B) Markdown リンク: [何でも](URL) → URL
+  //     ただし直前が "!" の場合 (= 画像) は対象外にする
   s = s.replace(
-    /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g,
+    /(?<!!)\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g,
     "$1"
   );
 
@@ -44,40 +41,71 @@ function simplifyLinks(raw: string): string {
 }
 
 /**
- * 2. 素の http / https を Markdown リンク [URL](URL) に変換しつつ、
- *    できるだけ URL を単独行に出す。
- *
- *   - 例: 「画像URL: https://...」 → 「画像URL:\n[https://...](https://...)」
+ * 2. 素の http / https を Markdown リンクや画像に変換。
+ *    - /api/images/?t=...&img=...png/jpg/... → 画像: ![](URL)
+ *    - それ以外 → リンク: [URL](URL)
+ *    なお、既存の Markdown 画像 `![](URL)` は保護する。
  */
 function autoLinkUrls(raw: string): string {
   if (!raw) return "";
 
-  // 素の URL（既に [text](url) にはなっていないもの）を検知
-  const urlRegex = /(?<!\]\()https?:\/\/[^\s)]+/g;
+  // まず Markdown 画像 `![](URL)` を一時退避して保護する
+  const imagePattern = /!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g;
+  const placeholders: string[] = [];
 
-  return raw.replace(urlRegex, (url) => `\n[${url}](${url})`);
+  let tmp = raw.replace(imagePattern, (match) => {
+    const key = `__MARKDOWN_IMAGE_PLACEHOLDER_${placeholders.length}__`;
+    placeholders.push(match);
+    return key;
+  });
+
+  // 素の URL をリンク化 or 画像化
+  const urlRegex = /(?<!\]\()https?:\/\/[^\s)]+/g;
+  tmp = tmp.replace(urlRegex, (url) => {
+    // AzureChat の画像エンドポイントだけは「画像として埋め込み」
+    const isImageApi =
+      /\/api\/images\/\?t=[^&]+&img=[^&]+\.(png|jpg|jpeg|gif|webp)/i.test(url);
+
+    if (isImageApi) {
+      // 画像として埋め込み
+      return `\n![](${url})`;
+    }
+
+    // 通常のリンクとして扱う
+    return `\n[${url}](${url})`;
+  });
+
+  // 一時退避していた画像 Markdown を元に戻す
+  placeholders.forEach((img, i) => {
+    const key = `__MARKDOWN_IMAGE_PLACEHOLDER_${i}__`;
+    tmp = tmp.replace(key, img);
+  });
+
+  return tmp;
 }
 
 export const Markdown: FC<Props> = (props) => {
-  // 1) まず HTML/Markdown のリンク表現を「URL だけ」に潰す
   const simplified = simplifyLinks(props.content);
-
-  // 2) その URL を [URL](URL) に変換（ついでに前に改行を入れる）
   const source = autoLinkUrls(simplified);
 
   const ast = Markdoc.parse(source);
 
-  // citationConfig に image ノードだけ追加する
+  const baseNodes = (citationConfig as any).nodes || {};
+
+  // ★ href/title を含めて link ノードを定義しつつ、target/_blank を追加
   const mergedConfig: any = {
     ...citationConfig,
     nodes: {
-      ...(citationConfig as any).nodes,
-      image: {
-        render: "img",
+      ...baseNodes,
+      link: {
+        ...(baseNodes.link || {}),
+        render: "a",
         attributes: {
-          src: { type: String, required: true },
-          alt: { type: String },
-          title: { type: String },
+          ...(baseNodes.link?.attributes || {}),
+          href: { type: String }, // ← これがないと href が落ちる
+          title: { type: String }, // 任意
+          target: { type: String, default: "_blank" },
+          rel: { type: String, default: "noopener noreferrer" },
         },
       },
     },
