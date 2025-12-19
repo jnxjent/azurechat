@@ -4,6 +4,10 @@ import { UserPrompt } from "@/features/chat-page/chat-services/models";
 
 export const runtime = "nodejs";
 
+// 🚀 キャッシュ禁止（既存）
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 /** UIの3値 */
 type ThinkingModeUI = "standard" | "thinking" | "fast";
 /** APIで使う3値（standardはnormalへ） */
@@ -62,18 +66,32 @@ export async function POST(req: Request) {
     });
   }
 
-  // API に渡すプロンプト
+  // 🧠 API に渡すプロンプト生成
   const userPrompt: UserPromptWithMode = {
     ...(parsed as UserPromptWithMode),
     thinkingMode: uiThinkingMode ?? "standard",
     apiThinkingMode,
-    // 型エラー対策：必ず string を渡す（なければ空文字）
     multimodalImage:
       typeof multimodalImage === "string" && multimodalImage.length > 0
         ? multimodalImage
         : "",
   };
 
-  // ここでは tool メッセージは一切いじらず、そのまま ChatAPIEntry へ渡す
+  // 🆕 GPTに渡す履歴を最新30件に制限（速度・Token・応答安定性◎）
+  // UserPromptWithMode の型定義上は `messages` が無い（`message` はある）ため、
+  // unknown 経由で安全に存在確認してから slice する。
+  const upAny = userPrompt as unknown as {
+    messages?: unknown;
+    history?: unknown;
+  };
+
+  if (Array.isArray(upAny.messages)) {
+    upAny.messages = upAny.messages.slice(-30);
+  }
+  if (Array.isArray(upAny.history)) {
+    upAny.history = upAny.history.slice(-30);
+  }
+
+  // LLMへ送信
   return await ChatAPIEntry(userPrompt, req.signal);
 }

@@ -100,8 +100,14 @@ function pickAlign(v: any): "left" | "center" | "right" {
 }
 
 function pickVAlign(v: any): "top" | "middle" | "bottom" {
-  return v === "top" || v === "middle" ? v : "bottom";
+  // 明示的に top / middle / bottom が来たときだけ変更
+  if (v === "top" || v === "middle" || v === "bottom") {
+    return v;
+  }
+  // 何も指定されていない（undefined 等）ときは「中央」を維持する前提で middle にする
+  return "middle";
 }
+
 
 // -------------------- Placard Detection -------------
 async function detectWhiteRectangle(
@@ -496,6 +502,13 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json().catch(() => ({} as any));
+
+    // ★ デバッグログ追加（暫定）
+    console.log(
+      "[gen-image] align/vAlign from body >>>",
+      body.align,
+      body.vAlign
+    );
 
     const width = pickNumber(body.width, 1024);
     const height = pickNumber(body.height, 1024);

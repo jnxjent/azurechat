@@ -1,3 +1,8 @@
+// src/app/(authenticated)/chat/[id]/page.tsx
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 import "@/lib/no-store-fetch"; // ← これだけで、このページのSSR中の fetch 既定が no-store になる
 import { ChatPage } from "@/features/chat-page/chat-page";
 import { FindAllChatDocuments } from "@/features/chat-page/chat-services/chat-document-service";

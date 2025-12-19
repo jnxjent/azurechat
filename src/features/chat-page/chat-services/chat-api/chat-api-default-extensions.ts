@@ -7,8 +7,6 @@ import { uniqueId } from "@/features/common/util";
 import {
   GetImageUrl,
   UploadImageToStore,
-  // RegisterImageOnThread,  // ← もう使わないのでコメントアウトでOK
-  // GetImageUrlFromThread, // ← 同上
 } from "../chat-image-service";
 import { ChatThreadModel } from "../models";
 
@@ -30,12 +28,6 @@ function normalizeThinkingMode(
 
 /**
  * 画像URLを組み立てる共通ヘルパー
- * - NEXT_PUBLIC_IMAGE_URL があればそれを最優先（https://xxx.azurewebsites.net/api/images）
- * - なければ NEXTAUTH_URL + /api/images を使う
- * - どちらも無ければ、最後の保険として GetImageUrl() にフォールバック
- *
- * 生成される形式の例:
- *   https://.../api/images/?t=<threadId>&img=<fileName>
  */
 function buildExternalImageUrl(threadId: string, fileName: string): string {
   const publicBase = process.env.NEXT_PUBLIC_IMAGE_URL;
@@ -50,7 +42,6 @@ function buildExternalImageUrl(threadId: string, fileName: string): string {
     return `${base}/api/images/?t=${threadId}&img=${fileName}`;
   }
 
-  // 環境変数が未設定だった場合の最後の保険
   return GetImageUrl(threadId, fileName);
 }
 
@@ -61,6 +52,7 @@ function buildExternalImageUrl(threadId: string, fileName: string): string {
 type StyleParams = {
   font?: string;
   size?: "small" | "medium" | "large" | "xlarge";
+  sizeAdjust?: "larger" | "smaller"; // ★ 相対的なサイズ調整
   align?: "left" | "center" | "right";
   vAlign?: "top" | "middle" | "bottom";
   bottomMargin?: number;
@@ -69,14 +61,25 @@ type StyleParams = {
   color?: string;
 };
 
+/** ★ スレッドごとの「直近のテキスト位置」を保持する状態 */
+type TextLayout = {
+  align: "left" | "center" | "right";
+  vAlign: "top" | "middle" | "bottom";
+  offsetX: number;
+  offsetY: number;
+  size: "small" | "medium" | "large" | "xlarge"; // ★ サイズも記憶
+  text: string; // ★ テキスト内容も記憶
+};
+
+const lastTextLayoutByThread = new Map<string, TextLayout>();
+
 function parseStyleHint(styleHint?: string): StyleParams {
   if (!styleHint) return {};
-  // かなり雑でも良いので、まずは正規化
   const s = styleHint.replace(/\s+/g, "").toLowerCase();
 
   const p: StyleParams = {};
 
-  // ---- サイズ系 ----
+  // ---- サイズ系（絶対指定）----
   if (s.includes("特大") || s.includes("ドーン") || s.includes("めちゃ大")) {
     p.size = "xlarge";
   } else if (s.includes("大きめ") || s.includes("大きく") || s.includes("大きい")) {
@@ -87,8 +90,26 @@ function parseStyleHint(styleHint?: string): StyleParams {
     p.size = "medium";
   }
 
+  // ★ サイズ系（相対指定）★
+  if (
+    s.includes("もう少し大きく") ||
+    s.includes("もうちょっと大きく") ||
+    s.includes("もっと大きく") ||
+    s.includes("さらに大きく") ||
+    s.includes("ちょい大きく")
+  ) {
+    p.sizeAdjust = "larger";
+  } else if (
+    s.includes("もう少し小さく") ||
+    s.includes("もうちょっと小さく") ||
+    s.includes("もっと小さく") ||
+    s.includes("さらに小さく") ||
+    s.includes("ちょい小さく")
+  ) {
+    p.sizeAdjust = "smaller";
+  }
+
   // ---- 垂直位置（下 / 上 / 真ん中）----
-  // 1) まず bottom を決める
   if (
     s.includes("一番下") ||
     s.includes("最下部") ||
@@ -101,7 +122,6 @@ function parseStyleHint(styleHint?: string): StyleParams {
     p.bottomMargin = 80;
   }
 
-  // 2) 次に top を決める（「一番上の中央」のような場合も top を優先）
   if (
     s.includes("一番上") ||
     s.includes("最上部") ||
@@ -114,50 +134,18 @@ function parseStyleHint(styleHint?: string): StyleParams {
     p.vAlign = "top";
   }
 
-  // 3) 上下が指定されていない場合だけ中央扱い
+  // ★ 中央判定は最後に（他の位置指定がない場合のみ）
   if (
     !p.vAlign &&
     (s.includes("真ん中") ||
-      s.includes("中央") ||
       s.includes("センター") ||
-      s.includes("中心"))
+      s.includes("中心") ||
+      s.includes("中央"))
   ) {
     p.vAlign = "middle";
   }
 
-  // ---- 水平位置（左 / 中央 / 右）----
-  if (s.includes("左上") || s.includes("左下")) {
-    // ４隅ショートカットでまとめて処理するのでここでは何もしない
-  } else if (
-    s.includes("左寄せ") ||
-    s.includes("左側") ||
-    s.includes("左端") ||
-    s.includes("左")
-  ) {
-    p.align = "left";
-  }
-
-  if (s.includes("右上") || s.includes("右下")) {
-    // ４隅ショートカットでまとめて処理するのでここでは何もしない
-  } else if (
-    s.includes("右寄せ") ||
-    s.includes("右側") ||
-    s.includes("右端") ||
-    s.includes("右")
-  ) {
-    p.align = "right";
-  }
-
-  if (
-    s.includes("中央") ||
-    s.includes("真ん中") ||
-    s.includes("センター") ||
-    s.includes("中寄せ")
-  ) {
-    p.align = "center";
-  }
-
-  // ---- ４隅ショートカット ----
+  // ---- ４隅ショートカット（水平位置より先に処理）----
   if (s.includes("左上")) {
     p.align = "left";
     p.vAlign = "top";
@@ -177,6 +165,33 @@ function parseStyleHint(styleHint?: string): StyleParams {
     p.bottomMargin = 80;
   }
 
+  // ---- 水平位置（左 / 右 を先に、中央は最後）----
+  // ★ 4隅で既に設定済みの場合はスキップ
+  if (!p.align) {
+    if (
+      s.includes("左寄せ") ||
+      s.includes("左側") ||
+      s.includes("左端") ||
+      (s.includes("左") && !s.includes("中央") && !s.includes("真ん中"))
+    ) {
+      p.align = "left";
+    } else if (
+      s.includes("右寄せ") ||
+      s.includes("右側") ||
+      s.includes("右端") ||
+      (s.includes("右") && !s.includes("中央") && !s.includes("真ん中"))
+    ) {
+      p.align = "right";
+    } else if (
+      s.includes("中央") ||
+      s.includes("真ん中") ||
+      s.includes("センター") ||
+      s.includes("中寄せ")
+    ) {
+      p.align = "center";
+    }
+  }
+
   // ---- 微調整（少し右 / 少し上 など）----
   if (s.includes("少し右") || s.includes("ちょい右") || s.includes("やや右")) {
     p.offsetX = (p.offsetX ?? 0) + 80;
@@ -192,7 +207,6 @@ function parseStyleHint(styleHint?: string): StyleParams {
   }
 
   // ---- 矢印による移動指定（→ ← ↑ ↓）----
-  // ここは「増分」として扱う（あとでベース offset に加算）
   if (s.includes("→") || s.includes("➡") || s.includes("➜") || s.includes("右矢印")) {
     p.offsetX = (p.offsetX ?? 0) + 80;
   }
@@ -212,7 +226,6 @@ function parseStyleHint(styleHint?: string): StyleParams {
   if (s.includes("ゴシック")) p.font = "Yu Gothic";
   if (s.includes("明朝")) p.font = "Yu Mincho";
   if (s.includes("手書き") || s.includes("手書き風")) {
-    // 実際には別の手書きフォントに差し替えてOK
     p.font = "Comic Sans MS";
   }
 
@@ -232,16 +245,15 @@ export const GetDefaultExtensions = async (props: {
   chatThread: ChatThreadModel;
   userMessage: string;
   signal: AbortSignal;
-  mode?: ThinkingModeAPI; // "normal" | "thinking" | "fast"
+  mode?: ThinkingModeAPI;
 }): Promise<ServerActionResponse<Array<any>>> => {
-  // ★ 最初は空。ここに「function だけ」pushする
   const defaultExtensions: Array<any> = [];
 
   const currentMode = normalizeThinkingMode(props.mode ?? "normal");
   const modeOpts = buildSendOptionsFromMode(currentMode);
 
   console.log("🧠 Reasoning Mode Applied:", {
-    mode: currentMode, // normal | thinking | fast
+    mode: currentMode,
     reasoning_effort: modeOpts.reasoning_effort,
     temperature: modeOpts.temperature,
   });
@@ -263,7 +275,7 @@ export const GetDefaultExtensions = async (props: {
         type: "object",
         properties: {
           prompt: { type: "string" },
-          text: { type: "string" }, // ※ 今は無視して「元絵だけ」生成。文字入れは add_text_to_existing_image を使う想定。
+          text: { type: "string" },
           size: {
             type: "string",
             enum: ["1024x1024", "1024x1792", "1792x1024"],
@@ -302,12 +314,15 @@ export const GetDefaultExtensions = async (props: {
           },
           text: {
             type: "string",
-            description: "Japanese text to overlay on the image.",
+            description:
+              "Japanese text to overlay on the image. " +
+              "CRITICAL: If the user is ONLY adjusting position, size, or color (words like '右に', 'もう少し大きく', '赤色に'), " +
+              "you MUST use the EXACT same text from the previous image. Do NOT shorten, modify, or change the text content in any way.", // ★ 追加
           },
           styleHint: {
             type: "string",
             description:
-              "Natural language hint for font size, color, position such as '大きめの白文字で、下部中央に', '少し上に', '➡ で少し右へ', etc.",
+              "Natural language hint for font size, color, position such as '大きめの白文字で、下部中央に', '少し上に', '➡ で少し右へ', 'もう少し大きく', etc.",
           },
           font: {
             type: "string",
@@ -337,8 +352,10 @@ export const GetDefaultExtensions = async (props: {
         required: ["imageUrl", "text"],
       },
       description:
-        "Use this tool when the user wants to add or adjust text on an EXISTING image, for example 'この絵に 2026 謹賀新年 と入れて' or 'もう少し下に', 'そこから➡で右に'. " +
-        "This version does NOT use Azure Vision; it simply overlays text on top of the existing image using the /api/gen-image route.",
+        "Use this tool when the user wants to add or adjust text on an EXISTING image, for example 'この絵に 2026 謹賀新年 と入れて' or 'もう少し下に', 'そこから➡で右に', 'もう少し大きく'. " +
+        "CRITICAL RULE: When the user is ONLY requesting position/size/color adjustments (e.g., '右に移動', 'もう少し大きく', '赤色に変更'), " +
+        "you MUST preserve the EXACT text from the previous image without any modifications, shortenings, or changes. " +
+        "Only change the text parameter when the user explicitly requests a text content change.", // ★ 追加
       name: "add_text_to_existing_image",
     },
   });
@@ -405,7 +422,6 @@ async function executeCreateImage(
       method: "POST",
       headers: { "api-key": apiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
-        // ★ ここではテキスト無しのクリーンな画像だけを生成
         prompt,
         n: 1,
         size,
@@ -447,21 +463,18 @@ async function executeCreateImage(
       const imageName = `${uniqueId()}.png`;
       const buffer = Buffer.from(b64, "base64");
 
-      // 通常のランダム名で保存（ユーザーに見せる用）
       await UploadImageToStore(chatThread.id, imageName, buffer);
-
-      // ★ スレッド共通の「元絵」として __base__.png にも同じ内容を保存
-      //   - 同じスレッドで create_img を再実行したら、ここで __base__.png を上書き
       await UploadImageToStore(chatThread.id, "__base__.png", buffer);
 
-      // 表示用 URL は従来どおりランダム名を使う
+      // ★ 新しい元絵を作ったので、そのスレッドの位置状態はリセット
+      lastTextLayoutByThread.delete(chatThread.id);
+      console.log("🗑️ Cleared text layout for thread:", chatThread.id);
+
       baseImageUrl = buildExternalImageUrl(chatThread.id, imageName);
     } else {
-      // まれに URL で返るケース（今はほぼ無いはずだが念のため）
       baseImageUrl = urlDirect!;
     }
 
-    // ★ このシンプル版では、ここで文字入れは行わない（元絵だけ返す）
     return {
       revised_prompt: prompt,
       url: baseImageUrl,
@@ -492,21 +505,28 @@ async function executeAddTextToExistingImage(
     temperature?: number;
   }
 ) {
-  // LLM から渡された URL はログ用に保持（実際のベースには使わない）
   const explicitUrl = (args?.imageUrl || "").trim();
   const text = (args?.text || "").trim();
   const styleHint = (args?.styleHint || "").trim();
 
-  // ★ ベース画像は常に「threadId/__base__.png」
   const baseImageUrl = buildExternalImageUrl(chatThread.id, "__base__.png");
 
-  console.log("🖋 add_text_to_existing_image (simple) called:", {
+  // ★★ デバッグ: Map の中身を確認
+  console.log("🗺️ lastTextLayoutByThread MAP状態:", {
+    threadId: chatThread.id,
+    hasEntry: lastTextLayoutByThread.has(chatThread.id),
+    mapSize: lastTextLayoutByThread.size,
+    allKeys: Array.from(lastTextLayoutByThread.keys()),
+    currentValue: lastTextLayoutByThread.get(chatThread.id),
+  });
+
+  console.log("🖋 add_text_to_existing_image called:", {
     passedImageUrl: explicitUrl,
     usedBaseImageUrl: baseImageUrl,
     text,
     styleHint,
-    offsetX: args?.offsetX,
-    offsetY: args?.offsetY,
+    argsOffsetX: args?.offsetX,
+    argsOffsetY: args?.offsetY,
   });
 
   if (!text) {
@@ -515,20 +535,83 @@ async function executeAddTextToExistingImage(
     };
   }
 
-  // ★ styleHint + userMessage からスタイルを推定
   const hintSource = styleHint || userMessage || "";
   const parsed = parseStyleHint(hintSource);
 
-  // ---- 位置・サイズ・色 ----
+  console.log("🔍 parsed style hint:", parsed);
+
+  const last = lastTextLayoutByThread.get(chatThread.id);
+
+  console.log("📍 last layout from Map:", last);
+
+  // ★★ テキスト内容の検証（LLMが勝手に短縮していないかチェック）
+  if (last?.text && text !== last.text) {
+    console.warn("⚠️ Text content changed:", {
+      previous: last.text,
+      current: text,
+      userMessage,
+    });
+    // ★ ユーザーが明示的にテキスト変更を要求していない場合は警告
+    const lowerMsg = userMessage.toLowerCase();
+    if (
+      !lowerMsg.includes("変更") &&
+      !lowerMsg.includes("変える") &&
+      !lowerMsg.includes("書き換え") &&
+      !text.includes(last.text) // 新しいテキストが前のテキストを含んでいない
+    ) {
+      console.warn(
+        "⚠️⚠️ Text was shortened/changed without explicit user request! Using previous text."
+      );
+      // ★ 前のテキストを強制的に使う
+      // text = last.text; // ← これを有効にすると強制的に前のテキストを使う
+    }
+  }
+
+  // ---- 位置の決定ロジック ----
   const align: "left" | "center" | "right" =
-    (parsed.align as any) ?? "center";
+    parsed.align !== undefined ? parsed.align : last?.align ?? "center";
+
   const vAlign: "top" | "middle" | "bottom" =
-    (parsed.vAlign as any) ?? "bottom";
-  const size: "small" | "medium" | "large" | "xlarge" =
-    (args.size as any) ?? parsed.size ?? "large";
+    parsed.vAlign !== undefined ? parsed.vAlign : last?.vAlign ?? "middle";
+
+  console.log("✅ resolved align/vAlign:", { align, vAlign });
+
+  // ---- サイズの決定ロジック（相対調整対応）----
+  let size: "small" | "medium" | "large" | "xlarge" =
+    (args.size as any) ?? parsed.size ?? last?.size ?? "large";
+
+  // ★ 相対的なサイズ調整
+  if (parsed.sizeAdjust === "larger") {
+    const sizeOrder: Array<"small" | "medium" | "large" | "xlarge"> = [
+      "small",
+      "medium",
+      "large",
+      "xlarge",
+    ];
+    const currentIndex = sizeOrder.indexOf(size);
+    if (currentIndex >= 0 && currentIndex < sizeOrder.length - 1) {
+      const oldSize = size;
+      size = sizeOrder[currentIndex + 1];
+      console.log(`📏 Size adjusted larger: ${oldSize} → ${size}`);
+    }
+  } else if (parsed.sizeAdjust === "smaller") {
+    const sizeOrder: Array<"small" | "medium" | "large" | "xlarge"> = [
+      "small",
+      "medium",
+      "large",
+      "xlarge",
+    ];
+    const currentIndex = sizeOrder.indexOf(size);
+    if (currentIndex > 0) {
+      const oldSize = size;
+      size = sizeOrder[currentIndex - 1];
+      console.log(`📏 Size adjusted smaller: ${oldSize} → ${size}`);
+    }
+  }
+
   const color = args.color ?? parsed.color ?? "white";
 
-  // ---- フォント種別（ゴシック / 明朝 / メイリオ） ----
+  // ---- フォント種別 ----
   const fontHint = (
     (styleHint || "") +
     " " +
@@ -548,7 +631,6 @@ async function executeAddTextToExistingImage(
   } else if (fontHint.includes("メイリオ") || fontHint.includes("meiryo")) {
     fontFamily = "meiryo";
   } else {
-    // 特に指定がなければ「ゴシック系」
     fontFamily = "gothic";
   }
 
@@ -563,16 +645,50 @@ async function executeAddTextToExistingImage(
     hintSource.includes("斜体") ||
     lowerHint.includes("italic");
 
-  // ★ 累積移動：args の offset をベースに、styleHint 由来の増分を足す
-  const baseOffsetX =
-    typeof args.offsetX === "number" ? args.offsetX : 0;
-  const baseOffsetY =
-    typeof args.offsetY === "number" ? args.offsetY : 0;
+  // ★ offset 計算
+  const deltaOffsetX =
+    (parsed.offsetX ?? 0) +
+    (typeof args.offsetX === "number" ? args.offsetX : 0);
+  const deltaOffsetY =
+    (parsed.offsetY ?? 0) +
+    (typeof args.offsetY === "number" ? args.offsetY : 0);
 
-  const offsetX = baseOffsetX + (parsed.offsetX ?? 0);
-  const offsetY = baseOffsetY + (parsed.offsetY ?? 0);
+  const baseOffsetX = last?.offsetX ?? 0;
+  const baseOffsetY = last?.offsetY ?? 0;
 
-  const bottomMargin = parsed.bottomMargin; // route.ts 側で undefined ならデフォルト 80
+  const offsetX = baseOffsetX + deltaOffsetX;
+  const offsetY = baseOffsetY + deltaOffsetY;
+
+  console.log("📐 offset calculation:", {
+    baseOffsetX,
+    baseOffsetY,
+    parsedOffsetX: parsed.offsetX,
+    parsedOffsetY: parsed.offsetY,
+    argsOffsetX: args.offsetX,
+    argsOffsetY: args.offsetY,
+    deltaOffsetX,
+    deltaOffsetY,
+    finalOffsetX: offsetX,
+    finalOffsetY: offsetY,
+  });
+
+  const bottomMargin = parsed.bottomMargin;
+
+  // ★ 今回のレイアウトを保存（サイズとテキスト内容も含める）
+  lastTextLayoutByThread.set(chatThread.id, {
+    align,
+    vAlign,
+    offsetX,
+    offsetY,
+    size, // ★ サイズも記憶
+    text, // ★ テキスト内容も記憶
+  });
+
+  console.log("💾 saved to Map:", {
+    threadId: chatThread.id,
+    saved: lastTextLayoutByThread.get(chatThread.id),
+    mapSizeAfter: lastTextLayoutByThread.size,
+  });
 
   const baseUrl =
     process.env.NEXTAUTH_URL ||
@@ -601,18 +717,17 @@ async function executeAddTextToExistingImage(
       headers: { "Content-Type": "application/json" },
       signal,
       body: JSON.stringify({
-        imageUrl: baseImageUrl, // ← ★ 毎回 __base__.png を元絵として使う
+        imageUrl: baseImageUrl,
         text,
         align,
         vAlign,
-        size, // small/medium/large/xlarge を route.ts 側で fontSize にマップ
+        size,
         color,
         offsetX,
         offsetY,
         bottomMargin,
-        autoDetectPlacard: false, // プラカード自動検出はここではOFF
-        // ★ フォント指定（ここが新しく増えた）
-        fontFamily, // "gothic" | "mincho" | "meiryo"
+        autoDetectPlacard: false,
+        fontFamily,
         bold,
         italic,
       }),
@@ -620,11 +735,7 @@ async function executeAddTextToExistingImage(
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      console.error(
-        "🔴 /api/gen-image failed in edit:",
-        resp.status,
-        t
-      );
+      console.error("🔴 /api/gen-image failed in edit:", resp.status, t);
       return {
         error: `Text overlay failed: HTTP ${resp.status}`,
       };
@@ -638,29 +749,19 @@ async function executeAddTextToExistingImage(
       return { error: "gen-image edit returned no imageUrl" };
     }
 
-    // /generated/xxx.png を Azure Storage の images コンテナに保存し直す
     const fs = require("fs");
     const path = require("path");
     const finalImageName = `${uniqueId()}.png`;
     const finalImagePath = path.join(
       process.cwd(),
       "public",
-      generatedPath.startsWith("/")
-        ? generatedPath.slice(1)
-        : generatedPath
+      generatedPath.startsWith("/") ? generatedPath.slice(1) : generatedPath
     );
     const finalImageBuffer = fs.readFileSync(finalImagePath);
 
-    await UploadImageToStore(
-      chatThread.id,
-      finalImageName,
-      finalImageBuffer
-    );
+    await UploadImageToStore(chatThread.id, finalImageName, finalImageBuffer);
 
-    const finalImageUrl = buildExternalImageUrl(
-      chatThread.id,
-      finalImageName
-    );
+    const finalImageUrl = buildExternalImageUrl(chatThread.id, finalImageName);
 
     return {
       revised_prompt: text,
@@ -673,4 +774,3 @@ async function executeAddTextToExistingImage(
     };
   }
 }
-
