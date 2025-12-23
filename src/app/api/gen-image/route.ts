@@ -1,12 +1,5 @@
 // File: src/app/api/gen-image/route.ts
 // AzureChat GPT5 画像生成・文字入れ統合ルート（フォント指定対応版）
-// - ベース画像生成（Azure OpenAI Images）
-// - 既存画像に日本語テキスト追加（SVG + sharp）
-// - Blob Storage 読込対応
-// - プラカード自動検出対応（必要に応じて ON）
-// - 豆腐文字完全排除：/public/fonts/*.ttf を file:/// で直指定
-// - fontFamily / bold / italic / offsetX / offsetY をサポート
-// ------------------------------------------------------
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -100,14 +93,13 @@ function pickAlign(v: any): "left" | "center" | "right" {
 }
 
 function pickVAlign(v: any): "top" | "middle" | "bottom" {
-  // 明示的に top / middle / bottom が来たときだけ変更
-  if (v === "top" || v === "middle" || v === "bottom") {
-    return v;
-  }
-  // 何も指定されていない（undefined 等）ときは「中央」を維持する前提で middle にする
+  if (v === "top" || v === "middle" || v === "bottom") return v;
   return "middle";
 }
 
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
 
 // -------------------- Placard Detection -------------
 async function detectWhiteRectangle(
@@ -177,14 +169,15 @@ async function detectWhiteRectangle(
 }
 
 // -------------------- Text Compose ------------------
-// fontFamily: "gothic" | "mincho" | "meiryo" （チャット側から来る）
-// bold / italic / offsetX / offsetY もここで反映する
 async function composeTextOnImageBase(
   baseImage: Buffer,
   opts: {
     text?: string;
+
+    // ※ body.width/height は “ヒント” 扱いにし、実画像メタを優先する
     width: number;
     height: number;
+
     fontSize: number;
     strokeWidth: number;
     align: "left" | "center" | "right";
@@ -202,8 +195,8 @@ async function composeTextOnImageBase(
 ) {
   const {
     text = "",
-    width,
-    height,
+    width: widthHint,
+    height: heightHint,
     fontSize,
     strokeWidth,
     align,
@@ -221,8 +214,12 @@ async function composeTextOnImageBase(
 
   if (!text) return baseImage;
 
+  // ★★★★★ 重要：実画像サイズを優先（キャンバス認識ズレ対策）
+  const meta = await sharp(baseImage).metadata();
+  const width = meta.width ?? widthHint ?? 1024;
+  const height = meta.height ?? heightHint ?? 1024;
+
   // --- フォントファイルの選択 ---
-  // それぞれ public/fonts に配置しておく想定
   const fontFileNameProd =
     fontFamily === "mincho"
       ? "/home/site/wwwroot/public/fonts/NotoSerifJP-Regular.otf"
@@ -241,7 +238,6 @@ async function composeTextOnImageBase(
       ? `file://${fontFilePathProd}`
       : `file://${fontFilePathLocal.replace(/\\/g, "/")}`;
 
-  // CSS 用 font-family（ゴシック/明朝/メイリオ風）
   const cssFontFamily =
     fontFamily === "mincho"
       ? "'MyJP', 'Noto Serif JP', 'Yu Mincho', serif"
@@ -253,6 +249,14 @@ async function composeTextOnImageBase(
   let y: number;
   let effectiveFontSize = fontSize;
   let anchor: "start" | "middle" | "end";
+
+  const paddingX = 40; // 左右の余白
+  const paddingTop = 40; // 上余白（中心座標計算用）
+  const paddingBottomExtra = 20; // 下側の最低余白（marginBottomとは別）
+
+  // ★ y は「文字の中心」なので top/bottom は fontSize/2 を考慮
+  const topYCenter = paddingTop + effectiveFontSize / 2;
+  const bottomYCenter = height - marginBottom - effectiveFontSize / 2;
 
   if (autoDetectPlacard) {
     const rect = await detectWhiteRectangle(baseImage);
@@ -269,29 +273,44 @@ async function composeTextOnImageBase(
         20
       );
     } else {
-      x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
+      x = align === "left" ? paddingX : align === "right" ? width - paddingX : width / 2;
       y =
         vAlign === "top"
-          ? 40 + fontSize
+          ? topYCenter
           : vAlign === "middle"
           ? height / 2
-          : height - marginBottom;
+          : bottomYCenter;
+
       anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
     }
   } else {
-    x = align === "left" ? 40 : align === "right" ? width - 40 : width / 2;
+    x = align === "left" ? paddingX : align === "right" ? width - paddingX : width / 2;
     y =
       vAlign === "top"
-        ? 40 + fontSize
+        ? topYCenter
         : vAlign === "middle"
         ? height / 2
-        : height - marginBottom;
+        : bottomYCenter;
+
     anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
   }
 
   // オフセット反映（「少し上」「➡で右に」など）
   x += offsetX;
   y += offsetY;
+
+  // ★★★★★ 重要：キャンバス外に出ないよう clamp
+  // x：左右 paddingX 内に保持
+  x = clamp(x, paddingX, width - paddingX);
+
+  // y：上は topYCenter 以上、下は (height - marginBottom - fontSize/2) 以下
+  // ただし bottom が極端に小さい/負になる場合に備えて保険
+  const yMin = topYCenter;
+  const yMax = Math.max(
+    yMin,
+    height - paddingBottomExtra - effectiveFontSize / 2
+  );
+  y = clamp(y, yMin, yMax);
 
   const fontWeight = bold ? "700" : "400";
   const fontStyle = italic ? "italic" : "normal";
@@ -342,7 +361,6 @@ async function getBaseImageBufferFromSource(
   imageUrl?: string,
   imageB64?: string
 ) {
-  // --- base64
   if (imageB64) {
     const b64 = imageB64.replace(/^data:image\/\w+;base64,/, "");
     return Buffer.from(b64, "base64");
@@ -350,7 +368,6 @@ async function getBaseImageBufferFromSource(
 
   if (!imageUrl) throw new Error("image source not provided");
 
-  // --- Blob SDK 経由（/api/images/?t=...&img=...）
   if (imageUrl.includes("/api/images")) {
     try {
       const u = new URL(imageUrl, "http://localhost");
@@ -397,13 +414,11 @@ async function getBaseImageBufferFromSource(
     }
   }
 
-  // --- data URL
   if (imageUrl.startsWith("data:image/")) {
     const b64 = imageUrl.replace(/^data:image\/\w+;base64,/, "");
     return Buffer.from(b64, "base64");
   }
 
-  // --- absolute URL
   if (/^https?:\/\//i.test(imageUrl)) {
     const cookie = req.headers.get("cookie") || "";
     const headers = cookie ? { cookie } : undefined;
@@ -419,7 +434,6 @@ async function getBaseImageBufferFromSource(
     return buf;
   }
 
-  // --- relative (/generated/xxx.png)
   const rel = imageUrl.startsWith("/") ? imageUrl.slice(1) : imageUrl;
   return await fs.readFile(path.join(process.cwd(), "public", rel));
 }
@@ -503,7 +517,6 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({} as any));
 
-    // ★ デバッグログ追加（暫定）
     console.log(
       "[gen-image] align/vAlign from body >>>",
       body.align,

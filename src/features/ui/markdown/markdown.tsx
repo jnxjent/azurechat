@@ -30,26 +30,55 @@ function isImageUrl(url: string): boolean {
 }
 
 /**
- * 裸の画像URLを Markdown画像に変換（はめ込み用）
- * - 行単独のURLも
- * - 文中のURLも（ただし誤爆を避けて画像っぽいものだけ）
+ * 裸の画像URLを Markdown画像に変換（最小・安全）
+ *
+ * ★FIX(A)
+ *   壊れた `![](<img src="...">)` を `![](URL)` に戻す
+ *
+ * ★FIX(B)
+ *   既に Markdown 記法内のURL（![](...), ](...)）は二重変換しない
  */
 function embedNakedImageUrls(src: string): string {
   if (!src) return src;
 
-  // 1) 行がURLだけの場合（前後空白OK）
+  // ------------------------------------------------------------
+  // ★FIX(A): 壊れた Markdown を正規化
+  // ------------------------------------------------------------
+  // ![](<img src="URL" ...>) → ![](URL)
+  src = src.replace(
+    /!\[[^\]]*\]\(\s*<img[^>]*src=["']([^"']+)["'][^>]*>\s*\)/gi,
+    "![]($1)"
+  );
+
+  // ------------------------------------------------------------
+  // 1) 行が URL だけの場合
+  // ------------------------------------------------------------
   src = src.replace(
     /^\s*(https?:\/\/[^\s]+)\s*$/gim,
     (m, url) => (isImageUrl(url) ? `![](${url})` : m)
   );
 
-  // 2) 文中のURL（スペース/改行区切り想定）
-  // 末尾の ) ] } . , などが付くケースを軽くケア
-  src = src.replace(/(https?:\/\/[^\s<>"']+)/g, (m) => {
-    let url = m;
-    // よくある末尾句読点や括弧を落とす
-    while (/[)\],.}。、】【]/.test(url.slice(-1))) url = url.slice(0, -1);
-    if (!isImageUrl(url)) return m;
+  // ------------------------------------------------------------
+  // 2) 文中の裸URL（ただし Markdown 内は除外）
+  // ------------------------------------------------------------
+  src = src.replace(/https?:\/\/[^\s<>"']+/g, function (match) {
+    const offset = arguments[arguments.length - 2] as number;
+    const whole = arguments[arguments.length - 1] as string;
+
+    // 直前が ]( or ![]( なら Markdown 内なので触らない
+    const before = whole.slice(Math.max(0, offset - 4), offset);
+    if (before.includes("](") || before.includes("![](")) {
+      return match;
+    }
+
+    let url = match;
+    // 末尾の句読点などを除去
+    while (/[)\],.}。、】【]/.test(url.slice(-1))) {
+      url = url.slice(0, -1);
+    }
+
+    if (!isImageUrl(url)) return match;
+
     return `![](${url})`;
   });
 
@@ -57,24 +86,19 @@ function embedNakedImageUrls(src: string): string {
 }
 
 /**
- * Citation表現を “react-markdownで扱える形” に正規化する（最小・安全）
- * - Markdoc: {% citation items=[ ... ] /%}
- * - Bracket: 〔Name, 0AbC...〕
- *
- * NOTE: dotAll(s) フラグは es2018+ が必要なため使用しない。
- *       [\s\S]*? で改行を含む非貪欲マッチを実現する。
+ * Citation表現を react-markdown 用に正規化
  */
 function preprocessCitations(src: string): string {
   if (!src) return src;
 
-  // Markdoc citation → [引用](citation:...)
+  // Markdoc citation
   const MARKDOC_RE = /\{%\s*citation\s+items=\[([\s\S]*?)\]\s*\/%\}/gi;
   src = src.replace(MARKDOC_RE, (_all, inner) => {
     const payload = encodeURIComponent(String(inner ?? "").trim());
     return `[引用](citation:${payload})`;
   });
 
-  // 〔Name, Id〕 → [引用](citation:...)
+  // 〔Name, Id〕
   const BRACKET_RE = /〔\s*([^,\]\n]+?)\s*,\s*([A-Za-z0-9_-]{10,})\s*〕/g;
   src = src.replace(BRACKET_RE, (_all, name, id) => {
     const safeName = String(name).trim().replace(/"/g, '\\"');
@@ -92,8 +116,7 @@ function decodeCitationItemsFromHref(
 ): Array<{ name: string; id: string }> | null {
   if (!href || !href.startsWith("citation:")) return null;
 
-  const encoded = href.slice("citation:".length);
-  const inner = decodeURIComponent(encoded || "").trim();
+  const inner = decodeURIComponent(href.slice("citation:".length)).trim();
   if (!inner) return null;
 
   const items: Array<{ name: string; id: string }> = [];
@@ -102,9 +125,9 @@ function decodeCitationItemsFromHref(
 
   let m: RegExpExecArray | null;
   while ((m = objRe.exec(inner)) !== null) {
-    const name = (m[1] || "").trim();
-    const id = (m[2] || "").trim();
-    if (name && id) items.push({ name, id });
+    if (m[1] && m[2]) {
+      items.push({ name: m[1].trim(), id: m[2].trim() });
+    }
   }
 
   return items.length ? items : null;
@@ -122,9 +145,10 @@ function isPureTextChildren(children: any): boolean {
 }
 
 export const Markdown: FC<Props> = (props) => {
-  // 1) citationを正規化
-  // 2) 裸の画像URLを ![]() に変換して “はめ込み” 寄せ
-  const content = embedNakedImageUrls(preprocessCitations(props.content));
+  // ★順序重要：citation → 画像正規化
+  const content = embedNakedImageUrls(
+    preprocessCitations(props.content)
+  );
 
   return (
     <MarkdownProvider onCitationClick={props.onCitationClick}>
@@ -132,7 +156,7 @@ export const Markdown: FC<Props> = (props) => {
         remarkPlugins={[remarkGfm]}
         urlTransform={(url) => url}
         components={{
-          a: ({ node, ...linkProps }) => {
+          a: ({ ...linkProps }) => {
             const href = String((linkProps as any).href || "");
             const items = decodeCitationItemsFromHref(href);
 
@@ -140,12 +164,11 @@ export const Markdown: FC<Props> = (props) => {
               return <Citation items={items as any} />;
             }
 
-            // ★リンク先が画像なら「リンク」ではなく「画像として表示」
+            // ★画像URLはリンクではなく画像として表示
             if (href && isImageUrl(href)) {
               return (
                 <img
                   src={href}
-                  alt={String((linkProps as any).children || "")}
                   loading="lazy"
                   style={{ maxWidth: "100%", height: "auto" }}
                 />
@@ -157,11 +180,10 @@ export const Markdown: FC<Props> = (props) => {
             );
           },
 
-          p: ({ node, ...pProps }) => {
+          p: ({ ...pProps }) => {
             const children = (pProps as any).children;
 
             if (isPureTextChildren(children)) {
-              // Paragraph は children 必須なので明示的に渡す
               const { children: _ignored, ...rest } = pProps as any;
               return <Paragraph {...rest}>{children}</Paragraph>;
             }
@@ -169,7 +191,7 @@ export const Markdown: FC<Props> = (props) => {
             return <p {...pProps} />;
           },
 
-          img: ({ node, ...imgProps }) => (
+          img: ({ ...imgProps }) => (
             <img
               {...imgProps}
               loading="lazy"
@@ -177,13 +199,10 @@ export const Markdown: FC<Props> = (props) => {
             />
           ),
 
-          code: ({ node, className, children, ...codeProps }) => {
-            // react-markdown の型では `inline` が無い場合があるため、
-            // className の language- でブロック/インラインを判定する。
+          code: ({ className, children, ...codeProps }) => {
             const match = /language-(\w+)/.exec(className || "");
             const language = match ? match[1] : "";
 
-            // language 指定が無ければインライン扱い
             if (!language) {
               return (
                 <code className={className} {...(codeProps as any)}>
@@ -192,7 +211,6 @@ export const Markdown: FC<Props> = (props) => {
               );
             }
 
-            // language 指定があればブロック扱い（CodeBlockは children で本文を渡す）
             const codeText = String(children).replace(/\n$/, "");
             return (
               <CodeBlock language={language} {...({} as any)}>
@@ -201,7 +219,7 @@ export const Markdown: FC<Props> = (props) => {
             );
           },
 
-          table: ({ node, ...tableProps }) => (
+          table: ({ ...tableProps }) => (
             <table className="markdown-table" {...tableProps} />
           ),
         }}

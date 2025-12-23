@@ -1,4 +1,3 @@
-
 // src/features/chat-page/chat-services/chat-image-service.ts
 "use server";
 import "server-only";
@@ -75,17 +74,6 @@ export const GetThreadAndImageFromUrl = (
 /* ★ 追加：スレッドに「元絵」と「最新画像」を記録／取得するためのヘルパー */
 /* -------------------------------------------------------------------------- */
 
-/**
- * 画像ファイル名をスレッドに登録するヘルパー。
- *
- * - originalImageFileName:
- *     まだ未設定なら、最初の1回だけここに入る（＝元絵）
- * - lastImageFileName:
- *     毎回、最新の画像ファイル名で上書きされる
- *
- * ※ ChatThreadModel を mutate するだけの純粋関数。
- *   実際の永続化（DB更新など）は呼び出し側で行う想定。
- */
 export const RegisterImageOnThread = (
   thread: ChatThreadModel,
   fileName: string
@@ -96,29 +84,12 @@ export const RegisterImageOnThread = (
   thread.lastImageFileName = fileName;
 };
 
-/**
- * 文字入れ（オーバーレイ）の「ベースとなる画像」のファイル名を返す。
- *
- * ✅ フォールバックなし：
- *   - つねに originalImageFileName（＝元絵）のみを使う
- *   - 設定されていない場合は undefined を返す
- *
- * これにより、
- * 「2回目以降の編集でも常に元絵に対して文字を描画」
- * となり、過去の文字レイヤーが重なり続けることを防ぐ。
- */
 export const GetBaseImageFileNameForOverlay = (
   thread: ChatThreadModel
 ): string | undefined => {
   return thread.originalImageFileName;
 };
 
-/**
- * 便利ヘルパー：スレッドから「元絵」の画像URLを返す。
- *
- * - originalImageFileName が存在しない場合は undefined を返す。
- * - 余計なフォールバックは行わない（＝元絵がなければ処理自体を見直すべき状態）。
- */
 export const GetImageUrlFromThread = (
   thread: ChatThreadModel
 ): string | undefined => {
@@ -127,3 +98,60 @@ export const GetImageUrlFromThread = (
   return GetImageUrl(thread.id, base);
 };
 
+/* -------------------------------------------------------------------------- */
+/* ★ NEW: overlay state JSON を Blob に保存/取得                              */
+/* -------------------------------------------------------------------------- */
+
+export type OverlayState = {
+  align: "left" | "center" | "right";
+  vAlign: "top" | "middle" | "bottom";
+  offsetX: number;
+  offsetY: number;
+  size: "small" | "medium" | "large" | "xlarge";
+  text: string;
+  color?: string;
+  fontFamily?: "gothic" | "mincho" | "meiryo";
+  bold?: boolean;
+  italic?: boolean;
+};
+
+const OVERLAY_STATE_BLOB_NAME = "__overlay_state__.json";
+
+export const SaveOverlayStateToStore = async (
+  threadId: string,
+  state: OverlayState
+): Promise<ServerActionResponse<string>> => {
+  const json = JSON.stringify(state ?? {}, null, 2);
+  const buf = Buffer.from(json, "utf-8");
+  return await UploadBlob(
+    IMAGE_CONTAINER_NAME,
+    `${threadId}/${OVERLAY_STATE_BLOB_NAME}`,
+    buf
+  );
+};
+
+export const LoadOverlayStateFromStore = async (
+  threadId: string
+): Promise<ServerActionResponse<OverlayState | null>> => {
+  const blobPath = `${threadId}/${OVERLAY_STATE_BLOB_NAME}`;
+  const res = await GetBlob(IMAGE_CONTAINER_NAME, blobPath);
+
+  if (res.status !== "OK") {
+    // 未作成は普通に起きるので「null」で返す（ERROR扱いにしない）
+    return { status: "OK", response: null };
+  }
+
+  try {
+    // GetBlob が ReadableStream を返す前提（Nodeの fetch Response で読める）
+    const stream = res.response!;
+    const text = await new Response(stream as any).text();
+    const obj = JSON.parse(text || "null");
+    if (!obj) return { status: "OK", response: null };
+    return { status: "OK", response: obj as OverlayState };
+  } catch (e: any) {
+    return {
+      status: "ERROR",
+      errors: [{ message: "Failed to parse overlay state JSON: " + String(e) }],
+    };
+  }
+};
