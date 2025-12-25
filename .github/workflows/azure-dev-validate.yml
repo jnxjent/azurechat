@@ -102,11 +102,11 @@ jobs:
         with:
           name: Nextjs-site
 
-      # 🔑 Service Principal(JSON)でログイン（sf-gateway と同じパターン）
-      - name: 🗝️ Azure Login
-        uses: azure/login@v2
+      # 🔑 Service Principal(JSON)でログイン（即復旧: OIDCを使わない）
+      - name: 🗝️ Azure Login (Service Principal JSON)
+        uses: azure/login@v1
         with:
-          creds: ${{ secrets.AZURE_CREDENTIAL }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       # SCM_DO_BUILD_DURING_DEPLOYMENT 無効化 & startup file 設定
       - name: ⚙️ Configure App Service settings
