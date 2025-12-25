@@ -4,7 +4,8 @@ name: Build & deploy Next.js app to Azure Web App
 on:
   # Automatically trigger it when detected changes in repo
   push:
-    branches: [main]
+    branches:
+      - master
 
   # Allow manual workflow trigger
   workflow_dispatch:
@@ -30,13 +31,24 @@ jobs:
           cd ..
 
       - name: 📂 Copy standalone into the root
-        run: cp -R ./src/.next/standalone ./site-deploy
+        run: |
+          mkdir -p ./site-deploy
+          cp -R ./src/.next/standalone/* ./site-deploy/
 
       - name: 📂 Copy static into the .next folder
-        run: cp -R ./src/.next/static ./site-deploy/.next/static
+        run: |
+          mkdir -p ./site-deploy/.next/static
+          cp -R ./src/.next/static/* ./site-deploy/.next/static/
 
       - name: 📂 Copy Public folder
-        run: cp -R ./src/public ./site-deploy/public
+        run: |
+          mkdir -p ./site-deploy/public
+          # public が空の場合に cp が失敗しないよう保険（空でもOKにする）
+          if [ -d ./public ]; then
+            cp -R ./public/* ./site-deploy/public/ || true
+          elif [ -d ./src/public ]; then
+            cp -R ./src/public/* ./site-deploy/public/ || true
+          fi
 
       - name: 📦 Package Next application
         run: |
@@ -45,9 +57,16 @@ jobs:
 
       - name: 🔍 Diagnostics
         run: |
+          echo "=== src ==="
           ls ./src
+          echo "=== src/.next ==="
           ls ./src/.next
+          echo "=== public ==="
+          ls -R ./public || true
+          echo "=== site-deploy ==="
           ls ./site-deploy
+          echo "=== site-deploy/public ==="
+          ls -R ./site-deploy/public || true
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4

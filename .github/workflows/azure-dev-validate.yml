@@ -32,7 +32,9 @@ jobs:
           cd ..
 
       - name: 📂 Copy standalone into the root
-        run: cp -R ./src/.next/standalone ./site-deploy
+        run: |
+          mkdir -p ./site-deploy
+          cp -R ./src/.next/standalone/* ./site-deploy/
 
       - name: 📂 Copy static into the .next folder
         run: |
@@ -42,7 +44,10 @@ jobs:
       - name: 📂 Copy Public folder
         run: |
           mkdir -p ./site-deploy/public
-          cp -R ./src/public/* ./site-deploy/public/
+          # public が空の場合に cp が失敗しないよう保険（空でもOKにする）
+          if [ -d ./public ]; then
+            cp -R ./public/* ./site-deploy/public/ || true
+          fi
 
       - name: 📦 Package Next application
         run: |
@@ -53,12 +58,12 @@ jobs:
         run: |
           echo "=== src ==="
           ls ./src
-          echo "=== src/public ==="
-          ls -R ./src/public
+          echo "=== public ==="
+          ls -R ./public || true
           echo "=== site-deploy ==="
           ls ./site-deploy
           echo "=== site-deploy/public ==="
-          ls -R ./site-deploy/public
+          ls -R ./site-deploy/public || true
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4
