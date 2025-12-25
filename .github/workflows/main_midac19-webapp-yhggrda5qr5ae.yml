@@ -16,16 +16,21 @@ jobs:
       - name: Set up Node.js version
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: "20.x"
 
+      # ★FIX: package.json は ./src にあるため、作業ディレクトリを src に寄せる
       - name: npm install, build, and test
+        working-directory: src
         run: |
           npm install
           npm run build --if-present
           npm run test --if-present
 
+      # ★FIX: src 配下を zip してデプロイに回す（root には package.json が無い想定）
       - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+        run: |
+          cd src
+          zip -qr ../release.zip .
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
@@ -37,10 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     environment:
-      name: 'Production'
+      name: "Production"
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
     permissions:
-      id-token: write #This is required for requesting the JWT
+      id-token: write # This is required for requesting the JWT
 
     steps:
       - name: Download artifact from build job
@@ -58,10 +63,10 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_C3FA7D203EB14518B2B9ED24369B211F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AF65308AAA6C4AFA88D23B60DC231AAE }}
 
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v2
         with:
-          app-name: 'midac19-webapp-yhggrda5qr5ae'
-          slot-name: 'Production'
+          app-name: "midac19-webapp-yhggrda5qr5ae"
+          slot-name: "Production"
           package: .
