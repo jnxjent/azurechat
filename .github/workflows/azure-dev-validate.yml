@@ -32,8 +32,14 @@ jobs:
         run: |
           set -e
           rm -rf ./site-deploy
-          mkdir -p ./site-deploy
+          mkdir -p ./site-deploy/.next
           cp -R ./src/.next/standalone/* ./site-deploy/
+
+          # ✅ ★追加: BUILD_ID を site-deploy/.next へコピー（MISSING対策）
+          cp -f ./src/.next/BUILD_ID ./site-deploy/.next/BUILD_ID
+
+          # ✅ ★追加: routes-manifest.json 等、.next 直下の JSON を site-deploy/.next へコピー（ENOENT対策）
+          cp -f ./src/.next/*.json ./site-deploy/.next/ 2>/dev/null || true
 
       - name: 📂 Copy static into the .next folder
         run: |
