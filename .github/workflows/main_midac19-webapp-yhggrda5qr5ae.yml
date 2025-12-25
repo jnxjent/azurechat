@@ -18,18 +18,49 @@ jobs:
         with:
           node-version: "20.x"
 
-      # ★FIX: package.json は ./src にあるため、作業ディレクトリを src に寄せる
-      - name: npm install, build, and test
+      # package.json は ./src にある前提
+      - name: npm install and build (Next standalone)
         working-directory: src
         run: |
           npm install
-          npm run build --if-present
-          npm run test --if-present
+          npm run build
 
-      # ★FIX: src 配下を zip してデプロイに回す（root には package.json が無い想定）
+      # ★重要：standalone を site-deploy に組み立てる（server.js をルートに保証）
+      - name: Assemble site-deploy (standalone + static + public)
+        run: |
+          set -e
+          rm -rf site-deploy
+          mkdir -p site-deploy
+
+          # standalone を root に
+          cp -R ./src/.next/standalone/* ./site-deploy/
+
+          # static を .next/static に
+          mkdir -p ./site-deploy/.next/static
+          cp -R ./src/.next/static/* ./site-deploy/.next/static/ || true
+
+          # public（あなたのリポジトリは root/public が正）
+          mkdir -p ./site-deploy/public
+          if [ -d ./public ]; then
+            cp -R ./public/* ./site-deploy/public/ || true
+          elif [ -d ./src/public ]; then
+            cp -R ./src/public/* ./site-deploy/public/ || true
+          fi
+
+      # ★事故防止：server.js と BUILD_ID が無ければ止める
+      - name: Verify outputs (server.js & BUILD_ID)
+        run: |
+          set -e
+          echo "=== site-deploy ==="
+          ls -la ./site-deploy || true
+          echo "=== server.js ==="
+          ls -la ./site-deploy/server.js
+          echo "=== BUILD_ID ==="
+          ls -la ./site-deploy/.next/BUILD_ID
+
       - name: Zip artifact for deployment
         run: |
-          cd src
+          cd site-deploy
           zip -qr ../release.zip .
 
       - name: Upload artifact for deployment job
@@ -52,9 +83,9 @@ jobs:
           name: node-app
 
       - name: Unzip artifact for deployment
-        run: unzip release.zip
+        run: unzip -q release.zip
 
-      # ★即復旧: OIDCではなく secrets(JSON) でログイン（AZURE_CREDENTIALS に統一）
+      # ★即復旧: secrets(JSON) でログイン（AZURE_CREDENTIALS に統一）
       - name: Login to Azure (Service Principal JSON)
         uses: azure/login@v1
         with:

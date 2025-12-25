@@ -51,6 +51,38 @@ jobs:
             cp -R ./src/public/* ./site-deploy/public/ || true
           fi
 
+      # ★最重要：server.js を site-deploy 直下に必ず用意する（本番 ApplicationError 回避）
+      - name: 🩹 Ensure server.js exists at site-deploy root
+        run: |
+          set -e
+
+          echo "=== list site-deploy top ==="
+          ls -la ./site-deploy || true
+
+          if [ -f ./site-deploy/server.js ]; then
+            echo "OK: server.js exists at ./site-deploy/server.js"
+          else
+            echo "server.js not found at root. Searching under site-deploy..."
+            FOUND=$(find ./site-deploy -maxdepth 8 -name server.js -print -quit || true)
+
+            if [ -z "$FOUND" ]; then
+              echo "ERROR: server.js not found anywhere under site-deploy"
+              echo "Hint: Next standalone output may be missing. Check next.config.js output: 'standalone'."
+              echo "=== debug: list src/.next ==="
+              ls -la ./src/.next || true
+              echo "=== debug: list src/.next/standalone ==="
+              ls -la ./src/.next/standalone || true
+              exit 1
+            fi
+
+            echo "Found server.js at: $FOUND"
+            cp "$FOUND" ./site-deploy/server.js
+            echo "Copied to ./site-deploy/server.js"
+          fi
+
+          echo "=== verify server.js ==="
+          ls -la ./site-deploy/server.js
+
       # ★重要：BUILD_ID が無い状態でデプロイしない（本番事故を止める）
       - name: ✅ Verify Next build output (BUILD_ID)
         run: |
@@ -67,8 +99,16 @@ jobs:
       - name: 📦 Package Next application
         run: |
           cd ./site-deploy
-          # ★最重要：site-deploy を丸ごと zip（.next を確実に含める）
+          # ★最重要：site-deploy を丸ごと zip（.next / server.js を確実に含める）
           zip -qr Nextjs-site.zip .
+
+      # ★保険：zip の中身に server.js / BUILD_ID が入っているかログで確認
+      - name: 🔎 Inspect zip contents (server.js / BUILD_ID)
+        run: |
+          echo "=== zip top ==="
+          unzip -l ./site-deploy/Nextjs-site.zip | head -80
+          echo "=== grep server.js / BUILD_ID ==="
+          unzip -l ./site-deploy/Nextjs-site.zip | grep -E '(^|/)server\.js$|\.next/BUILD_ID' || true
 
       - name: 🔍 Diagnostics
         run: |
@@ -84,6 +124,8 @@ jobs:
           ls -la ./site-deploy/.next || true
           echo "=== site-deploy/.next/BUILD_ID ==="
           ls -la ./site-deploy/.next/BUILD_ID || true
+          echo "=== site-deploy/server.js ==="
+          ls -la ./site-deploy/server.js || true
           echo "=== site-deploy/public ==="
           ls -R ./site-deploy/public || true
 
