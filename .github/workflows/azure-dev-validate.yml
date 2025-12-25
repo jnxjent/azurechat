@@ -27,8 +27,10 @@ jobs:
           npm run build
           cd ..
 
-      - name: 📂 Copy standalone into the root
+      # ✅ IMPORTANT: standalone の「中身」を site-deploy 直下へ
+      - name: 📂 Assemble site-deploy (standalone root)
         run: |
+          set -e
           rm -rf ./site-deploy
           mkdir -p ./site-deploy
           cp -R ./src/.next/standalone/* ./site-deploy/
@@ -47,40 +49,20 @@ jobs:
             cp -R ./src/public/* ./site-deploy/public/ || true
           fi
 
-      # ★FIX: site-deploy/.next に BUILD_ID を確実に配置（App ServiceのENOENT対策）
-      - name: 🩹 Copy BUILD_ID into site-deploy/.next
+      # ✅ 事故防止：本番で死んだ routes-manifest.json を必須チェック
+      - name: ✅ Verify Next standalone output (server.js / BUILD_ID / routes-manifest.json)
         run: |
           set -e
-          mkdir -p ./site-deploy/.next
-          if [ -f ./src/.next/BUILD_ID ]; then
-            cp ./src/.next/BUILD_ID ./site-deploy/.next/BUILD_ID
-          else
-            echo "❌ MISSING: ./src/.next/BUILD_ID (next build failed?)"
-            ls -la ./src/.next || true
-            exit 1
-          fi
-          echo "✅ Copied BUILD_ID:"
-          ls -la ./site-deploy/.next/BUILD_ID
-
-      # ★最重要：standalone 成果物として server.js / BUILD_ID が揃っていること
-      - name: ✅ Verify Next standalone output (server.js / BUILD_ID)
-        run: |
-          echo "=== verify site-deploy root ==="
+          echo "=== site-deploy root ==="
           ls -la ./site-deploy || true
-          echo "=== verify site-deploy/.next ==="
+          echo "=== site-deploy/.next ==="
           ls -la ./site-deploy/.next || true
 
           test -f ./site-deploy/server.js || (echo "❌ MISSING: ./site-deploy/server.js" && exit 1)
           test -f ./site-deploy/.next/BUILD_ID || (echo "❌ MISSING: ./site-deploy/.next/BUILD_ID" && exit 1)
+          test -f ./site-deploy/.next/routes-manifest.json || (echo "❌ MISSING: ./site-deploy/.next/routes-manifest.json" && exit 1)
 
-          echo "✅ OK: server.js and BUILD_ID exist"
-
-      # ★保険：runnerにzip/unzipがある前提だが念のため（壊れたrunner対策）
-      - name: 🧰 Verify zip/unzip tools exist
-        run: |
-          command -v zip >/dev/null 2>&1 || (echo "❌ zip not found" && exit 1)
-          command -v unzip >/dev/null 2>&1 || (echo "❌ unzip not found" && exit 1)
-          echo "✅ OK: zip/unzip exist"
+          echo "✅ OK: server.js / BUILD_ID / routes-manifest.json exist"
 
       - name: 📦 Package Next application
         run: |
@@ -88,26 +70,26 @@ jobs:
           zip -qr ../Nextjs-site.zip .
           cd ..
 
-      # ★保険：zip の中身に server.js / BUILD_ID が入っていなければ落とす
-      - name: 🔎 Verify zip contains server.js / BUILD_ID
+      - name: 🔎 Verify zip contains server.js / BUILD_ID / routes-manifest.json
         run: |
           unzip -l ./Nextjs-site.zip | grep -qE '(^|/)server\.js$' || (echo "❌ ZIP MISSING server.js" && exit 1)
           unzip -l ./Nextjs-site.zip | grep -qE '\.next/BUILD_ID$' || (echo "❌ ZIP MISSING .next/BUILD_ID" && exit 1)
-          echo "✅ OK: zip contains server.js & BUILD_ID"
+          unzip -l ./Nextjs-site.zip | grep -qE '\.next/routes-manifest\.json$' || (echo "❌ ZIP MISSING .next/routes-manifest.json" && exit 1)
+          echo "✅ OK: zip contains server.js & BUILD_ID & routes-manifest.json"
 
       - name: 🔍 Diagnostics
         if: always()
         run: |
-          echo "=== src/.next ==="
+          echo "=== src/.next (top) ==="
           ls -la ./src/.next || true
-          echo "=== src/.next/standalone ==="
+          echo "=== src/.next/standalone (top) ==="
           ls -la ./src/.next/standalone || true
-          echo "=== site-deploy ==="
+          echo "=== site-deploy (top) ==="
           ls -la ./site-deploy || true
-          echo "=== site-deploy/.next ==="
+          echo "=== site-deploy/.next (top) ==="
           ls -la ./site-deploy/.next || true
           echo "=== zip check (top) ==="
-          unzip -l ./Nextjs-site.zip | head -120 || true
+          unzip -l ./Nextjs-site.zip | head -160 || true
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4
@@ -127,11 +109,13 @@ jobs:
         with:
           name: Nextjs-site
 
+      # ✅ 即復旧: secrets(JSON) でログイン（AZURE_CREDENTIALS に統一）
       - name: 🗝️ Azure Login (Service Principal JSON)
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # SCM_DO_BUILD_DURING_DEPLOYMENT 無効化 & startup file 設定
       - name: ⚙️ Configure App Service settings
         uses: azure/CLI@v1
         with:
@@ -139,12 +123,14 @@ jobs:
             APP_NAME=${{ secrets.AZURE_APP_SERVICE_NAME }}
             RG=$(az webapp list --query "[?name=='$APP_NAME'].resourceGroup" --output tsv)
 
+            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=false on app service $APP_NAME"
             az webapp config appsettings set \
               -n $APP_NAME \
               -g $RG \
               --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
               -o none
 
+            echo "Setting startup file to 'node server.js' on app service $APP_NAME"
             az webapp config set \
               --startup-file="node server.js" \
               -n $APP_NAME \
@@ -152,7 +138,11 @@ jobs:
               -o none
 
       - name: 🚀 Deploy to Azure Web App
+        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ secrets.AZURE_APP_SERVICE_NAME }}
           package: ${{ github.workspace }}/Nextjs-site.zip
+
+      - name: 🧹 Cleanup
+        run: rm -f ${{ github.workspace }}/Nextjs-site.zip
