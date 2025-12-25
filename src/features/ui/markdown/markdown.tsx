@@ -15,7 +15,10 @@ interface Props {
   ) => Promise<JSX.Element>;
 }
 
-/** 画像っぽいURL判定（拡張子 or /api/images） */
+/* ------------------------------------------------------------
+ * utils
+ * ------------------------------------------------------------ */
+
 function isImageUrl(url: string): boolean {
   const u = (url || "").toLowerCase();
   if (!u) return false;
@@ -29,60 +32,15 @@ function isImageUrl(url: string): boolean {
   );
 }
 
-/**
- * 裸の画像URLを Markdown画像に変換（最小・安全）
- *
- * ★FIX(A)
- *   壊れた `![](<img src="...">)` を `![](URL)` に戻す
- *
- * ★FIX(B)
- *   既に Markdown 記法内のURL（![](...), ](...)）は二重変換しない
- */
-function embedNakedImageUrls(src: string): string {
-  if (!src) return src;
-
-  // ------------------------------------------------------------
-  // ★FIX(A): 壊れた Markdown を正規化
-  // ------------------------------------------------------------
-  // ![](<img src="URL" ...>) → ![](URL)
-  src = src.replace(
-    /!\[[^\]]*\]\(\s*<img[^>]*src=["']([^"']+)["'][^>]*>\s*\)/gi,
-    "![]($1)"
-  );
-
-  // ------------------------------------------------------------
-  // 1) 行が URL だけの場合
-  // ------------------------------------------------------------
-  src = src.replace(
-    /^\s*(https?:\/\/[^\s]+)\s*$/gim,
-    (m, url) => (isImageUrl(url) ? `![](${url})` : m)
-  );
-
-  // ------------------------------------------------------------
-  // 2) 文中の裸URL（ただし Markdown 内は除外）
-  // ------------------------------------------------------------
-  src = src.replace(/https?:\/\/[^\s<>"']+/g, function (match) {
-    const offset = arguments[arguments.length - 2] as number;
-    const whole = arguments[arguments.length - 1] as string;
-
-    // 直前が ]( or ![]( なら Markdown 内なので触らない
-    const before = whole.slice(Math.max(0, offset - 4), offset);
-    if (before.includes("](") || before.includes("![](")) {
-      return match;
-    }
-
-    let url = match;
-    // 末尾の句読点などを除去
-    while (/[)\],.}。、】【]/.test(url.slice(-1))) {
-      url = url.slice(0, -1);
-    }
-
-    if (!isImageUrl(url)) return match;
-
-    return `![](${url})`;
-  });
-
-  return src;
+function isPureTextChildren(children: any): boolean {
+  if (children == null) return true;
+  if (typeof children === "string" || typeof children === "number") return true;
+  if (Array.isArray(children)) {
+    return children.every(
+      (c) => c == null || typeof c === "string" || typeof c === "number"
+    );
+  }
+  return false;
 }
 
 /**
@@ -133,22 +91,86 @@ function decodeCitationItemsFromHref(
   return items.length ? items : null;
 }
 
-function isPureTextChildren(children: any): boolean {
-  if (children == null) return true;
-  if (typeof children === "string" || typeof children === "number") return true;
-  if (Array.isArray(children)) {
-    return children.every(
-      (c) => c == null || typeof c === "string" || typeof c === "number"
-    );
-  }
-  return false;
+/**
+ * 重要:
+ * LLMが「表」を ``` で囲って返してしまうと、react-markdownは <pre> 扱いにして黒い箱になる。
+ * そこで、``` フェンスの中身が "GFMテーブルっぽい" 場合だけフェンスを剥がして表に戻す。
+ *
+ * ★安定化:
+ * - CRLF/末尾改行なし でもマッチするようにする
+ * - 閉じフェンス直前に改行が無いケースも拾う
+ */
+function unwrapFencedTables(md: string): string {
+  if (!md) return md;
+
+  // ```lang?\n ... \n``` だけでなく、最後が ``` で終わる(末尾改行なし)も拾う
+  return md.replace(
+    /```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n?```/g,
+    (all, inner) => {
+      const s = String(inner ?? "").trim();
+      if (!s) return all;
+
+      const lines = s.split(/\r?\n/).map((l) => l.trim());
+      if (lines.length < 2) return all;
+
+      const l1 = lines[0];
+      const l2 = lines[1];
+
+      // 2行目が区切りっぽいか（| --- | --- | / |:---|---:| 等）
+      const looksLikeTable =
+        l1.startsWith("|") &&
+        l1.includes("|") &&
+        l2.startsWith("|") &&
+        /^\|(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(l2);
+
+      if (!looksLikeTable) return all;
+
+      // フェンスを剥がして中身だけ返す（= 表として解釈される）
+      return s + "\n";
+    }
+  );
 }
 
-export const Markdown: FC<Props> = (props) => {
-  // ★順序重要：citation → 画像正規化
-  const content = embedNakedImageUrls(
-    preprocessCitations(props.content)
+/**
+ * 裸の画像URLだけを Markdown画像に変換（最小・安全）
+ * ※ 表( GFM )の中身は壊さない
+ *
+ * ★安定化:
+ * - 変換対象は「行がURLだけ」のケースに限定（文中URLまで触らない）
+ *   → テーブル・リンク周りへの副作用をさらに減らす
+ */
+function embedNakedImageUrls(src: string): string {
+  if (!src) return src;
+
+  // 壊れた Markdown を正規化
+  src = src.replace(
+    /!\[[^\]]*\]\(\s*<img[^>]*src=["']([^"']+)["'][^>]*>\s*\)/gi,
+    "![]($1)"
   );
+
+  // 行が URL だけの場合のみ画像にする（最小化）
+  src = src.replace(/^\s*(https?:\/\/[^\s]+)\s*$/gim, (m, url) => {
+    // 末尾の句読点などを除去
+    let u = String(url || "").trim();
+    while (/[)\],.}。、】【]/.test(u.slice(-1))) u = u.slice(0, -1);
+    return isImageUrl(u) ? `![](${u})` : m;
+  });
+
+  return src;
+}
+
+/* ------------------------------------------------------------
+ * Component
+ * ------------------------------------------------------------ */
+
+export const Markdown: FC<Props> = (props) => {
+  // ★順序重要：
+  // 1) citation正規化
+  // 2) フェンス内の「表」を剥がして表に戻す（黒い箱対策の本丸）
+  // 3) 画像URL正規化（副作用を最小化）
+  const step1 = preprocessCitations(props.content);
+  const step2 = unwrapFencedTables(step1);
+  const content = embedNakedImageUrls(step2);
 
   return (
     <MarkdownProvider onCitationClick={props.onCitationClick}>
@@ -156,6 +178,7 @@ export const Markdown: FC<Props> = (props) => {
         remarkPlugins={[remarkGfm]}
         urlTransform={(url) => url}
         components={{
+          // a はリンク専用（img化しない）
           a: ({ ...linkProps }) => {
             const href = String((linkProps as any).href || "");
             const items = decodeCitationItemsFromHref(href);
@@ -164,19 +187,13 @@ export const Markdown: FC<Props> = (props) => {
               return <Citation items={items as any} />;
             }
 
-            // ★画像URLはリンクではなく画像として表示
-            if (href && isImageUrl(href)) {
-              return (
-                <img
-                  src={href}
-                  loading="lazy"
-                  style={{ maxWidth: "100%", height: "auto" }}
-                />
-              );
-            }
-
             return (
-              <a {...linkProps} target="_blank" rel="noopener noreferrer" />
+              <a
+                {...(linkProps as any)}
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
             );
           },
 
@@ -188,12 +205,12 @@ export const Markdown: FC<Props> = (props) => {
               return <Paragraph {...rest}>{children}</Paragraph>;
             }
 
-            return <p {...pProps} />;
+            return <p {...(pProps as any)} />;
           },
 
           img: ({ ...imgProps }) => (
             <img
-              {...imgProps}
+              {...(imgProps as any)}
               loading="lazy"
               style={{ maxWidth: "100%", height: "auto" }}
             />
@@ -220,7 +237,7 @@ export const Markdown: FC<Props> = (props) => {
           },
 
           table: ({ ...tableProps }) => (
-            <table className="markdown-table" {...tableProps} />
+            <table className="markdown-table" {...(tableProps as any)} />
           ),
         }}
       >
