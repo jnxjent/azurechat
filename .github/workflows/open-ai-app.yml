@@ -1,13 +1,9 @@
 name: Build & deploy Next.js app to Azure Web App
 
-# When this action will be executed
 on:
-  # Automatically trigger it when detected changes in repo
   push:
     branches:
       - master
-
-  # Allow manual workflow trigger
   workflow_dispatch:
 
 jobs:
@@ -26,12 +22,13 @@ jobs:
       - name: ⚙️ npm install and build
         run: |
           cd ./src
-          npm install
-          npm run build --if-present
+          npm ci
+          npm run build
           cd ..
 
       - name: 📂 Copy standalone into the root
         run: |
+          rm -rf ./site-deploy
           mkdir -p ./site-deploy
           cp -R ./src/.next/standalone/* ./site-deploy/
 
@@ -40,6 +37,19 @@ jobs:
           mkdir -p ./site-deploy/.next/static
           # static が空/未生成でも止まらないよう保険
           cp -R ./src/.next/static/* ./site-deploy/.next/static/ || true
+
+      # ★FIX: BUILD_ID を site-deploy/.next にコピー（ENOENT対策の本丸）
+      - name: 📌 Copy BUILD_ID into site-deploy/.next
+        run: |
+          set -e
+          mkdir -p ./site-deploy/.next
+          if [ -f ./src/.next/BUILD_ID ]; then
+            cp ./src/.next/BUILD_ID ./site-deploy/.next/BUILD_ID
+          else
+            echo "ERROR: ./src/.next/BUILD_ID is missing (next build failed?)"
+            ls -la ./src/.next || true
+            exit 1
+          fi
 
       - name: 📂 Copy Public folder
         run: |
@@ -84,56 +94,53 @@ jobs:
           ls -la ./site-deploy/server.js
 
       # ★重要：BUILD_ID が無い状態でデプロイしない（本番事故を止める）
-      - name: ✅ Verify Next build output (BUILD_ID)
+      - name: ✅ Verify Next build output (server.js / BUILD_ID)
         run: |
-          echo "=== verify .next/BUILD_ID ==="
-          ls -la ./src/.next || true
+          set -e
+          echo "=== verify site-deploy root ==="
+          ls -la ./site-deploy || true
+          echo "=== verify site-deploy/.next ==="
           ls -la ./site-deploy/.next || true
-          if [ ! -f ./site-deploy/.next/BUILD_ID ]; then
-            echo "ERROR: ./site-deploy/.next/BUILD_ID is missing"
-            echo "Hint: standalone/.next copy or zipping is wrong"
-            exit 1
-          fi
-          echo "OK: BUILD_ID exists"
+
+          test -f ./site-deploy/server.js || (echo "❌ MISSING: ./site-deploy/server.js" && exit 1)
+          test -f ./site-deploy/.next/BUILD_ID || (echo "❌ MISSING: ./site-deploy/.next/BUILD_ID" && exit 1)
+
+          echo "✅ OK: server.js and BUILD_ID exist"
 
       - name: 📦 Package Next application
         run: |
           cd ./site-deploy
-          # ★最重要：site-deploy を丸ごと zip（.next / server.js を確実に含める）
-          zip -qr Nextjs-site.zip .
+          # site-deploy を丸ごと zip（.next / server.js を確実に含める）
+          zip -qr ../Nextjs-site.zip .
+          cd ..
 
-      # ★保険：zip の中身に server.js / BUILD_ID が入っているかログで確認
-      - name: 🔎 Inspect zip contents (server.js / BUILD_ID)
+      # ★保険：zip の中身に server.js / BUILD_ID が入っていなければ落とす
+      - name: 🔎 Verify zip contains server.js / BUILD_ID
         run: |
-          echo "=== zip top ==="
-          unzip -l ./site-deploy/Nextjs-site.zip | head -80
-          echo "=== grep server.js / BUILD_ID ==="
-          unzip -l ./site-deploy/Nextjs-site.zip | grep -E '(^|/)server\.js$|\.next/BUILD_ID' || true
+          set -e
+          unzip -l ./Nextjs-site.zip | grep -qE '(^|/)server\.js$' || (echo "❌ ZIP MISSING server.js" && exit 1)
+          unzip -l ./Nextjs-site.zip | grep -qE '\.next/BUILD_ID$' || (echo "❌ ZIP MISSING .next/BUILD_ID" && exit 1)
+          echo "✅ OK: zip contains server.js & BUILD_ID"
 
       - name: 🔍 Diagnostics
+        if: always()
         run: |
-          echo "=== src ==="
-          ls ./src
           echo "=== src/.next ==="
-          ls ./src/.next || true
-          echo "=== public ==="
-          ls -R ./public || true
+          ls -la ./src/.next || true
+          echo "=== src/.next/standalone ==="
+          ls -la ./src/.next/standalone || true
           echo "=== site-deploy ==="
-          ls ./site-deploy
+          ls -la ./site-deploy || true
           echo "=== site-deploy/.next ==="
           ls -la ./site-deploy/.next || true
-          echo "=== site-deploy/.next/BUILD_ID ==="
-          ls -la ./site-deploy/.next/BUILD_ID || true
-          echo "=== site-deploy/server.js ==="
-          ls -la ./site-deploy/server.js || true
-          echo "=== site-deploy/public ==="
-          ls -R ./site-deploy/public || true
+          echo "=== zip check (top) ==="
+          unzip -l ./Nextjs-site.zip | head -120 || true
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4
         with:
           name: Nextjs-site
-          path: ./site-deploy/Nextjs-site.zip
+          path: ./Nextjs-site.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -157,7 +164,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Set the build during deployment setting to false. This setting was added in the templates to all azd to work, but breaks deployment via webapps-deploy
       - name: Azure CLI script
         uses: azure/CLI@v1
         with:

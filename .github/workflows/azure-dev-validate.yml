@@ -47,6 +47,21 @@ jobs:
             cp -R ./src/public/* ./site-deploy/public/ || true
           fi
 
+      # ★FIX: site-deploy/.next に BUILD_ID を確実に配置（App ServiceのENOENT対策）
+      - name: 🩹 Copy BUILD_ID into site-deploy/.next
+        run: |
+          set -e
+          mkdir -p ./site-deploy/.next
+          if [ -f ./src/.next/BUILD_ID ]; then
+            cp ./src/.next/BUILD_ID ./site-deploy/.next/BUILD_ID
+          else
+            echo "❌ MISSING: ./src/.next/BUILD_ID (next build failed?)"
+            ls -la ./src/.next || true
+            exit 1
+          fi
+          echo "✅ Copied BUILD_ID:"
+          ls -la ./site-deploy/.next/BUILD_ID
+
       # ★最重要：standalone 成果物として server.js / BUILD_ID が揃っていること
       - name: ✅ Verify Next standalone output (server.js / BUILD_ID)
         run: |
@@ -59,6 +74,13 @@ jobs:
           test -f ./site-deploy/.next/BUILD_ID || (echo "❌ MISSING: ./site-deploy/.next/BUILD_ID" && exit 1)
 
           echo "✅ OK: server.js and BUILD_ID exist"
+
+      # ★保険：runnerにzip/unzipがある前提だが念のため（壊れたrunner対策）
+      - name: 🧰 Verify zip/unzip tools exist
+        run: |
+          command -v zip >/dev/null 2>&1 || (echo "❌ zip not found" && exit 1)
+          command -v unzip >/dev/null 2>&1 || (echo "❌ unzip not found" && exit 1)
+          echo "✅ OK: zip/unzip exist"
 
       - name: 📦 Package Next application
         run: |

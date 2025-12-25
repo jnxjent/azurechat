@@ -22,11 +22,11 @@ jobs:
       - name: npm install and build (Next standalone)
         working-directory: src
         run: |
-          npm install
+          npm ci
           npm run build
 
       # ★重要：standalone を site-deploy に組み立てる（server.js をルートに保証）
-      - name: Assemble site-deploy (standalone + static + public)
+      - name: Assemble site-deploy (standalone + static + public + BUILD_ID)
         run: |
           set -e
           rm -rf site-deploy
@@ -38,6 +38,16 @@ jobs:
           # static を .next/static に
           mkdir -p ./site-deploy/.next/static
           cp -R ./src/.next/static/* ./site-deploy/.next/static/ || true
+
+          # ★FIX: BUILD_ID を site-deploy/.next に配置（ENOENT対策の本丸）
+          mkdir -p ./site-deploy/.next
+          if [ -f ./src/.next/BUILD_ID ]; then
+            cp ./src/.next/BUILD_ID ./site-deploy/.next/BUILD_ID
+          else
+            echo "ERROR: ./src/.next/BUILD_ID is missing (next build failed?)"
+            ls -la ./src/.next || true
+            exit 1
+          fi
 
           # public（あなたのリポジトリは root/public が正）
           mkdir -p ./site-deploy/public
