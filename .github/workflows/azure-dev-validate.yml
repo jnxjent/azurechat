@@ -39,7 +39,8 @@ jobs:
       - name: 📂 Copy static into the .next folder
         run: |
           mkdir -p ./site-deploy/.next/static
-          cp -R ./src/.next/static/* ./site-deploy/.next/static/
+          # static が空/未生成でも止まらないよう保険
+          cp -R ./src/.next/static/* ./site-deploy/.next/static/ || true
 
       - name: 📂 Copy Public folder
         run: |
@@ -49,10 +50,24 @@ jobs:
             cp -R ./public/* ./site-deploy/public/ || true
           fi
 
+      # ★重要：BUILD_ID が無い状態でデプロイしない（本番事故を止める）
+      - name: ✅ Verify Next build output (BUILD_ID)
+        run: |
+          echo "=== verify .next/BUILD_ID ==="
+          ls -la ./src/.next || true
+          ls -la ./site-deploy/.next || true
+          if [ ! -f ./site-deploy/.next/BUILD_ID ]; then
+            echo "ERROR: ./site-deploy/.next/BUILD_ID is missing"
+            echo "Hint: standalone/.next copy or zipping is wrong"
+            exit 1
+          fi
+          echo "OK: BUILD_ID exists"
+
       - name: 📦 Package Next application
         run: |
           cd ./site-deploy
-          zip Nextjs-site.zip ./* .next -qr
+          # ★最重要：site-deploy を丸ごと zip（.next を確実に含める）
+          zip -qr Nextjs-site.zip .
 
       - name: 🔍 Diagnostics
         run: |
@@ -62,6 +77,10 @@ jobs:
           ls -R ./public || true
           echo "=== site-deploy ==="
           ls ./site-deploy
+          echo "=== site-deploy/.next ==="
+          ls -la ./site-deploy/.next || true
+          echo "=== site-deploy/.next/BUILD_ID ==="
+          ls -la ./site-deploy/.next/BUILD_ID || true
           echo "=== site-deploy/public ==="
           ls -R ./site-deploy/public || true
 
