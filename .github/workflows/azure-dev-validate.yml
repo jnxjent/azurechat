@@ -33,12 +33,51 @@ jobs:
           set -e
           rm -rf ./site-deploy
           mkdir -p ./site-deploy
-          
+
           # standalone の中身を root に
           cp -R ./src/.next/standalone/* ./site-deploy/
-          
+
           # ✅ ★重要: .next ディレクトリ全体を上書きコピー（server/, BUILD_ID, *.json すべて含む）
           cp -R ./src/.next ./site-deploy/
+
+      # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
+      - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
+        run: |
+          set -e
+
+          # 1) fonts.conf を wwwroot 直下へ（FONTCONFIG_FILE=/home/site/wwwroot/fonts.conf）
+          if [ -f ./fonts.conf ]; then
+            cp -f ./fonts.conf ./site-deploy/fonts.conf
+          else
+            echo "❌ missing ./fonts.conf (repo root)"
+            exit 1
+          fi
+
+          # 2) font-cache を wwwroot 直下へ（XDG_CACHE_HOME=/home/site/wwwroot/font-cache）
+          mkdir -p ./site-deploy/font-cache
+          if [ -d ./font-cache ]; then
+            cp -R ./font-cache/* ./site-deploy/font-cache/ 2>/dev/null || true
+          fi
+
+          # 3) （推奨）日本語フォント本体も同梱（fonts.conf が参照する場所に合わせて）
+          # 置き場所はあなたの repo に合わせてどちらかに置いてください:
+          #   - ./src/assets/fonts/NotoSansJP-*.ttf
+          #   - ./assets/fonts/NotoSansJP-*.ttf
+          mkdir -p ./site-deploy/.fonts
+          if [ -d ./src/assets/fonts ]; then
+            cp -R ./src/assets/fonts/* ./site-deploy/.fonts/ || true
+          elif [ -d ./assets/fonts ]; then
+            cp -R ./assets/fonts/* ./site-deploy/.fonts/ || true
+          else
+            echo "⚠️ No fonts folder found (./src/assets/fonts or ./assets/fonts). If tofu remains, add NotoSansJP ttf files."
+          fi
+
+          echo "=== verify fonts.conf ==="
+          ls -la ./site-deploy/fonts.conf || true
+          echo "=== verify font-cache ==="
+          ls -la ./site-deploy/font-cache || true
+          echo "=== verify .fonts ==="
+          ls -la ./site-deploy/.fonts || true
 
       - name: 📂 Copy Public folder
         run: |
@@ -50,7 +89,7 @@ jobs:
           fi
 
       # ✅ 事故防止：必須ファイルをチェック
-      - name: ✅ Verify Next standalone output
+      - name: ✅ Verify Next standalone output (+ fonts.conf)
         run: |
           set -e
           echo "=== site-deploy root ==="
@@ -65,7 +104,10 @@ jobs:
           test -f ./site-deploy/.next/routes-manifest.json || (echo "❌ MISSING: routes-manifest.json" && exit 1)
           test -f ./site-deploy/.next/server/pages-manifest.json || (echo "❌ MISSING: pages-manifest.json" && exit 1)
 
-          echo "✅ OK: All required files exist"
+          # ★テスト互換：FONTCONFIG_FILE の対象も必須にする
+          test -f ./site-deploy/fonts.conf || (echo "❌ MISSING: fonts.conf" && exit 1)
+
+          echo "✅ OK: required files exist"
 
       - name: 📦 Package Next application
         run: |
@@ -73,26 +115,25 @@ jobs:
           zip -qr ../Nextjs-site.zip .
           cd ..
 
-      - name: 🔎 Verify zip contents
+      - name: 🔎 Verify zip contents (+ fonts.conf)
         run: |
           unzip -l ./Nextjs-site.zip | grep -qE '(^|/)server\.js$' || (echo "❌ ZIP MISSING server.js" && exit 1)
           unzip -l ./Nextjs-site.zip | grep -qE '\.next/BUILD_ID$' || (echo "❌ ZIP MISSING BUILD_ID" && exit 1)
           unzip -l ./Nextjs-site.zip | grep -qE '\.next/server/pages-manifest\.json$' || (echo "❌ ZIP MISSING pages-manifest.json" && exit 1)
+          unzip -l ./Nextjs-site.zip | grep -qE '(^|/)fonts\.conf$' || (echo "❌ ZIP MISSING fonts.conf" && exit 1)
           echo "✅ OK: zip contains all required files"
 
       - name: 🔍 Diagnostics
         if: always()
         run: |
-          echo "=== src/.next (top) ==="
-          ls -la ./src/.next || true
-          echo "=== src/.next/server (top) ==="
-          ls -la ./src/.next/server || true
           echo "=== site-deploy (top) ==="
           ls -la ./site-deploy || true
-          echo "=== site-deploy/.next (top) ==="
-          ls -la ./site-deploy/.next || true
-          echo "=== site-deploy/.next/server (top) ==="
-          ls -la ./site-deploy/.next/server || true
+          echo "=== site-deploy fonts.conf ==="
+          ls -la ./site-deploy/fonts.conf || true
+          echo "=== site-deploy font-cache ==="
+          ls -la ./site-deploy/font-cache || true
+          echo "=== site-deploy .fonts ==="
+          ls -la ./site-deploy/.fonts || true
 
       - name: ⬆️ Publish Next Application artifact
         uses: actions/upload-artifact@v4
@@ -136,6 +177,16 @@ jobs:
               --startup-file="node server.js" \
               -n $APP_NAME \
               -g $RG \
+              -o none
+
+            # ✅ テストサイト互換の環境変数（本番にも同じ前提）
+            echo "Setting FONTCONFIG_FILE and XDG_CACHE_HOME"
+            az webapp config appsettings set \
+              -n $APP_NAME \
+              -g $RG \
+              --settings \
+                FONTCONFIG_FILE=/home/site/wwwroot/fonts.conf \
+                XDG_CACHE_HOME=/home/site/wwwroot/font-cache \
               -o none
 
       - name: 🚀 Deploy to Azure Web App
