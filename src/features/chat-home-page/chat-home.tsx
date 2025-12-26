@@ -19,8 +19,8 @@ interface ChatPersonaProps {
   canUseSalesforce: boolean;
 }
 
-/** Salesforce 連携 Extension の ID */
-const SF_EXTENSION_ID = "46b6Cn4aU3Wjq9o0SPvl4h5InX83YH70uRkf";
+/** Salesforce 連携 Extension の ID（環境変数から取得） */
+const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
 
 export const ChatHome: FC<ChatPersonaProps> = (props) => {
   // ★ログ出力（必要なくなったら消してOK）

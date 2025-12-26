@@ -1,4 +1,3 @@
-
 // src/features/chat-page/chat-services/chat-api/chat-api-extension.ts
 "use server";
 import "server-only";
@@ -13,34 +12,24 @@ import { ChatThreadModel } from "../models";
 // ★ 追加:ログインユーザー情報を取得するヘルパー
 import { getCurrentUser } from "@/features/auth-page/helpers";
 
-/** Salesforce 連携 Extension の ID（chat-home.tsx と同じ値に揃える） */
-const SF_EXTENSION_ID = "46b6Cn4aU3Wjq9o0SPvl4h5InX83YH70uRkf";
+/** Salesforce 連携 Extension の ID（環境変数） */
+const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
-/** GPT-5 用:履歴から旧式の function ロール等を除去（最小限）
- *  + ★追加：過去のSF JSON貼り付け(system)を履歴から除外して、追加質問が途切れにくくする
- */
+/** GPT-5 用:履歴サニタイズ（最小限）  */
 function sanitizeHistory(
   history: ChatCompletionMessageParam[]
 ): ChatCompletionMessageParam[] {
   return history
     .filter((m: any) => {
-      // 旧式/無効 tool message を除去
-      if (m?.role === "function") return false;
+            if (m?.role === "function") return false;
       if (m?.role === "tool" && !m?.tool_call_id) return false;
 
-      // ★追加：過去のSF JSON貼り付け(system)や gateway エラー(system)を履歴から除外
-      //  - これらが残り続けると history が肥大化し、上位レイヤの自動トリミングで文脈が途切れやすくなる
-      if (m?.role === "system") {
+            if (m?.role === "system") {
         const c = typeof m?.content === "string" ? m.content : "";
-
-        // JSON ブロックを含むsystem（ほぼSFレスポンス注入）を落とす
         if (c.includes("```json")) return false;
-
-        // SFゲートウェイ由来のsystem（保険）
         if (c.includes("以下は Salesforce ゲートウェイから取得した JSON")) return false;
         if (c.includes("Salesforce ゲートウェイ呼び出しでエラーが発生しました")) return false;
       }
-
       return true;
     })
     .map((m: any) => {
@@ -49,24 +38,13 @@ function sanitizeHistory(
     });
 }
 
-/**
- * ★ 追加：SF拡張スレッドにおける「考察/提案だけの追加質問」を判定
- * - true なら：Salesforce への再検索は行わず、会話履歴（直前の表/要約）を根拠に回答させる
- * - false なら：従来通り SF-Gateway に投げて JSON を取得して回答させる
- *
- * ※最小変更方針：ここは保守的に判定（迷ったらSFへ）
- */
 function isAnalysisFollowupOnly(userMessage: string): boolean {
   const s = (userMessage || "").trim();
   if (!s) return false;
 
-  // ★最優先：データ取得（再検索）っぽい語が入っていたら、絶対にSFへ
-  //  - 「日報をまとめて」は “考察” ではなく “取得＋要約” なので here で止める
-  if (/(日報|部下|商談|取引先|責任者|活動|訪問|案件|売上|見込|失注|受注)/i.test(s)) {
+    if (/(日報|部下|商談|取引先|責任者|活動|訪問|案件|売上|見込|失注|受注)/i.test(s)) {
     return false;
   }
-
-  // 明らかに「再抽出/再検索/条件変更」系なら SF へ
   if (
     /(一覧|抽出|検索|探して|教えて|何件|件数|先週|昨日|今月|今期|今週|直近|過去|条件|絞|フィルタ|WHERE|AND|OR|LIMIT|OFFSET|並び替え|ソート|上位|下位|Aランク|Bランク|Sランク|ステージ|フェーズ|金額|担当)/i.test(
       s
@@ -74,9 +52,6 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   ) {
     return false;
   }
-
-  // 考察/提案/理由/次アクション系は履歴だけで回答（＝続き感）
-  // ★注意：「まとめ/要約/分析」は誤爆しやすいので除外
   if (
     /(理由|要因|なぜ|背景|課題|改善|提案|次|アクション|対策|打ち手|優先|方針|戦略|どうすれば|推測|考察|示唆|リスク)/i.test(
       s
@@ -84,22 +59,12 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   ) {
     return true;
   }
-
-  // 指示語の短文は「直前の結果に対する追加質問」の可能性が高い
   if (/^(それ|その|この|上記|さっき|先ほど|今の|この中で)/i.test(s) && s.length <= 40) {
     return true;
   }
-
-  // デフォルト：安全側（SFへ）
   return false;
 }
 
-/**
- * モデル解決ロジック
- * - 通常: これまでどおり thread.model → OPENAI_CHAT_MODEL → AZURE_OPENAI_CHAT_MODEL ...
- * - ただし、このスレッドに Salesforce 拡張が含まれている場合だけ、
- *   AZURE_OPENAI_SOQL_CHAT_MODEL / AZURE_OPENAI_SOQL_MODEL を優先して使う
- */
 function resolveModelForExtensions(chatThread: ChatThreadModel): string {
   // ChatThreadModel 型には model が定義されていないので、実データ側の model を any 経由で参照
   const threadModel = (chatThread as any)?.model as string | undefined;
@@ -116,7 +81,10 @@ function resolveModelForExtensions(chatThread: ChatThreadModel): string {
     ? chatThread.extension
     : [];
 
-  const hasSfExtension = extensions.includes(SF_EXTENSION_ID);
+  const hasSfExtension =
+    typeof SF_EXTENSION_ID === "string" &&
+    SF_EXTENSION_ID.length > 0 &&
+    extensions.includes(SF_EXTENSION_ID);
 
   if (hasSfExtension) {
     const sfOrchestratorModel =
@@ -145,7 +113,11 @@ function hasSfExtension(chatThread: ChatThreadModel): boolean {
   const extensions = Array.isArray(chatThread.extension)
     ? chatThread.extension
     : [];
-  return extensions.includes(SF_EXTENSION_ID);
+  return (
+    typeof SF_EXTENSION_ID === "string" &&
+    SF_EXTENSION_ID.length > 0 &&
+    extensions.includes(SF_EXTENSION_ID)
+  );
 }
 
 export const ChatApiExtensions = async (props: {
@@ -388,8 +360,6 @@ async function runSfDirect(props: {
   ];
 
   if (sfError) {
-    // ゲートウェイエラー時は、その情報をシステムメッセージとして渡し、
-    // ユーザー向けに丁寧に日本語で説明させる
     messages.push({
       role: "system",
       content:
@@ -409,7 +379,6 @@ async function runSfDirect(props: {
         "\n```",
     });
   } else {
-    // ここに来るのはほぼ無いはずだが保険
     messages.push({
       role: "system",
       content:
@@ -420,7 +389,6 @@ async function runSfDirect(props: {
 
   console.log("[SF] Using model for direct summary:", model);
 
-  // ★ ツールは一切使わず、単純な chat.completions.stream で本文だけを生成
   return openAI.beta.chat.completions.stream(
     {
       model,
@@ -441,4 +409,3 @@ const extensionsSystemMessage = async (chatThread: ChatThreadModel) => {
   }
   return message;
 };
-

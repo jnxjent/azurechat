@@ -2,8 +2,8 @@
 "use server";
 import "server-only";
 
-// ★ SF拡張の Extension ID（あなたの環境に合わせている）
-const SF_EXTENSION_ID = "46b6Cn4aU3Wjq9o0SPvl4h5InX83YH70uRkf";
+// ★ SF拡張の Extension ID（環境変数化）
+const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
 
 import { getCurrentUser } from "@/features/auth-page/helpers";
 import { CHAT_DEFAULT_SYSTEM_PROMPT } from "@/features/theme/theme-config";

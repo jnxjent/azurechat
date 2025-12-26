@@ -98,7 +98,9 @@ export const ChatMessageArea = (props: {
           </div>
         </div>
       </div>
-      <div className="flex flex-col gap-2 flex-1 px-10">
+
+      {/* ★ここが「1行おきの空き」の主因：gap-2 を gap-0 に */}
+      <div className="flex flex-col gap-0 flex-1 px-10">
         <div className="prose prose-slate dark:prose-invert whitespace-break-spaces prose-p:leading-relaxed prose-pre:p-0 max-w-none">
           {props.children}
         </div>
