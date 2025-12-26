@@ -5,8 +5,10 @@ import { FindAllExtensionForCurrentUser } from "@/features/extensions-page/exten
 import { FindAllPersonaForCurrentUser } from "@/features/persona-page/persona-services/persona-service";
 import { DisplayError } from "@/features/ui/error/display-error";
 
+// 実際のログインユーザー取得
+import { getCurrentUser } from "@/features/auth-page/helpers";
+
 export default async function Home() {
-  // Persona + Extension をまとめて取得（元の動き）
   const [personaResponse, extensionResponse] = await Promise.all([
     FindAllPersonaForCurrentUser(),
     FindAllExtensionForCurrentUser(),
@@ -20,24 +22,18 @@ export default async function Home() {
     return <DisplayError errors={extensionResponse.errors} />;
   }
 
-  // -------------------------------
-  // ★ ローカル専用：擬似「現在ユーザーのメール」
-  //   - .env.local に NEXT_PUBLIC_DEV_USER_EMAIL を定義してテスト
-  //   - 例: NEXT_PUBLIC_DEV_USER_EMAIL=xxxx@xxxx.co.jp
-  // -------------------------------
-  const emailRaw = process.env.NEXT_PUBLIC_DEV_USER_EMAIL || "";
-  const email = String(emailRaw || "").toLowerCase();
+  // 実際のログインユーザー（Local/Remote 共通）
+  const user = await getCurrentUser();
+  const email = (user?.email || "").toLowerCase().trim();
 
-  // ★ .env.local からホワイトリストを読み込む（カンマ区切り）
-  //   例: SF_WHITELIST_EMAILS=foo@bar.com,xxxx@xxxx.co.jp
-  const rawWhitelist = process.env.SF_WHITELIST_EMAILS || "";
-  const whitelist = rawWhitelist
-    .split(",")
+  // ホワイトリスト（カンマ or 改行 区切り対応）
+  const raw = (process.env.SF_WHITELIST_EMAILS || "").trim();
+  const allowList = raw
+    .split(/[,\n]/)
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 
-  // ★ この「擬似ユーザー」が SF 連携を使ってよいか判定
-  const canUseSalesforce = email !== "" && whitelist.includes(email);
+  const canUseSalesforce = !!email && allowList.includes(email);
 
   return (
     <ChatHome
