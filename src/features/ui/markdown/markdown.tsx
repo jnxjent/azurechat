@@ -44,6 +44,24 @@ function isPureTextChildren(children: any): boolean {
 }
 
 /**
+ * ★ GPT-5.1 対策：
+ * 過剰な改行（\n\n\n...）を UI 側で正規化する
+ *
+ * - 意味的段落（\n\n）は維持
+ * - 3行以上の空行は 2行に圧縮
+ * - 見出し直前の空行も暴れないよう制御
+ */
+function normalizeNewlines(src: string): string {
+  if (!src) return src;
+
+  return src
+    // 3行以上の連続改行 → 2行に
+    .replace(/\n{3,}/g, "\n\n")
+    // 見出し直前の空行を整理
+    .replace(/\n{2,}(?=#)/g, "\n\n");
+}
+
+/**
  * Citation表現を react-markdown 用に正規化
  */
 function preprocessCitations(src: string): string {
@@ -92,18 +110,11 @@ function decodeCitationItemsFromHref(
 }
 
 /**
- * 重要:
- * LLMが「表」を ``` で囲って返してしまうと、react-markdownは <pre> 扱いにして黒い箱になる。
- * そこで、``` フェンスの中身が "GFMテーブルっぽい" 場合だけフェンスを剥がして表に戻す。
- *
- * ★安定化:
- * - CRLF/末尾改行なし でもマッチするようにする
- * - 閉じフェンス直前に改行が無いケースも拾う
+ * ``` フェンス内に入ってしまった GFM テーブルを救出
  */
 function unwrapFencedTables(md: string): string {
   if (!md) return md;
 
-  // ```lang?\n ... \n``` だけでなく、最後が ``` で終わる(末尾改行なし)も拾う
   return md.replace(
     /```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n?```/g,
     (all, inner) => {
@@ -116,7 +127,6 @@ function unwrapFencedTables(md: string): string {
       const l1 = lines[0];
       const l2 = lines[1];
 
-      // 2行目が区切りっぽいか（| --- | --- | / |:---|---:| 等）
       const looksLikeTable =
         l1.startsWith("|") &&
         l1.includes("|") &&
@@ -125,32 +135,23 @@ function unwrapFencedTables(md: string): string {
 
       if (!looksLikeTable) return all;
 
-      // フェンスを剥がして中身だけ返す（= 表として解釈される）
       return s + "\n";
     }
   );
 }
 
 /**
- * 裸の画像URLだけを Markdown画像に変換（最小・安全）
- * ※ 表( GFM )の中身は壊さない
- *
- * ★安定化:
- * - 変換対象は「行がURLだけ」のケースに限定（文中URLまで触らない）
- *   → テーブル・リンク周りへの副作用をさらに減らす
+ * 裸の画像URLを Markdown画像に変換
  */
 function embedNakedImageUrls(src: string): string {
   if (!src) return src;
 
-  // 壊れた Markdown を正規化
   src = src.replace(
     /!\[[^\]]*\]\(\s*<img[^>]*src=["']([^"']+)["'][^>]*>\s*\)/gi,
     "![]($1)"
   );
 
-  // 行が URL だけの場合のみ画像にする（最小化）
   src = src.replace(/^\s*(https?:\/\/[^\s]+)\s*$/gim, (m, url) => {
-    // 末尾の句読点などを除去
     let u = String(url || "").trim();
     while (/[)\],.}。、】【]/.test(u.slice(-1))) u = u.slice(0, -1);
     return isImageUrl(u) ? `![](${u})` : m;
@@ -165,10 +166,12 @@ function embedNakedImageUrls(src: string): string {
 
 export const Markdown: FC<Props> = (props) => {
   // ★順序重要：
+  // 0) 改行正規化（GPT-5.1 癖の吸収）
   // 1) citation正規化
-  // 2) フェンス内の「表」を剥がして表に戻す（黒い箱対策の本丸）
-  // 3) 画像URL正規化（副作用を最小化）
-  const step1 = preprocessCitations(props.content);
+  // 2) フェンス内テーブル救出
+  // 3) 画像URL正規化
+  const step0 = normalizeNewlines(props.content);
+  const step1 = preprocessCitations(step0);
   const step2 = unwrapFencedTables(step1);
   const content = embedNakedImageUrls(step2);
 
@@ -178,7 +181,6 @@ export const Markdown: FC<Props> = (props) => {
         remarkPlugins={[remarkGfm]}
         urlTransform={(url) => url}
         components={{
-          // a はリンク専用（img化しない）
           a: ({ ...linkProps }) => {
             const href = String((linkProps as any).href || "");
             const items = decodeCitationItemsFromHref(href);
