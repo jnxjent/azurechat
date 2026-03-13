@@ -19,12 +19,7 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) =>
-        await executeCreateImage(
-          args,
-          props.chatThread.id,
-          props.userMessage,
-          props.signal
-        ),
+        await executeCreateImage(args, props.chatThread.id, props.signal),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -38,19 +33,16 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
-  // Add any other default Extension here
-
   return {
     status: "OK",
     response: defaultExtensions,
   };
 };
 
-// Extension for image creation using DALL-E
+// Extension for image creation
 async function executeCreateImage(
   args: { prompt: string },
   threadId: string,
-  userMessage: string,
   signal: AbortSignal
 ) {
   console.log("createImage called with prompt:", args.prompt);
@@ -59,7 +51,7 @@ async function executeCreateImage(
     return "No prompt provided";
   }
 
-  // Check the prompt is < 4000 characters (DALL-E 3)
+  // Check the prompt is < 4000 characters
   if (args.prompt.length >= 4000) {
     return "Prompt is too long, it must be less than 4000 characters";
   }
@@ -71,9 +63,8 @@ async function executeCreateImage(
   try {
     response = await openAI.images.generate(
       {
-        model: "dall-e-3",
-        prompt: userMessage,
-        response_format: "b64_json",
+        model: "gpt-image-1.5",
+        prompt: args.prompt,
       },
       {
         signal,
@@ -90,14 +81,13 @@ async function executeCreateImage(
   }
 
   // Check the response is valid
-  if (response.data[0].b64_json === undefined) {
+  if (!response.data?.[0]?.b64_json) {
     return {
       error:
         "There was an error creating the image: Invalid API response received. Return this message to the user and halt execution.",
     };
   }
 
-  // upload image to blob storage
   const imageName = `${uniqueId()}.png`;
 
   try {
@@ -107,12 +97,10 @@ async function executeCreateImage(
       Buffer.from(response.data[0].b64_json, "base64")
     );
 
-    const updated_response = {
+    return {
       revised_prompt: response.data[0].revised_prompt,
       url: GetImageUrl(threadId, imageName),
     };
-
-    return updated_response;
   } catch (error) {
     console.error("🔴 error:\n", error);
     return {
