@@ -154,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     environment:
-      name: Production
+      name: test
 
     steps:
       - name: ⬇️ Download artifact from build job

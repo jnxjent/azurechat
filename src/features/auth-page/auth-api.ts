@@ -1,16 +1,26 @@
+// src/features/auth-page/auth-api.ts
 import NextAuth, { NextAuthOptions } from "next-auth";
 import AzureADProvider from "next-auth/providers/azure-ad";
 import CredentialsProvider from "next-auth/providers/credentials";
 import GitHubProvider from "next-auth/providers/github";
-import { Provider } from "next-auth/providers/index";
-import { hashValue } from "./helpers";
+import type { Provider } from "next-auth/providers/index";
+import { hashValue } from "@/features/auth-page/helpers";
+
+const AAD_SCOPE = [
+  "openid",
+  "profile",
+  "email",
+  "offline_access",
+  "User.Read",
+  "Files.ReadWrite",
+].join(" ");
 
 const configureIdentityProvider = () => {
   const providers: Array<Provider> = [];
 
-  const adminEmails = process.env.ADMIN_EMAIL_ADDRESS?.split(",").map((email) =>
-    email.toLowerCase().trim()
-  );
+  const adminEmails = process.env.ADMIN_EMAIL_ADDRESS
+    ?.split(",")
+    .map((email) => email.toLowerCase().trim());
 
   if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
     providers.push(
@@ -18,11 +28,10 @@ const configureIdentityProvider = () => {
         clientId: process.env.AUTH_GITHUB_ID!,
         clientSecret: process.env.AUTH_GITHUB_SECRET!,
         async profile(profile) {
-          const newProfile = {
+          return {
             ...profile,
-            isAdmin: adminEmails?.includes(profile.email.toLowerCase()),
-          };
-          return newProfile;
+            isAdmin: adminEmails?.includes(profile.email?.toLowerCase()),
+          } as any;
         },
       })
     );
@@ -38,25 +47,25 @@ const configureIdentityProvider = () => {
         clientId: process.env.AZURE_AD_CLIENT_ID!,
         clientSecret: process.env.AZURE_AD_CLIENT_SECRET!,
         tenantId: process.env.AZURE_AD_TENANT_ID!,
+        authorization: {
+          params: { scope: AAD_SCOPE },
+        },
         async profile(profile) {
-          const newProfile = {
-            ...profile,
-            // throws error without this - unsure of the root cause (https://stackoverflow.com/questions/76244244/profile-id-is-missing-in-google-oauth-profile-response-nextauth)
-            id: profile.sub,
+          const p: any = profile ?? {};
+          return {
+            ...p,
+            id: p.sub,
             isAdmin:
-              adminEmails?.includes(profile.email.toLowerCase()) ||
-              adminEmails?.includes(profile.preferred_username.toLowerCase()),
+              adminEmails?.includes(String(p.email || "").toLowerCase()) ||
+              adminEmails?.includes(
+                String(p.preferred_username || "").toLowerCase()
+              ),
           };
-          return newProfile;
         },
       })
     );
   }
 
-  // If we're in local dev, add a basic credential provider option as well
-  // (Useful when a dev doesn't have access to create app registration in their tenant)
-  // This currently takes any username and makes a user with it, ignores password
-  // Refer to: https://next-auth.js.org/configuration/providers/credentials
   if (process.env.NODE_ENV === "development") {
     providers.push(
       CredentialsProvider({
@@ -65,24 +74,18 @@ const configureIdentityProvider = () => {
           username: { label: "Username", type: "text", placeholder: "dev" },
           password: { label: "Password", type: "password" },
         },
-        async authorize(credentials, req): Promise<any> {
-          // You can put logic here to validate the credentials and return a user.
-          // We're going to take any username and make a new user with it
-          // Create the id as the hash of the email as per userHashedId (helpers.ts)
+        async authorize(credentials) {
           const username = credentials?.username || "dev";
-          const email = username + "@localhost";
+          const email = `${username}@localhost`;
           const user = {
             id: hashValue(email),
             name: username,
-            email: email,
+            email,
             isAdmin: false,
             image: "",
           };
-          console.log(
-            "=== DEV USER LOGGED IN:\n",
-            JSON.stringify(user, null, 2)
-          );
-          return user;
+          console.log("=== DEV USER LOGGED IN ===\n", JSON.stringify(user, null, 2));
+          return user as any;
         },
       })
     );
@@ -91,24 +94,107 @@ const configureIdentityProvider = () => {
   return providers;
 };
 
+async function refreshAzureADAccessToken(token: any) {
+  const tenantId = process.env.AZURE_AD_TENANT_ID;
+  const clientId = process.env.AZURE_AD_CLIENT_ID;
+  const clientSecret = process.env.AZURE_AD_CLIENT_SECRET;
+
+  if (!tenantId || !clientId || !clientSecret) return token;
+  if (!token?.refreshToken) return token;
+
+  try {
+    const res = await fetch(
+      `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          grant_type: "refresh_token",
+          refresh_token: token.refreshToken,
+          scope: AAD_SCOPE,
+        }),
+      }
+    );
+
+    const data: any = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      return { ...token, refreshError: data };
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiresIn = Number(data.expires_in ?? 3600);
+
+    return {
+      ...token,
+      accessToken: data.access_token ?? token.accessToken,
+      accessTokenExpiresAt: nowSec + expiresIn,
+      refreshToken: data.refresh_token ?? token.refreshToken,
+      refreshError: undefined,
+    };
+  } catch (e) {
+    return { ...token, refreshError: String(e) };
+  }
+}
+
+// ✅ options のみ export（NextAuth の呼び出しは route.ts で行う）
 export const options: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
   providers: [...configureIdentityProvider()],
+
   callbacks: {
-    async jwt({ token, user }) {
-      if (user?.isAdmin) {
-        token.isAdmin = user.isAdmin;
+    async jwt({ token, user, profile, account }) {
+      if (user) {
+        (token as any).isAdmin = (user as any).isAdmin ?? (token as any).isAdmin;
+        token.email = (user as any).email ?? token.email;
+        token.name = (user as any).name ?? token.name;
+        (token as any).picture = (user as any).image ?? (token as any).picture;
       }
+
+      const p: any = profile ?? {};
+      const profileEmail = p.email || p.preferred_username || p.upn || null;
+      if (!token.email && profileEmail) token.email = String(profileEmail);
+
+      if (account?.provider === "azure-ad") {
+        if (account.access_token) (token as any).accessToken = account.access_token;
+        if (account.expires_at)
+          (token as any).accessTokenExpiresAt = Number(account.expires_at);
+        const rt = (account as any).refresh_token;
+        if (rt) (token as any).refreshToken = rt;
+      }
+
+      if (!process.env.AZURE_AD_TENANT_ID) return token;
+
+      const accessToken = (token as any).accessToken as string | undefined;
+      const expiresAt = (token as any).accessTokenExpiresAt as number | undefined;
+      if (!accessToken || !expiresAt) return token;
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec >= expiresAt - 60) {
+        return (await refreshAzureADAccessToken(token as any)) as any;
+      }
+
       return token;
     },
-    async session({ session, token, user }) {
-      session.user.isAdmin = token.isAdmin as boolean;
+
+    async session({ session, token }) {
+      if (session.user) {
+        (session.user as any).isAdmin = (token as any).isAdmin as boolean;
+        session.user.email = token.email as string;
+        session.user.name = token.name as string;
+        (session.user as any).image = (token as any).picture as string;
+      }
+      (session as any).accessToken = (token as any).accessToken;
+      (session as any).accessTokenExpiresAt = (token as any).accessTokenExpiresAt;
+      (session as any).refreshError = (token as any).refreshError;
       return session;
     },
   },
+
   session: {
     strategy: "jwt",
   },
 };
-
-export const handlers = NextAuth(options);
+// ↑ ここで終わり。末尾の export const { auth } = NextAuth(options); は削除済み

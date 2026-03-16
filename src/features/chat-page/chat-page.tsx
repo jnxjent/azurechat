@@ -22,6 +22,7 @@ interface ChatPageProps {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
+  isAdmin?: boolean; // ★ 追加
 }
 
 export const ChatPage: FC<ChatPageProps> = (props) => {

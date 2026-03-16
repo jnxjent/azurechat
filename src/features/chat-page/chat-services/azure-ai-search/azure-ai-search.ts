@@ -23,6 +23,8 @@ export interface AzureSearchDocumentIndex {
   chatThreadId: string;
   metadata: string;
   fileUrl: string;
+  dept: string;
+  isSlDoc: boolean | null;
 }
 
 export type DocumentSearchResponse = {
@@ -30,15 +32,69 @@ export type DocumentSearchResponse = {
   document: AzureSearchDocumentIndex;
 };
 
+function escapeODataValue(value: string): string {
+  return String(value ?? "").replace(/'/g, "''");
+}
+
+function combineFilters(a?: string, b?: string): string | undefined {
+  const aa = (a ?? "").trim();
+  const bb = (b ?? "").trim();
+
+  if (!aa) return bb || undefined;
+  if (!bb) return aa || undefined;
+
+  return `(${aa}) and (${bb})`;
+}
+
+/**
+ * ACL統一関数
+ * - 個人文書: isSlDoc != true かつ user一致
+ * - SL文書  : isSlDoc == true かつ dept一致 or common
+ *
+ * 使い分け:
+ * - deptLower === null      → ACLを付けない（明示的無効化）
+ * - deptLower === undefined → fallbackで "others"
+ * - userHash が渡された場合はそれを使う（Route Handler経由）
+ * - userHash が未指定の場合は userHashedId() を呼ぶ（Server Action経由）
+ */
+async function buildSearchAclFilter(
+  deptLower?: string | null,
+  userHash?: string
+): Promise<string | undefined> {
+  if (deptLower === null) return undefined;
+
+  const normalizedDept = (deptLower ?? "others").toLowerCase().trim();
+  const d = escapeODataValue(normalizedDept);
+
+  const resolvedUserHash = userHash ?? (await userHashedId());
+
+  const userFilter = `(isSlDoc ne true and user eq '${escapeODataValue(resolvedUserHash)}')`;
+  const deptFilter = `(isSlDoc eq true and (dept eq '${d}' or dept eq 'common'))`;
+
+  return `(${userFilter} or ${deptFilter})`;
+}
+
+// -------------------------------------------------------
+// Search
+// -------------------------------------------------------
+
 export const SimpleSearch = async (
   searchText?: string,
-  filter?: string
+  filter?: string,
+  deptLower?: string | null
 ): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
-    const searchResults = await instance.search(searchText, { filter: filter });
+
+    const scopeFilter = await buildSearchAclFilter(deptLower);
+    const finalFilter = combineFilters(filter, scopeFilter);
+
+    const searchResults = await instance.search(searchText ?? "*", {
+      filter: finalFilter,
+    });
 
     const results: Array<DocumentSearchResponse> = [];
+
     for await (const result of searchResults.results) {
       results.push({
         score: result.score,
@@ -46,29 +102,21 @@ export const SimpleSearch = async (
       });
     }
 
-    return {
-      status: "OK",
-      response: results,
-    };
+    return { status: "OK", response: results };
   } catch (e) {
-    return {
-      status: "ERROR",
-      errors: [
-        {
-          message: `${e}`,
-        },
-      ],
-    };
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
   }
 };
 
 export const SimilaritySearch = async (
   searchText: string,
   k: number,
-  filter?: string
+  filter?: string,
+  deptLower?: string | null
 ): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const openai = OpenAIEmbeddingInstance();
+
     const embeddings = await openai.embeddings.create({
       input: searchText,
       model: "",
@@ -76,9 +124,12 @@ export const SimilaritySearch = async (
 
     const searchClient = AzureAISearchInstance<AzureSearchDocumentIndex>();
 
+    const scopeFilter = await buildSearchAclFilter(deptLower);
+    const finalFilter = combineFilters(filter, scopeFilter);
+
     const searchResults = await searchClient.search(searchText, {
       top: k,
-      filter: filter,
+      filter: finalFilter,
       vectorSearchOptions: {
         queries: [
           {
@@ -92,6 +143,7 @@ export const SimilaritySearch = async (
     });
 
     const results: Array<DocumentSearchResponse> = [];
+
     for await (const result of searchResults.results) {
       results.push({
         score: result.score,
@@ -99,19 +151,9 @@ export const SimilaritySearch = async (
       });
     }
 
-    return {
-      status: "OK",
-      response: results,
-    };
+    return { status: "OK", response: results };
   } catch (e) {
-    return {
-      status: "ERROR",
-      errors: [
-        {
-          message: `${e}`,
-        },
-      ],
-    };
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
   }
 };
 
@@ -121,10 +163,23 @@ export const ExtensionSimilaritySearch = async (props: {
   apiKey: string;
   searchName: string;
   indexName: string;
+  filter?: string;
+  deptLower?: string | null;
+  userHash?: string; // Route Handler経由で渡すuserHash
 }): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const openai = OpenAIEmbeddingInstance();
-    const { searchText, vectors, apiKey, searchName, indexName } = props;
+
+    const {
+      searchText,
+      vectors,
+      apiKey,
+      searchName,
+      indexName,
+      filter,
+      deptLower,
+      userHash,
+    } = props;
 
     const embeddings = await openai.embeddings.create({
       input: searchText,
@@ -137,13 +192,20 @@ export const ExtensionSimilaritySearch = async (props: {
       endpoint,
       indexName,
       new AzureKeyCredential(apiKey),
-      {allowInsecureConnection: process.env.NODE_ENV === "development"}
+      { allowInsecureConnection: process.env.NODE_ENV === "development" }
     );
+
+    // userHash を外から受け取り buildSearchAclFilter に渡す
+    const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
+    const finalFilter = combineFilters(filter, scopeFilter);
+
+    console.log("[SEARCH:Extension] deptLower =", deptLower);
+    console.log("[SEARCH:Extension] userHash =", userHash ? "***" : "(none)");
+    console.log("[SEARCH:Extension] finalFilter =", finalFilter);
 
     const searchResults = await searchClient.search(searchText, {
       top: 3,
-
-      // filter: filter,
+      filter: finalFilter,
       vectorSearchOptions: {
         queries: [
           {
@@ -156,114 +218,136 @@ export const ExtensionSimilaritySearch = async (props: {
       },
     });
 
-    const results: Array<any> = [];
+    const results: Array<DocumentSearchResponse> = [];
+
     for await (const result of searchResults.results) {
-      const item = {
-        score: result.score,
-        document: result.document,
-      };
-
-      // exclude the all the fields that are not in the fields array
-      const document = item.document as any;
-      const newDocument: any = {};
-
-      // iterate over the object entries in document
-      // and only include the fields that are in the fields array
+      const document = result.document as Record<string, unknown>;
+      const newDocument: Record<string, unknown> = {};
 
       for (const key in document) {
-        const hasKey = vectors.includes(key);
-        if (!hasKey) {
+        if (!vectors.includes(key)) {
           newDocument[key] = document[key];
         }
       }
 
       results.push({
         score: result.score,
-        document: newDocument, // Use the newDocument object instead of the original document
+        document: newDocument as unknown as AzureSearchDocumentIndex,
       });
     }
 
-    return {
-      status: "OK",
-      response: results,
-    };
+    return { status: "OK", response: results };
   } catch (e) {
-    return {
-      status: "ERROR",
-      errors: [
-        {
-          message: `${e}`,
-        },
-      ],
-    };
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
   }
 };
+
+// -------------------------------------------------------
+// Indexing
+// -------------------------------------------------------
 
 export const IndexDocuments = async (
   fileName: string,
   fileUrl: string,
   docs: string[],
-  chatThreadId: string
+  chatThreadId: string,
+  dept: string,
+  isSlDoc: boolean
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
+    const currentUserHash = await userHashedId();
 
     for (const doc of docs) {
-      const docToAdd: AzureSearchDocumentIndex = {
+      documentsToIndex.push({
         id: uniqueId(),
         chatThreadId,
-        user: await userHashedId(),
+        user: isSlDoc ? "" : currentUserHash,
         pageContent: doc,
         metadata: fileName,
         fileUrl,
         embedding: [],
-      };
-
-      documentsToIndex.push(docToAdd);
+        dept: (dept ?? "others").toLowerCase().trim(),
+        isSlDoc,
+      });
     }
 
-    const instance = AzureAISearchInstance();
+    const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
+
     const embeddingsResponse = await EmbedDocuments(documentsToIndex);
 
-    if (embeddingsResponse.status === "OK") {
-      const uploadResponse = await instance.uploadDocuments(
-        embeddingsResponse.response
-      );
-
-      const response: Array<ServerActionResponse<boolean>> = [];
-      uploadResponse.results.forEach((r) => {
-        if (r.succeeded) {
-          response.push({
-            status: "OK",
-            response: r.succeeded,
-          });
-        } else {
-          response.push({
-            status: "ERROR",
-            errors: [
-              {
-                message: `${r.errorMessage}`,
-              },
-            ],
-          });
-        }
-      });
-
-      return response;
+    if (embeddingsResponse.status !== "OK") {
+      return [embeddingsResponse];
     }
 
-    return [embeddingsResponse];
+    const uploadResponse = await instance.uploadDocuments(
+      embeddingsResponse.response
+    );
+
+    const response: Array<ServerActionResponse<boolean>> = [];
+
+    uploadResponse.results.forEach((r) => {
+      if (r.succeeded) {
+        response.push({ status: "OK", response: true });
+      } else {
+        response.push({
+          status: "ERROR",
+          errors: [{ message: `${r.errorMessage}` }],
+        });
+      }
+    });
+
+    return response;
   } catch (e) {
-    return [
-      {
-        status: "ERROR",
-        errors: [
-          {
-            message: `${e}`,
-          },
-        ],
-      },
-    ];
+    return [{ status: "ERROR", errors: [{ message: `${e}` }] }];
+  }
+};
+
+// -------------------------------------------------------
+// Embed
+// -------------------------------------------------------
+
+export const EmbedDocuments = async (
+  documents: AzureSearchDocumentIndex[]
+): Promise<ServerActionResponse<Array<AzureSearchDocumentIndex>>> => {
+  try {
+    const openai = OpenAIEmbeddingInstance();
+
+    const embeddings = await openai.embeddings.create({
+      input: documents.map((d) => d.pageContent),
+      model: "",
+    });
+
+    const embeddedDocuments = documents.map((doc, index) => ({
+      ...doc,
+      embedding: embeddings.data[index]?.embedding ?? [],
+    }));
+
+    return {
+      status: "OK",
+      response: embeddedDocuments,
+    };
+  } catch (e) {
+    return {
+      status: "ERROR",
+      errors: [{ message: `${e}` }],
+    };
+  }
+};
+
+// -------------------------------------------------------
+// Index helpers
+// -------------------------------------------------------
+
+export const GetSearchIndex = async (
+  indexName: string
+): Promise<ServerActionResponse<SearchIndex>> => {
+  try {
+    const client = AzureAISearchIndexClientInstance();
+    const index = await client.getIndex(indexName);
+    return { status: "OK", response: index };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
   }
 };
 
@@ -271,183 +355,57 @@ export const DeleteDocuments = async (
   chatThreadId: string
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
-    // find all documents for chat thread
+    const safeChatThreadId = escapeODataValue(chatThreadId);
+
     const documentsInChatResponse = await SimpleSearch(
       undefined,
-      `chatThreadId eq '${chatThreadId}'`
+      `chatThreadId eq '${safeChatThreadId}'`,
+      null
     );
 
-    if (documentsInChatResponse.status === "OK") {
-      const instance = AzureAISearchInstance();
-      const deletedResponse = await instance.deleteDocuments(
-        documentsInChatResponse.response.map((r) => r.document)
-      );
-      const response: Array<ServerActionResponse<boolean>> = [];
-      deletedResponse.results.forEach((r) => {
-        if (r.succeeded) {
-          response.push({
-            status: "OK",
-            response: r.succeeded,
-          });
-        } else {
-          response.push({
-            status: "ERROR",
-            errors: [
-              {
-                message: `${r.errorMessage}`,
-              },
-            ],
-          });
-        }
-      });
-
-      return response;
+    if (documentsInChatResponse.status !== "OK") {
+      return [
+        {
+          status: "ERROR",
+          errors: documentsInChatResponse.errors ?? [
+            { message: "Failed to search documents before delete." },
+          ],
+        },
+      ];
     }
 
-    return [documentsInChatResponse];
-  } catch (e) {
-    return [
-      {
-        status: "ERROR",
-        errors: [
-          {
-            message: `${e}`,
-          },
-        ],
-      },
-    ];
-  }
-};
+    const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
+    const deletedResponse = await instance.deleteDocuments(
+      documentsInChatResponse.response.map((r) => r.document)
+    );
 
-export const EmbedDocuments = async (
-  documents: Array<AzureSearchDocumentIndex>
-): Promise<ServerActionResponse<Array<AzureSearchDocumentIndex>>> => {
-  try {
-    const openai = OpenAIEmbeddingInstance();
-
-    const contentsToEmbed = documents.map((d) => d.pageContent);
-
-    const embeddings = await openai.embeddings.create({
-      input: contentsToEmbed,
-      model: process.env.AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME,
+    const response: Array<ServerActionResponse<boolean>> = [];
+    deletedResponse.results.forEach((r) => {
+      if (r.succeeded) {
+        response.push({ status: "OK", response: true });
+      } else {
+        response.push({
+          status: "ERROR",
+          errors: [{ message: `${r.errorMessage}` }],
+        });
+      }
     });
 
-    embeddings.data.forEach((embedding, index) => {
-      documents[index].embedding = embedding.embedding;
-    });
-
-    return {
-      status: "OK",
-      response: documents,
-    };
+    return response;
   } catch (e) {
-    return {
-      status: "ERROR",
-      errors: [
-        {
-          message: `${e}`,
-        },
-      ],
-    };
+    return [{ status: "ERROR", errors: [{ message: `${e}` }] }];
   }
 };
 
 export const EnsureIndexIsCreated = async (): Promise<
-  ServerActionResponse<SearchIndex>
+  ServerActionResponse<boolean>
 > => {
   try {
-    const client = AzureAISearchIndexClientInstance();
-    const result = await client.getIndex(process.env.AZURE_SEARCH_INDEX_NAME);
-    return {
-      status: "OK",
-      response: result,
-    };
-  } catch (e) {
-    return await CreateSearchIndex();
-  }
-};
-
-const CreateSearchIndex = async (): Promise<
-  ServerActionResponse<SearchIndex>
-> => {
-  try {
-    const client = AzureAISearchIndexClientInstance();
-    const result = await client.createIndex({
-      name: process.env.AZURE_SEARCH_INDEX_NAME,
-      vectorSearch: {
-        algorithms: [
-          {
-            name: "hnsw-vector",
-            kind: "hnsw",
-            parameters: {
-              m: 4,
-              efConstruction: 200,
-              efSearch: 200,
-              metric: "cosine",
-            },
-          },
-        ],
-        profiles: [
-          {
-            name: "hnsw-vector",
-            algorithmConfigurationName: "hnsw-vector",
-          },
-        ],
-      },
-
-      fields: [
-        {
-          name: "id",
-          type: "Edm.String",
-          key: true,
-          filterable: true,
-        },
-        {
-          name: "user",
-          type: "Edm.String",
-          searchable: true,
-          filterable: true,
-        },
-        {
-          name: "chatThreadId",
-          type: "Edm.String",
-          searchable: true,
-          filterable: true,
-        },
-        {
-          name: "pageContent",
-          searchable: true,
-          type: "Edm.String",
-        },
-        {
-          name: "metadata",
-          type: "Edm.String",
-        },
-        {
-          name: "embedding",
-          type: "Collection(Edm.Single)",
-          searchable: true,
-          filterable: false,
-          sortable: false,
-          facetable: false,
-          vectorSearchDimensions: 1536,
-          vectorSearchProfileName: "hnsw-vector",
-        },
-      ],
-    });
-
-    return {
-      status: "OK",
-      response: result,
-    };
-  } catch (e) {
-    return {
-      status: "ERROR",
-      errors: [
-        {
-          message: `${e}`,
-        },
-      ],
-    };
+    await AzureAISearchIndexClientInstance().getIndex(
+      process.env.AZURE_SEARCH_INDEX_NAME!
+    );
+    return { status: "OK", response: true };
+  } catch {
+    return { status: "OK", response: false };
   }
 };
