@@ -1,38 +1,209 @@
-name: Validate bicep scripts
+#test trigger
+name: Build & deploy Next.js app to Azure Web App
+
 on:
-  workflow_dispatch:
   push:
     branches:
-      - main
       - master
-  pull_request:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
 
-      - name: Build Bicep for linting
+    steps:
+      - name: 🌱 Checkout to the branch
+        uses: actions/checkout@v4
+
+      - name: 🍏 Set up Node.js version
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: ⚙️ npm install and build
+        run: |
+          cd ./src
+          npm ci
+          npm run build
+          cd ..
+
+      # ✅ FIX: standalone の中身を site-deploy 直下へ + .next 全体をコピー
+      - name: 📂 Assemble site-deploy (standalone + complete .next)
+        run: |
+          set -e
+          rm -rf ./site-deploy
+          mkdir -p ./site-deploy
+
+          # standalone の中身を root に
+          cp -R ./src/.next/standalone/* ./site-deploy/
+
+          # ✅ ★重要: .next ディレクトリ全体を上書きコピー（server/, BUILD_ID, *.json すべて含む）
+          cp -R ./src/.next ./site-deploy/
+
+      # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
+      - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
+        run: |
+          set -e
+
+          # 1) fonts.conf を wwwroot 直下へ（FONTCONFIG_FILE=/home/site/wwwroot/fonts.conf）
+          if [ -f ./fonts.conf ]; then
+            cp -f ./fonts.conf ./site-deploy/fonts.conf
+          else
+            echo "❌ missing ./fonts.conf (repo root)"
+            exit 1
+          fi
+
+          # 2) font-cache を wwwroot 直下へ（XDG_CACHE_HOME=/home/site/wwwroot/font-cache）
+          mkdir -p ./site-deploy/font-cache
+          if [ -d ./font-cache ]; then
+            cp -R ./font-cache/* ./site-deploy/font-cache/ 2>/dev/null || true
+          fi
+
+          # 3) （推奨）日本語フォント本体も同梱（fonts.conf が参照する場所に合わせて）
+          # 置き場所はあなたの repo に合わせてどちらかに置いてください:
+          #   - ./src/assets/fonts/NotoSansJP-*.ttf
+          #   - ./assets/fonts/NotoSansJP-*.ttf
+          mkdir -p ./site-deploy/.fonts
+          if [ -d ./src/assets/fonts ]; then
+            cp -R ./src/assets/fonts/* ./site-deploy/.fonts/ || true
+          elif [ -d ./assets/fonts ]; then
+            cp -R ./assets/fonts/* ./site-deploy/.fonts/ || true
+          else
+            echo "⚠️ No fonts folder found (./src/assets/fonts or ./assets/fonts). If tofu remains, add NotoSansJP ttf files."
+          fi
+
+          echo "=== verify fonts.conf ==="
+          ls -la ./site-deploy/fonts.conf || true
+          echo "=== verify font-cache ==="
+          ls -la ./site-deploy/font-cache || true
+          echo "=== verify .fonts ==="
+          ls -la ./site-deploy/.fonts || true
+
+      - name: 📂 Copy Public folder
+        run: |
+          mkdir -p ./site-deploy/public
+          if [ -d ./public ]; then
+            cp -R ./public/* ./site-deploy/public/ || true
+          elif [ -d ./src/public ]; then
+            cp -R ./src/public/* ./site-deploy/public/ || true
+          fi
+
+      # ✅ 事故防止：必須ファイルをチェック
+      - name: ✅ Verify Next standalone output (+ fonts.conf)
+        run: |
+          set -e
+          echo "=== site-deploy root ==="
+          ls -la ./site-deploy || true
+          echo "=== site-deploy/.next ==="
+          ls -la ./site-deploy/.next || true
+          echo "=== site-deploy/.next/server ==="
+          ls -la ./site-deploy/.next/server || true
+
+          test -f ./site-deploy/server.js || (echo "❌ MISSING: server.js" && exit 1)
+          test -f ./site-deploy/.next/BUILD_ID || (echo "❌ MISSING: BUILD_ID" && exit 1)
+          test -f ./site-deploy/.next/routes-manifest.json || (echo "❌ MISSING: routes-manifest.json" && exit 1)
+          test -f ./site-deploy/.next/server/pages-manifest.json || (echo "❌ MISSING: pages-manifest.json" && exit 1)
+
+          # ★テスト互換：FONTCONFIG_FILE の対象も必須にする
+          test -f ./site-deploy/fonts.conf || (echo "❌ MISSING: fonts.conf" && exit 1)
+
+          echo "✅ OK: required files exist"
+
+      - name: 📦 Package Next application
+        run: |
+          cd ./site-deploy
+          zip -qr ../Nextjs-site.zip .
+          cd ..
+
+      # ✅ FIX: unzip -l ではなく unzip -Z1（ファイル名のみ）で堅牢にチェック
+      - name: 🔎 Verify zip contents (+ fonts.conf)
+        run: |
+          set -e
+          echo "=== zip file list (first 200) ==="
+          unzip -Z1 ./Nextjs-site.zip | head -200 || true
+
+          unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx 'server.js' || (echo "❌ ZIP MISSING server.js" && exit 1)
+          unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx '.next/BUILD_ID' || (echo "❌ ZIP MISSING BUILD_ID" && exit 1)
+          unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx '.next/server/pages-manifest.json' || (echo "❌ ZIP MISSING pages-manifest.json" && exit 1)
+          unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx 'fonts.conf' || (echo "❌ ZIP MISSING fonts.conf" && exit 1)
+
+          echo "✅ OK: zip contains all required files"
+
+      - name: 🔍 Diagnostics
+        if: always()
+        run: |
+          echo "=== site-deploy (top) ==="
+          ls -la ./site-deploy || true
+          echo "=== site-deploy fonts.conf ==="
+          ls -la ./site-deploy/fonts.conf || true
+          echo "=== site-deploy font-cache ==="
+          ls -la ./site-deploy/font-cache || true
+          echo "=== site-deploy .fonts ==="
+          ls -la ./site-deploy/.fonts || true
+
+          echo "=== zip list sample (first 200) ==="
+          unzip -Z1 ./Nextjs-site.zip | head -200 || true
+
+      - name: ⬆️ Publish Next Application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nextjs-site
+          path: ./Nextjs-site.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: Production
+
+    steps:
+      - name: ⬇️ Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: Nextjs-site
+
+      - name: 🗝️ Azure Login (Service Principal JSON)
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ⚙️ Configure App Service settings
         uses: azure/CLI@v1
         with:
-          inlineScript: az config set bicep.use_binary_from_path=false && az bicep build -f infra/main.bicep --stdout
+          inlineScript: |
+            APP_NAME=${{ secrets.AZURE_APP_SERVICE_NAME }}
+            RG=$(az webapp list --query "[?name=='$APP_NAME'].resourceGroup" --output tsv)
 
-      - name: Run Microsoft Security DevOps Analysis
-        uses: microsoft/security-devops-action@preview
-        id: msdo
-        continue-on-error: true
-        with:
-          tools: templateanalyzer
-        env:
-          GDN_TEMPLATEANALYZER_VERBOSE: 1
+            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=false"
+            az webapp config appsettings set \
+              -n $APP_NAME \
+              -g $RG \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+              -o none
 
-      - name: Upload alerts to Security tab
-        uses: github/codeql-action/upload-sarif@v2
+            echo "Setting startup file to 'node server.js'"
+            az webapp config set \
+              --startup-file="node server.js" \
+              -n $APP_NAME \
+              -g $RG \
+              -o none
+
+            # ✅ テストサイト互換の環境変数（本番にも同じ前提）
+            echo "Setting FONTCONFIG_FILE and XDG_CACHE_HOME"
+            az webapp config appsettings set \
+              -n $APP_NAME \
+              -g $RG \
+              --settings \
+                FONTCONFIG_FILE=/home/site/wwwroot/fonts.conf \
+                XDG_CACHE_HOME=/home/site/wwwroot/font-cache \
+              -o none
+
+      - name: 🚀 Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
         with:
-          sarif_file: ${{ steps.msdo.outputs.sarifFile }}
+          app-name: ${{ secrets.AZURE_APP_SERVICE_NAME }}
+          package: ${{ github.workspace }}/Nextjs-site.zip
+
+      - name: 🧹 Cleanup
+        run: rm -f ${{ github.workspace }}/Nextjs-site.zip
