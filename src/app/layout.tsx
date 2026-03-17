@@ -12,6 +12,12 @@ export const metadata = {
   description: AI_NAME,
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+
 export const dynamic = "force-dynamic";
 
 export default function RootLayout({
@@ -22,7 +28,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full w-full overflow-hidden text-sm">
       <body
-        className={cn(inter.className, "h-full w-full flex  bg-background")}
+        className={cn(inter.className, "flex h-full w-full bg-background")}
       >
         <ThemeProvider
           attribute="class"

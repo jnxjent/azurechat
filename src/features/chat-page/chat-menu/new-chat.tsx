@@ -10,10 +10,11 @@ export const NewChat = () => {
 
   return (
     <Button
+      type="submit"
       aria-disabled={pending}
-      size={"default"}
+      size="default"
       className="flex gap-2"
-      variant={"outline"}
+      variant="outline"
     >
       {pending ? <LoadingIndicator isLoading={pending} /> : <Plus size={18} />}
       New Chat

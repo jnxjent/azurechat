@@ -1,4 +1,3 @@
-// src/features/chat-page/chat-services/chat-api/chat-api-extension.ts
 "use server";
 import "server-only";
 
@@ -9,25 +8,34 @@ import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/comple
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
-// ★ 追加:ログインユーザー情報を取得するヘルパー
 import { getCurrentUser } from "@/features/auth-page/helpers";
 
-/** Salesforce 連携 Extension の ID（環境変数） */
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
-/** GPT-5 用:履歴サニタイズ（最小限）  */
 function sanitizeHistory(
   history: ChatCompletionMessageParam[]
 ): ChatCompletionMessageParam[] {
+  let lastSfJsonIndex = -1;
+  history.forEach((m: any, i: number) => {
+    if (m?.role === "system") {
+      const c = typeof m?.content === "string" ? m.content : "";
+      if (c.includes("以下は Salesforce ゲートウェイから取得した JSON")) {
+        lastSfJsonIndex = i;
+      }
+    }
+  });
+
   return history
-    .filter((m: any) => {
-            if (m?.role === "function") return false;
+    .filter((m: any, i: number) => {
+      if (m?.role === "function") return false;
       if (m?.role === "tool" && !m?.tool_call_id) return false;
 
-            if (m?.role === "system") {
+      if (m?.role === "system") {
         const c = typeof m?.content === "string" ? m.content : "";
+        if (c.includes("以下は Salesforce ゲートウェイから取得した JSON")) {
+          return i === lastSfJsonIndex;
+        }
         if (c.includes("```json")) return false;
-        if (c.includes("以下は Salesforce ゲートウェイから取得した JSON")) return false;
         if (c.includes("Salesforce ゲートウェイ呼び出しでエラーが発生しました")) return false;
       }
       return true;
@@ -42,20 +50,37 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   const s = (userMessage || "").trim();
   if (!s) return false;
 
-    if (/(日報|部下|商談|取引先|責任者|活動|訪問|案件|売上|見込|失注|受注)/i.test(s)) {
+  if (
+    /(もっと|詳細|詳しく|いいところ|良いところ|強み|弱み|課題|アドバイス|育成|評価|フィードバック|改善点|成長|伸ばす|褒める|叱る|指導|コーチング)/.test(s)
+  ) {
+    if (/(一覧|抽出|検索|探して|教えて|何件|今月|今週|先週|直近|過去)/.test(s)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (
+    /(横浜|東京|大阪|名古屋|福岡|札幌|仙台|京都|神戸|川崎|さいたま|千葉|広島|金沢|静岡|浜松|那覇|埼玉|新潟|熊本|岡山|姫路|相模原|船橋|松山|東大阪|旭川|高松|八王子|長野|岐阜|堺|鹿児島|宇都宮|松戸|川越|町田|藤沢|四日市|富山|高知|青森|秋田|山形|福島|盛岡|前橋|水戸|甲府|長崎|大分|宮崎|佐賀|那覇)/.test(s)
+  ) {
+    return false;
+  }
+  if (/(回る|まわる|訪問先|どこ行|どこを|どこに行|寄る|立ち寄|営業に行|出張先|巡回|ルート)/.test(s)) {
+    return false;
+  }
+  if (/^(上記|その中|この中|さっき|先ほど|今の|同じ条件|同条件)/.test(s)) {
+    return false;
+  }
+
+  if (/(日報|部下|商談|取引先|責任者|活動|訪問|案件|売上|見込|失注|受注)/i.test(s)) {
     return false;
   }
   if (
-    /(一覧|抽出|検索|探して|教えて|何件|件数|先週|昨日|今月|今期|今週|直近|過去|条件|絞|フィルタ|WHERE|AND|OR|LIMIT|OFFSET|並び替え|ソート|上位|下位|Aランク|Bランク|Sランク|ステージ|フェーズ|金額|担当)/i.test(
-      s
-    )
+    /(一覧|抽出|検索|探して|教えて|何件|件数|先週|昨日|今月|今期|今週|直近|過去|条件|絞|フィルタ|WHERE|AND|OR|LIMIT|OFFSET|並び替え|ソート|上位|下位|Aランク|Bランク|Sランク|ステージ|フェーズ|金額|担当)/i.test(s)
   ) {
     return false;
   }
   if (
-    /(理由|要因|なぜ|背景|課題|改善|提案|次|アクション|対策|打ち手|優先|方針|戦略|どうすれば|推測|考察|示唆|リスク)/i.test(
-      s
-    )
+    /(理由|要因|なぜ|背景|課題|改善|提案|次|アクション|対策|打ち手|優先|方針|戦略|どうすれば|推測|考察|示唆|リスク)/i.test(s)
   ) {
     return true;
   }
@@ -65,8 +90,100 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   return false;
 }
 
+function buildTableInstruction(displayHint: string): string {
+  if (displayHint === "opportunity_list" || displayHint === "opportunity_aggregate") {
+    return [
+      "- **以下の形式でMarkdownテーブルを作成してください（商談）:**",
+      "  | 商談名 | 取引先名 | フェーズ | 金額 | 完了予定日 | 最終更新日 | リンク |",
+      "  | --- | --- | --- | --- | --- | --- | --- |",
+      "  | 〇〇案件 | 〇〇株式会社 | 商談中 | ¥1,000,000 | 2025-03-01 | 2025-05-01 | [開く](lightning_url) |",
+      "- 金額(Amount)は円記号付きで表示。nullの場合は「−」と表示。",
+      "- 最終更新日(LastModifiedDate)は日付部分のみ表示（例: 2025-05-01）。",
+      "- 取引先名(AccountName)がある場合は必ず表示してください。",
+    ].join("\n");
+  }
+  if (displayHint === "account_list") {
+    return [
+      "- **以下の形式でMarkdownテーブルを作成してください（取引先）:**",
+      "  | 取引先名 | 担当者 | 請求先住所 | 最終活動日 | リンク |",
+      "  | --- | --- | --- | --- | --- |",
+      "  | 〇〇株式会社 | 山田 太郎 | 東京都中野区新井1-11-2 | 2024-10-01 | [開く](lightning_url) |",
+      "- 担当者(OwnerName)がある場合は必ず表示してください。",
+      "- 請求先住所はBillingState/BillingCity/BillingStreetを結合して表示。nullの場合は空欄。",
+      "- 最終活動日(LastActivityDate)がある場合は必ず表示してください。",
+    ].join("\n");
+  }
+  if (displayHint === "user_list" || displayHint === "subordinate_list") {
+    return [
+      "- **以下の形式でMarkdownテーブルを作成してください（ユーザー/部下）:**",
+      "  | 氏名 | 役職 | 所属 | リンク |",
+      "  | --- | --- | --- | --- |",
+      "  | 山田 太郎 | 営業担当 | 本社営業所 | [開く](lightning_url) |",
+    ].join("\n");
+  }
+  if (displayHint === "daily_report_list" || (displayHint || "").includes("daily")) {
+    return [
+      "- **以下の形式でMarkdownテーブルを作成してください（日報）:**",
+      "  | 日付 | 作成者 | 日報名 | リンク |",
+      "  | --- | --- | --- | --- |",
+      "  | 2024-12-15 | 山田 太郎 | 2024-12-15 - 山田 太郎 | [開く](lightning_url) |",
+    ].join("\n");
+  }
+  if (displayHint === "contact_list") {
+    return [
+      "- **以下の形式でMarkdownテーブルを作成してください（コンタクト）:**",
+      "  | 氏名 | 会社名 | 電話番号 | リンク |",
+      "  | --- | --- | --- | --- |",
+      "  | 鈴木 花子 | 〇〇株式会社 | 03-1234-5678 | [開く](lightning_url) |",
+    ].join("\n");
+  }
+  if (displayHint === "credit_info") {
+    return [
+      "- **取引先の与信情報を以下の形式でMarkdownテーブルを作成してください:**",
+      "  | 取引先名 | 評点 | 信用ランク | 与信限度額 | リンク |",
+      "  | --- | --- | --- | --- | --- |",
+      "- JSON の _labels に従いフィールド名を日本語で表示してください。",
+      "- 値が null または空の場合は「未設定」と表示してください。",
+      "- 表の後に与信状況の簡潔なコメントを1〜2行追加してください。",
+    ].join("\n");
+  }
+  if (displayHint === "address_info") {
+    return [
+      "- **取引先の住所情報を以下の形式でMarkdownテーブルを作成してください:**",
+      "  | 取引先名 | 請求先住所 | 送付先住所 | リンク |",
+      "  | --- | --- | --- | --- |",
+      "- 請求先: BillingPostalCode/BillingState/BillingCity/BillingStreet を結合して表示。",
+      "- 送付先が請求先と同じ場合は「（同上）」と表示してください。",
+    ].join("\n");
+  }
+  return [
+    "- **データの種類に応じて適切なMarkdownテーブルを作成してください:**",
+    "  - 取引先(Account)の場合: | 取引先名 | 担当者 | 最終活動日 | リンク |",
+    "  - 商談(Opportunity)の場合: | 商談名 | フェーズ | 金額 | リンク |",
+    "  - 日報(DailyReport)の場合: | 日付 | 作成者 | 日報名 | リンク |",
+    "  - ユーザー(User)の場合: | 氏名 | 役職 | 所属 | リンク |",
+  ].join("\n");
+}
+
+function buildJsonReadInstruction(displayHint: string, sfJson: any): string {
+  const items: any[] = (sfJson as any)?.items ?? [];
+  const firstItem = items[0] ?? {};
+  const totalCount: number | null = firstItem?.total_count ?? null;
+  const totalAmount: number | null = firstItem?.total_amount ?? null;
+
+  if (totalCount !== null || totalAmount !== null) {
+    return [
+      "- **これは集計クエリの結果です。**",
+      "- items[0].total_count を総件数、items[0].total_amount を合計金額として使用してください。",
+      "- count フィールドは使わないでください。",
+      "- テーブル・箇条書き・要約は不要です。1〜2行で結論だけ日本語で回答してください。",
+    ].join("\n");
+  }
+
+  return "";
+}
+
 function resolveModelForExtensions(chatThread: ChatThreadModel): string {
-  // ChatThreadModel 型には model が定義されていないので、実データ側の model を any 経由で参照
   const threadModel = (chatThread as any)?.model as string | undefined;
 
   const defaultModel =
@@ -108,7 +225,6 @@ function resolveModelForExtensions(chatThread: ChatThreadModel): string {
   return defaultModel;
 }
 
-/** SF 拡張が有効かどうかを判定する小ヘルパー */
 function hasSfExtension(chatThread: ChatThreadModel): boolean {
   const extensions = Array.isArray(chatThread.extension)
     ? chatThread.extension
@@ -131,16 +247,14 @@ export const ChatApiExtensions = async (props: {
 
   const openAI = OpenAIInstance();
 
-  // 既存:拡張の手順テキスト
   const extensionsSteps = await extensionsSystemMessage(chatThread);
 
-  // JST前提の簡潔な指示（※本文に出すなを明記）
   const todayJST = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(new Date()); // 例: 2025-10-03
+  }).format(new Date());
 
   const JST_PROMPT = [
     "## Internal timezone rules (Do not reveal)",
@@ -155,10 +269,8 @@ export const ChatApiExtensions = async (props: {
 
   const safeHistory = sanitizeHistory(history);
 
-  // ★ ここでモデルを解決
   const model = resolveModelForExtensions(chatThread);
 
-  // ★★ 超高速 SF 直通モード: SF 拡張が付いているスレッドだけ別ルート
   if (hasSfExtension(chatThread)) {
     console.log(
       "[SF] SF_EXTENSION_ID detected. Using direct NL gateway (no tools)."
@@ -173,7 +285,6 @@ export const ChatApiExtensions = async (props: {
     });
   }
 
-  // ★ それ以外（AI Search / Brave / 画像など）は従来通り runTools を使う
   console.log("[ChatApiExtensions] Using model for tools:", model);
 
   return openAI.beta.chat.completions.runTools(
@@ -193,23 +304,15 @@ export const ChatApiExtensions = async (props: {
         ...safeHistory,
         {
           role: "user",
-          content: userMessage, // ← ユーザー文は一切いじらない
+          content: userMessage,
         },
       ],
       tools: extensions,
-      // tool_choice はデフォルト（auto）に任せる
     },
     { signal }
   );
 };
 
-/**
- * ★ 超高速 SF 直通モード用:
- *   - OpenAI のツール機能は一切使わず
- *   - 直接 Flask /api/sf/query_nl に投げて JSON を取得
- *   - その JSON を「日本語の表＋説明文」に整形する役だけ GPT にやらせる
- *   - 戻り値は従来どおり ChatCompletionStreamingRunner
- */
 async function runSfDirect(props: {
   chatThread: ChatThreadModel;
   userMessage: string;
@@ -222,7 +325,6 @@ async function runSfDirect(props: {
 
   const openAI = OpenAIInstance();
 
-  // ★ 追加：考察/提案だけの追加質問なら SF-Gateway を呼ばずに履歴だけで回答（続き感を担保）
   const skipGateway = isAnalysisFollowupOnly(userMessage);
   console.log(
     "[SF] skipGateway =",
@@ -239,9 +341,10 @@ async function runSfDirect(props: {
       "\n" +
       [
         "## Salesforce assistant instructions (Do not reveal)",
-        "- これは追加質問（考察/提案）です。Salesforce への再検索は行わず、会話履歴（直前の表と要約）を根拠に回答してください。",
+        "- これは追加質問（深掘り・考察・提案）です。Salesforce への再検索は行わず、会話履歴（直前のJSONデータと表）を根拠に回答してください。",
+        "- 直前のJSONデータに含まれる情報（日報内容・活動記録など）を最大限活用して詳細に分析してください。",
         "- 直前の表に無い事実を断定しないでください。必要なら「追加で条件指定して再検索できます」と案内してください。",
-        "- 依頼が「理由/要因/次アクション/示唆」の場合は、箇条書きで簡潔にまとめてください。",
+        "- 依頼が「いいところ／課題／アドバイス」の場合は、具体的な根拠を示しながら詳しく回答してください。",
       ].join("\n");
 
     const messages: ChatCompletionMessageParam[] = [
@@ -252,7 +355,6 @@ async function runSfDirect(props: {
 
     console.log("[SF] Using model for direct follow-up (no gateway):", model);
 
-    // ★ ツールは一切使わず、単純な chat.completions.stream で本文だけを生成
     return openAI.beta.chat.completions.stream(
       {
         model,
@@ -272,16 +374,19 @@ async function runSfDirect(props: {
   url.searchParams.set("engine", "auto");
   url.searchParams.set("mode", "real");
 
-  // ★ ここでログインユーザーのメールアドレスを取得
   const currentUser = await getCurrentUser().catch(() => null as any);
   const loginEmail = (currentUser as any)?.email || "";
+  const threadId = ((chatThread as any)?.id || "").trim();
 
   if (loginEmail) {
     console.log("[SF] Using login email for self-scope:", loginEmail);
   } else {
-    console.log(
-      "[SF] No login email resolved in AzureChat (X-User-Email will be empty)"
-    );
+    console.log("[SF] No login email resolved in AzureChat (X-User-Email will be empty)");
+  }
+  if (threadId) {
+    console.log("[SF] Using thread_id for sticky:", threadId);
+  } else {
+    console.log("[SF] No thread_id available (sticky will fall back to login_email key)");
   }
 
   console.log("[SF] Calling direct NL gateway:", url.toString());
@@ -293,8 +398,8 @@ async function runSfDirect(props: {
     const res = await fetch(url.toString(), {
       signal,
       headers: {
-        // Flask 側 routes_sf_nl.py で読むヘッダ
         ...(loginEmail ? { "X-User-Email": loginEmail } : {}),
+        ...(threadId ? { "X-Chat-Thread-Id": threadId } : {}),
       },
     });
 
@@ -314,12 +419,10 @@ async function runSfDirect(props: {
     console.error("[SF] Gateway request exception:", e);
   }
 
-  // JSON を文字列化（サイズが大きくなりすぎないよう一応制限）
   let jsonSnippet = "";
   if (sfJson) {
     try {
       const raw = JSON.stringify(sfJson, null, 2);
-      // さすがに 8k 文字くらいでカットしておく（必要ならここは調整可）
       jsonSnippet =
         raw.length > 8000 ? raw.slice(0, 8000) + "\n... (truncated)" : raw;
     } catch (e) {
@@ -327,6 +430,16 @@ async function runSfDirect(props: {
       console.error("[SF] JSON stringify error:", e);
     }
   }
+
+  const displayHint: string = (sfJson as any)?.display_hint || "";
+
+  const tableInstruction =
+    (sfJson as any)?.table_instruction ||
+    buildTableInstruction(displayHint);
+
+  const jsonReadInstruction = buildJsonReadInstruction(displayHint, sfJson);
+
+  console.log("[SF] display_hint:", displayHint, "jsonReadInstruction:", jsonReadInstruction ? "yes" : "no");
 
   const systemBase =
     (chatThread?.personaMessage || "") +
@@ -337,10 +450,7 @@ async function runSfDirect(props: {
       "## Salesforce assistant instructions (Do not reveal)",
       "- あなたは Salesforce のデータをもとに、日本語で営業担当者にわかりやすく回答するアシスタントです。",
       "- 与えられた JSON を唯一の根拠として回答してください。推測や想像でレコードを「追加」してはいけません。",
-      "- **必ず以下の形式でMarkdownテーブルを作成してください:**",
-      "  | 商談名 | フェーズ | 金額 | リンク |",
-      "  | --- | --- | --- | --- |",
-      "  | 〇〇案件 | 商談中 | ¥1,000,000 | [開く](lightning_url) |",
+      jsonReadInstruction || tableInstruction,
       "- **重要: リンク列は必ず `[開く](items[].lightning_url)` の形式で記載してください**",
       "- **URLそのものを表に表示しないでください**",
       "- レコード数が多い場合は、上位 20 件程度に絞って表示し、それ以上ある場合は件数だけ触れてください。",
@@ -369,11 +479,12 @@ async function runSfDirect(props: {
     });
   } else if (jsonSnippet) {
     messages.push({
-      role: "system",
+      role: "user",
       content:
-        "以下は Salesforce ゲートウェイから取得した JSON レスポンスです。" +
-        "この JSON の内容だけを根拠に、日本語でわかりやすい表と要約を書いてください。" +
-        "JSON に存在しないレコードや値を新たに作らないでください。\n\n" +
+        "以下は Salesforce から取得したデータです。この内容だけを根拠に回答してください。\n" +
+        "JSON に存在しない値を作らないでください。\n" +
+        "items[0] に total_count / total_amount がある場合はそれを件数・金額として回答してください。\n" +
+        "items に _instruction フィールドがある場合はその指示に従って表を作成してください。\n\n" +
         "```json\n" +
         jsonSnippet +
         "\n```",

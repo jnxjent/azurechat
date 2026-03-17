@@ -1,5 +1,6 @@
 import { ChatMenu } from "@/features/chat-page/chat-menu/chat-menu";
 import { ChatMenuHeader } from "@/features/chat-page/chat-menu/chat-menu-header";
+import { MobileChatMenu } from "@/features/chat-page/chat-menu/mobile-chat-menu";
 import { FindAllChatThreadForCurrentUser } from "@/features/chat-page/chat-services/chat-thread-service";
 import { MenuTray } from "@/features/main-menu/menu-tray";
 import { cn } from "@/ui/lib";
@@ -28,7 +29,8 @@ export default async function RootLayout({
 
   return (
     <div className={cn("flex flex-1 items-stretch")}>
-      <div className="flex-1 flex">
+      {/* PC / タブレット: 旧レイアウトをそのまま維持 */}
+      <div className="hidden flex-1 md:flex">
         <MenuTray>
           <ChatMenuHeader />
           <ScrollArea>
@@ -36,6 +38,17 @@ export default async function RootLayout({
           </ScrollArea>
         </MenuTray>
         {children}
+      </div>
+
+      {/* モバイル: children はそのまま、☰だけ浮かせる */}
+      <div className="relative flex flex-1 md:hidden">
+        {children}
+
+        <div className="pointer-events-none absolute left-3 top-20 z-[400]">
+        <div className="pointer-events-auto">
+          <MobileChatMenu menuItems={chatHistoryResponse.response} />
+        </div>
+      </div>
       </div>
     </div>
   );
