@@ -19,7 +19,8 @@ import { ImageInput } from "@/features/ui/chat/chat-input-area/image-input";
 import { Microphone } from "@/features/ui/chat/chat-input-area/microphone";
 import { StopChat } from "@/features/ui/chat/chat-input-area/stop-chat";
 import { SubmitChat } from "@/features/ui/chat/chat-input-area/submit-chat";
-import React, { useRef } from "react";
+import React, { useRef, useState } from "react";
+import { useSession } from "next-auth/react";
 import { chatStore, useChat } from "../chat-store";
 import { fileStore, useFileStore } from "./file/file-store";
 import { PromptSlider } from "./prompt/prompt-slider";
@@ -32,6 +33,12 @@ import {
   useTextToSpeech,
 } from "./speech/use-text-to-speech";
 
+// ★ 思考モードトグル（3段階：標準→熟考→即答）
+//import {
+//ModeCycleButton,
+//type ThinkingMode,
+//} from "@/components/chatModeToggle";
+
 export const ChatInput = () => {
   const { loading, input, chatThreadId } = useChat();
   const { uploadButtonLabel } = useFileStore();
@@ -41,6 +48,21 @@ export const ChatInput = () => {
 
   const submitButton = React.useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+
+  // ★ モードは ChatInput 側で保持（hidden input で route に渡す）
+  const mode = "standard";
+
+  // ★ 管理者判定
+  const { data: session } = useSession();
+  const adminEmails = (process.env.NEXT_PUBLIC_SL_ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const me = (session?.user as any)?.email?.toLowerCase?.() ?? "";
+  const isAdmin = adminEmails.includes(me);
+
+
+  const [uploadTarget, setUploadTarget] = useState<"cp" | "common" | "others">("cp");
 
   const submit = () => {
     if (formRef.current) {
@@ -57,6 +79,9 @@ export const ChatInput = () => {
       }}
       status={uploadButtonLabel}
     >
+      {/* ★ サーバに確実に届くよう hidden input を同送 */}
+      <input type="hidden" name="thinkingMode" value={mode} />
+
       <ChatTextInput
         onBlur={(e) => {
           if (e.currentTarget.value.replace(/\s/g, "").length === 0) {
@@ -75,15 +100,45 @@ export const ChatInput = () => {
           chatStore.updateInput(e.currentTarget.value);
         }}
       />
+
       <ChatInputActionArea>
         <ChatInputSecondaryActionArea>
           <AttachFile
             onClick={(formData) =>
-              fileStore.onFileChange({ formData, chatThreadId })
+              fileStore.onFileChange({
+                formData,
+                chatThreadId,
+                dept: isAdmin ? uploadTarget : undefined,
+              })
             }
           />
           <PromptSlider />
+
+          {/* ★ 管理者のみ：アップロード先トグル */}
+          {isAdmin && (
+            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+              <span>UP先:</span>
+              {(["cp", "common", "others"] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setUploadTarget(t)}
+                  className={`px-2 py-0.5 rounded border text-xs transition-colors ${
+                    uploadTarget === t
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "border-muted-foreground hover:bg-muted"
+                  }`}
+                >
+                  {t.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* ★ 思考モードトグル（標準→熟考→即答→…） */}
+          {/*<ModeCycleButton value={mode} onChange={setMode} />*/}
         </ChatInputSecondaryActionArea>
+
         <ChatInputPrimaryActionArea>
           <ImageInput />
           <Microphone

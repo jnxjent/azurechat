@@ -1,8 +1,39 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
+
   experimental: {
-    serverComponentsExternalPackages: ["@azure/storage-blob"],
+    serverComponentsExternalPackages: [
+      "@azure/storage-blob",
+      "@napi-rs/canvas", // ← 追加
+    ],
+  },
+
+  images: {
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384], // ← 追加
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "midac19-webapp-yhggrda5qr5ae.azurewebsites.net",
+        pathname: "/api/images/**",
+      },
+      // 必要であれば、test 環境なども後でここに追加できます
+      // {
+      //   protocol: "https",
+      //   hostname: "azurechat-gpt5-test.azurewebsites.net",
+      //   pathname: "/api/images/**",
+      // },
+    ],
+  },
+
+  webpack: (config, { isServer }) => {
+    // .node ネイティブバイナリ用のローダーを追加
+    config.module.rules.push({
+      test: /\.node$/,
+      use: "node-loader",
+    });
+
+    return config;
   },
 };
 

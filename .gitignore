@@ -40,7 +40,7 @@ infra/aad_setup.sh
 
 # Windows system files and directories to ignore
 /AppData/
-/NTUSER.DAT*
+NTUSER.DAT*
 /OneDrive*/
 /Cookies/
 /Documents/
@@ -78,11 +78,14 @@ infra/aad_setup.sh
 /AppData/Local/Temporary Internet Files/
 /AppData/Roaming/Microsoft/Windows/Start Menu/プログラム/
 
-# Ignore all hidden files at the root level (optional, depending on your project structure)
-/.*
+# Ignore all hidden files at the root level
+# ※ これを有効にすると .github/ も無視されて GitHub Actions が動かなくなるのでコメントアウト
+# /.*
 
 # Ignore system-generated files
 ntuser.dat.*
 ntuser.ini
 *.log
 AppData/Local/Comms/UnistoreDB/USS.jtx
+.env*
+src/.env azurechat-test src/.env.example src/.env.local

@@ -57,3 +57,102 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ===== Markdown 行間詰め（箇条書き対策） ===== */
+
+/* ★本文が太字になるのを止める：markdown本文は標準ウェイトに固定 */
+.markdown {
+  font-weight: 400;
+}
+
+/* strong / b だけ太字にする（本文の太字はここだけ） */
+.markdown strong,
+.markdown b {
+  font-weight: 600;
+}
+
+/* ★先頭/末尾の余白を完全に潰す（一行空き体感の主因） */
+.markdown > :first-child {
+  margin-top: 0 !important;
+}
+.markdown > :last-child {
+  margin-bottom: 0 !important;
+}
+
+/* 段落 */
+.markdown p {
+  margin: 0 0 0.3em 0 !important;
+  font-weight: 400;
+}
+
+/* 連続段落 */
+.markdown p + p {
+  margin-top: 0.3em !important;
+}
+
+/* li の中に p が入るケース（react-markdown 対策） */
+.markdown li > p {
+  margin: 0 !important;
+  font-weight: 400;
+}
+
+/* 箇条書き全体 */
+.markdown ul,
+.markdown ol {
+  margin: 0.3em 0 !important;
+  padding-left: 1.2em;
+}
+
+/* 入れ子リスト */
+.markdown ul ul,
+.markdown ol ol,
+.markdown ul ol,
+.markdown ol ul {
+  margin: 0 !important;
+  padding-left: 1.2em;
+}
+
+/* 箇条書き1行ごと */
+.markdown li {
+  margin: 0 0 0.2em 0 !important;
+  padding: 0;
+  font-weight: 400;
+}
+
+/* 見出し */
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 0.5em 0 0.3em 0 !important;
+  padding: 0;
+  font-weight: 600;
+}
+
+/* 見出し直後のリスト */
+.markdown h1 + ul,
+.markdown h2 + ul,
+.markdown h3 + ul,
+.markdown h4 + ul,
+.markdown h5 + ul,
+.markdown h6 + ul,
+.markdown h1 + ol,
+.markdown h2 + ol,
+.markdown h3 + ol,
+.markdown h4 + ol,
+.markdown h5 + ol,
+.markdown h6 + ol {
+  margin-top: 0 !important;
+}
+
+/* 見出し直後の段落（0.3em → 0.2em） */
+.markdown h1 + p,
+.markdown h2 + p,
+.markdown h3 + p,
+.markdown h4 + p,
+.markdown h5 + p,
+.markdown h6 + p {
+  margin-top: 0.2em !important;
+}

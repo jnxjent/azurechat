@@ -170,12 +170,13 @@ class ChatState {
         if (event.type === "event") {
           const responseType = JSON.parse(event.data) as AzureChatCompletion;
           switch (responseType.type) {
-            case "functionCall":
-              const mappedFunction: ChatMessageModel = {
+            case "functionCall": {
+              // ✅ GPT-5互換：履歴には role:"tool" として保存（旧 "function" は使用しない）
+              const mappedToolCall: ChatMessageModel = {
                 id: uniqueId(),
                 content: responseType.response.arguments,
-                name: responseType.response.name,
-                role: "function",
+                name: responseType.response.name ?? "tool",
+                role: "tool",
                 createdAt: new Date(),
                 isDeleted: false,
                 threadId: this.chatThreadId,
@@ -183,10 +184,12 @@ class ChatState {
                 userId: "",
                 multiModalImage: "",
               };
-              this.addToMessages(mappedFunction);
+              this.addToMessages(mappedToolCall);
               break;
-            case "functionCallResult":
-              const mappedFunctionResult: ChatMessageModel = {
+            }
+            case "functionCallResult": {
+              // ✅ 実行結果も role:"tool" で統一
+              const mappedToolResult: ChatMessageModel = {
                 id: uniqueId(),
                 content: responseType.response,
                 name: "tool",
@@ -198,9 +201,10 @@ class ChatState {
                 userId: "",
                 multiModalImage: "",
               };
-              this.addToMessages(mappedFunctionResult);
+              this.addToMessages(mappedToolResult);
               break;
-            case "content":
+            }
+            case "content": {
               const mappedContent: ChatMessageModel = {
                 id: responseType.response.id,
                 content: responseType.response.choices[0].message.content || "",
@@ -218,6 +222,7 @@ class ChatState {
               this.lastMessage = mappedContent.content;
 
               break;
+            }
             case "abort":
               this.removeMessage(newUserMessage.id);
               this.loading = "idle";

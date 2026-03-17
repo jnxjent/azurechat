@@ -1,11 +1,16 @@
+// src/features/chat-page/chat-services/chat-image-service.ts
 "use server";
 import "server-only";
 
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { GetBlob, UploadBlob } from "../../common/services/azure-storage";
+import { ChatThreadModel } from "./models";
 
 const IMAGE_CONTAINER_NAME = "images";
-const IMAGE_API_PATH = process.env.NEXTAUTH_URL + "/api/images";
+// ★ まず NEXT_PUBLIC_IMAGE_URL を優先し、なければ NEXTAUTH_URL + /api/images
+const IMAGE_API_PATH =
+  process.env.NEXT_PUBLIC_IMAGE_URL ||
+  (process.env.NEXTAUTH_URL + "/api/images");
 
 export const GetBlobPath = (threadId: string, blobName: string): string => {
   return `${threadId}/${blobName}`;
@@ -32,21 +37,18 @@ export const GetImageFromStore = async (
 };
 
 export const GetImageUrl = (threadId: string, fileName: string): string => {
-  // add threadId and fileName as query parameters t and img respectively
+  // ?t=...&img=... を付けるだけ（余分なスラッシュを入れない）
   const params = `?t=${threadId}&img=${fileName}`;
-
-  return `${IMAGE_API_PATH}/${params}`;
+  return `${IMAGE_API_PATH}${params}`; // ← ここがポイント（末尾に / を付けない）
 };
 
 export const GetThreadAndImageFromUrl = (
   urlString: string
 ): ServerActionResponse<{ threadId: string; imgName: string }> => {
-  // Get threadId and img from query parameters t and img
   const url = new URL(urlString);
   const threadId = url.searchParams.get("t");
   const imgName = url.searchParams.get("img");
 
-  // Check if threadId and img are valid
   if (!threadId || !imgName) {
     return {
       status: "ERROR",
@@ -66,4 +68,90 @@ export const GetThreadAndImageFromUrl = (
       imgName,
     },
   };
+};
+
+/* -------------------------------------------------------------------------- */
+/* ★ 追加：スレッドに「元絵」と「最新画像」を記録／取得するためのヘルパー */
+/* -------------------------------------------------------------------------- */
+
+export const RegisterImageOnThread = (
+  thread: ChatThreadModel,
+  fileName: string
+): void => {
+  if (!thread.originalImageFileName) {
+    thread.originalImageFileName = fileName;
+  }
+  thread.lastImageFileName = fileName;
+};
+
+export const GetBaseImageFileNameForOverlay = (
+  thread: ChatThreadModel
+): string | undefined => {
+  return thread.originalImageFileName;
+};
+
+export const GetImageUrlFromThread = (
+  thread: ChatThreadModel
+): string | undefined => {
+  const base = thread.originalImageFileName; // ★ 元絵のみ
+  if (!base) return undefined;
+  return GetImageUrl(thread.id, base);
+};
+
+/* -------------------------------------------------------------------------- */
+/* ★ NEW: overlay state JSON を Blob に保存/取得                              */
+/* -------------------------------------------------------------------------- */
+
+export type OverlayState = {
+  align: "left" | "center" | "right";
+  vAlign: "top" | "middle" | "bottom";
+  offsetX: number;
+  offsetY: number;
+  size: "small" | "medium" | "large" | "xlarge";
+  text: string;
+  color?: string;
+  fontFamily?: "gothic" | "mincho" | "meiryo";
+  bold?: boolean;
+  italic?: boolean;
+};
+
+const OVERLAY_STATE_BLOB_NAME = "__overlay_state__.json";
+
+export const SaveOverlayStateToStore = async (
+  threadId: string,
+  state: OverlayState
+): Promise<ServerActionResponse<string>> => {
+  const json = JSON.stringify(state ?? {}, null, 2);
+  const buf = Buffer.from(json, "utf-8");
+  return await UploadBlob(
+    IMAGE_CONTAINER_NAME,
+    `${threadId}/${OVERLAY_STATE_BLOB_NAME}`,
+    buf
+  );
+};
+
+export const LoadOverlayStateFromStore = async (
+  threadId: string
+): Promise<ServerActionResponse<OverlayState | null>> => {
+  const blobPath = `${threadId}/${OVERLAY_STATE_BLOB_NAME}`;
+  const res = await GetBlob(IMAGE_CONTAINER_NAME, blobPath);
+
+  if (res.status !== "OK") {
+    // 未作成は普通に起きるので「null」で返す（ERROR扱いにしない）
+    return { status: "OK", response: null };
+  }
+
+  try {
+    // GetBlob が ReadableStream を返す前提（Nodeの fetch Response で読める）
+    const stream = res.response!;
+    const text = await new Response(stream as any).text();
+    const obj = JSON.parse(text || "null");
+    if (!obj) return { status: "OK", response: null };
+    return { status: "OK", response: obj as OverlayState };
+  } catch (e: any) {
+    return {
+      status: "ERROR",
+      errors: [{ message: "Failed to parse overlay state JSON: " + String(e) }],
+    };
+  }
 };

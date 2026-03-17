@@ -14,7 +14,7 @@ export const ChatMessageArea = (props: {
   children?: React.ReactNode;
   profilePicture?: string | null;
   profileName?: string;
-  role: "function" | "user" | "assistant" | "system" | "tool";
+  role: "user" | "assistant" | "system" | "tool";
   onCopy: () => void;
 }) => {
   const [isIconChecked, setIsIconChecked] = useState(false);
@@ -28,11 +28,10 @@ export const ChatMessageArea = (props: {
     const timeout = setTimeout(() => {
       setIsIconChecked(false);
     }, 2000);
-
     return () => clearTimeout(timeout);
   }, [isIconChecked]);
 
-  let profile = null;
+  let profile: React.ReactNode = null;
 
   switch (props.role) {
     case "assistant":
@@ -54,7 +53,6 @@ export const ChatMessageArea = (props: {
       }
       break;
     case "tool":
-    case "function":
       profile = (
         <PocketKnife
           size={28}
@@ -63,6 +61,7 @@ export const ChatMessageArea = (props: {
         />
       );
       break;
+    case "system":
     default:
       break;
   }
@@ -75,15 +74,13 @@ export const ChatMessageArea = (props: {
           <div
             className={cn(
               "text-primary capitalize items-center flex",
-              props.role === "function" || props.role === "tool"
-                ? "text-muted-foreground text-sm"
-                : ""
+              props.role === "tool" ? "text-muted-foreground text-sm" : ""
             )}
           >
             {props.profileName}
           </div>
         </div>
-        <div className=" h-7 flex items-center justify-between">
+        <div className="h-7 flex items-center justify-between">
           <div>
             <Button
               variant={"ghost"}
@@ -101,7 +98,9 @@ export const ChatMessageArea = (props: {
           </div>
         </div>
       </div>
-      <div className="flex flex-col gap-2 flex-1 px-10">
+
+      {/* ★ここが「1行おきの空き」の主因：gap-2 を gap-0 に */}
+      <div className="flex flex-col gap-0 flex-1 px-10">
         <div className="prose prose-slate dark:prose-invert whitespace-break-spaces prose-p:leading-relaxed prose-pre:p-0 max-w-none">
           {props.children}
         </div>

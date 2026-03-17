@@ -13,6 +13,8 @@ export interface ChatMessageModel {
   threadId: string;
   userId: string;
   content: string;
+  message?: string;        // ★ 追加：BEの .message を保持
+  message_format?: string;
   role: ChatRole;
   name: string;
   multiModalImage?: string;
@@ -33,6 +35,13 @@ export interface ChatThreadModel {
   personaMessage: string;
   personaMessageTitle: string;
   extension: string[];
+
+  /** ★ 追加: 画像お絵かき用の情報 */
+  /** 最初に生成した「元絵」のファイル名（1回だけセットされる想定） */
+  originalImageFileName?: string;
+  /** 現在表示中の最新画像のファイル名（上書きされていく想定） */
+  lastImageFileName?: string;
+
   type: typeof CHAT_THREAD_ATTRIBUTE;
 }
 

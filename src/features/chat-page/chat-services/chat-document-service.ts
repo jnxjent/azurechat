@@ -13,39 +13,59 @@ import { EnsureIndexIsCreated } from "./azure-ai-search/azure-ai-search";
 import { CHAT_DOCUMENT_ATTRIBUTE, ChatDocumentModel } from "./models";
 import { UploadBlob } from "@/features/common/services/azure-storage";
 
-const MAX_UPLOAD_DOCUMENT_SIZE: number = 20000000;
+// ─────────────────────────────────────────────
+// アップロード上限（バイト）
+// デフォルトは 100MB。環境変数 MAX_UPLOAD_DOCUMENT_SIZE で上書き可能。
+// ─────────────────────────────────────────────
+const DEFAULT_MAX_UPLOAD_DOCUMENT_SIZE = 100 * 1024 * 1024; // 100MB
+
+function resolveMaxUploadDocumentSize(): number {
+  const raw = process.env.MAX_UPLOAD_DOCUMENT_SIZE;
+  if (!raw) {
+    return DEFAULT_MAX_UPLOAD_DOCUMENT_SIZE;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    // 不正値の場合はログを出してデフォルトにフォールバック
+    console.warn(
+      `[Upload] MAX_UPLOAD_DOCUMENT_SIZE is invalid (${raw}), using default ${DEFAULT_MAX_UPLOAD_DOCUMENT_SIZE} bytes`
+    );
+    return DEFAULT_MAX_UPLOAD_DOCUMENT_SIZE;
+  }
+
+  return parsed;
+}
+
+const MAX_UPLOAD_DOCUMENT_SIZE = resolveMaxUploadDocumentSize();
+
 const CHUNK_SIZE = 2300;
 // 25% overlap
 const CHUNK_OVERLAP = CHUNK_SIZE * 0.25;
 
-
-const DOCUMENT_CONTAINER_NAME = "dl-link"
+const DOCUMENT_CONTAINER_NAME = "dl-link";
 
 export const UploadDocumentToStore = async (
   threadId: string,
   fileName: string,
   fileData: Buffer
 ): Promise<ServerActionResponse<string>> => {
-  return await UploadBlob(
-    DOCUMENT_CONTAINER_NAME,
-    fileName,
-    fileData,
-  );
+  return await UploadBlob(DOCUMENT_CONTAINER_NAME, fileName, fileData);
 };
 
 export const UploadDocument = async (formData: FormData) => {
-  const threadId = String(formData.get("id"))
+  const threadId = String(formData.get("id"));
   const file: File | null = formData.get("file") as unknown as File;
-  const fileName = formData.get("fileName") as string
+  const fileName = formData.get("fileName") as string;
   const blob = new Blob([file], { type: file.type });
-  const buff = await blob.arrayBuffer()
+  const buff = await blob.arrayBuffer();
   const uploadResponse = await UploadDocumentToStore(
     threadId,
     `${threadId}/${fileName}`,
     Buffer.from(buff)
   );
-  return uploadResponse
-}
+  return uploadResponse;
+};
 
 export const CrackDocument = async (
   formData: FormData
@@ -87,11 +107,7 @@ const LoadFile = async (
   try {
     const file: File | null = formData.get("file") as unknown as File;
 
-    const fileSize = process.env.MAX_UPLOAD_DOCUMENT_SIZE
-      ? Number(process.env.MAX_UPLOAD_DOCUMENT_SIZE)
-      : MAX_UPLOAD_DOCUMENT_SIZE;
-
-    if (file && file.size < fileSize) {
+    if (file && file.size < MAX_UPLOAD_DOCUMENT_SIZE) {
       const client = DocumentIntelligenceInstance();
 
       const blob = new Blob([file], { type: file.type });
