@@ -8,7 +8,7 @@ import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/comple
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
-import { getCurrentUser } from "@/features/auth-page/helpers";
+import { userSession } from "@/features/auth-page/helpers"; // ← getCurrentUser → userSession
 
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
@@ -374,8 +374,9 @@ async function runSfDirect(props: {
   url.searchParams.set("engine", "auto");
   url.searchParams.set("mode", "real");
 
-  const currentUser = await getCurrentUser().catch(() => null as any);
-  const loginEmail = (currentUser as any)?.email || "";
+  // ★ 修正: getCurrentUser → userSession（Server Action外でも動作）
+  const currentUser = await userSession().catch(() => null);
+  const loginEmail = currentUser?.email || "";
   const threadId = ((chatThread as any)?.id || "").trim();
 
   if (loginEmail) {
