@@ -3,7 +3,7 @@ import NextAuth, { NextAuthOptions } from "next-auth";
 import AzureADProvider from "next-auth/providers/azure-ad";
 import CredentialsProvider from "next-auth/providers/credentials";
 import GitHubProvider from "next-auth/providers/github";
-import type { Provider } from "next-auth/providers";
+import type { Provider } from "next-auth/providers/index";  // ← 修正
 import { hashValue } from "@/features/auth-page/helpers";
 
 const AAD_SCOPE = [
@@ -18,7 +18,7 @@ const AAD_SCOPE = [
 const configureIdentityProvider = () => {
   const providers: Array<Provider> = [];
 
-  const adminEmails = process.env.ADMIN_EMAIL_ADDRESS
+  const adminEmails = process.env.SL_ADMIN_EMAILS
     ?.split(",")
     .map((email) => email.toLowerCase().trim());
 
@@ -139,7 +139,6 @@ async function refreshAzureADAccessToken(token: any) {
   }
 }
 
-// ✅ options のみ export（NextAuth の呼び出しは route.ts で行う）
 export const options: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
   providers: [...configureIdentityProvider()],
@@ -192,9 +191,7 @@ export const options: NextAuthOptions = {
       return session;
     },
   },
-
   session: {
     strategy: "jwt",
   },
 };
-// ↑ ここで終わり。末尾の export const { auth } = NextAuth(options); は削除済み

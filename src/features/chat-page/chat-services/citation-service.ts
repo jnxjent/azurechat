@@ -108,6 +108,8 @@ export const FormatCitations = (citation: DocumentSearchResponse[]) => {
         fileUrl: d.document.fileUrl,
         id: "",
         user: "",
+        dept: d.document.dept ?? "",        // ← 追加
+        isSlDoc: d.document.isSlDoc ?? null, // ← 追加
       },
     });
   });

@@ -25,37 +25,41 @@ async function fileToBase64(file: File): Promise<string> {
   });
 }
 
-function normalizeDept(value?: string | null): string {
-  const d = (value ?? "").toLowerCase().trim();
-  return d || "cp";
+type UploadScope = "common" | "personal";
+
+/**
+ * uploadScope の正規化
+ * - common / personal を正式値とする
+ * - 旧値 cp は personal として吸収
+ * - 未指定も personal 扱い
+ */
+function normalizeUploadScope(value?: string | null): UploadScope {
+  const v = (value ?? "").toLowerCase().trim();
+
+  if (v === "common") return "common";
+  if (v === "personal") return "personal";
+  if (v === "cp") return "personal";
+
+  return "personal";
 }
 
 /**
- * アップロード先 dept の決定
- * 優先順位: props.dept（トグル選択） > NEXT_PUBLIC_SL_DEPT（従来） > "cp"
+ * フロント側の希望 uploadScope
+ * 優先順位:
+ * 1) props.uploadScope
+ * 2) 旧 env 値（互換）
+ * 3) personal
  */
-function resolveUploadDept(propsDept?: string): string {
-  const fromProps = normalizeDept(propsDept);
-  if (propsDept && fromProps) return fromProps;
+function resolveRequestedUploadScope(propsUploadScope?: string): UploadScope {
+  const fromProps = normalizeUploadScope(propsUploadScope);
+  if (propsUploadScope) return fromProps;
 
-  const fromEnv = normalizeDept(process.env.NEXT_PUBLIC_SL_DEPT);
-  return fromEnv || "cp";
-}
-
-/**
- * SL文書かどうかの判定
- * NEXT_PUBLIC_SL_DEPT_NON_SP に設定された dept は SP未対応 → isSlDoc=false
- * それ以外は SP対応部署 → isSlDoc=true
- */
-function resolveIsSlDoc(uploadDept: string): boolean {
-  const nonSpDept = (process.env.NEXT_PUBLIC_SL_DEPT_NON_SP ?? "others")
-    .toLowerCase()
-    .trim();
-  return uploadDept !== nonSpDept;
+  const fromEnv = normalizeUploadScope(process.env.NEXT_PUBLIC_SL_DEPT);
+  return fromEnv;
 }
 
 // SharePointへ同期コピー（失敗したらthrow）
-async function publishToSharePoint(file: File, dept: string) {
+async function publishToSharePoint(file: File, uploadScope: UploadScope) {
   const fileBase64 = await fileToBase64(file);
 
   const r = await fetch("/api/sl/publish", {
@@ -64,20 +68,23 @@ async function publishToSharePoint(file: File, dept: string) {
     body: JSON.stringify({
       fileName: file.name,
       fileBase64,
-      dept,
+      uploadScope,
     }),
   });
 
   const json = await r.json().catch(() => ({}));
 
   if (!r.ok || !json?.ok) {
-    const msg = json?.error || `SharePoint publish failed (status=${r.status})`;
+    const msg =
+      json?.error || `SharePoint publish failed (status=${r.status})`;
     throw new Error(msg);
   }
 
   return json as {
     ok: true;
     dept?: string;
+    uploadScope?: UploadScope;
+    isSharePointEnabled?: boolean;
     webUrl?: string;
     name?: string;
   };
@@ -89,9 +96,9 @@ class FileStore {
   public async onFileChange(props: {
     formData: FormData;
     chatThreadId: string;
-    dept?: string; // トグルから渡す
+    uploadScope?: string; // トグルから渡す
   }) {
-    const { formData, chatThreadId, dept: requestedDept } = props;
+    const { formData, chatThreadId, uploadScope: requestedScopeRaw } = props;
 
     try {
       chatStore.updateLoading("file upload");
@@ -104,9 +111,8 @@ class FileStore {
         return;
       }
 
-      // FE上の候補dept（最終確定値ではない）
-      const requestedUploadDept = resolveUploadDept(requestedDept);
-      const requestedIsSlDoc = resolveIsSlDoc(requestedUploadDept);
+      // フロント側の希望値（最終決定はサーバ側）
+      const requestedUploadScope = resolveRequestedUploadScope(requestedScopeRaw);
 
       this.uploadButtonLabel = "Processing document";
       formData.append("fileName", file.name);
@@ -115,44 +121,55 @@ class FileStore {
       const crackingResponse = await CrackDocument(formData);
 
       if (crackingResponse.status === "OK" && uploadResponse.status === "OK") {
-        // 先に SharePoint 側で最終 dept を確定させる
-        let actualDept = requestedUploadDept;
-        let actualIsSlDoc = requestedIsSlDoc;
-        let sp:
-          | {
-              ok: true;
-              dept?: string;
-              webUrl?: string;
-              name?: string;
-            }
-          | undefined;
+        let actualDept = "";
+        let actualIsSlDoc = false;
+        let actualUploadScope: UploadScope = requestedUploadScope;
 
-        if (requestedIsSlDoc) {
-          try {
-            this.uploadButtonLabel = "Syncing to SharePoint";
-            sp = await publishToSharePoint(file, requestedUploadDept);
+        try {
+          this.uploadButtonLabel = "Syncing to SharePoint";
 
-            // サーバで最終的に決定した dept を採用
-            actualDept = normalizeDept(sp.dept || requestedUploadDept);
-            actualIsSlDoc = resolveIsSlDoc(actualDept);
+          const sp = await publishToSharePoint(file, requestedUploadScope);
 
+          actualDept = String(sp.dept ?? "").toLowerCase().trim();
+          actualUploadScope = normalizeUploadScope(
+            sp.uploadScope ?? requestedUploadScope
+          );
+          actualIsSlDoc = sp.isSharePointEnabled === true;
+
+          showSuccess({
+            title: "SharePoint sync",
+            description: sp.webUrl
+              ? `Synced to SharePoint (${actualDept || "unknown"} / ${actualUploadScope}): ${sp.webUrl}`
+              : `Synced to SharePoint (${actualDept || "unknown"} / ${actualUploadScope}): ${sp.name || file.name}`,
+          });
+        } catch (e: any) {
+          const msg = String(e?.message ?? e);
+
+          // SP非対応部署は新仕様上ありうる
+          if (
+            msg.includes("not SharePoint-enabled") ||
+            msg.includes("Use Blob upload flow instead")
+          ) {
             showSuccess({
-              title: "SharePoint sync",
-              description: sp.webUrl
-                ? `Synced to SharePoint (${actualDept}): ${sp.webUrl}`
-                : `Synced to SharePoint (${actualDept}): ${sp.name || file.name}`,
+              title: "Blob upload",
+              description:
+                `${file.name} uploaded to Blob. ` +
+                `This department is not SharePoint-enabled, so SharePoint sync was skipped.`,
             });
-          } catch (e: any) {
-            showError(
-              `SharePoint sync failed (index skipped): ${String(
-                e?.message ?? e
-              )}`
-            );
+
+            // 従来どおり Blob インデックス用
+            actualDept = (
+              process.env.NEXT_PUBLIC_SL_DEPT_NON_SP ?? "others"
+            ).toLowerCase().trim();
+            actualIsSlDoc = false;
+            actualUploadScope = "personal";
+          } else {
+            showError(`SharePoint sync failed (index skipped): ${msg}`);
             return;
           }
         }
 
-        // SharePoint 確定後の dept で Index 作成
+        // SharePoint / Blob の最終状態確定後に Index 作成
         let index = 0;
         const documentIndexResponses: Array<ServerActionResponse<boolean>> = [];
 
@@ -167,7 +184,8 @@ class FileStore {
             [doc],
             chatThreadId,
             actualDept,
-            actualIsSlDoc
+            actualIsSlDoc,
+            actualUploadScope
           );
 
           documentIndexResponses.push(...indexResponses);
@@ -205,8 +223,9 @@ class FileStore {
         }
       } else {
         const crackingErrors =
-          (crackingResponse as any)?.errors?.map((e: any) => e.message).join("\n") ||
-          "Failed to process document.";
+          (crackingResponse as any)?.errors
+            ?.map((e: any) => e.message)
+            .join("\n") || "Failed to process document.";
         showError(crackingErrors);
       }
     } catch (error) {

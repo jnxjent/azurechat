@@ -153,7 +153,7 @@ async function getSpFileNames(
     `/root:/${folderPath}:/children?$select=name,file&$top=200`;
 
   while (nextUrl) {
-    const res = await fetch(nextUrl, {
+    const res: Response = await fetch(nextUrl, {  // ← Response 型を明示
       headers: { Authorization: `Bearer ${accessToken}` },
       cache: "no-store",
     });

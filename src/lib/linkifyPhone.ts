@@ -71,7 +71,9 @@ export function splitTextWithPhones(text: string): TextPart[] {
   const parts: TextPart[] = [];
   let lastIndex = 0;
 
-  for (const match of text.matchAll(PHONE_REGEX)) {
+  const matches = Array.from(text.matchAll(PHONE_REGEX));  // ← 修正
+
+  for (const match of matches) {
     const raw = match[0];
     const index = match.index ?? 0;
 

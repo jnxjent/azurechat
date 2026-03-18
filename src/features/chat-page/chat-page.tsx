@@ -22,28 +22,24 @@ interface ChatPageProps {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
+  isAdmin: boolean; // ← 追加
 }
 
 // ChatMessageArea が受け取れるロール（UI 用）
 type ChatUiRole = "user" | "system" | "assistant" | "tool";
 
-/**
- * ChatMessageModel の role（ChatRole）を
- * UI 用のロールに正規化する。
- *
- * - "function" は UI では "assistant" として扱う
- * - それ以外はそのまま通す
- */
 function toUiRole(role: ChatMessageModel["role"]): ChatUiRole {
   if (role === "function") {
     return "assistant";
   }
-  // ChatMessageModel["role"] には "user" | "system" | "assistant" | "tool" も含まれている前提
   return role as ChatUiRole;
 }
 
 export const ChatPage: FC<ChatPageProps> = (props) => {
   const { data: session } = useSession();
+
+  // Server Component 側で確定済みの isAdmin を使う
+  const isAdmin = props.isAdmin;
 
   useEffect(() => {
     chatStore.initChatSession({
@@ -65,6 +61,7 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
         chatThread={props.chatThread}
         chatDocuments={props.chatDocuments}
         extensions={props.extensions}
+        isAdmin={isAdmin}
       />
       <ChatMessageContainer ref={current}>
         <ChatMessageContentArea>

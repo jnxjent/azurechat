@@ -25,6 +25,8 @@ export interface AzureSearchDocumentIndex {
   fileUrl: string;
   dept: string;
   isSlDoc: boolean | null;
+  slScope?: "common" | "personal" | null;
+  slOwner?: string | null;
 }
 
 export type DocumentSearchResponse = {
@@ -46,10 +48,35 @@ function combineFilters(a?: string, b?: string): string | undefined {
   return `(${aa}) and (${bb})`;
 }
 
+type UploadScope = "common" | "personal";
+
+function normalizeUploadScope(value?: string | null): UploadScope {
+  const v = (value ?? "").toLowerCase().trim();
+
+  if (v === "common") return "common";
+  if (v === "personal") return "personal";
+  if (v === "cp") return "personal";
+
+  return "personal";
+}
+
 /**
- * ACL統一関数
- * - 個人文書: isSlDoc != true かつ user一致
- * - SL文書  : isSlDoc == true かつ dept一致 or common
+ * ACL統一関数（新仕様）
+ *
+ * - 個人文書（従来Blob等）:
+ *     isSlDoc != true and user == 自分
+ *
+ * - SL文書:
+ *     isSlDoc == true
+ *     and dept == 自部署
+ *     and (
+ *       slScope == "common"
+ *       or (slScope == "personal" and slOwner == 自分)
+ *     )
+ *
+ * 互換:
+ * - 旧SL文書（slScope/slOwner未設定）は
+ *   dept一致なら暫定的に検索対象へ含める
  *
  * 使い分け:
  * - deptLower === null      → ACLを付けない（明示的無効化）
@@ -67,11 +94,33 @@ async function buildSearchAclFilter(
   const d = escapeODataValue(normalizedDept);
 
   const resolvedUserHash = userHash ?? (await userHashedId());
+  const u = escapeODataValue(resolvedUserHash);
 
-  const userFilter = `(isSlDoc ne true and user eq '${escapeODataValue(resolvedUserHash)}')`;
-  const deptFilter = `(isSlDoc eq true and (dept eq '${d}' or dept eq 'common'))`;
+  // 従来の個人文書
+  const userFilter = `(isSlDoc ne true and user eq '${u}')`;
 
-  return `(${userFilter} or ${deptFilter})`;
+  // 新仕様のSL文書:
+  // - 共通
+  // - 個人（自分所有）
+  const slCommonFilter =
+    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'common')`;
+
+  const slPersonalFilter =
+    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'personal' and slOwner eq '${u}')`;
+
+  // 旧インデックス互換:
+  // slScope が未設定/null の SL 文書は、ひとまず dept 一致なら対象に含める
+  const slLegacyFilter =
+    `(isSlDoc eq true and dept eq '${d}' and (slScope eq null or slScope eq ''))`;
+  
+    console.log("[ACL] resolvedUserHash =", resolvedUserHash);
+    console.log("[ACL] normalizedDept =", normalizedDept);
+    console.log("[ACL] userFilter =", userFilter);
+    console.log("[ACL] slCommonFilter =", slCommonFilter);
+    console.log("[ACL] slPersonalFilter =", slPersonalFilter);
+    console.log("[ACL] slLegacyFilter =", slLegacyFilter);
+
+  return `(${userFilter} or ${slCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
 }
 
 // -------------------------------------------------------
@@ -195,7 +244,6 @@ export const ExtensionSimilaritySearch = async (props: {
       { allowInsecureConnection: process.env.NODE_ENV === "development" }
     );
 
-    // userHash を外から受け取り buildSearchAclFilter に渡す
     const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
     const finalFilter = combineFilters(filter, scopeFilter);
 
@@ -232,7 +280,7 @@ export const ExtensionSimilaritySearch = async (props: {
 
       results.push({
         score: result.score,
-        document: newDocument as AzureSearchDocumentIndex,
+        document: newDocument as unknown as AzureSearchDocumentIndex,
       });
     }
 
@@ -252,11 +300,14 @@ export const IndexDocuments = async (
   docs: string[],
   chatThreadId: string,
   dept: string,
-  isSlDoc: boolean
+  isSlDoc: boolean,
+  uploadScope?: string
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
     const currentUserHash = await userHashedId();
+    const normalizedDept = (dept ?? "others").toLowerCase().trim();
+    const normalizedScope = normalizeUploadScope(uploadScope);
 
     for (const doc of docs) {
       documentsToIndex.push({
@@ -267,8 +318,11 @@ export const IndexDocuments = async (
         metadata: fileName,
         fileUrl,
         embedding: [],
-        dept: (dept ?? "others").toLowerCase().trim(),
+        dept: normalizedDept,
         isSlDoc,
+        slScope: isSlDoc ? normalizedScope : null,
+        slOwner:
+          isSlDoc && normalizedScope === "personal" ? currentUserHash : null,
       });
     }
 

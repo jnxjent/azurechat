@@ -12,7 +12,7 @@ interface Props {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
-  isAdmin?: boolean; // 管理者のみ同期ボタンを表示
+  isAdmin?: boolean;
 }
 
 export const ChatHeader: FC<Props> = (props) => {
@@ -36,7 +36,6 @@ export const ChatHeader: FC<Props> = (props) => {
       });
       const data = await res.json();
       if (data.ok) {
-        // 削除件数の合計を集計
         const total = Object.values(data.results as Record<string, any>)
           .filter((r) => !r.error)
           .reduce((sum, r) => sum + (r.deleted ?? 0), 0);
@@ -48,7 +47,6 @@ export const ChatHeader: FC<Props> = (props) => {
       setSyncResult(`❌ エラー: ${e.message}`);
     } finally {
       setSyncing(false);
-      // 3秒後にメッセージを消す
       setTimeout(() => setSyncResult(null), 3000);
     }
   };
@@ -64,7 +62,6 @@ export const ChatHeader: FC<Props> = (props) => {
           </span>
         </div>
         <div className="flex gap-2 items-center">
-          {/* 管理者のみIndex同期ボタンを表示 */}
           {props.isAdmin && (
             <div className="flex items-center gap-2">
               {syncResult && (

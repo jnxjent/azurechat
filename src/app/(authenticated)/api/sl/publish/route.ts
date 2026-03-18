@@ -5,9 +5,13 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
 import {
+  buildUploadFolder,
   decideDept,
   getDeptConfig,
   getUserEmailFromJwtToken,
+  isSharePointEnabledDept,
+  normalizeUploadScope,
+  type UploadScope,
 } from "@/lib/sl-dept";
 
 // -------------------------------------------------------
@@ -66,7 +70,7 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
 }
 
 // -------------------------------------------------------
-// Admin helpers (COMMON upload gate)
+// Admin helpers
 // -------------------------------------------------------
 function parseCsvLower(value?: string | null) {
   return (value ?? "")
@@ -131,19 +135,13 @@ async function graphPutBinary(
   buffer: Buffer,
   mimeType: string
 ): Promise<any> {
-  // Buffer -> ArrayBuffer（fetch互換を最大化）
-  const arrayBuffer = buffer.buffer.slice(
-    buffer.byteOffset,
-    buffer.byteOffset + buffer.byteLength
-  );
-
   const res = await fetch(uploadUrl, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": mimeType,
     },
-    body: arrayBuffer,
+    body: new Uint8Array(buffer),  // ← Uint8Array は BodyInit として有効
   });
 
   if (!res.ok) {
@@ -151,6 +149,35 @@ async function graphPutBinary(
     throw new Error(`Upload failed (${res.status}): ${err}`);
   }
   return res.json();
+}
+
+// -------------------------------------------------------
+// Utils
+// -------------------------------------------------------
+function getMimeType(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+
+  const mimeMap: Record<string, string> = {
+    pdf: "application/pdf",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    txt: "text/plain",
+  };
+
+  return mimeMap[ext] ?? "application/octet-stream";
+}
+
+/**
+ * 互換対応:
+ * - 新: body.uploadScope
+ * - 旧: body.dept に common / personal / cp が来る場合
+ */
+function resolveRequestedUploadScope(body: any): UploadScope {
+  return normalizeUploadScope(body?.uploadScope ?? body?.dept);
 }
 
 // -------------------------------------------------------
@@ -171,7 +198,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { fileName, fileBase64, dept } = body;
+    const { fileName, fileBase64 } = body;
 
     if (!fileName || !fileBase64) {
       return NextResponse.json(
@@ -180,55 +207,89 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // user email を token から取得（dept判定に使用）
     const token = await getToken({ req });
     const userEmail = token ? getUserEmailFromJwtToken(token) : null;
 
-    // email優先 → requested dept → default
-    const deptLower = decideDept({ requestedDept: dept, userEmail });
-
-    // common は管理者のみ許可
-    if (deptLower === "common" && !isAdminEmail(userEmail)) {
+    if (!userEmail) {
       return NextResponse.json(
-        { ok: false, error: "You are not allowed to upload to COMMON." },
-        { status: 403 }
+        { ok: false, error: "Failed to identify current user email." },
+        { status: 401 }
       );
     }
 
-    // dept config
-    const { siteUrl, driveName, folder } = getDeptConfig(deptLower);
+    const requestedUploadScope = resolveRequestedUploadScope(body);
+
+    // 部署は userEmail から確定
+    // requestedDept は「本当に部署を明示したい互換用途」がある場合だけ補助的に使う
+    const deptLower = decideDept({
+      requestedDept:
+        typeof body?.requestedDept === "string" ? body.requestedDept : undefined,
+      userEmail,
+    });
+
+    const isSpDept = isSharePointEnabledDept(deptLower);
+    const admin = isAdminEmail(userEmail);
+
+    // SP非対応部署はこのAPI対象外
+    if (!isSpDept) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Your department is not SharePoint-enabled. Use Blob upload flow instead.",
+          dept: deptLower,
+          isSharePointEnabled: false,
+        },
+        { status: 400 }
+      );
+    }
+
+    // 一般メンバーは personal 固定
+    const actualUploadScope: UploadScope = admin
+      ? requestedUploadScope
+      : "personal";
+
+    // 部署ごとの SP 設定
+    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(deptLower);
+
+    // 最終アップ先フォルダー
+    // common   -> SL/common
+    // personal -> SL/<mailPrefix>
+    const uploadFolder = buildUploadFolder({
+      baseFolder,
+      uploadScope: actualUploadScope,
+      userEmail,
+    });
 
     console.log(
-      `[SL publish] dept=${deptLower} user=${userEmail ?? "unknown"} site=${siteUrl} drive=${driveName} folder=${folder}`
+      `[SL publish] dept=${deptLower} user=${userEmail} admin=${admin} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
     );
 
     const fileBuffer = Buffer.from(fileBase64, "base64");
-
-    const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
-    const mimeMap: Record<string, string> = {
-      pdf: "application/pdf",
-      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      txt: "text/plain",
-    };
-    const mimeType = mimeMap[ext] ?? "application/octet-stream";
+    const mimeType = getMimeType(fileName);
 
     const { driveId } = await resolveSiteAndDrive(accessToken, siteUrl, driveName);
 
-    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${folder}/${fileName}:/content`;
+    const uploadUrl =
+      `https://graph.microsoft.com/v1.0/drives/${driveId}` +
+      `/root:/${uploadFolder}/${fileName}:/content`;
+
     console.log(`[SL publish] Uploading to: ${uploadUrl}`);
 
-    const result = await graphPutBinary(uploadUrl, accessToken, fileBuffer, mimeType);
+    const result = await graphPutBinary(
+      uploadUrl,
+      accessToken,
+      fileBuffer,
+      mimeType
+    );
 
     console.log(`[SL publish] Upload success: ${result.webUrl}`);
 
     return NextResponse.json({
       ok: true,
-      dept: deptLower,  // ★追加
+      dept: deptLower,
+      uploadScope: actualUploadScope,
+      isSharePointEnabled: true,
       name: result.name,
       webUrl: result.webUrl,
     });
