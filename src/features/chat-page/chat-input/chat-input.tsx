@@ -33,12 +33,6 @@ import {
   useTextToSpeech,
 } from "./speech/use-text-to-speech";
 
-// ★ 思考モードトグル（3段階：標準→熟考→即答）
-// import {
-//   ModeCycleButton,
-//   type ThinkingMode,
-// } from "@/components/chatModeToggle";
-
 type UploadScope = "common" | "personal";
 
 export const ChatInput = () => {
@@ -51,22 +45,12 @@ export const ChatInput = () => {
   const submitButton = React.useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
-  // ★ モードは ChatInput 側で保持（hidden input で route に渡す）
   const mode = "standard";
 
-  // ★ 管理者判定
+  // ★ 管理者判定（セッションのisAdminを使用 - ビルド時env不要）
   const { data: session } = useSession();
-  const adminEmails = (process.env.NEXT_PUBLIC_SL_ADMIN_EMAILS ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+  const isAdmin = Boolean((session?.user as any)?.isAdmin);
 
-  const me = (session?.user as any)?.email?.toLowerCase?.() ?? "";
-  const isAdmin = adminEmails.includes(me);
-
-  // 新仕様:
-  // - 管理者は 共通 / 個人 を選択可能
-  // - 一般メンバーは uploadScope を送らず、サーバ側で personal 固定 / 非SP部署はBlob判定
   const [uploadScope, setUploadScope] = useState<UploadScope>("personal");
 
   const submit = () => {
@@ -84,7 +68,6 @@ export const ChatInput = () => {
       }}
       status={uploadButtonLabel}
     >
-      {/* ★ サーバに確実に届くよう hidden input を同送 */}
       <input type="hidden" name="thinkingMode" value={mode} />
 
       <ChatTextInput
@@ -147,9 +130,6 @@ export const ChatInput = () => {
               ))}
             </div>
           )}
-
-          {/* ★ 思考モードトグル（標準→熟考→即答→…） */}
-          {/* <ModeCycleButton value={mode} onChange={setMode} /> */}
         </ChatInputSecondaryActionArea>
 
         <ChatInputPrimaryActionArea>
