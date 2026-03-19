@@ -8,7 +8,7 @@ import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/comple
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
-import { userSession } from "@/features/auth-page/helpers"; // ← getCurrentUser → userSession
+import { userSession } from "@/features/auth-page/helpers";
 
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
@@ -36,7 +36,12 @@ function sanitizeHistory(
           return i === lastSfJsonIndex;
         }
         if (c.includes("```json")) return false;
-        if (c.includes("Salesforce ゲートウェイ呼び出しでエラーが発生しました")) return false;
+        if (
+          c.includes(
+            "Salesforce ゲートウェイ呼び出しでエラーが発生しました"
+          )
+        )
+          return false;
       }
       return true;
     })
@@ -51,20 +56,30 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   if (!s) return false;
 
   if (
-    /(もっと|詳細|詳しく|いいところ|良いところ|強み|弱み|課題|アドバイス|育成|評価|フィードバック|改善点|成長|伸ばす|褒める|叱る|指導|コーチング)/.test(s)
+    /(もっと|詳細|詳しく|いいところ|良いところ|強み|弱み|課題|アドバイス|育成|評価|フィードバック|改善点|成長|伸ばす|褒める|叱る|指導|コーチング)/.test(
+      s
+    )
   ) {
-    if (/(一覧|抽出|検索|探して|教えて|何件|今月|今週|先週|直近|過去)/.test(s)) {
+    if (
+      /(一覧|抽出|検索|探して|教えて|何件|今月|今週|先週|直近|過去)/.test(s)
+    ) {
       return false;
     }
     return true;
   }
 
   if (
-    /(横浜|東京|大阪|名古屋|福岡|札幌|仙台|京都|神戸|川崎|さいたま|千葉|広島|金沢|静岡|浜松|那覇|埼玉|新潟|熊本|岡山|姫路|相模原|船橋|松山|東大阪|旭川|高松|八王子|長野|岐阜|堺|鹿児島|宇都宮|松戸|川越|町田|藤沢|四日市|富山|高知|青森|秋田|山形|福島|盛岡|前橋|水戸|甲府|長崎|大分|宮崎|佐賀|那覇)/.test(s)
+    /(横浜|東京|大阪|名古屋|福岡|札幌|仙台|京都|神戸|川崎|さいたま|千葉|広島|金沢|静岡|浜松|那覇|埼玉|新潟|熊本|岡山|姫路|相模原|船橋|松山|東大阪|旭川|高松|八王子|長野|岐阜|堺|鹿児島|宇都宮|松戸|川越|町田|藤沢|四日市|富山|高知|青森|秋田|山形|福島|盛岡|前橋|水戸|甲府|長崎|大分|宮崎|佐賀|那覇)/.test(
+      s
+    )
   ) {
     return false;
   }
-  if (/(回る|まわる|訪問先|どこ行|どこを|どこに行|寄る|立ち寄|営業に行|出張先|巡回|ルート)/.test(s)) {
+  if (
+    /(回る|まわる|訪問先|どこ行|どこを|どこに行|寄る|立ち寄|営業に行|出張先|巡回|ルート)/.test(
+      s
+    )
+  ) {
     return false;
   }
   if (/^(上記|その中|この中|さっき|先ほど|今の|同じ条件|同条件)/.test(s)) {
@@ -75,23 +90,33 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
     return false;
   }
   if (
-    /(一覧|抽出|検索|探して|教えて|何件|件数|先週|昨日|今月|今期|今週|直近|過去|条件|絞|フィルタ|WHERE|AND|OR|LIMIT|OFFSET|並び替え|ソート|上位|下位|Aランク|Bランク|Sランク|ステージ|フェーズ|金額|担当)/i.test(s)
+    /(一覧|抽出|検索|探して|教えて|何件|件数|先週|昨日|今月|今期|今週|直近|過去|条件|絞|フィルタ|WHERE|AND|OR|LIMIT|OFFSET|並び替え|ソート|上位|下位|Aランク|Bランク|Sランク|ステージ|フェーズ|金額|担当)/i.test(
+      s
+    )
   ) {
     return false;
   }
   if (
-    /(理由|要因|なぜ|背景|課題|改善|提案|次|アクション|対策|打ち手|優先|方針|戦略|どうすれば|推測|考察|示唆|リスク)/i.test(s)
+    /(理由|要因|なぜ|背景|課題|改善|提案|次|アクション|対策|打ち手|優先|方針|戦略|どうすれば|推測|考察|示唆|リスク)/i.test(
+      s
+    )
   ) {
     return true;
   }
-  if (/^(それ|その|この|上記|さっき|先ほど|今の|この中で)/i.test(s) && s.length <= 40) {
+  if (
+    /^(それ|その|この|上記|さっき|先ほど|今の|この中で)/i.test(s) &&
+    s.length <= 40
+  ) {
     return true;
   }
   return false;
 }
 
 function buildTableInstruction(displayHint: string): string {
-  if (displayHint === "opportunity_list" || displayHint === "opportunity_aggregate") {
+  if (
+    displayHint === "opportunity_list" ||
+    displayHint === "opportunity_aggregate"
+  ) {
     return [
       "- **以下の形式でMarkdownテーブルを作成してください（商談）:**",
       "  | 商談名 | 取引先名 | フェーズ | 金額 | 完了予定日 | 最終更新日 | リンク |",
@@ -198,12 +223,12 @@ function resolveModelForExtensions(chatThread: ChatThreadModel): string {
     ? chatThread.extension
     : [];
 
-  const hasSfExtension =
+  const hasSfExt =
     typeof SF_EXTENSION_ID === "string" &&
     SF_EXTENSION_ID.length > 0 &&
     extensions.includes(SF_EXTENSION_ID);
 
-  if (hasSfExtension) {
+  if (hasSfExt) {
     const sfOrchestratorModel =
       process.env.AZURE_OPENAI_SOQL_CHAT_MODEL?.trim() ||
       process.env.AZURE_OPENAI_SOQL_MODEL?.trim();
@@ -249,6 +274,18 @@ export const ChatApiExtensions = async (props: {
 
   const extensionsSteps = await extensionsSystemMessage(chatThread);
 
+  const currentUser = await userSession().catch((e) => {
+    console.error("[SF] userSession() failed in ChatApiExtensions:", e);
+    return null;
+  });
+  const loginEmail = currentUser?.email || "";
+
+  if (loginEmail) {
+    console.log("[SF] ChatApiExtensions resolved loginEmail:", loginEmail);
+  } else {
+    console.log("[SF] ChatApiExtensions could not resolve loginEmail");
+  }
+
   const todayJST = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
     year: "numeric",
@@ -282,6 +319,7 @@ export const ChatApiExtensions = async (props: {
       signal,
       jstPrompt: JST_PROMPT,
       model,
+      loginEmail,
     });
   }
 
@@ -320,8 +358,17 @@ async function runSfDirect(props: {
   signal: AbortSignal;
   jstPrompt: string;
   model: string;
+  loginEmail?: string;
 }): Promise<ChatCompletionStreamingRunner> {
-  const { chatThread, userMessage, history, signal, jstPrompt, model } = props;
+  const {
+    chatThread,
+    userMessage,
+    history,
+    signal,
+    jstPrompt,
+    model,
+    loginEmail = "",
+  } = props;
 
   const openAI = OpenAIInstance();
 
@@ -374,20 +421,20 @@ async function runSfDirect(props: {
   url.searchParams.set("engine", "auto");
   url.searchParams.set("mode", "real");
 
-  // ★ 修正: getCurrentUser → userSession（Server Action外でも動作）
-  const currentUser = await userSession().catch(() => null);
-  const loginEmail = currentUser?.email || "";
   const threadId = ((chatThread as any)?.id || "").trim();
 
   if (loginEmail) {
     console.log("[SF] Using login email for self-scope:", loginEmail);
   } else {
-    console.log("[SF] No login email resolved in AzureChat (X-User-Email will be empty)");
+    console.log("[SF] No login email resolved in ChatApiExtensions");
   }
+
   if (threadId) {
     console.log("[SF] Using thread_id for sticky:", threadId);
   } else {
-    console.log("[SF] No thread_id available (sticky will fall back to login_email key)");
+    console.log(
+      "[SF] No thread_id available (sticky will fall back to login_email key)"
+    );
   }
 
   console.log("[SF] Calling direct NL gateway:", url.toString());
@@ -440,7 +487,12 @@ async function runSfDirect(props: {
 
   const jsonReadInstruction = buildJsonReadInstruction(displayHint, sfJson);
 
-  console.log("[SF] display_hint:", displayHint, "jsonReadInstruction:", jsonReadInstruction ? "yes" : "no");
+  console.log(
+    "[SF] display_hint:",
+    displayHint,
+    "jsonReadInstruction:",
+    jsonReadInstruction ? "yes" : "no"
+  );
 
   const systemBase =
     (chatThread?.personaMessage || "") +
