@@ -54,8 +54,12 @@ function resolveIsSlDoc(uploadDept: string): boolean {
   return uploadDept !== nonSpDept;
 }
 
-// SharePointへ同期コピー（失敗したらthrow）
-async function publishToSharePoint(file: File, dept: string) {
+// SharePointへ同期コピー
+// 戻り値: null = SL無効（スキップ）, オブジェクト = 成功, throw = エラー
+async function publishToSharePoint(
+  file: File,
+  dept: string
+): Promise<{ ok: true; dept?: string; webUrl?: string; name?: string } | null> {
   const fileBase64 = await fileToBase64(file);
 
   const r = await fetch("/api/sl/publish", {
@@ -67,6 +71,13 @@ async function publishToSharePoint(file: File, dept: string) {
       dept,
     }),
   });
+
+  // ★ SL無効時（NEXT_PUBLIC_SL_ENABLED=false）はサーバが404を返す
+  // → エラーにせずnullを返してスキップ
+  if (r.status === 404) {
+    console.log("[SL] publish disabled, skipping SharePoint sync");
+    return null;
+  }
 
   const json = await r.json().catch(() => ({}));
 
@@ -89,7 +100,7 @@ class FileStore {
   public async onFileChange(props: {
     formData: FormData;
     chatThreadId: string;
-    dept?: string; // トグルから渡す
+    dept?: string;
   }) {
     const { formData, chatThreadId, dept: requestedDept } = props;
 
@@ -104,7 +115,6 @@ class FileStore {
         return;
       }
 
-      // FE上の候補dept（最終確定値ではない）
       const requestedUploadDept = resolveUploadDept(requestedDept);
       const requestedIsSlDoc = resolveIsSlDoc(requestedUploadDept);
 
@@ -115,16 +125,11 @@ class FileStore {
       const crackingResponse = await CrackDocument(formData);
 
       if (crackingResponse.status === "OK" && uploadResponse.status === "OK") {
-        // 先に SharePoint 側で最終 dept を確定させる
         let actualDept = requestedUploadDept;
         let actualIsSlDoc = requestedIsSlDoc;
         let sp:
-          | {
-              ok: true;
-              dept?: string;
-              webUrl?: string;
-              name?: string;
-            }
+          | { ok: true; dept?: string; webUrl?: string; name?: string }
+          | null
           | undefined;
 
         if (requestedIsSlDoc) {
@@ -132,16 +137,23 @@ class FileStore {
             this.uploadButtonLabel = "Syncing to SharePoint";
             sp = await publishToSharePoint(file, requestedUploadDept);
 
-            // サーバで最終的に決定した dept を採用
-            actualDept = normalizeDept(sp.dept || requestedUploadDept);
-            actualIsSlDoc = resolveIsSlDoc(actualDept);
+            if (sp === null) {
+              // ★ SL無効 → SP syncスキップ、通常indexingへ
+              actualDept = requestedUploadDept;
+              actualIsSlDoc = false;
+              console.log("[SL] SP sync skipped (disabled). Proceeding with normal indexing.");
+            } else {
+              // SP sync成功
+              actualDept = normalizeDept(sp.dept || requestedUploadDept);
+              actualIsSlDoc = resolveIsSlDoc(actualDept);
 
-            showSuccess({
-              title: "SharePoint sync",
-              description: sp.webUrl
-                ? `Synced to SharePoint (${actualDept}): ${sp.webUrl}`
-                : `Synced to SharePoint (${actualDept}): ${sp.name || file.name}`,
-            });
+              showSuccess({
+                title: "SharePoint sync",
+                description: sp.webUrl
+                  ? `Synced to SharePoint (${actualDept}): ${sp.webUrl}`
+                  : `Synced to SharePoint (${actualDept}): ${sp.name || file.name}`,
+              });
+            }
           } catch (e: any) {
             showError(
               `SharePoint sync failed (index skipped): ${String(
@@ -205,8 +217,9 @@ class FileStore {
         }
       } else {
         const crackingErrors =
-          (crackingResponse as any)?.errors?.map((e: any) => e.message).join("\n") ||
-          "Failed to process document.";
+          (crackingResponse as any)?.errors
+            ?.map((e: any) => e.message)
+            .join("\n") || "Failed to process document.";
         showError(crackingErrors);
       }
     } catch (error) {
