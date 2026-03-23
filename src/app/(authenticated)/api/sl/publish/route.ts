@@ -174,7 +174,7 @@ async function graphPutBinary(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": mimeType,
     },
-    body: uint8,  // ★ ArrayBuffer/SharedArrayBuffer ではなく Uint8Array を使う
+    body: uint8,
   });
 
   if (!res.ok) {
@@ -193,6 +193,18 @@ export async function OPTIONS() {
 
 export async function POST(req: NextRequest) {
   try {
+    // ---------------------------------------------------
+    // SL機能の有効/無効を最初に判定
+    // false / 未設定 / 空文字 の場合は SharePoint 処理へ入らない
+    // ---------------------------------------------------
+    if (process.env.NEXT_PUBLIC_SL_ENABLED !== "true") {
+      console.log("[SL publish] disabled by NEXT_PUBLIC_SL_ENABLED");
+      return NextResponse.json(
+        { ok: false, disabled: true, error: "SL publish is disabled" },
+        { status: 404 }
+      );
+    }
+
     const accessToken = await getValidAccessToken(req);
     if (!accessToken) {
       return NextResponse.json(
