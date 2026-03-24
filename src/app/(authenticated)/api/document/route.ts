@@ -4,14 +4,28 @@ import { getToken } from "next-auth/jwt";
 import { decideDept, getUserEmailFromJwtToken } from "@/lib/sl-dept";
 import { SearchAzureAISimilarDocuments } from "@/features/chat-page/chat-services/chat-api/chat-api-rag-extension";
 import { hashValue } from "@/features/auth-page/helpers";
+import { userSession } from "@/features/auth-page/helpers";
 
 export async function POST(req: NextRequest) {
   try {
-    // NextRequest からトークン取得（cookieが正しく読める）
-    const token = await getToken({ req });
-    const email = token
-      ? getUserEmailFromJwtToken(token)
-      : (process.env.SL_LOCAL_DEFAULT_EMAIL ?? null);
+    let email: string | null = null;
+
+    const token = await getToken({ req }).catch(() => null);
+    const tokenEmail = token ? getUserEmailFromJwtToken(token) : null;
+
+    let sessionEmail: string | null = null;
+    try {
+      const session = await userSession();
+      sessionEmail = session?.email ?? null;
+    } catch (e) {
+      console.log("[DOC] userSession() failed");
+    }
+
+    email =
+      tokenEmail ||
+      sessionEmail ||
+      (process.env.SL_LOCAL_DEFAULT_EMAIL ?? null);
+
     const deptLower = decideDept({ requestedDept: undefined, userEmail: email });
     const userHash = email ? hashValue(email) : null;
 
