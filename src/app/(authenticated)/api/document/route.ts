@@ -10,9 +10,14 @@ export async function POST(req: NextRequest) {
   try {
     let email: string | null = null;
 
+    // 優先①: executeFunction が付けた x-user-email ヘッダー
+    const headerEmail = req.headers.get("x-user-email") ?? null;
+
+    // 優先②: JWTトークン
     const token = await getToken({ req }).catch(() => null);
     const tokenEmail = token ? getUserEmailFromJwtToken(token) : null;
 
+    // 優先③: サーバーセッション
     let sessionEmail: string | null = null;
     try {
       const session = await userSession();
@@ -22,6 +27,7 @@ export async function POST(req: NextRequest) {
     }
 
     email =
+      headerEmail ||
       tokenEmail ||
       sessionEmail ||
       (process.env.SL_LOCAL_DEFAULT_EMAIL ?? null);
