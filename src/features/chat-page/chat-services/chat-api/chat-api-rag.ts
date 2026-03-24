@@ -15,19 +15,27 @@ import { ChatCitationModel, ChatThreadModel } from "../models";
 import { decideDept, getUserEmailFromJwtToken } from "@/lib/sl-dept";
 import { getToken } from "next-auth/jwt";
 import { cookies } from "next/headers";
+import { hashValue } from "@/features/auth-page/helpers";
 
 // OData filter用にシングルクォートをエスケープ
 function odataEscape(v: string) {
   return String(v ?? "").replace(/'/g, "''");
 }
 
+type UserContext = {
+  email: string | null;
+  deptLower: string;
+  userHash: string | null;
+};
+
 /**
- * サーバ側で「ユーザーの deptLower」を決める
+ * サーバ側で「ユーザーの email / deptLower / userHash」を決める
  * - token から email を抜く
  * - email → dept 判定（sl-dept.ts）
+ * - email → hashValue(email)
  * - fallback は SL_DEPT_DEFAULT
  */
-async function resolveDeptLower(): Promise<string> {
+async function resolveUserContext(): Promise<UserContext> {
   try {
     const cookieStore = await cookies();
 
@@ -45,12 +53,27 @@ async function resolveDeptLower(): Promise<string> {
 
     const email = token ? getUserEmailFromJwtToken(token) : null;
 
-    return decideDept({
+    const deptLower = decideDept({
       requestedDept: undefined,
       userEmail: email,
     });
+
+    const userHash = email ? hashValue(email) : null;
+
+    return {
+      email,
+      deptLower,
+      userHash,
+    };
   } catch {
-    return (process.env.SL_DEPT_DEFAULT ?? "cp").toLowerCase().trim() || "cp";
+    const deptLower =
+      (process.env.SL_DEPT_DEFAULT ?? "cp").toLowerCase().trim() || "cp";
+
+    return {
+      email: null,
+      deptLower,
+      userHash: null,
+    };
   }
 }
 
@@ -71,9 +94,11 @@ export const ChatApiRAG = async (props: {
   const { chatThread, userMessage, history, signal } = props;
 
   const openAI = OpenAIInstance();
-  const deptLower = await resolveDeptLower();
+  const { email, deptLower, userHash } = await resolveUserContext();
 
+  console.log("[RAG-EXT] email =", email);
   console.log("[RAG-EXT] deptLower =", deptLower);
+  console.log("[RAG-EXT] userHash =", userHash ? "***" : "(none)");
 
   // 業務条件は chatThreadId のみ
   // ACL は azure-ai-search.ts 側の buildSearchAclFilter() に一本化
@@ -94,12 +119,15 @@ export const ChatApiRAG = async (props: {
     indexName,
     filter,
     deptLower,
+    userHash, // ★ 追加: ACL用 userHash を明示的に渡す
   });
 
   const documents: ChatCitationModel[] = [];
 
   if (documentResponse.status === "OK") {
     const withoutEmbedding = FormatCitations(documentResponse.response);
+
+    // 既存シグネチャを維持
     const citationResponse = await CreateCitations(withoutEmbedding);
 
     citationResponse.forEach((c) => {
@@ -108,7 +136,10 @@ export const ChatApiRAG = async (props: {
       }
     });
   } else {
-    console.error("[RAG-EXT] ExtensionSimilaritySearch error:", documentResponse.errors);
+    console.error(
+      "[RAG-EXT] ExtensionSimilaritySearch error:",
+      documentResponse.errors
+    );
   }
 
   const content = documents
