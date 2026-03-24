@@ -119,7 +119,7 @@ export const ChatApiRAG = async (props: {
     indexName,
     filter,
     deptLower,
-    userHash, // ★ 追加: ACL用 userHash を明示的に渡す
+    userHash: userHash ?? undefined, // ★ null → undefined に変換
   });
 
   const documents: ChatCitationModel[] = [];
