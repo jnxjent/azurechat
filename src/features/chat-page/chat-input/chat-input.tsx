@@ -35,7 +35,7 @@ import {
 
 type UploadScope = "common" | "personal";
 
-export const ChatInput = () => {
+export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
   const { loading, input, chatThreadId } = useChat();
   const { uploadButtonLabel } = useFileStore();
   const { isPlaying } = useTextToSpeech();
@@ -49,7 +49,7 @@ export const ChatInput = () => {
 
   // ★ 管理者判定（セッションのisAdminを使用 - ビルド時env不要）
   const { data: session } = useSession();
-  const isAdmin = Boolean((session?.user as any)?.isAdmin);
+  const isAdmin = isAdminProp ?? Boolean((session?.user as any)?.isAdmin);
 
   const [uploadScope, setUploadScope] = useState<UploadScope>("personal");
 
