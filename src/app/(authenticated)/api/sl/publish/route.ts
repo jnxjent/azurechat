@@ -11,6 +11,7 @@ import {
   getUserEmailFromJwtToken,
   isSharePointEnabledDept,
   normalizeUploadScope,
+  resolveSlRole,
   type UploadScope,
 } from "@/lib/sl-dept";
 
@@ -70,22 +71,6 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
 }
 
 // -------------------------------------------------------
-// Admin helpers
-// -------------------------------------------------------
-function parseCsvLower(value?: string | null) {
-  return (value ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function isAdminEmail(email: string | null) {
-  if (!email) return false;
-  const admins = parseCsvLower(process.env.SL_ADMIN_EMAILS);
-  return admins.includes(email.toLowerCase());
-}
-
-// -------------------------------------------------------
 // Graph API helpers
 // -------------------------------------------------------
 async function resolveSiteAndDrive(
@@ -141,7 +126,7 @@ async function graphPutBinary(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": mimeType,
     },
-    body: new Uint8Array(buffer),  // ← Uint8Array は BodyInit として有効
+    body: new Uint8Array(buffer),
   });
 
   if (!res.ok) {
@@ -219,8 +204,6 @@ export async function POST(req: NextRequest) {
 
     const requestedUploadScope = resolveRequestedUploadScope(body);
 
-    // 部署は userEmail から確定
-    // requestedDept は「本当に部署を明示したい互換用途」がある場合だけ補助的に使う
     const deptLower = decideDept({
       requestedDept:
         typeof body?.requestedDept === "string" ? body.requestedDept : undefined,
@@ -228,7 +211,10 @@ export async function POST(req: NextRequest) {
     });
 
     const isSpDept = isSharePointEnabledDept(deptLower);
-    const admin = isAdminEmail(userEmail);
+
+    // ★ isAdminEmail → resolveSlRole に変更
+    const slRole = resolveSlRole(userEmail, deptLower);
+    const admin = slRole === "global_admin" || slRole === "dept_admin";
 
     // SP非対応部署はこのAPI対象外
     if (!isSpDept) {
@@ -248,21 +234,23 @@ export async function POST(req: NextRequest) {
     const actualUploadScope: UploadScope = admin
       ? requestedUploadScope
       : "personal";
-
-    // 部署ごとの SP 設定
-    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(deptLower);
-
-    // 最終アップ先フォルダー
-    // common   -> SL/common
-    // personal -> SL/<mailPrefix>
-    const uploadFolder = buildUploadFolder({
-      baseFolder,
-      uploadScope: actualUploadScope,
-      userEmail,
-    });
+    
+      // ★ global_admin + common → SLCommon（全社）へ
+    // ★ それ以外 → 部署フォルダー
+    const deptForConfig =
+      slRole === "global_admin" && actualUploadScope === "common"
+        ? "common"          // ← 文字列で直接指定
+        : deptLower;
+    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(deptForConfig);
+    // ★ global_admin + common → SL/Common 直下
+    // ★ それ以外 → buildUploadFolder（common/個人サブフォルダー）
+    const uploadFolder =
+      slRole === "global_admin" && actualUploadScope === "common"
+        ? baseFolder
+        : buildUploadFolder({ baseFolder, uploadScope: actualUploadScope, userEmail });
 
     console.log(
-      `[SL publish] dept=${deptLower} user=${userEmail} admin=${admin} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
+      `[SL publish] dept=${deptLower} user=${userEmail} role=${slRole} admin=${admin} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
     );
 
     const fileBuffer = Buffer.from(fileBase64, "base64");

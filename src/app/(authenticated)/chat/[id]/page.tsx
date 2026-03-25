@@ -11,6 +11,7 @@ import { AI_NAME } from "@/features/theme/theme-config";
 import { DisplayError } from "@/features/ui/error/display-error";
 import { getServerSession } from "next-auth";
 import { options as authOptions } from "@/features/auth-page/auth-api";
+import { decideDept, resolveSlRole } from "@/lib/sl-dept"; // ★ 追加
 
 export const metadata = {
   title: AI_NAME,
@@ -23,14 +24,7 @@ interface HomeParams {
   };
 }
 
-function isAdminEmail(email: string | null | undefined): boolean {
-  if (!email) return false;
-  const admins = (process.env.SL_ADMIN_EMAILS ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  return admins.includes(email.toLowerCase());
-}
+// ★ isAdminEmail関数を削除（resolveSlRoleに統合）
 
 export default async function Home(props: HomeParams) {
   const { id } = props.params;
@@ -57,10 +51,12 @@ export default async function Home(props: HomeParams) {
     return <DisplayError errors={chatThreadResponse.errors} />;
   }
 
-  // SL_ADMIN_EMAILS に含まれるユーザーのみ isAdmin=true
+  // ★ resolveSlRole でrole解決
   const userEmail = session?.user?.email;
-  const isAdmin = isAdminEmail(userEmail);
-
+  const deptLower = decideDept({ userEmail });
+  const slRole = resolveSlRole(userEmail, deptLower);
+  const isAdmin = slRole === "global_admin" || slRole === "dept_admin";
+  console.log(`[ROLE] email=${userEmail} dept=${deptLower} role=${slRole}`);
   return (
     <ChatPage
       messages={chatResponse.response}

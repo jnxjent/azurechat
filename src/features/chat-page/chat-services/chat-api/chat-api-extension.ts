@@ -227,7 +227,8 @@ function resolveModelForExtensions(chatThread: ChatThreadModel): string {
     typeof SF_EXTENSION_ID === "string" &&
     SF_EXTENSION_ID.length > 0 &&
     extensions.includes(SF_EXTENSION_ID);
-
+  
+  
   if (hasSfExt) {
     const sfOrchestratorModel =
       process.env.AZURE_OPENAI_SOQL_CHAT_MODEL?.trim() ||

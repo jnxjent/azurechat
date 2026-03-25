@@ -215,7 +215,8 @@ export function getPersonalFolderNameFromEmail(email: string): string {
 export function getDeptConfig(deptLower: string): SlDeptConfig {
   const dept = deptLower.trim().toLowerCase();
 
-  if (!isAllowedDept(dept)) {
+  // ★ "common" は RESERVED だが getDeptConfig では許可（SLCommon用）
+  if (dept !== "common" && !isAllowedDept(dept)) {
     throw new Error(`Dept "${dept}" is not allowed (check SL_DEPTS).`);
   }
 
@@ -282,4 +283,45 @@ export function getUserEmailFromJwtToken(token: any): string | null {
   }
 
   return null;
+}
+// ============================================================
+// ★ DeptAdmin / SlRole（2026-03追加）
+// ============================================================
+
+export type SlRole = "global_admin" | "dept_admin" | "dept_member";
+
+/**
+ * メールアドレスが指定部署のDeptAdminか判定
+ * 環境変数: SL_DEPT_ADMIN_EMAILS_CP / SL_DEPT_ADMIN_EMAILS_SS
+ */
+export function isDeptAdmin(email: string, dept: string): boolean {
+  const emailLc = email.trim().toLowerCase();
+  const key = `SL_DEPT_ADMIN_EMAILS_${dept.toUpperCase()}`;
+  const set = parseCsvEmails(process.env[key]); // 既存関数を再利用
+  return set.has(emailLc);
+}
+
+/**
+ * SlRole解決（優先順位: global_admin > dept_admin > dept_member）
+ * 環境変数:
+ *   SL_ADMIN_EMAILS          → global_admin
+ *   SL_DEPT_ADMIN_EMAILS_CP  → dept_admin（cp）
+ *   SL_DEPT_ADMIN_EMAILS_SS  → dept_admin（ss）
+ */
+export function resolveSlRole(
+  email: string | null | undefined,
+  dept: string
+): SlRole {
+  if (!email) return "dept_member";
+  const emailLc = email.trim().toLowerCase();
+
+  // 1) GlobalAdmin
+  const globalAdminSet = parseCsvEmails(process.env.SL_ADMIN_EMAILS);
+  if (globalAdminSet.has(emailLc)) return "global_admin";
+
+  // 2) DeptAdmin
+  if (isDeptAdmin(emailLc, dept)) return "dept_admin";
+
+  // 3) Member
+  return "dept_member";
 }

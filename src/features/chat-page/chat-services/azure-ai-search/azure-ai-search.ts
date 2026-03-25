@@ -1,7 +1,7 @@
 "use server";
 import "server-only";
-
 import { userHashedId } from "@/features/auth-page/helpers";
+import { isSharePointEnabledDept } from "@/lib/sl-dept"; // ★ 追加
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import {
   AzureAISearchIndexClientInstance,
@@ -89,13 +89,18 @@ async function buildSearchAclFilter(
   userHash?: string
 ): Promise<string | undefined> {
   if (deptLower === null) return undefined;
-
   const normalizedDept = (deptLower ?? "others").toLowerCase().trim();
-  const d = escapeODataValue(normalizedDept);
-
+  console.log("[ACL] buildSearchAclFilter called, normalizedDept =", normalizedDept); // ★追加
   const resolvedUserHash = userHash ?? (await userHashedId());
   const u = escapeODataValue(resolvedUserHash);
 
+  // ★ 非SP部署（others等）はSL文書を検索対象外にする
+  if (!isSharePointEnabledDept(normalizedDept)) {
+    console.log("[ACL] non-SP dept, SL docs excluded:", normalizedDept);
+    return `((isSlDoc ne true and user eq '${u}'))`;
+  }
+
+  const d = escapeODataValue(normalizedDept);
   // 従来の個人文書
   const userFilter = `(isSlDoc ne true and user eq '${u}')`;
 
