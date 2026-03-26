@@ -125,7 +125,9 @@ async function buildSearchAclFilter(
     console.log("[ACL] slPersonalFilter =", slPersonalFilter);
     console.log("[ACL] slLegacyFilter =", slLegacyFilter);
 
-  return `(${userFilter} or ${slCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
+  const slGlobalCommonFilter = `(isSlDoc eq true and slScope eq 'common')`;
+  console.log("[ACL] slGlobalCommonFilter =", slGlobalCommonFilter);
+  return `(${userFilter} or ${slCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter} or ${slGlobalCommonFilter})`;
 }
 
 // -------------------------------------------------------
