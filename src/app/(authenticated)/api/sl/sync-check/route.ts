@@ -239,7 +239,7 @@ async function getIndexDocs(
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
         `&$select=id,fileUrl,dept` +
-        `&$filter=dept eq '${dept.replace(/'/g, "''")}'` +
+        `&$filter=dept eq '${dept.replace(/'/g, "''")}' and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
         headers: { "api-key": apiKey, "Content-Type": "application/json" },

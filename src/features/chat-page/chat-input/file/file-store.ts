@@ -124,12 +124,19 @@ class FileStore {
         let actualDept = "";
         let actualIsSlDoc = false;
         let actualUploadScope: UploadScope = requestedUploadScope;
+        // ★ SP webUrl を保持する変数（SPアップ成功時のみ設定される）
+        let spWebUrl: string | undefined;
 
         try {
           this.uploadButtonLabel = "Syncing to SharePoint";
 
           const sp = await publishToSharePoint(file, requestedUploadScope);
 
+          // ★ SP webUrl を取得（Index の fileUrl に使う）
+          if (sp.isSharePointEnabled === true && !sp.webUrl) {
+            throw new Error("SharePoint publish succeeded but webUrl was empty.");
+          }
+          spWebUrl = sp.webUrl;
           actualDept = String(sp.dept ?? "").toLowerCase().trim();
           actualUploadScope = normalizeUploadScope(
             sp.uploadScope ?? requestedUploadScope
@@ -178,9 +185,14 @@ class FileStore {
             crackingResponse.response.length
           }]`;
 
+          // ★ SPアップ成功時は SP webUrl を使う。それ以外は従来通り Blob URL。
+          // SL documents use SP webUrl as fileUrl so that deleted SP files
+          // are no longer reachable, avoiding stale Blob links in search results.
+          const effectiveFileUrl = spWebUrl ?? uploadResponse.response;
+
           const indexResponses = await IndexDocuments(
             file.name,
-            uploadResponse.response,
+            effectiveFileUrl,
             [doc],
             chatThreadId,
             actualDept,
