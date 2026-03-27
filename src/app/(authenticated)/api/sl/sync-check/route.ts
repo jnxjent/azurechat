@@ -4,6 +4,12 @@
 // Indexに残っている孤立ドキュメントを削除する。
 // - SharePoint: Graph (delegate / session accessToken)
 // - Azure AI Search: REST API (api-key)
+//
+// v3 変更点（最終版）:
+//   - SP走査: SL直下のみ → baseFolder配下を再帰走査
+//   - 照合キー: ファイル名（BlobURLと一致するため）
+//   - 安全ガード: fetchFailed=true（404等）の場合は削除スキップ
+//   - 安全ガード: 子フォルダのfetchFailedを親に伝播
 
 export const runtime = "nodejs";
 
@@ -17,11 +23,9 @@ import { getDeptConfig, getAllowedDepts } from "@/lib/sl-dept";
 // Optional endpoint guard
 // -------------------------------------------------------
 async function requireSyncKey(req: NextRequest) {
-  // ブラウザからの管理者セッションがあればOK
   const session = await getServerSession(authOptions);
   if ((session?.user as any)?.email) return;
 
-  // Logic App等からはキーで認証
   const required = (process.env.SL_SYNC_CHECK_KEY ?? "").trim();
   if (!required) return;
 
@@ -32,7 +36,7 @@ async function requireSyncKey(req: NextRequest) {
 }
 
 // -------------------------------------------------------
-// 委任Token取得（publish/route.ts と同じ考え方）
+// 委任Token取得
 // -------------------------------------------------------
 async function getValidAccessToken(req: NextRequest): Promise<string | null> {
   const token = await getToken({ req });
@@ -101,10 +105,7 @@ async function resolveSiteId(accessToken: string, siteUrl: string): Promise<stri
   const url = new URL(siteUrl);
   const res = await fetch(
     `https://graph.microsoft.com/v1.0/sites/${url.hostname}:${url.pathname}`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      cache: "no-store",
-    }
+    { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" }
   );
   if (!res.ok) throw new Error(`Failed to get site: ${await res.text()}`);
   const json = await res.json();
@@ -118,10 +119,7 @@ async function resolveDriveId(
 ): Promise<string> {
   const res = await fetch(
     `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      cache: "no-store",
-    }
+    { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" }
   );
   if (!res.ok) throw new Error(`Failed to get drives: ${await res.text()}`);
   const json = await res.json();
@@ -134,45 +132,93 @@ async function resolveDriveId(
 }
 
 // -------------------------------------------------------
-// Graph API: SharePoint folder file names
+// Graph API: baseFolder配下を再帰走査してファイル名を収集
+//
+// 照合キーはファイル名（item.name）
+// IndexのfileUrlがBlobURLのため、relativePath照合は不可
+//
+// 返値:
+//   fileNames   : Set<string> — ファイル名のSet
+//   fetchFailed : true = 404など参照失敗（削除禁止）
+//                 false = 正常取得（0件でも削除許可）
 // -------------------------------------------------------
-async function getSpFileNames(
+async function collectFileNamesRecursive(
   accessToken: string,
-  siteUrl: string,
-  driveName: string,
-  folder: string
-): Promise<Set<string>> {
-  const siteId = await resolveSiteId(accessToken, siteUrl);
-  const driveId = await resolveDriveId(accessToken, siteId, driveName);
-
-  const folderPath = encodeGraphPath(folder);
-
-  const fileNames = new Set<string>();
+  driveId: string,
+  currentFolderPath: string,
+  fileNames: Set<string>
+): Promise<{ fetchFailed: boolean }> {
+  const encoded = encodeGraphPath(currentFolderPath);
   let nextUrl: string | null =
     `https://graph.microsoft.com/v1.0/drives/${driveId}` +
-    `/root:/${folderPath}:/children?$select=name,file&$top=200`;
+    `/root:/${encoded}:/children?$select=name,file,folder&$top=200`;
 
   while (nextUrl) {
-    const res: Response = await fetch(nextUrl, {  // ← Response 型を明示
+    const res: Response = await fetch(nextUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
       cache: "no-store",
     });
 
-    if (res.status === 404) break; // folder not found -> empty
-    if (!res.ok) throw new Error(`Failed to list folder: ${await res.text()}`);
+    if (res.status === 404) {
+      console.warn(`[SL sync-check] Folder not found (404): ${currentFolderPath}`);
+      return { fetchFailed: true };
+    }
+    if (!res.ok) {
+      throw new Error(`Failed to list folder "${currentFolderPath}": ${await res.text()}`);
+    }
 
     const json = await res.json();
     for (const item of json.value ?? []) {
-      if (item?.file && item?.name) fileNames.add(String(item.name));
+      if (item?.file && item?.name) {
+        // ファイル → ファイル名を収集
+        fileNames.add(String(item.name));
+      } else if (item?.folder && item?.name) {
+        // サブフォルダ → 再帰。子で失敗したら親にも伝播して即返す
+        const child = await collectFileNamesRecursive(
+          accessToken,
+          driveId,
+          `${currentFolderPath}/${item.name}`,
+          fileNames
+        );
+        if (child.fetchFailed) {
+          console.warn(
+            `[SL sync-check] Child folder fetch failed: ${currentFolderPath}/${item.name} — propagating to parent`
+          );
+          return { fetchFailed: true };
+        }
+      }
     }
     nextUrl = json["@odata.nextLink"] ?? null;
   }
 
-  return fileNames;
+  return { fetchFailed: false };
+}
+
+async function getSpFileNames(
+  accessToken: string,
+  siteUrl: string,
+  driveName: string,
+  baseFolder: string
+): Promise<{ fileNames: Set<string>; fetchFailed: boolean }> {
+  const siteId = await resolveSiteId(accessToken, siteUrl);
+  const driveId = await resolveDriveId(accessToken, siteId, driveName);
+
+  const fileNames = new Set<string>();
+  const { fetchFailed } = await collectFileNamesRecursive(
+    accessToken,
+    driveId,
+    baseFolder,
+    fileNames
+  );
+
+  console.log(
+    `[SL sync-check] SP recursive scan: baseFolder="${baseFolder}" total=${fileNames.size} fetchFailed=${fetchFailed}`
+  );
+  return { fileNames, fetchFailed };
 }
 
 // -------------------------------------------------------
-// Azure Search: dept docs
+// Azure Search: dept docs（ファイル名で照合）
 // -------------------------------------------------------
 async function getIndexDocs(
   dept: string
@@ -180,7 +226,7 @@ async function getIndexDocs(
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
   const apiKey = process.env.AZURE_SEARCH_API_KEY;
-  
+
   if (!endpoint || !apiKey || !indexName) {
     throw new Error("Missing Azure Search env vars (AZURE_SEARCH_ENDPOINT/API_KEY/INDEX_NAME)");
   }
@@ -196,10 +242,7 @@ async function getIndexDocs(
         `&$filter=dept eq '${dept.replace(/'/g, "''")}'` +
         `&$top=${top}&$skip=${skip}`,
       {
-        headers: {
-          "api-key": apiKey,
-          "Content-Type": "application/json",
-        },
+        headers: { "api-key": apiKey, "Content-Type": "application/json" },
         cache: "no-store",
       }
     );
@@ -287,21 +330,45 @@ export async function POST(req: NextRequest) {
 
     for (const dept of getAllowedDepts()) {
       try {
-        const { siteUrl, driveName, folder } = getDeptConfig(dept);
+        const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(dept);
 
-        const spFiles = await getSpFileNames(accessToken, siteUrl, driveName, folder);
-        console.log(`[SL sync-check] dept=${dept} SP files=${spFiles.size}`);
+        // SP側: ファイル名のSetを再帰取得
+        const { fileNames: spFileNames, fetchFailed } = await getSpFileNames(
+          accessToken,
+          siteUrl,
+          driveName,
+          baseFolder
+        );
+        console.log(
+          `[SL sync-check] dept=${dept} SP fileNames=${spFileNames.size} fetchFailed=${fetchFailed}`
+        );
 
+        // ★ 安全ガード: 参照失敗（404等）の場合は削除をスキップ
+        if (fetchFailed) {
+          console.warn(
+            `[SL sync-check] dept=${dept} SP fetch failed — skipping deletion to avoid data loss`
+          );
+          results[dept] = {
+            spFileNames: 0,
+            indexDocs: "unknown",
+            deleted: 0,
+            skipped: "sp_fetch_failed",
+          };
+          continue;
+        }
+
+        // Index側: ファイル名で取得
         const indexDocs = await getIndexDocs(dept);
-        console.log(`[SL sync-check] dept=${dept} indexed files=${indexDocs.length}`);
+        console.log(`[SL sync-check] dept=${dept} indexed docs=${indexDocs.length}`);
 
+        // 照合: ファイル名で比較
         const orphanIds = indexDocs
-          .filter((doc) => !spFiles.has(doc.fileName))
+          .filter((doc) => !spFileNames.has(doc.fileName))
           .map((doc) => doc.id);
 
         if (orphanIds.length === 0) {
           results[dept] = {
-            spFiles: spFiles.size,
+            spFileNames: spFileNames.size,
             indexDocs: indexDocs.length,
             deleted: 0,
           };
@@ -312,7 +379,7 @@ export async function POST(req: NextRequest) {
         await deleteIndexDocs(orphanIds);
 
         results[dept] = {
-          spFiles: spFiles.size,
+          spFileNames: spFileNames.size,
           indexDocs: indexDocs.length,
           deleted: orphanIds.length,
         };

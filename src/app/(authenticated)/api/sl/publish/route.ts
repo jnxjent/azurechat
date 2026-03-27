@@ -235,7 +235,7 @@ export async function POST(req: NextRequest) {
       ? requestedUploadScope
       : "personal";
     
-      // ★ global_admin + common → SLCommon（全社）へ
+    // ★ global_admin + common → SLCommon（全社）へ
     // ★ それ以外 → 部署フォルダー
     const deptForConfig =
       slRole === "global_admin" && actualUploadScope === "common"
