@@ -117,10 +117,10 @@ async function collectFileNamesRecursive(
     `/root:/${encoded}:/children?$select=name,file,folder&$top=200`;
 
   while (nextUrl) {
-    const res = await fetch(nextUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      cache: "no-store",
-    });
+    const res: Response = await fetch(nextUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    cache: "no-store",
+  });
 
     if (res.status === 404) {
       console.warn(`[SL sync] Folder not found (404): ${currentFolderPath}`);
