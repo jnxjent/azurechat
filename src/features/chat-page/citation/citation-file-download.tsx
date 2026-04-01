@@ -2,6 +2,7 @@
 
 import { FindCitationByID } from "../chat-services/citation-service";
 import { GenerateSasUrl } from "@/features/common/services/azure-storage";
+
 export const CitationFileDownload = async (
   formData: FormData
 ) => {
@@ -9,8 +10,8 @@ export const CitationFileDownload = async (
 
   if (searchResponse.status === "OK") {
     const response = searchResponse.response;
-    const {document} = response.content;
-    return document.fileUrl
+    const { document } = response.content;
+    return document.effectiveFileUrl || document.fileUrl; // ★ 修正
   }
 
   return null;

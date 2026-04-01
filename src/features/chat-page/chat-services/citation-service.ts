@@ -106,10 +106,11 @@ export const FormatCitations = (citation: DocumentSearchResponse[]) => {
         pageContent: d.document.pageContent,
         chatThreadId: d.document.chatThreadId,
         fileUrl: d.document.fileUrl,
+        effectiveFileUrl: d.document.effectiveFileUrl ?? null, // ★ 追加
         id: "",
         user: "",
-        dept: d.document.dept ?? "",        // ← 追加
-        isSlDoc: d.document.isSlDoc ?? null, // ← 追加
+        dept: d.document.dept ?? "",
+        isSlDoc: d.document.isSlDoc ?? null,
       },
     });
   });
