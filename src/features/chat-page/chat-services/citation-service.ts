@@ -98,15 +98,26 @@ export const FindCitationByID = async (
 
 export const FormatCitations = (citation: DocumentSearchResponse[]) => {
   const withoutEmbedding: DocumentSearchResponse[] = [];
+
   citation.forEach((d) => {
+    console.log(
+      "[CITATION] effectiveFileUrl=",
+      d.document.effectiveFileUrl,
+      "fileUrl=",
+      d.document.fileUrl
+    );
+
     withoutEmbedding.push({
       score: d.score,
       document: {
         metadata: d.document.metadata,
         pageContent: d.document.pageContent,
         chatThreadId: d.document.chatThreadId,
-        fileUrl: d.document.fileUrl,
-        effectiveFileUrl: d.document.effectiveFileUrl ?? null, // ★ 追加
+
+        // ★★★ ここが修正ポイント ★★★
+        fileUrl: d.document.effectiveFileUrl ?? d.document.fileUrl,
+
+        effectiveFileUrl: d.document.effectiveFileUrl ?? null,
         id: "",
         user: "",
         dept: d.document.dept ?? "",
