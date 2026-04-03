@@ -23,10 +23,10 @@ export interface AzureSearchDocumentIndex {
   chatThreadId: string;
   metadata: string;
   fileUrl: string;
-  effectiveFileUrl?: string | null; // ★ 追加
+  effectiveFileUrl?: string | null;
   dept: string;
   isSlDoc: boolean | null;
-  slScope?: "common" | "personal" | null;
+  slScope?: "global_common" | "dept_common" | "personal" | null;
   slOwner?: string | null;
 }
 
@@ -49,77 +49,85 @@ function combineFilters(a?: string, b?: string): string | undefined {
   return `(${aa}) and (${bb})`;
 }
 
-type UploadScope = "common" | "personal";
+type UploadScope = "global_common" | "dept_common" | "personal";
 
 function normalizeUploadScope(value?: string | null): UploadScope {
   const v = (value ?? "").toLowerCase().trim();
 
-  if (v === "common") return "common";
+  if (v === "global_common") return "global_common";
+  if (v === "dept_common") return "dept_common";
   if (v === "personal") return "personal";
+
+  // 旧値互換
+  if (v === "common") return "dept_common";
   if (v === "cp") return "personal";
 
   return "personal";
 }
 
 /**
- * ACL統一関数（新仕様）
+ * ACL統一関数（3Scope版）
  *
- * - 個人文書（従来Blob等）:
- *     isSlDoc != true and user == 自分
+ * 非SL文書:
+ *   isSlDoc != true and user == 自分
  *
- * - SL文書:
- *     isSlDoc == true
- *     and dept == 自部署
- *     and (
- *       slScope == "common"
- *       or (slScope == "personal" and slOwner == 自分)
- *     )
+ * SL文書:
+ *   global_common : 全員
+ *   dept_common   : 自部署
+ *   personal      : 自部署 + 自分
  *
- * 互換:
- * - 旧SL文書（slScope/slOwner未設定）は
- *   dept一致なら暫定的に検索対象へ含める
- *
- * 使い分け:
- * - deptLower === null      → ACLを付けない（明示的無効化）
- * - deptLower === undefined → fallbackで "others"
- * - userHash が渡された場合はそれを使う（Route Handler経由）
- * - userHash が未指定の場合は userHashedId() を呼ぶ（Server Action経由）
+ * 旧SL文書互換:
+ *   slScope/slOwner 未設定なら dept一致で暫定許可
  */
 async function buildSearchAclFilter(
   deptLower?: string | null,
   userHash?: string
 ): Promise<string | undefined> {
   if (deptLower === null) return undefined;
+
   const normalizedDept = (deptLower ?? "others").toLowerCase().trim();
   console.log("[ACL] buildSearchAclFilter called, normalizedDept =", normalizedDept);
+
   const resolvedUserHash = userHash ?? (await userHashedId());
   const u = escapeODataValue(resolvedUserHash);
 
-  // 非SP部署（others等）はSL文書を検索対象外にする
+  // 非SP部署（others等）はSL文書を検索対象外
   if (!isSharePointEnabledDept(normalizedDept)) {
     console.log("[ACL] non-SP dept, SL docs excluded:", normalizedDept);
     return `((isSlDoc ne true and user eq '${u}'))`;
   }
 
   const d = escapeODataValue(normalizedDept);
+
   const userFilter = `(isSlDoc ne true and user eq '${u}')`;
-  const slCommonFilter =
-    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'common')`;
+
+  const slGlobalCommonFilter =
+    `(isSlDoc eq true and slScope eq 'global_common')`;
+
+  const slDeptCommonFilter =
+    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'dept_common')`;
+
   const slPersonalFilter =
     `(isSlDoc eq true and dept eq '${d}' and slScope eq 'personal' and slOwner eq '${u}')`;
+
   const slLegacyFilter =
     `(isSlDoc eq true and dept eq '${d}' and (slScope eq null or slScope eq ''))`;
 
   console.log("[ACL] resolvedUserHash =", resolvedUserHash);
   console.log("[ACL] normalizedDept =", normalizedDept);
   console.log("[ACL] userFilter =", userFilter);
-  console.log("[ACL] slCommonFilter =", slCommonFilter);
+  console.log("[ACL] slGlobalCommonFilter =", slGlobalCommonFilter);
+  console.log("[ACL] slDeptCommonFilter =", slDeptCommonFilter);
   console.log("[ACL] slPersonalFilter =", slPersonalFilter);
   console.log("[ACL] slLegacyFilter =", slLegacyFilter);
 
-  const slGlobalCommonFilter = `(isSlDoc eq true and slScope eq 'common')`;
-  console.log("[ACL] slGlobalCommonFilter =", slGlobalCommonFilter);
-  return `(${userFilter} or ${slCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter} or ${slGlobalCommonFilter})`;
+  const finalAcl = `(${userFilter} or ${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
+    console.log("[ACL] FINAL FILTER =", finalAcl);
+    return finalAcl;
+
+  
+
+  
 }
 
 // -------------------------------------------------------
@@ -301,7 +309,7 @@ export const IndexDocuments = async (
   dept: string,
   isSlDoc: boolean,
   uploadScope?: string,
-  effectiveFileUrl?: string // ★ 追加
+  effectiveFileUrl?: string
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
@@ -317,7 +325,7 @@ export const IndexDocuments = async (
         pageContent: doc,
         metadata: fileName,
         fileUrl,
-        effectiveFileUrl: effectiveFileUrl ?? fileUrl, // ★ 追加（未指定時はfileUrlをフォールバック）
+        effectiveFileUrl: effectiveFileUrl ?? fileUrl,
         embedding: [],
         dept: normalizedDept,
         isSlDoc,
