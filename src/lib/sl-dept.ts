@@ -201,6 +201,11 @@ export type SlAccess = {
   dept: string;
 };
 
+export type SlUploadTarget = {
+  dept: string;
+  access: SlAccess;
+};
+
 export function isDeptAdmin(email: string, dept: string): boolean {
   const emailLc = email.trim().toLowerCase();
   const key = `SL_DEPT_ADMIN_EMAILS_${dept.toUpperCase()}`;
@@ -278,4 +283,49 @@ export function resolveSlRole(
   dept: string
 ): SlRole {
   return resolveSlAccess(email, dept).role;
+}
+
+export function resolveSlUploadTarget(
+  email: string | null | undefined,
+  uploadScope: UploadScope,
+  preferredDept?: string | null
+): SlUploadTarget {
+  const access = resolveSlAccess(email, preferredDept);
+  const emailDept = email ? detectDeptByEmail(email) : null;
+
+  if (uploadScope === "common") {
+    if (access.role === "global_admin") {
+      return {
+        dept: "common",
+        access,
+      };
+    }
+
+    return {
+      dept: access.dept,
+      access,
+    };
+  }
+
+  if (emailDept) {
+    return {
+      dept: emailDept,
+      access,
+    };
+  }
+
+  if (access.role === "dept_admin") {
+    return {
+      dept: access.dept,
+      access,
+    };
+  }
+
+  return {
+    dept: decideDept({
+      requestedDept: preferredDept ?? undefined,
+      userEmail: email ?? undefined,
+    }),
+    access,
+  };
 }

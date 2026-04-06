@@ -99,8 +99,6 @@ async function buildSearchAclFilter(
 
   const d = escapeODataValue(normalizedDept);
 
-  const userFilter = `(isSlDoc ne true and user eq '${u}')`;
-
   const slGlobalCommonFilter =
     `(isSlDoc eq true and slScope eq 'global_common')`;
 
@@ -115,13 +113,13 @@ async function buildSearchAclFilter(
 
   console.log("[ACL] resolvedUserHash =", resolvedUserHash);
   console.log("[ACL] normalizedDept =", normalizedDept);
-  console.log("[ACL] userFilter =", userFilter);
   console.log("[ACL] slGlobalCommonFilter =", slGlobalCommonFilter);
   console.log("[ACL] slDeptCommonFilter =", slDeptCommonFilter);
   console.log("[ACL] slPersonalFilter =", slPersonalFilter);
   console.log("[ACL] slLegacyFilter =", slLegacyFilter);
 
-  const finalAcl = `(${userFilter} or ${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
+  // SharePoint対応ユーザーは SharePoint由来の文書のみ検索対象にする。
+  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
     console.log("[ACL] FINAL FILTER =", finalAcl);
     return finalAcl;
 
@@ -315,7 +313,9 @@ export const IndexDocuments = async (
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
     const currentUserHash = await userHashedId();
     const normalizedDept = (dept ?? "others").toLowerCase().trim();
-    const normalizedScope = normalizeUploadScope(uploadScope);
+    // "common" dept は global_admin が全社共有 SP にアップしたもの → global_common 扱い
+    const normalizedScope =
+      normalizedDept === "common" ? "global_common" : normalizeUploadScope(uploadScope);
 
     for (const doc of docs) {
       documentsToIndex.push({

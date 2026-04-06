@@ -12,12 +12,10 @@ import {
   isSharePointEnabledDept,
   normalizeUploadScope,
   resolveSlAccess,
+  resolveSlUploadTarget,
   type UploadScope,
 } from "@/lib/sl-dept";
 
-// -------------------------------------------------------
-// Token refresh helper
-// -------------------------------------------------------
 async function getValidAccessToken(req: NextRequest): Promise<string | null> {
   const token = await getToken({ req });
   if (!token) return null;
@@ -62,7 +60,6 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
       return accessToken;
     }
 
-    console.log("[SL publish] Token refreshed successfully");
     return data.access_token as string;
   } catch (e) {
     console.error("[SL publish] Token refresh error:", e);
@@ -70,9 +67,6 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
   }
 }
 
-// -------------------------------------------------------
-// Graph API helpers
-// -------------------------------------------------------
 async function resolveSiteAndDrive(
   accessToken: string,
   siteUrl: string,
@@ -87,8 +81,7 @@ async function resolveSiteAndDrive(
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   if (!siteRes.ok) {
-    const err = await siteRes.text();
-    throw new Error(`Failed to get site: ${err}`);
+    throw new Error(`Failed to get site: ${await siteRes.text()}`);
   }
   const siteJson = await siteRes.json();
   const siteId: string = siteJson.id;
@@ -98,8 +91,7 @@ async function resolveSiteAndDrive(
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   if (!drivesRes.ok) {
-    const err = await drivesRes.text();
-    throw new Error(`Failed to get drives: ${err}`);
+    throw new Error(`Failed to get drives: ${await drivesRes.text()}`);
   }
   const drivesJson = await drivesRes.json();
   const drive = drivesJson.value.find((d: any) => d.name === driveName);
@@ -130,15 +122,11 @@ async function graphPutBinary(
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${err}`);
+    throw new Error(`Upload failed (${res.status}): ${await res.text()}`);
   }
   return res.json();
 }
 
-// -------------------------------------------------------
-// Utils
-// -------------------------------------------------------
 function getMimeType(fileName: string): string {
   const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
 
@@ -156,18 +144,10 @@ function getMimeType(fileName: string): string {
   return mimeMap[ext] ?? "application/octet-stream";
 }
 
-/**
- * 互換対応:
- * - 新: body.uploadScope
- * - 旧: body.dept に common / personal / cp が来る場合
- */
 function resolveRequestedUploadScope(body: any): UploadScope {
   return normalizeUploadScope(body?.uploadScope ?? body?.dept);
 }
 
-// -------------------------------------------------------
-// Route handlers
-// -------------------------------------------------------
 export async function OPTIONS() {
   return NextResponse.json({}, { status: 200 });
 }
@@ -203,66 +183,63 @@ export async function POST(req: NextRequest) {
     }
 
     const requestedUploadScope = resolveRequestedUploadScope(body);
-
-    const deptLower = decideDept({
+    const preferredDept = decideDept({
       requestedDept:
         typeof body?.requestedDept === "string" ? body.requestedDept : undefined,
       userEmail,
     });
 
-    const isSpDept = isSharePointEnabledDept(deptLower);
+    const access = resolveSlAccess(userEmail, preferredDept);
+    const admin =
+      access.role === "global_admin" || access.role === "dept_admin";
+    const actualUploadScope: UploadScope = admin
+      ? requestedUploadScope
+      : "personal";
 
-    // ★ isAdminEmail → resolveSlRole に変更
-    const slRole = resolveSlAccess(userEmail, deptLower).role;
-    const admin = slRole === "global_admin" || slRole === "dept_admin";
+    const uploadTarget = resolveSlUploadTarget(
+      userEmail,
+      actualUploadScope,
+      preferredDept
+    );
+    const targetDept = uploadTarget.dept;
 
-    // SP非対応部署はこのAPI対象外
+    const isSpDept =
+      targetDept === "common" ? true : isSharePointEnabledDept(targetDept);
+
     if (!isSpDept) {
       return NextResponse.json(
         {
           ok: false,
           error:
             "Your department is not SharePoint-enabled. Use Blob upload flow instead.",
-          dept: deptLower,
+          dept: targetDept,
           isSharePointEnabled: false,
         },
         { status: 400 }
       );
     }
 
-    // 一般メンバーは personal 固定
-    const actualUploadScope: UploadScope = admin
-      ? requestedUploadScope
-      : "personal";
-    
-    // ★ global_admin + common → SLCommon（全社）へ
-    // ★ それ以外 → 部署フォルダー
-    const deptForConfig =
-      slRole === "global_admin" && actualUploadScope === "common"
-        ? "common"          // ← 文字列で直接指定
-        : deptLower;
-    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(deptForConfig);
-    // ★ global_admin + common → SL/Common 直下
-    // ★ それ以外 → buildUploadFolder（common/個人サブフォルダー）
+    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(targetDept);
     const uploadFolder =
-      slRole === "global_admin" && actualUploadScope === "common"
+      targetDept === "common" && actualUploadScope === "common"
         ? baseFolder
-        : buildUploadFolder({ baseFolder, uploadScope: actualUploadScope, userEmail });
+        : buildUploadFolder({
+            baseFolder,
+            uploadScope: actualUploadScope,
+            userEmail,
+          });
 
     console.log(
-      `[SL publish] dept=${deptLower} user=${userEmail} role=${slRole} admin=${admin} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
+      `[SL publish] preferredDept=${preferredDept} targetDept=${targetDept} user=${userEmail} role=${access.role} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
     );
 
     const fileBuffer = Buffer.from(fileBase64, "base64");
     const mimeType = getMimeType(fileName);
-
     const { driveId } = await resolveSiteAndDrive(accessToken, siteUrl, driveName);
 
     const uploadUrl =
       `https://graph.microsoft.com/v1.0/drives/${driveId}` +
       `/root:/${uploadFolder}/${fileName}:/content`;
-
-    console.log(`[SL publish] Uploading to: ${uploadUrl}`);
 
     const result = await graphPutBinary(
       uploadUrl,
@@ -271,11 +248,9 @@ export async function POST(req: NextRequest) {
       mimeType
     );
 
-    console.log(`[SL publish] Upload success: ${result.webUrl}`);
-
     return NextResponse.json({
       ok: true,
-      dept: deptLower,
+      dept: targetDept,
       uploadScope: actualUploadScope,
       isSharePointEnabled: true,
       name: result.name,

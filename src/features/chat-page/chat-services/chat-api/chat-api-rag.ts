@@ -12,10 +12,10 @@ import { CreateCitations, FormatCitations } from "../citation-service";
 import { ChatCitationModel, ChatThreadModel } from "../models";
 
 // dept判定ユーティリティ
-import { decideDept, getUserEmailFromJwtToken } from "@/lib/sl-dept";
+import { decideDept, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
 import { getToken } from "next-auth/jwt";
 import { cookies } from "next/headers";
-import { hashValue } from "@/features/auth-page/helpers";
+import { hashValue, userSession } from "@/features/auth-page/helpers";
 
 // OData filter用にシングルクォートをエスケープ
 function odataEscape(v: string) {
@@ -37,6 +37,7 @@ type UserContext = {
  */
 async function resolveUserContext(): Promise<UserContext> {
   try {
+    const session = await userSession().catch(() => null);
     const cookieStore = await cookies();
 
     const token = await getToken({
@@ -53,10 +54,13 @@ async function resolveUserContext(): Promise<UserContext> {
 
     const email = token ? getUserEmailFromJwtToken(token) : null;
 
-    const deptLower = decideDept({
-      requestedDept: undefined,
-      userEmail: email,
-    });
+    const deptLower = email
+      ? resolveSlAccess(email).dept
+      : session?.slDept?.trim().toLowerCase() ||
+        decideDept({
+          requestedDept: undefined,
+          userEmail: email,
+        });
 
     const userHash = email ? hashValue(email) : null;
 
@@ -102,7 +106,7 @@ export const ChatApiRAG = async (props: {
 
   // 業務条件は chatThreadId のみ
   // ACL は azure-ai-search.ts 側の buildSearchAclFilter() に一本化
-  const filter = `chatThreadId eq '${odataEscape(chatThread.id)}'`;
+  const filter = `(chatThreadId eq '${odataEscape(chatThread.id)}' or isSlDoc eq true)`;
 
   console.log("[RAG-EXT] base filter =", filter);
 

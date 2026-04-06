@@ -16,6 +16,13 @@ interface Props {
   isAdmin?: boolean;
 }
 
+type SyncRow = {
+  deleted?: number;
+  error?: string;
+  skipped?: string;
+  urlUpdated?: number;
+};
+
 export const ChatHeader: FC<Props> = (props) => {
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
@@ -39,12 +46,35 @@ export const ChatHeader: FC<Props> = (props) => {
 
       const data = await res.json();
       if (data.ok) {
-        const rows = Object.values(data.results as Record<string, any>).filter(
-          (r) => !r.error
+        const allRows = Object.entries(data.results as Record<string, SyncRow>);
+        const errorDepts = allRows
+          .filter(([, row]) => row.error)
+          .map(([dept]) => dept);
+        const skippedDepts = allRows
+          .filter(([, row]) => row.skipped)
+          .map(([dept, row]) => `${dept}:${row.skipped}`);
+        const okRows = allRows
+          .filter(([, row]) => !row.error)
+          .map(([, row]) => row);
+
+        const updated = okRows.reduce(
+          (sum, row) => sum + (row.urlUpdated ?? 0),
+          0
         );
-        const updated = rows.reduce((sum, r) => sum + (r.urlUpdated ?? 0), 0);
-        const deleted = rows.reduce((sum, r) => sum + (r.deleted ?? 0), 0);
-        setSyncResult(`更新:${updated}件 削除:${deleted}件`);
+        const deleted = okRows.reduce(
+          (sum, row) => sum + (row.deleted ?? 0),
+          0
+        );
+
+        const parts = [`更新:${updated}件`, `削除:${deleted}件`];
+        if (errorDepts.length > 0) {
+          parts.push(`エラー:${errorDepts.join(",")}`);
+        }
+        if (skippedDepts.length > 0) {
+          parts.push(`スキップ:${skippedDepts.join(",")}`);
+        }
+
+        setSyncResult(parts.join(" "));
       } else {
         setSyncResult(`エラー: ${data.error}`);
       }
@@ -52,7 +82,7 @@ export const ChatHeader: FC<Props> = (props) => {
       setSyncResult(`エラー: ${e.message}`);
     } finally {
       setSyncing(false);
-      setTimeout(() => setSyncResult(null), 3000);
+      setTimeout(() => setSyncResult(null), 5000);
     }
   };
 

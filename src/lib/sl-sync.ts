@@ -276,8 +276,9 @@ async function collectFileItemsRecursive(
   driveId: string,
   currentFolderPath: string,
   sourceSiteUrl: string,
-  fileItems: SpFileItem[]
-): Promise<{ fetchFailed: boolean }> {
+  fileItems: SpFileItem[],
+  isRoot = false
+): Promise<{ fetchFailed: boolean; rootMissing: boolean }> {
   const encoded = encodeGraphPath(currentFolderPath);
   let nextUrl: string | null =
     `https://graph.microsoft.com/v1.0/drives/${driveId}` +
@@ -291,7 +292,8 @@ async function collectFileItemsRecursive(
 
     if (res.status === 404) {
       console.warn(`[SL sync] Folder not found (404): ${currentFolderPath}`);
-      return { fetchFailed: true };
+      // isRoot=true ならベースフォルダ自体が存在しない → rootMissing
+      return { fetchFailed: true, rootMissing: isRoot };
     }
 
     if (!res.ok) {
@@ -315,11 +317,12 @@ async function collectFileItemsRecursive(
           driveId,
           `${currentFolderPath}/${item.name}`,
           sourceSiteUrl,
-          fileItems
+          fileItems,
+          false  // 子フォルダは isRoot=false
         );
         if (child.fetchFailed) {
           console.warn(`[SL sync] Child folder fetch failed: ${currentFolderPath}/${item.name}`);
-          return { fetchFailed: true };
+          return { fetchFailed: true, rootMissing: false };
         }
       }
     }
@@ -327,7 +330,7 @@ async function collectFileItemsRecursive(
     nextUrl = json["@odata.nextLink"] ?? null;
   }
 
-  return { fetchFailed: false };
+  return { fetchFailed: false, rootMissing: false };
 }
 
 async function getSpFileItemsForFolder(
@@ -335,24 +338,25 @@ async function getSpFileItemsForFolder(
   siteUrl: string,
   driveName: string,
   folderPath: string
-): Promise<{ inventory: SpInventory; fetchFailed: boolean }> {
+): Promise<{ inventory: SpInventory; fetchFailed: boolean; rootMissing: boolean }> {
   const siteId = await resolveSiteId(accessToken, siteUrl);
   const driveId = await resolveDriveId(accessToken, siteId, driveName);
 
   const fileItems: SpFileItem[] = [];
-  const { fetchFailed } = await collectFileItemsRecursive(
+  const { fetchFailed, rootMissing } = await collectFileItemsRecursive(
     accessToken,
     driveId,
     folderPath,
     siteUrl,
-    fileItems
+    fileItems,
+    true  // ベースフォルダ呼び出しは isRoot=true
   );
 
   console.log(
-    `[SL sync] SP recursive scan: site="${siteUrl}" folder="${folderPath}" total=${fileItems.length} fetchFailed=${fetchFailed}`
+    `[SL sync] SP recursive scan: site="${siteUrl}" folder="${folderPath}" total=${fileItems.length} fetchFailed=${fetchFailed} rootMissing=${rootMissing}`
   );
 
-  return { inventory: buildInventory(fileItems), fetchFailed };
+  return { inventory: buildInventory(fileItems), fetchFailed, rootMissing };
 }
 
 async function getSpFileItems(
@@ -360,7 +364,7 @@ async function getSpFileItems(
   deptSiteUrl: string,
   deptDriveName: string,
   deptBaseFolder: string
-): Promise<{ inventory: SpInventory; fetchFailed: boolean }> {
+): Promise<{ inventory: SpInventory; fetchFailed: boolean; rootMissing: boolean }> {
   const deptScan = await getSpFileItemsForFolder(
     accessToken,
     deptSiteUrl,
@@ -369,7 +373,8 @@ async function getSpFileItems(
   );
 
   if (deptScan.fetchFailed) {
-    return { inventory: buildInventory([]), fetchFailed: true };
+    // rootMissing を上位に伝播させる（ベースフォルダ不在の情報を保持）
+    return { inventory: buildInventory([]), fetchFailed: true, rootMissing: deptScan.rootMissing };
   }
 
   const merged = [...deptScan.inventory.allItems];
@@ -396,7 +401,7 @@ async function getSpFileItems(
     `[SL sync] SP merged scan: deptBaseFolder="${deptBaseFolder}" total=${merged.length}`
   );
 
-  return { inventory: buildInventory(merged), fetchFailed: false };
+  return { inventory: buildInventory(merged), fetchFailed: false, rootMissing: false };
 }
 
 async function getIndexDocs(
@@ -420,7 +425,7 @@ async function getIndexDocs(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,fileUrl,effectiveFileUrl,dept,slScope` +
+        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope` +
         `&$filter=(dept eq '${dept.replace(/'/g, "''")}' or slScope eq 'global_common') and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -438,9 +443,11 @@ async function getIndexDocs(
     for (const item of items) {
       const fileUrl = String(item.fileUrl ?? "");
       const effectiveFileUrl = String(item.effectiveFileUrl ?? "");
+      // metadata が最も信頼できるファイル名。URLパースをフォールバックとする
       const fileName =
-        safeDecodeURIComponent(fileUrl).split("/").pop() ??
-        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ??
+        String(item.metadata ?? "").trim() ||
+        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ||
+        safeDecodeURIComponent(fileUrl).split("/").pop() ||
         "";
 
       if (item.id && fileName) {
@@ -487,7 +494,7 @@ async function getIndexDocsGlobalCommon(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,fileUrl,effectiveFileUrl,dept,slScope` +
+        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope` +
         `&$filter=slScope eq 'global_common' and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -506,8 +513,9 @@ async function getIndexDocsGlobalCommon(
       const fileUrl = String(item.fileUrl ?? "");
       const effectiveFileUrl = String(item.effectiveFileUrl ?? "");
       const fileName =
-        safeDecodeURIComponent(fileUrl).split("/").pop() ??
-        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ??
+        String(item.metadata ?? "").trim() ||
+        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ||
+        safeDecodeURIComponent(fileUrl).split("/").pop() ||
         "";
 
       if (item.id && fileName) {
@@ -621,7 +629,7 @@ export async function runSlSync({
       const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(dept);
       const globalCommon = getGlobalCommonConfig();
 
-      const { inventory, fetchFailed } = await getSpFileItems(
+      const { inventory, fetchFailed, rootMissing } = await getSpFileItems(
         accessToken,
         siteUrl,
         driveName,
@@ -629,16 +637,38 @@ export async function runSlSync({
       );
 
       console.log(
-        `[SL sync] dept=${dept} SP fileItems=${inventory.allItems.length} fetchFailed=${fetchFailed}`
+        `[SL sync] dept=${dept} SP fileItems=${inventory.allItems.length} fetchFailed=${fetchFailed} rootMissing=${rootMissing}`
       );
 
       if (fetchFailed) {
-        results[dept] = {
-          spFileNames: 0,
-          indexDocs: "unknown",
-          deleted: 0,
-          skipped: "sp_fetch_failed",
-        };
+        if (rootMissing) {
+          // ベースフォルダ自体が存在しない → SP上にファイルは0件確定
+          // インデックス上の孤立ドキュメントをすべて削除する
+          const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon);
+          const orphanIds = indexDocs
+            .filter((doc) => doc.slScope !== "global_common")
+            .map((doc) => doc.id);
+          console.log(
+            `[SL sync] dept=${dept} base folder missing, orphans=${orphanIds.length} apply=${apply}`
+          );
+          if (apply && orphanIds.length > 0) {
+            await deleteIndexDocs(orphanIds);
+          }
+          results[dept] = {
+            spFileNames: 0,
+            indexDocs: indexDocs.length,
+            deleted: apply ? orphanIds.length : 0,
+            orphanIds,
+          };
+        } else {
+          // 子フォルダの一時的な 404 → 安全のためスキップ
+          results[dept] = {
+            spFileNames: 0,
+            indexDocs: "unknown",
+            deleted: 0,
+            skipped: "sp_fetch_failed",
+          };
+        }
         continue;
       }
 
@@ -654,6 +684,8 @@ export async function runSlSync({
         .filter(({ doc }) => doc.slScope !== "global_common")
         .filter(({ spItem }) => !spItem)
         .map(({ doc }) => doc.id);
+
+      console.log(`[SL sync] dept=${dept} orphans=${orphanIds.length} apply=${apply}`);
 
       const docUpdates = matchedDocs
         .filter((entry): entry is { doc: IndexDoc; spItem: SpFileItem } => Boolean(entry.spItem))
