@@ -1,11 +1,13 @@
 // src/lib/sl-sync.ts
 
-import { getDeptConfig, getAllowedDepts } from "@/lib/sl-dept";
+import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
 
 export type SpFileItem = {
   id: string;
+  name: string;
   webUrl: string;
   sourceSiteUrl: string;
+  relativePath: string;
 };
 
 export type SlSyncDeptResult = {
@@ -32,8 +34,10 @@ export type RunSlSyncParams = {
 type IndexDoc = {
   id: string;
   fileName: string;
+  fileUrl: string;
   effectiveFileUrl: string;
   slScope: string | null;
+  relativePath: string | null;
 };
 
 type ScopeKind = "global_common" | "dept_common" | "personal";
@@ -44,13 +48,15 @@ type GlobalCommonConfig = {
   folder: string;
 };
 
-// -------------------------------------------------------
-// Helpers
-// -------------------------------------------------------
+type SpInventory = {
+  allItems: SpFileItem[];
+  byName: Map<string, SpFileItem[]>;
+};
+
 function encodeGraphPath(path: string): string {
   return (path ?? "")
     .split("/")
-    .filter((s) => s.length > 0)
+    .filter(Boolean)
     .map((seg) => encodeURIComponent(seg))
     .join("/");
 }
@@ -95,12 +101,7 @@ function getGlobalCommonConfig(): GlobalCommonConfig | null {
   const folder = process.env.SL_COMMON_FOLDER || "Common";
 
   if (!siteUrl || !driveName) return null;
-
-  return {
-    siteUrl,
-    driveName,
-    folder,
-  };
+  return { siteUrl, driveName, folder };
 }
 
 function deriveDeptCommonFolder(baseFolder: string): string {
@@ -112,8 +113,8 @@ function isWithinFolderByWebUrl(webUrl: string, folderPath: string): boolean {
   const normalizedFolder = normalizeFolderPath(folderPath).toLowerCase();
 
   return (
-    decodedPathname.includes(`/${normalizedFolder.toLowerCase()}/`) ||
-    decodedPathname.endsWith(`/${normalizedFolder.toLowerCase()}`)
+    decodedPathname.includes(`/${normalizedFolder}/`) ||
+    decodedPathname.endsWith(`/${normalizedFolder}`)
   );
 }
 
@@ -155,6 +156,91 @@ function resolveScopeFromLocation(params: {
   return "personal";
 }
 
+function buildInventory(items: SpFileItem[]): SpInventory {
+  const byName = new Map<string, SpFileItem[]>();
+
+  for (const item of items) {
+    const key = item.name.toLowerCase();
+    const bucket = byName.get(key) ?? [];
+    bucket.push(item);
+    byName.set(key, bucket);
+  }
+
+  return { allItems: items, byName };
+}
+
+function extractRelativePathFromWebUrl(
+  webUrl: string,
+  roots: Array<{ siteUrl: string; folder: string }>
+): string | null {
+  const decodedPathname = getDecodedPathnameFromWebUrl(webUrl).toLowerCase();
+
+  for (const root of roots) {
+    const sitePath = (() => {
+      try {
+        return safeDecodeURIComponent(new URL(root.siteUrl).pathname).toLowerCase();
+      } catch {
+        return "";
+      }
+    })();
+
+    if (!sitePath || !decodedPathname.startsWith(sitePath)) {
+      continue;
+    }
+
+    const rootFolder = normalizeFolderPath(root.folder).toLowerCase();
+    const marker = `/${rootFolder}/`;
+    const markerIndex = decodedPathname.indexOf(marker);
+
+    if (markerIndex >= 0) {
+      return decodedPathname.slice(markerIndex + 1);
+    }
+
+    const endMarker = `/${rootFolder}`;
+    if (decodedPathname.endsWith(endMarker)) {
+      return rootFolder;
+    }
+  }
+
+  return null;
+}
+
+function resolveIndexRelativePath(
+  doc: Pick<IndexDoc, "effectiveFileUrl" | "fileUrl">,
+  deptSiteUrl: string,
+  deptBaseFolder: string,
+  globalCommon?: GlobalCommonConfig | null
+): string | null {
+  const roots = [{ siteUrl: deptSiteUrl, folder: deptBaseFolder }];
+  if (globalCommon) {
+    roots.push({
+      siteUrl: globalCommon.siteUrl,
+      folder: globalCommon.folder,
+    });
+  }
+
+  return (
+    extractRelativePathFromWebUrl(doc.effectiveFileUrl, roots) ??
+    extractRelativePathFromWebUrl(doc.fileUrl, roots)
+  );
+}
+
+function findMatchingSpItem(doc: IndexDoc, inventory: SpInventory): SpFileItem | null {
+  if (doc.relativePath) {
+    const exact = inventory.allItems.find(
+      (item) => item.relativePath.toLowerCase() === doc.relativePath?.toLowerCase()
+    );
+    if (exact) return exact;
+  }
+
+  const sameName = inventory.byName.get(doc.fileName.toLowerCase()) ?? [];
+  if (sameName.length === 1) {
+    return sameName[0];
+  }
+
+  return null;
+}
+
 async function resolveSiteId(accessToken: string, siteUrl: string): Promise<string> {
   const url = new URL(siteUrl);
   const res = await fetch(
@@ -171,13 +257,10 @@ async function resolveDriveId(
   siteId: string,
   driveName: string
 ): Promise<string> {
-  const res = await fetch(
-    `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      cache: "no-store",
-    }
-  );
+  const res = await fetch(`https://graph.microsoft.com/v1.0/sites/${siteId}/drives`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    cache: "no-store",
+  });
   if (!res.ok) throw new Error(`Failed to get drives: ${await res.text()}`);
   const json = await res.json();
   const drive = (json.value ?? []).find((d: any) => d.name === driveName);
@@ -193,12 +276,12 @@ async function collectFileItemsRecursive(
   driveId: string,
   currentFolderPath: string,
   sourceSiteUrl: string,
-  fileItems: Map<string, SpFileItem>
+  fileItems: SpFileItem[]
 ): Promise<{ fetchFailed: boolean }> {
   const encoded = encodeGraphPath(currentFolderPath);
   let nextUrl: string | null =
     `https://graph.microsoft.com/v1.0/drives/${driveId}` +
-    `/root:/${encoded}:/children?$select=name,file,folder,id,webUrl&$top=200`;
+    `/root:/${encoded}:/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -215,14 +298,16 @@ async function collectFileItemsRecursive(
       throw new Error(`Failed to list folder "${currentFolderPath}": ${await res.text()}`);
     }
 
-    const json = await res.json();
+    const json: any = await res.json();
 
     for (const item of json.value ?? []) {
       if (item?.file && item?.name) {
-        fileItems.set(String(item.name), {
+        fileItems.push({
           id: String(item.id ?? ""),
+          name: String(item.name ?? ""),
           webUrl: String(item.webUrl ?? ""),
           sourceSiteUrl,
+          relativePath: normalizeFolderPath(`${currentFolderPath}/${item.name}`),
         });
       } else if (item?.folder && item?.name) {
         const child = await collectFileItemsRecursive(
@@ -233,9 +318,7 @@ async function collectFileItemsRecursive(
           fileItems
         );
         if (child.fetchFailed) {
-          console.warn(
-            `[SL sync] Child folder fetch failed: ${currentFolderPath}/${item.name}`
-          );
+          console.warn(`[SL sync] Child folder fetch failed: ${currentFolderPath}/${item.name}`);
           return { fetchFailed: true };
         }
       }
@@ -252,11 +335,11 @@ async function getSpFileItemsForFolder(
   siteUrl: string,
   driveName: string,
   folderPath: string
-): Promise<{ fileItems: Map<string, SpFileItem>; fetchFailed: boolean }> {
+): Promise<{ inventory: SpInventory; fetchFailed: boolean }> {
   const siteId = await resolveSiteId(accessToken, siteUrl);
   const driveId = await resolveDriveId(accessToken, siteId, driveName);
 
-  const fileItems = new Map<string, SpFileItem>();
+  const fileItems: SpFileItem[] = [];
   const { fetchFailed } = await collectFileItemsRecursive(
     accessToken,
     driveId,
@@ -266,10 +349,10 @@ async function getSpFileItemsForFolder(
   );
 
   console.log(
-    `[SL sync] SP recursive scan: site="${siteUrl}" folder="${folderPath}" total=${fileItems.size} fetchFailed=${fetchFailed}`
+    `[SL sync] SP recursive scan: site="${siteUrl}" folder="${folderPath}" total=${fileItems.length} fetchFailed=${fetchFailed}`
   );
 
-  return { fileItems, fetchFailed };
+  return { inventory: buildInventory(fileItems), fetchFailed };
 }
 
 async function getSpFileItems(
@@ -277,9 +360,7 @@ async function getSpFileItems(
   deptSiteUrl: string,
   deptDriveName: string,
   deptBaseFolder: string
-): Promise<{ fileItems: Map<string, SpFileItem>; fetchFailed: boolean }> {
-  const merged = new Map<string, SpFileItem>();
-
+): Promise<{ inventory: SpInventory; fetchFailed: boolean }> {
   const deptScan = await getSpFileItemsForFolder(
     accessToken,
     deptSiteUrl,
@@ -288,14 +369,12 @@ async function getSpFileItems(
   );
 
   if (deptScan.fetchFailed) {
-    return { fileItems: merged, fetchFailed: true };
+    return { inventory: buildInventory([]), fetchFailed: true };
   }
 
-  deptScan.fileItems.forEach((item, name) => {
-    merged.set(name, item);
-  });
-
+  const merged = [...deptScan.inventory.allItems];
   const globalCommon = getGlobalCommonConfig();
+
   if (globalCommon) {
     const globalScan = await getSpFileItemsForFolder(
       accessToken,
@@ -305,9 +384,7 @@ async function getSpFileItems(
     );
 
     if (!globalScan.fetchFailed) {
-      globalScan.fileItems.forEach((item, name) => {
-        merged.set(name, item);
-      });
+      merged.push(...globalScan.inventory.allItems);
     } else {
       console.warn(
         `[SL sync] Global common scan skipped: ${globalCommon.siteUrl} / ${globalCommon.folder}`
@@ -316,13 +393,18 @@ async function getSpFileItems(
   }
 
   console.log(
-    `[SL sync] SP merged scan: deptBaseFolder="${deptBaseFolder}" total=${merged.size}`
+    `[SL sync] SP merged scan: deptBaseFolder="${deptBaseFolder}" total=${merged.length}`
   );
 
-  return { fileItems: merged, fetchFailed: false };
+  return { inventory: buildInventory(merged), fetchFailed: false };
 }
 
-async function getIndexDocs(dept: string): Promise<IndexDoc[]> {
+async function getIndexDocs(
+  dept: string,
+  deptSiteUrl: string,
+  deptBaseFolder: string,
+  globalCommon?: GlobalCommonConfig | null
+): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
   const apiKey = process.env.AZURE_SEARCH_API_KEY;
@@ -354,17 +436,29 @@ async function getIndexDocs(dept: string): Promise<IndexDoc[]> {
     if (items.length === 0) break;
 
     for (const item of items) {
-      const rawUrl: string = item.fileUrl ?? "";
-      const decoded = safeDecodeURIComponent(rawUrl);
-      const fileName = decoded.split("/").pop() ?? "";
+      const fileUrl = String(item.fileUrl ?? "");
+      const effectiveFileUrl = String(item.effectiveFileUrl ?? "");
+      const fileName =
+        safeDecodeURIComponent(fileUrl).split("/").pop() ??
+        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ??
+        "";
 
       if (item.id && fileName) {
-        docs.push({
+        const doc: IndexDoc = {
           id: String(item.id),
           fileName,
-          effectiveFileUrl: String(item.effectiveFileUrl ?? ""),
+          fileUrl,
+          effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
-        });
+          relativePath: null,
+        };
+        doc.relativePath = resolveIndexRelativePath(
+          doc,
+          deptSiteUrl,
+          deptBaseFolder,
+          globalCommon
+        );
+        docs.push(doc);
       }
     }
 
@@ -375,8 +469,9 @@ async function getIndexDocs(dept: string): Promise<IndexDoc[]> {
   return docs;
 }
 
-// ★ 追加: global_common専用のIndex取得
-async function getIndexDocsGlobalCommon(): Promise<IndexDoc[]> {
+async function getIndexDocsGlobalCommon(
+  globalCommon: GlobalCommonConfig
+): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
   const apiKey = process.env.AZURE_SEARCH_API_KEY;
@@ -408,17 +503,29 @@ async function getIndexDocsGlobalCommon(): Promise<IndexDoc[]> {
     if (items.length === 0) break;
 
     for (const item of items) {
-      const rawUrl: string = item.fileUrl ?? "";
-      const decoded = safeDecodeURIComponent(rawUrl);
-      const fileName = decoded.split("/").pop() ?? "";
+      const fileUrl = String(item.fileUrl ?? "");
+      const effectiveFileUrl = String(item.effectiveFileUrl ?? "");
+      const fileName =
+        safeDecodeURIComponent(fileUrl).split("/").pop() ??
+        safeDecodeURIComponent(effectiveFileUrl).split("/").pop() ??
+        "";
 
       if (item.id && fileName) {
-        docs.push({
+        const doc: IndexDoc = {
           id: String(item.id),
           fileName,
-          effectiveFileUrl: String(item.effectiveFileUrl ?? ""),
+          fileUrl,
+          effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
-        });
+          relativePath: null,
+        };
+        doc.relativePath = resolveIndexRelativePath(
+          doc,
+          globalCommon.siteUrl,
+          globalCommon.folder,
+          null
+        );
+        docs.push(doc);
       }
     }
 
@@ -503,9 +610,6 @@ async function updateIndexDocs(
   console.log(`[SL sync] Updated ${updates.length} docs`);
 }
 
-// -------------------------------------------------------
-// Main
-// -------------------------------------------------------
 export async function runSlSync({
   accessToken,
   apply = false,
@@ -517,7 +621,7 @@ export async function runSlSync({
       const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(dept);
       const globalCommon = getGlobalCommonConfig();
 
-      const { fileItems: spFileItems, fetchFailed } = await getSpFileItems(
+      const { inventory, fetchFailed } = await getSpFileItems(
         accessToken,
         siteUrl,
         driveName,
@@ -525,11 +629,10 @@ export async function runSlSync({
       );
 
       console.log(
-        `[SL sync] dept=${dept} SP fileItems=${spFileItems.size} fetchFailed=${fetchFailed}`
+        `[SL sync] dept=${dept} SP fileItems=${inventory.allItems.length} fetchFailed=${fetchFailed}`
       );
 
       if (fetchFailed) {
-        console.warn(`[SL sync] dept=${dept} SP fetch failed — skipping`);
         results[dept] = {
           spFileNames: 0,
           indexDocs: "unknown",
@@ -539,21 +642,22 @@ export async function runSlSync({
         continue;
       }
 
-      const indexDocs = await getIndexDocs(dept);
+      const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon);
       console.log(`[SL sync] dept=${dept} indexed docs=${indexDocs.length}`);
 
-      // global_common はこの dept sync で削除しない
-      const orphanIds = indexDocs
-        .filter((doc) => doc.slScope !== "global_common")
-        .filter((doc) => !spFileItems.has(doc.fileName))
-        .map((doc) => doc.id);
+      const matchedDocs = indexDocs.map((doc) => ({
+        doc,
+        spItem: findMatchingSpItem(doc, inventory),
+      }));
 
-      const docUpdates = indexDocs
-        .filter((doc) => {
-          const spItem = spFileItems.get(doc.fileName);
-          if (!spItem) return false;
-          if (!spItem.webUrl) return false;
+      const orphanIds = matchedDocs
+        .filter(({ doc }) => doc.slScope !== "global_common")
+        .filter(({ spItem }) => !spItem)
+        .map(({ doc }) => doc.id);
 
+      const docUpdates = matchedDocs
+        .filter((entry): entry is { doc: IndexDoc; spItem: SpFileItem } => Boolean(entry.spItem))
+        .filter(({ doc, spItem }) => {
           const desiredScope = resolveScopeFromLocation({
             webUrl: spItem.webUrl,
             sourceSiteUrl: spItem.sourceSiteUrl,
@@ -563,14 +667,9 @@ export async function runSlSync({
             globalCommonFolder: globalCommon?.folder ?? null,
           });
 
-          const urlChanged = doc.effectiveFileUrl !== spItem.webUrl;
-          const scopeChanged = doc.slScope !== desiredScope;
-
-          return urlChanged || scopeChanged;
+          return doc.effectiveFileUrl !== spItem.webUrl || doc.slScope !== desiredScope;
         })
-        .map((doc) => {
-          const spItem = spFileItems.get(doc.fileName)!;
-
+        .map(({ doc, spItem }) => {
           const desiredScope = resolveScopeFromLocation({
             webUrl: spItem.webUrl,
             sourceSiteUrl: spItem.sourceSiteUrl,
@@ -588,20 +687,13 @@ export async function runSlSync({
           };
         });
 
-      if (orphanIds.length > 0) {
-        console.log(`[SL sync] dept=${dept} orphans=${orphanIds.length}`);
-      }
-      if (docUpdates.length > 0) {
-        console.log(`[SL sync] dept=${dept} updates=${docUpdates.length}`);
-      }
-
       if (apply) {
         await deleteIndexDocs(orphanIds);
         await updateIndexDocs(docUpdates);
       }
 
       results[dept] = {
-        spFileNames: spFileItems.size,
+        spFileNames: inventory.allItems.length,
         indexDocs: indexDocs.length,
         deleted: apply ? orphanIds.length : 0,
         urlUpdated: docUpdates.length,
@@ -618,7 +710,6 @@ export async function runSlSync({
     }
   }
 
-  // ★ 追加: global_common 専用 orphan 削除
   try {
     const globalCommon = getGlobalCommonConfig();
     if (globalCommon) {
@@ -630,29 +721,27 @@ export async function runSlSync({
       );
 
       if (!globalScan.fetchFailed) {
-        const globalIndexDocs = await getIndexDocsGlobalCommon();
-        console.log(`[SL sync] global_common indexed docs=${globalIndexDocs.length}`);
+        const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon);
+        const matchedDocs = globalIndexDocs.map((doc) => ({
+          doc,
+          spItem: findMatchingSpItem(doc, globalScan.inventory),
+        }));
 
-        const globalOrphanIds = globalIndexDocs
-          .filter((doc) => !globalScan.fileItems.has(doc.fileName))
-          .map((doc) => doc.id);
-
-        if (globalOrphanIds.length > 0) {
-          console.log(`[SL sync] global_common orphans=${globalOrphanIds.length}`);
-        }
+        const globalOrphanIds = matchedDocs
+          .filter(({ spItem }) => !spItem)
+          .map(({ doc }) => doc.id);
 
         if (apply && globalOrphanIds.length > 0) {
           await deleteIndexDocs(globalOrphanIds);
         }
 
         results["global_common"] = {
-          spFileNames: globalScan.fileItems.size,
+          spFileNames: globalScan.inventory.allItems.length,
           indexDocs: globalIndexDocs.length,
           deleted: apply ? globalOrphanIds.length : 0,
           orphanIds: globalOrphanIds,
         };
       } else {
-        console.warn(`[SL sync] global_common SP scan failed — skipping orphan delete`);
         results["global_common"] = {
           spFileNames: 0,
           indexDocs: 0,

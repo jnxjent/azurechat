@@ -11,7 +11,7 @@ import {
   getUserEmailFromJwtToken,
   isSharePointEnabledDept,
   normalizeUploadScope,
-  resolveSlRole,
+  resolveSlAccess,
   type UploadScope,
 } from "@/lib/sl-dept";
 
@@ -213,7 +213,7 @@ export async function POST(req: NextRequest) {
     const isSpDept = isSharePointEnabledDept(deptLower);
 
     // ★ isAdminEmail → resolveSlRole に変更
-    const slRole = resolveSlRole(userEmail, deptLower);
+    const slRole = resolveSlAccess(userEmail, deptLower).role;
     const admin = slRole === "global_admin" || slRole === "dept_admin";
 
     // SP非対応部署はこのAPI対象外

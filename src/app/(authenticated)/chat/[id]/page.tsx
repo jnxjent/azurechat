@@ -1,7 +1,10 @@
 // src/app/(authenticated)/chat/[id]/page.tsx
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+
 import "@/lib/no-store-fetch";
+import { getServerSession } from "next-auth";
+import { options as authOptions } from "@/features/auth-page/auth-api";
 import { ChatPage } from "@/features/chat-page/chat-page";
 import { FindAllChatDocuments } from "@/features/chat-page/chat-services/chat-document-service";
 import { FindAllChatMessagesForCurrentUser } from "@/features/chat-page/chat-services/chat-message-service";
@@ -9,9 +12,7 @@ import { FindChatThreadForCurrentUser } from "@/features/chat-page/chat-services
 import { FindAllExtensionForCurrentUser } from "@/features/extensions-page/extension-services/extension-service";
 import { AI_NAME } from "@/features/theme/theme-config";
 import { DisplayError } from "@/features/ui/error/display-error";
-import { getServerSession } from "next-auth";
-import { options as authOptions } from "@/features/auth-page/auth-api";
-import { decideDept, resolveSlRole } from "@/lib/sl-dept"; // ★ 追加
+import { resolveSlAccess } from "@/lib/sl-dept";
 
 export const metadata = {
   title: AI_NAME,
@@ -23,8 +24,6 @@ interface HomeParams {
     id: string;
   };
 }
-
-// ★ isAdminEmail関数を削除（resolveSlRoleに統合）
 
 export default async function Home(props: HomeParams) {
   const { id } = props.params;
@@ -51,12 +50,22 @@ export default async function Home(props: HomeParams) {
     return <DisplayError errors={chatThreadResponse.errors} />;
   }
 
-  // ★ resolveSlRole でrole解決
   const userEmail = session?.user?.email;
-  const deptLower = decideDept({ userEmail });
-  const slRole = resolveSlRole(userEmail, deptLower);
-  const isAdmin = slRole === "global_admin" || slRole === "dept_admin";
-  console.log(`[ROLE] email=${userEmail} dept=${deptLower} role=${slRole}`);
+  const sessionRole = session?.user?.slRole;
+  const sessionDept = session?.user?.slDept;
+  const resolvedAccess =
+    sessionRole && sessionDept
+      ? { role: sessionRole, dept: sessionDept }
+      : resolveSlAccess(userEmail);
+
+  const isAdmin =
+    resolvedAccess.role === "global_admin" ||
+    resolvedAccess.role === "dept_admin";
+
+  console.log(
+    `[ROLE] email=${userEmail} dept=${resolvedAccess.dept} role=${resolvedAccess.role}`
+  );
+
   return (
     <ChatPage
       messages={chatResponse.response}

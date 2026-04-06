@@ -5,6 +5,7 @@ import CredentialsProvider from "next-auth/providers/credentials";
 import GitHubProvider from "next-auth/providers/github";
 import type { Provider } from "next-auth/providers/index";  // ← 修正
 import { hashValue } from "@/features/auth-page/helpers";
+import { resolveSlAccess } from "@/lib/sl-dept";
 
 const AAD_SCOPE = [
   "openid",
@@ -76,12 +77,17 @@ const configureIdentityProvider = () => {
         },
         async authorize(credentials) {
           const username = credentials?.username || "dev";
-          const email = `${username}@localhost`;
+          // NEXT_PUBLIC_DEV_USER_EMAIL が設定されていればそのメールを使う（SL ロール判定のため）
+          const email =
+            process.env.NEXT_PUBLIC_DEV_USER_EMAIL ?? `${username}@localhost`;
+          const adminEmails = process.env.SL_ADMIN_EMAILS
+            ?.split(",")
+            .map((e) => e.toLowerCase().trim()) ?? [];
           const user = {
             id: hashValue(email),
             name: username,
             email,
-            isAdmin: false,
+            isAdmin: adminEmails.includes(email.toLowerCase()),
             image: "",
           };
           console.log("=== DEV USER LOGGED IN ===\n", JSON.stringify(user, null, 2));
@@ -150,6 +156,16 @@ export const options: NextAuthOptions = {
         token.email = (user as any).email ?? token.email;
         token.name = (user as any).name ?? token.name;
         (token as any).picture = (user as any).image ?? (token as any).picture;
+
+        // ★ SlRole / SlDept をトークンに保存（サインイン時に1回計算）
+        try {
+          const emailForRole = String((user as any).email ?? token.email ?? "");
+          const access = resolveSlAccess(emailForRole);
+          (token as any).slRole = access.role;
+          (token as any).slDept = access.dept;
+        } catch {
+          // SL_DEPTS / SL_DEPT_DEFAULT 未設定時はスキップ（バッジ非表示）
+        }
       }
 
       const p: any = profile ?? {};
@@ -184,6 +200,8 @@ export const options: NextAuthOptions = {
         session.user.email = token.email as string;
         session.user.name = token.name as string;
         (session.user as any).image = (token as any).picture as string;
+        session.user.slRole = (token as any).slRole;
+        session.user.slDept = (token as any).slDept;
       }
       (session as any).accessToken = (token as any).accessToken;
       (session as any).accessTokenExpiresAt = (token as any).accessTokenExpiresAt;

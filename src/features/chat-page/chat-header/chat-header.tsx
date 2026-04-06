@@ -1,7 +1,8 @@
 "use client";
+
 import { ExtensionModel } from "@/features/extensions-page/extension-services/models";
 import { CHAT_DEFAULT_PERSONA } from "@/features/theme/theme-config";
-import { VenetianMask, RefreshCw } from "lucide-react";
+import { RefreshCw, VenetianMask } from "lucide-react";
 import { FC, useState } from "react";
 import { ChatDocumentModel, ChatThreadModel } from "../chat-services/models";
 import { DocumentDetail } from "./document-detail";
@@ -28,23 +29,27 @@ export const ChatHeader: FC<Props> = (props) => {
   const handleSync = async () => {
     setSyncing(true);
     setSyncResult(null);
+
     try {
-      const res = await fetch("/api/sl/sync-check", {
+      const res = await fetch("/api/sl/sync-check?apply=true", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
+
       const data = await res.json();
       if (data.ok) {
-        const total = Object.values(data.results as Record<string, any>)
-          .filter((r) => !r.error)
-          .reduce((sum, r) => sum + (r.deleted ?? 0), 0);
-        setSyncResult(`✅ 同期完了（${total}件削除）`);
+        const rows = Object.values(data.results as Record<string, any>).filter(
+          (r) => !r.error
+        );
+        const updated = rows.reduce((sum, r) => sum + (r.urlUpdated ?? 0), 0);
+        const deleted = rows.reduce((sum, r) => sum + (r.deleted ?? 0), 0);
+        setSyncResult(`更新:${updated}件 削除:${deleted}件`);
       } else {
-        setSyncResult(`❌ エラー: ${data.error}`);
+        setSyncResult(`エラー: ${data.error}`);
       }
     } catch (e: any) {
-      setSyncResult(`❌ エラー: ${e.message}`);
+      setSyncResult(`エラー: ${e.message}`);
     } finally {
       setSyncing(false);
       setTimeout(() => setSyncResult(null), 3000);
