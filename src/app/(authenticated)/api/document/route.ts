@@ -1,7 +1,7 @@
 // app/api/document/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
-import { decideDept, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
+import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
 import { SearchAzureAISimilarDocuments } from "@/features/chat-page/chat-services/chat-api/chat-api-rag-extension";
 import { hashValue } from "@/features/auth-page/helpers";
 import { userSession } from "@/features/auth-page/helpers";
@@ -33,6 +33,7 @@ export async function POST(req: NextRequest) {
       tokenEmail ||
       sessionEmail ||
       (process.env.SL_LOCAL_DEFAULT_EMAIL ?? null);
+    email = getEffectiveSlUserEmail(email);
 
     const deptLower = email
       ? resolveSlAccess(email).dept

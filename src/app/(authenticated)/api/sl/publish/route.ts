@@ -8,6 +8,7 @@ import {
   buildUploadFolder,
   decideDept,
   getDeptConfig,
+  getEffectiveSlUserEmail,
   getUserEmailFromJwtToken,
   isSharePointEnabledDept,
   normalizeUploadScope,
@@ -173,7 +174,8 @@ export async function POST(req: NextRequest) {
     }
 
     const token = await getToken({ req });
-    const userEmail = token ? getUserEmailFromJwtToken(token) : null;
+    const rawUserEmail = token ? getUserEmailFromJwtToken(token) : null;
+    const userEmail = getEffectiveSlUserEmail(rawUserEmail);
 
     if (!userEmail) {
       return NextResponse.json(

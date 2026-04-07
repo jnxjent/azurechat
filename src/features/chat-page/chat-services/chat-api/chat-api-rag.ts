@@ -12,7 +12,7 @@ import { CreateCitations, FormatCitations } from "../citation-service";
 import { ChatCitationModel, ChatThreadModel } from "../models";
 
 // dept判定ユーティリティ
-import { decideDept, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
+import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
 import { getToken } from "next-auth/jwt";
 import { cookies } from "next/headers";
 import { hashValue, userSession } from "@/features/auth-page/helpers";
@@ -52,7 +52,9 @@ async function resolveUserContext(): Promise<UserContext> {
       secret: process.env.NEXTAUTH_SECRET!,
     }).catch(() => null);
 
-    const email = token ? getUserEmailFromJwtToken(token) : null;
+    const email = getEffectiveSlUserEmail(
+      token ? getUserEmailFromJwtToken(token) : null
+    );
 
     const deptLower = email
       ? resolveSlAccess(email).dept

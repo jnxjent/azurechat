@@ -23,10 +23,12 @@ function getRoleLabel(
   slRole?: "global_admin" | "dept_admin" | "dept_member" | null,
   slDept?: string | null
 ): string {
+  if (slRole === "global_admin") return "全社管理者";
+
   const deptLower = (slDept ?? "").trim().toLowerCase();
   if (NON_SP_DEPTS.includes(deptLower)) return "";
+
   const dept = deptLower.toUpperCase();
-  if (slRole === "global_admin") return "全社管理者";
   if (slRole === "dept_admin") return `${dept}管理者`;
   if (slRole === "dept_member") return `${dept}員`;
   return "";

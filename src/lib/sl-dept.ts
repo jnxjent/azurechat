@@ -27,6 +27,11 @@ function parseCsvEmails(value?: string): Set<string> {
   return new Set(parseCsv(value).map((s) => s.toLowerCase()));
 }
 
+function normalizeOptionalEmail(email: string | null | undefined): string | null {
+  const normalized = (email ?? "").trim().toLowerCase();
+  return normalized || null;
+}
+
 export function getAllowedDepts(): string[] {
   const raw = process.env.SL_DEPTS ?? "cp";
   return parseCsvLower(raw).filter((d) => !RESERVED_UPLOAD_SCOPES.has(d));
@@ -205,6 +210,34 @@ export function getUserEmailFromJwtToken(token: any): string | null {
   }
 
   return null;
+}
+
+export function getEffectiveSlUserEmail(
+  email: string | null | undefined
+): string | null {
+  const localOverride = normalizeOptionalEmail(process.env.SL_LOCAL_DEFAULT_EMAIL);
+  const actualEmail = normalizeOptionalEmail(email);
+
+  if (process.env.NODE_ENV === "development" && localOverride) {
+    if (actualEmail) {
+      const globalAdminSet = parseCsvEmails(process.env.SL_ADMIN_EMAILS);
+      if (globalAdminSet.has(actualEmail)) {
+        return actualEmail;
+      }
+
+      if (getDeptAdminDepts(actualEmail).length > 0) {
+        return actualEmail;
+      }
+
+      if (detectAllDeptsByEmail(actualEmail).length > 0) {
+        return actualEmail;
+      }
+    }
+
+    return localOverride;
+  }
+
+  return actualEmail;
 }
 
 export type SlRole = "global_admin" | "dept_admin" | "dept_member";
