@@ -28,6 +28,8 @@ export interface AzureSearchDocumentIndex {
   isSlDoc: boolean | null;
   slScope?: "global_common" | "dept_common" | "personal" | null;
   slOwner?: string | null;
+  /** SharePoint drive item ID。ファイル移動後もIDは不変のため、sync時の追跡に使用 */
+  spItemId?: string | null;
 }
 
 export type DocumentSearchResponse = {
@@ -307,7 +309,8 @@ export const IndexDocuments = async (
   dept: string,
   isSlDoc: boolean,
   uploadScope?: string,
-  effectiveFileUrl?: string
+  effectiveFileUrl?: string,
+  spItemId?: string | null
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
@@ -332,6 +335,7 @@ export const IndexDocuments = async (
         slScope: isSlDoc ? normalizedScope : null,
         slOwner:
           isSlDoc && normalizedScope === "personal" ? currentUserHash : null,
+        spItemId: spItemId ?? null,
       });
     }
 

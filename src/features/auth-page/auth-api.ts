@@ -19,9 +19,10 @@ const AAD_SCOPE = [
 const configureIdentityProvider = () => {
   const providers: Array<Provider> = [];
 
-  const adminEmails = process.env.SL_ADMIN_EMAILS
-    ?.split(",")
-    .map((email) => email.toLowerCase().trim());
+  const adminEmails = [
+    ...(process.env.SL_ADMIN_EMAILS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+    ...(process.env.ADMIN_EMAIL_ADDRESS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+  ];
 
   if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
     providers.push(
@@ -80,9 +81,10 @@ const configureIdentityProvider = () => {
           // NEXT_PUBLIC_DEV_USER_EMAIL が設定されていればそのメールを使う（SL ロール判定のため）
           const email =
             process.env.NEXT_PUBLIC_DEV_USER_EMAIL ?? `${username}@localhost`;
-          const adminEmails = process.env.SL_ADMIN_EMAILS
-            ?.split(",")
-            .map((e) => e.toLowerCase().trim()) ?? [];
+          const adminEmails = [
+            ...(process.env.SL_ADMIN_EMAILS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+            ...(process.env.ADMIN_EMAIL_ADDRESS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+          ];
           const user = {
             id: hashValue(email),
             name: username,

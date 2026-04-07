@@ -69,6 +69,17 @@ function getSafeDefaultDept(): string {
   throw new Error(`No allowed departments found. Check SL_DEPTS.`);
 }
 
+/**
+ * メールが指定されているがどの SL_DEPT_BY_EMAIL_* にもマッチしない場合の
+ * フォールバック部署を返す。SL_DEPT_NON_SP で設定された非SP部署を優先し、
+ * 見つからなければ SL_DEPT_DEFAULT に落ちる。
+ */
+function getUnknownEmailFallbackDept(): string {
+  const nonSpDepts = getNonSharePointDepts();
+  const allowed = getAllowedDepts();
+  return nonSpDepts.find((d) => allowed.includes(d)) ?? getSafeDefaultDept();
+}
+
 export function decideDept(params: {
   requestedDept?: string;
   userEmail?: string | null;
@@ -78,6 +89,8 @@ export function decideDept(params: {
   if (params.userEmail) {
     const hit = detectDeptByEmail(params.userEmail);
     if (hit) return hit;
+    // メールはあるが SL_DEPT_BY_EMAIL_* にマッチなし → 非SP部署にフォールバック
+    return getUnknownEmailFallbackDept();
   }
 
   if (params.requestedDept) {
@@ -272,9 +285,10 @@ export function resolveSlAccess(
     };
   }
 
+  // メール指定あるがどの SL_DEPT_BY_EMAIL_* にもマッチしないユーザー → 非SP部署
   return {
     role: "dept_member",
-    dept: fallbackDept,
+    dept: getUnknownEmailFallbackDept(),
   };
 }
 

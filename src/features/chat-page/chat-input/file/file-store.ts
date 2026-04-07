@@ -87,6 +87,7 @@ async function publishToSharePoint(file: File, uploadScope: UploadScope) {
     isSharePointEnabled?: boolean;
     webUrl?: string;
     name?: string;
+    spItemId?: string | null;
   };
 }
 
@@ -126,6 +127,8 @@ class FileStore {
         let actualUploadScope: UploadScope = requestedUploadScope;
         // ★ SP webUrl を保持する変数（SPアップ成功時のみ設定される）
         let spWebUrl: string | undefined;
+        // ★ SP item ID（移動後もindexと紐付けるための不変ID）
+        let spItemId: string | null = null;
 
         try {
           this.uploadButtonLabel = "Syncing to SharePoint";
@@ -137,6 +140,7 @@ class FileStore {
             throw new Error("SharePoint publish succeeded but webUrl was empty.");
           }
           spWebUrl = sp.webUrl;
+          spItemId = sp.spItemId ?? null;
           actualDept = String(sp.dept ?? "").toLowerCase().trim();
           actualUploadScope = normalizeUploadScope(
             sp.uploadScope ?? requestedUploadScope
@@ -197,7 +201,9 @@ class FileStore {
             chatThreadId,
             actualDept,
             actualIsSlDoc,
-            actualUploadScope
+            actualUploadScope,
+            undefined,
+            spItemId
           );
 
           documentIndexResponses.push(...indexResponses);

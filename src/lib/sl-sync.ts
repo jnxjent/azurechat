@@ -38,6 +38,7 @@ type IndexDoc = {
   effectiveFileUrl: string;
   slScope: string | null;
   relativePath: string | null;
+  spItemId: string | null;
 };
 
 type ScopeKind = "global_common" | "dept_common" | "personal";
@@ -51,6 +52,7 @@ type GlobalCommonConfig = {
 type SpInventory = {
   allItems: SpFileItem[];
   byName: Map<string, SpFileItem[]>;
+  byId: Map<string, SpFileItem>;
 };
 
 function encodeGraphPath(path: string): string {
@@ -158,15 +160,20 @@ function resolveScopeFromLocation(params: {
 
 function buildInventory(items: SpFileItem[]): SpInventory {
   const byName = new Map<string, SpFileItem[]>();
+  const byId = new Map<string, SpFileItem>();
 
   for (const item of items) {
     const key = item.name.toLowerCase();
     const bucket = byName.get(key) ?? [];
     bucket.push(item);
     byName.set(key, bucket);
+
+    if (item.id) {
+      byId.set(item.id, item);
+    }
   }
 
-  return { allItems: items, byName };
+  return { allItems: items, byName, byId };
 }
 
 function extractRelativePathFromWebUrl(
@@ -226,6 +233,13 @@ function resolveIndexRelativePath(
 }
 
 function findMatchingSpItem(doc: IndexDoc, inventory: SpInventory): SpFileItem | null {
+  // 第1優先: SP item ID（ファイル移動後も不変）
+  if (doc.spItemId) {
+    const byId = inventory.byId.get(doc.spItemId);
+    if (byId) return byId;
+  }
+
+  // 第2優先: relativePath の完全一致（spItemId 未保存の旧ドキュメント向け）
   if (doc.relativePath) {
     const exact = inventory.allItems.find(
       (item) => item.relativePath.toLowerCase() === doc.relativePath?.toLowerCase()
@@ -233,6 +247,7 @@ function findMatchingSpItem(doc: IndexDoc, inventory: SpInventory): SpFileItem |
     if (exact) return exact;
   }
 
+  // 第3優先: ファイル名一致（同名が1件のみの場合）
   const sameName = inventory.byName.get(doc.fileName.toLowerCase()) ?? [];
   if (sameName.length === 1) {
     return sameName[0];
@@ -425,7 +440,7 @@ async function getIndexDocs(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope` +
+        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId` +
         `&$filter=(dept eq '${dept.replace(/'/g, "''")}' or slScope eq 'global_common') and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -458,6 +473,7 @@ async function getIndexDocs(
           effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
           relativePath: null,
+          spItemId: item.spItemId ? String(item.spItemId) : null,
         };
         doc.relativePath = resolveIndexRelativePath(
           doc,
@@ -494,7 +510,7 @@ async function getIndexDocsGlobalCommon(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope` +
+        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId` +
         `&$filter=slScope eq 'global_common' and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -526,6 +542,7 @@ async function getIndexDocsGlobalCommon(
           effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
           relativePath: null,
+          spItemId: item.spItemId ? String(item.spItemId) : null,
         };
         doc.relativePath = resolveIndexRelativePath(
           doc,

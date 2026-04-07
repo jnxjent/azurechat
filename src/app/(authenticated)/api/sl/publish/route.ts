@@ -255,6 +255,7 @@ export async function POST(req: NextRequest) {
       isSharePointEnabled: true,
       name: result.name,
       webUrl: result.webUrl,
+      spItemId: result.id ?? null,
     });
   } catch (e: any) {
     console.error("[SL publish] Error:", e);
