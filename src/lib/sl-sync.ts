@@ -232,6 +232,60 @@ function resolveIndexRelativePath(
   );
 }
 
+/**
+ * spItemId を使って Graph API でドライブ内のアイテムを直接ルックアップ。
+ * scan 範囲外（基点フォルダより上位）に移動されたファイルを追跡するために使用。
+ */
+async function lookupSpItemByIdInDrive(
+  accessToken: string,
+  siteUrl: string,
+  driveName: string,
+  itemId: string
+): Promise<SpFileItem | null> {
+  try {
+    const siteId = await resolveSiteId(accessToken, siteUrl);
+    const driveId = await resolveDriveId(accessToken, siteId, driveName);
+
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}` +
+        `?$select=name,file,id,webUrl,parentReference`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" }
+    );
+
+    if (res.status === 404) return null; // ファイルが実際に削除済み
+    if (!res.ok) {
+      console.warn(`[SL sync] lookupSpItemById failed (${res.status}): ${await res.text()}`);
+      return null;
+    }
+
+    const item = await res.json();
+    if (!item?.file || !item?.name) return null; // フォルダ等はスキップ
+
+    // parentReference.path = "/drives/{id}/root:/folder/path" 形式
+    const parentPath = (() => {
+      const raw: string = item.parentReference?.path ?? "";
+      const rootIdx = raw.indexOf("root:");
+      if (rootIdx < 0) return "";
+      return normalizeFolderPath(safeDecodeURIComponent(raw.slice(rootIdx + 5)));
+    })();
+
+    const relativePath = parentPath
+      ? normalizeFolderPath(`${parentPath}/${item.name}`)
+      : normalizeFolderPath(String(item.name));
+
+    return {
+      id: String(item.id),
+      name: String(item.name),
+      webUrl: String(item.webUrl),
+      sourceSiteUrl: siteUrl,
+      relativePath,
+    };
+  } catch (e) {
+    console.warn(`[SL sync] lookupSpItemByIdInDrive error:`, e);
+    return null;
+  }
+}
+
 function findMatchingSpItem(doc: IndexDoc, inventory: SpInventory): SpFileItem | null {
   // 第1優先: SP item ID（ファイル移動後も不変）
   if (doc.spItemId) {
@@ -696,6 +750,26 @@ export async function runSlSync({
         doc,
         spItem: findMatchingSpItem(doc, inventory),
       }));
+
+      // scan 範囲外（基点フォルダより上位など）へ移動したファイルを Graph API で直接追跡
+      const scanMissed = matchedDocs.filter(
+        (entry) => !entry.spItem && entry.doc.spItemId && entry.doc.slScope !== "global_common"
+      );
+      if (scanMissed.length > 0) {
+        console.log(`[SL sync] dept=${dept} looking up ${scanMissed.length} scan-missed items by spItemId`);
+        for (const entry of scanMissed) {
+          const found = await lookupSpItemByIdInDrive(
+            accessToken,
+            siteUrl,
+            driveName,
+            entry.doc.spItemId!
+          );
+          if (found) {
+            entry.spItem = found;
+            console.log(`[SL sync] dept=${dept} found outside scan scope: ${entry.doc.fileName} → ${found.webUrl}`);
+          }
+        }
+      }
 
       const orphanIds = matchedDocs
         .filter(({ doc }) => doc.slScope !== "global_common")
