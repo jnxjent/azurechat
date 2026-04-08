@@ -183,6 +183,8 @@ class FileStore {
         // SharePoint / Blob の最終状態確定後に Index 作成
         let index = 0;
         const documentIndexResponses: Array<ServerActionResponse<boolean>> = [];
+        const searchableFileUrl = spWebUrl ?? uploadResponse.response;
+        const downloadableFileUrl = uploadResponse.response;
 
         for (const doc of crackingResponse.response) {
           this.uploadButtonLabel = `Indexing document [${index + 1}]/[${
@@ -192,17 +194,15 @@ class FileStore {
           // ★ SPアップ成功時は SP webUrl を使う。それ以外は従来通り Blob URL。
           // SL documents use SP webUrl as fileUrl so that deleted SP files
           // are no longer reachable, avoiding stale Blob links in search results.
-          const effectiveFileUrl = spWebUrl ?? uploadResponse.response;
-
           const indexResponses = await IndexDocuments(
             file.name,
-            effectiveFileUrl,
+            searchableFileUrl,
             [doc],
             chatThreadId,
             actualDept,
             actualIsSlDoc,
             actualUploadScope,
-            undefined,
+            downloadableFileUrl,
             spItemId
           );
 

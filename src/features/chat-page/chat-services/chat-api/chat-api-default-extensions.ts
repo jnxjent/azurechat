@@ -2,6 +2,7 @@
 "use server";
 import "server-only";
 
+import { GenerateSasUrl } from "@/features/common/services/azure-storage";
 import { OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
@@ -41,6 +42,39 @@ function buildExternalImageUrl(threadId: string, fileName: string): string {
   }
 
   return GetImageUrl(threadId, fileName);
+}
+
+async function resolveDocumentUrlForVision(
+  fileUrl: string,
+  threadId: string
+): Promise<string> {
+  try {
+    const url = new URL(fileUrl);
+    const isSharePointUrl = url.hostname.includes("sharepoint.com");
+    const isAzureBlobWithoutSas =
+      url.hostname.includes(".blob.core.windows.net") && !url.searchParams.has("sig");
+
+    if (!isSharePointUrl && !isAzureBlobWithoutSas) {
+      return fileUrl;
+    }
+
+    const fileName = decodeURIComponent(url.pathname.split("/").pop() ?? "").trim();
+    if (!fileName) {
+      return fileUrl;
+    }
+
+    const sasResponse = await GenerateSasUrl("dl-link", `${threadId}/${fileName}`);
+    if (sasResponse.status === "OK" && sasResponse.response) {
+      console.log(
+        `[convert_doc_to_pptx] Resolved document URL to SAS for thread ${threadId}: ${fileName}`
+      );
+      return sasResponse.response;
+    }
+  } catch (error) {
+    console.warn("[convert_doc_to_pptx] Failed to resolve document URL for Vision:", error);
+  }
+
+  return fileUrl;
 }
 
 /* ------------------------------------------------------------------ */
@@ -390,8 +424,233 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
+  // ★ PowerPoint 生成ツール（テキストベース）
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeCreatePptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "プレゼンテーション全体のタイトル",
+          },
+          slides: {
+            type: "array",
+            description: "スライドのリスト",
+            items: {
+              type: "object",
+              properties: {
+                title: {
+                  type: "string",
+                  description: "スライドのタイトル",
+                },
+                bullets: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "箇条書きの内容リスト",
+                },
+              },
+              required: ["title", "bullets"],
+            },
+          },
+          fontFace: {
+            type: "string",
+            description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
+          },
+        },
+        required: ["title", "slides"],
+      },
+      description:
+        "ユーザーがテーマや内容を指定してPowerPoint（PPTX）を新規作成するツール。\n" +
+        "テキストベースでスライド構成を作る場合に使用する。\n" +
+        "ファイル（PDF・画像）をPPTに変換する場合は、代わりに convert_doc_to_pptx ツールを使うこと。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "create_pptx",
+    },
+  });
+
+  // ★ ドキュメント（PDF・画像）→ PPTX 変換ツール（Vision API使用・高精度）
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeConvertDocToPptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "変換するファイルのURL（Azure BlobのURL）。会話コンテキストの file_url または fileUrl から取得すること。",
+          },
+          presentationTitle: {
+            type: "string",
+            description:
+              "プレゼンテーション全体のタイトル（省略可能、省略時はファイル名から自動設定）",
+          },
+          fontFace: {
+            type: "string",
+            description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
+          },
+          maxPages: {
+            type: "number",
+            description: "変換する最大ページ数（省略可能、デフォルト30）",
+          },
+        },
+        required: ["fileUrl"],
+      },
+      description:
+        "ユーザーがアップロードしたPDF・画像ファイルをPowerPoint（PPTX）に変換するツール。\n" +
+        "Vision APIを使って各ページを視覚的に解析するため、グラフ・表・図も含めて高精度に変換できる。\n" +
+        "使用タイミング：ユーザーが「PPTに変換して」「スライドにして」「PPT化して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
+        "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "convert_doc_to_pptx",
+    },
+  });
+
   return { status: "OK", response: defaultExtensions };
 };
+
+// ---------------- PowerPoint 生成 ----------------
+async function executeCreatePptx(
+  args: {
+    title: string;
+    slides: Array<{ title: string; bullets: string[] }>;
+    fontFace?: string;
+  },
+  chatThread: ChatThreadModel
+) {
+  const { title, slides, fontFace } = args ?? {};
+
+  if (!title || !slides?.length) {
+    return { error: "title と slides は必須です。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/gen-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, slides, threadId: chatThread.id, fontFace }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[create_pptx] gen-pptx failed:", res.status, t);
+      return { error: `PowerPoint生成に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      message: `PowerPointファイルを生成しました。以下のリンクからダウンロードできます。`,
+    };
+  } catch (e: any) {
+    console.error("[create_pptx] error:", e);
+    return { error: "PowerPoint生成中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- ドキュメント → PPTX 変換（Vision API使用） ----------------
+async function executeConvertDocToPptx(
+  args: {
+    fileUrl: string;
+    presentationTitle?: string;
+    fontFace?: string;
+    maxPages?: number;
+  },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl, presentationTitle, fontFace, maxPages } = args ?? {};
+
+  if (!fileUrl?.trim()) {
+    return { error: "fileUrl は必須です。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    // Step 1: Vision API でドキュメントを解析してスライド構造を取得
+    const resolvedFileUrl = await resolveDocumentUrlForVision(
+      fileUrl,
+      chatThread.id
+    );
+    console.log("[convert_doc_to_pptx] Analyzing document with Vision API:", resolvedFileUrl.substring(0, 80));
+    const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+    });
+
+    if (!analyzeRes.ok) {
+      const t = await analyzeRes.text().catch(() => "");
+      console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
+      return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
+    }
+
+    const analyzeResult = await analyzeRes.json();
+    if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+      return { error: analyzeResult?.error ?? "ドキュメントの解析結果が空でした。" };
+    }
+
+    const slides: Array<{ title: string; bullets: string[] }> = analyzeResult.slides;
+    const totalPages: number = analyzeResult.totalPages ?? slides.length;
+
+    // タイトルを決定（指定がなければ最初のスライドのタイトルを使う）
+    const title =
+      presentationTitle?.trim() ||
+      slides[0]?.title ||
+      "プレゼンテーション";
+
+    console.log(`[convert_doc_to_pptx] Analyzed ${totalPages} pages → ${slides.length} slides`);
+
+    // Step 2: 解析結果から PPTX を生成
+    const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, slides, threadId: chatThread.id, fontFace }),
+    });
+
+    if (!pptxRes.ok) {
+      const t = await pptxRes.text().catch(() => "");
+      console.error("[convert_doc_to_pptx] gen-pptx failed:", pptxRes.status, t);
+      return { error: `PowerPoint生成に失敗しました: HTTP ${pptxRes.status}` };
+    }
+
+    const pptxResult = await pptxRes.json();
+    if (!pptxResult?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: pptxResult.downloadUrl,
+      fileName: pptxResult.fileName,
+      totalPages,
+      message: `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
+    };
+  } catch (e: any) {
+    console.error("[convert_doc_to_pptx] error:", e);
+    return { error: "変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
 
 // ---------------- 画像生成（NEW image 用） ----------------
 async function executeCreateImage(

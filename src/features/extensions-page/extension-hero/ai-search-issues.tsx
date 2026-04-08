@@ -5,6 +5,14 @@ import { ExtensionModel } from "../extension-services/models";
 import { extensionStore } from "../extension-store";
 
 export const AISearch = () => {
+  const resolveDocumentEndpoint = () => {
+    if (typeof window !== "undefined" && window.location.origin) {
+      return `${window.location.origin}/api/document`;
+    }
+
+    return "http://localhost:3000/api/document";
+  };
+
   const newExample = () => {
     const aiSearchExample: ExtensionModel = {
       createdAt: new Date(),
@@ -35,7 +43,7 @@ export const AISearch = () => {
 },
 "description": "You must use this to search for content based on user questions."
 }`,
-          endpoint: "https:AZURE_CHAT_HOST.com/api/document",
+          endpoint: resolveDocumentEndpoint(),
           id: uniqueId(),
           endpointType: "POST",
           isOpen: false,

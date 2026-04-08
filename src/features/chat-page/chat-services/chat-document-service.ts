@@ -11,7 +11,10 @@ import { uniqueId } from "@/features/common/util";
 import { SqlQuerySpec } from "@azure/cosmos";
 import { EnsureIndexIsCreated } from "./azure-ai-search/azure-ai-search";
 import { CHAT_DOCUMENT_ATTRIBUTE, ChatDocumentModel } from "./models";
-import { UploadBlob } from "@/features/common/services/azure-storage";
+import {
+  GenerateSasUrl,
+  UploadBlob,
+} from "@/features/common/services/azure-storage";
 
 // ─────────────────────────────────────────────
 // アップロード上限（バイト）
@@ -50,7 +53,12 @@ export const UploadDocumentToStore = async (
   fileName: string,
   fileData: Buffer
 ): Promise<ServerActionResponse<string>> => {
-  return await UploadBlob(DOCUMENT_CONTAINER_NAME, fileName, fileData);
+  const uploadResponse = await UploadBlob(DOCUMENT_CONTAINER_NAME, fileName, fileData);
+  if (uploadResponse.status !== "OK") {
+    return uploadResponse;
+  }
+
+  return await GenerateSasUrl(DOCUMENT_CONTAINER_NAME, fileName);
 };
 
 export const UploadDocument = async (formData: FormData) => {

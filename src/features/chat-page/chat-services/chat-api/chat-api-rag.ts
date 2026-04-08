@@ -2,14 +2,12 @@
 import "server-only";
 
 import { OpenAIInstance } from "@/features/common/services/openai";
-import {
-  ChatCompletionStreamingRunner,
-  ChatCompletionStreamParams,
-} from "openai/resources/beta/chat/completions";
+import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/completions";
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ExtensionSimilaritySearch } from "../azure-ai-search/azure-ai-search";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { ChatCitationModel, ChatThreadModel } from "../models";
+import { GetDefaultExtensions } from "./chat-api-default-extensions";
 
 // dept判定ユーティリティ
 import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
@@ -106,13 +104,9 @@ export const ChatApiRAG = async (props: {
   console.log("[RAG-EXT] deptLower =", deptLower);
   console.log("[RAG-EXT] userHash =", userHash ? "***" : "(none)");
 
-  // 業務条件は chatThreadId のみ
-  // ACL は azure-ai-search.ts 側の buildSearchAclFilter() に一本化
   const filter = `(chatThreadId eq '${odataEscape(chatThread.id)}' or isSlDoc eq true)`;
-
   console.log("[RAG-EXT] base filter =", filter);
 
-  // ※ 環境変数名は、あなたの既存プロジェクトに合わせて必要なら読み替えてください
   const apiKey = getRequiredEnv("AZURE_SEARCH_API_KEY");
   const searchName = getRequiredEnv("AZURE_SEARCH_NAME");
   const indexName = getRequiredEnv("AZURE_SEARCH_INDEX_NAME");
@@ -125,42 +119,53 @@ export const ChatApiRAG = async (props: {
     indexName,
     filter,
     deptLower,
-    userHash: userHash ?? undefined, // ★ null → undefined に変換
+    userHash: userHash ?? undefined,
   });
 
   const documents: ChatCitationModel[] = [];
 
   if (documentResponse.status === "OK") {
     const withoutEmbedding = FormatCitations(documentResponse.response);
-
-    // 既存シグネチャを維持
     const citationResponse = await CreateCitations(withoutEmbedding);
-
     citationResponse.forEach((c) => {
       if (c.status === "OK") {
         documents.push(c.response);
       }
     });
   } else {
-    console.error(
-      "[RAG-EXT] ExtensionSimilaritySearch error:",
-      documentResponse.errors
-    );
+    console.error("[RAG-EXT] ExtensionSimilaritySearch error:", documentResponse.errors);
   }
 
   const content = documents
     .map((result, index) => {
       const page = result.content.document.pageContent;
+      const fileUrl =
+        result.content.document.effectiveFileUrl ??
+        result.content.document.fileUrl ??
+        "";
       return `[${index}]. file name: ${result.content.document.metadata}
-file id: ${result.id}
+file id: ${result.id}${fileUrl ? `\nfile_url: ${fileUrl}` : ""}
 ${page}`;
     })
     .join("\n------\n");
+
+  // ファイルURLリスト（convert_doc_to_pptx ツールに渡すため）
+  const fileUrls = documents
+    .map(
+      (r) =>
+        r.content.document.effectiveFileUrl ?? r.content.document.fileUrl
+    )
+    .filter(Boolean);
+  const fileUrlHint =
+    fileUrls.length > 0
+      ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.`
+      : "";
 
   const _userMessage = `
 - Review the following content from documents uploaded by the user and create a final answer.
 - If you don't know the answer, just say that you don't know. Don't try to make up an answer.
 - You must always include a citation at the end of your answer and don't include full stop after the citations.
+- If the user asks to create a PowerPoint or slides from the document content, use the convert_doc_to_pptx tool with the file_url from the document context below. This tool uses Vision API for high-quality conversion.${fileUrlHint}
 
 ----------------
 content:
@@ -171,15 +176,41 @@ question:
 ${userMessage}
 `;
 
-  const stream: ChatCompletionStreamParams = {
-    model: "",
-    stream: true,
-    messages: [
-      { role: "system", content: chatThread.personaMessage },
-      ...history,
-      { role: "user", content: _userMessage },
-    ],
-  };
+  // ★ デフォルトツール（create_pptx 等）を RAG モードでも有効にする
+  const extensionsResponse = await GetDefaultExtensions({
+    chatThread,
+    userMessage,
+    signal,
+  });
+  const tools = extensionsResponse.status === "OK" ? extensionsResponse.response : [];
 
-  return openAI.beta.chat.completions.stream(stream, { signal });
+  if (tools.length > 0) {
+    return openAI.beta.chat.completions.runTools(
+      {
+        model: "",
+        stream: true,
+        messages: [
+          { role: "system", content: chatThread.personaMessage },
+          ...history,
+          { role: "user", content: _userMessage },
+        ],
+        tools,
+      },
+      { signal }
+    );
+  }
+
+  // ツールなしフォールバック
+  return openAI.beta.chat.completions.stream(
+    {
+      model: "",
+      stream: true,
+      messages: [
+        { role: "system", content: chatThread.personaMessage },
+        ...history,
+        { role: "user", content: _userMessage },
+      ],
+    },
+    { signal }
+  );
 };
