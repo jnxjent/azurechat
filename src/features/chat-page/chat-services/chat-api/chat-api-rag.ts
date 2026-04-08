@@ -139,22 +139,23 @@ export const ChatApiRAG = async (props: {
   const content = documents
     .map((result, index) => {
       const page = result.content.document.pageContent;
-      const fileUrl =
+      // effectiveFileUrl はSP URLの場合が多く認証が必要なため、citationリンク用
+      // Vision APIダウンロード用にはBlob URLである fileUrl を使う
+      const displayUrl =
         result.content.document.effectiveFileUrl ??
         result.content.document.fileUrl ??
         "";
+      const blobUrl = result.content.document.fileUrl ?? displayUrl;
       return `[${index}]. file name: ${result.content.document.metadata}
-file id: ${result.id}${fileUrl ? `\nfile_url: ${fileUrl}` : ""}
+file id: ${result.id}${blobUrl ? `\nfile_url: ${blobUrl}` : ""}
 ${page}`;
     })
     .join("\n------\n");
 
   // ファイルURLリスト（convert_doc_to_pptx ツールに渡すため）
+  // ★ fileUrl (Blob URL) を使う。effectiveFileUrl はSP URLで認証必要なため不可
   const fileUrls = documents
-    .map(
-      (r) =>
-        r.content.document.effectiveFileUrl ?? r.content.document.fileUrl
-    )
+    .map((r) => r.content.document.fileUrl)
     .filter(Boolean);
   const fileUrlHint =
     fileUrls.length > 0

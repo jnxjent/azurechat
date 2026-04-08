@@ -49,7 +49,7 @@ const CHUNK_OVERLAP = CHUNK_SIZE * 0.25;
 const DOCUMENT_CONTAINER_NAME = "dl-link";
 
 export const UploadDocumentToStore = async (
-  threadId: string,
+  _threadId: string,
   fileName: string,
   fileData: Buffer
 ): Promise<ServerActionResponse<string>> => {
@@ -109,6 +109,62 @@ export const CrackDocument = async (
   }
 };
 
+// ---------- Excel (.xlsx / .xlsm) テキスト抽出 ----------
+async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const XLSX = require("xlsx");
+
+  const workbook = XLSX.read(Buffer.from(buffer), {
+    type: "buffer",
+    cellFormula: false, // 数式は読まない（値のみ）
+    cellHTML: false,
+    cellNF: false,
+    sheetStubs: false,
+  });
+
+  const docs: string[] = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+
+    // シート全体をJSON（行の配列）に変換
+    const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,          // 1-based配列形式（ヘッダー行も含む）
+      defval: "",         // 空セルは空文字
+      blankrows: false,   // 完全空行はスキップ
+    });
+
+    if (!rows.length) continue;
+
+    const lines: string[] = [`=== シート: ${sheetName} ===`];
+
+    for (const row of rows) {
+      // undefined/null を空文字に変換し、区切り文字「|」で結合
+      const cells = row.map((cell) => {
+        if (cell === null || cell === undefined) return "";
+        // Dateオブジェクトは日付文字列に変換
+        if (cell instanceof Date) return cell.toLocaleDateString("ja-JP");
+        return String(cell).trim();
+      });
+      // 全セルが空の行はスキップ
+      if (cells.every((c) => c === "")) continue;
+      lines.push(cells.join(" | "));
+    }
+
+    if (lines.length > 1) {
+      docs.push(lines.join("\n"));
+    }
+  }
+
+  return docs;
+}
+
+// Excel拡張子判定
+function isExcelFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return lower.endsWith(".xlsx") || lower.endsWith(".xlsm");
+}
+
 const LoadFile = async (
   formData: FormData
 ): Promise<ServerActionResponse<string[]>> => {
@@ -116,13 +172,27 @@ const LoadFile = async (
     const file: File | null = formData.get("file") as unknown as File;
 
     if (file && file.size < MAX_UPLOAD_DOCUMENT_SIZE) {
-      const client = DocumentIntelligenceInstance();
+      const buffer = await file.arrayBuffer();
 
-      const blob = new Blob([file], { type: file.type });
+      // Excel ファイル (.xlsx / .xlsm) は SheetJS で全シート抽出
+      if (isExcelFile(file.name)) {
+        console.log(`[LoadFile] Excel extraction: ${file.name}`);
+        const docs = await extractExcelText(buffer);
+        if (!docs.length) {
+          return {
+            status: "ERROR",
+            errors: [{ message: "Excelファイルの内容が空か読み取れませんでした。" }],
+          };
+        }
+        return { status: "OK", response: docs };
+      }
+
+      // その他のファイルは Azure Document Intelligence で抽出
+      const client = DocumentIntelligenceInstance();
 
       const poller = await client.beginAnalyzeDocument(
         "prebuilt-read",
-        await blob.arrayBuffer()
+        buffer
       );
       const { paragraphs } = await poller.pollUntilDone();
 
