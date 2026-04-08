@@ -79,7 +79,6 @@ export async function POST(req: NextRequest) {
     pptx.subject = title;
     pptx.title = title;
     pptx.company = "azurechat";
-    pptx.lang = "ja-JP";
 
     const titleSlide = pptx.addSlide();
     titleSlide.background = { color: "1F3864" };
@@ -93,7 +92,7 @@ export async function POST(req: NextRequest) {
       bold: true,
       color: "FFFFFF",
       align: "center",
-      valign: "mid",
+      valign: "middle",
       margin: 0.1,
     });
 
@@ -140,7 +139,7 @@ export async function POST(req: NextRequest) {
           h: 5.2,
           margin: 0.08,
           valign: "top",
-          paraSpaceAfterPt: 10,
+          paraSpaceAfter: 10,
           breakLine: false,
         });
       }
