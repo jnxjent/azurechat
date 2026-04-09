@@ -3,10 +3,11 @@
 import "server-only";
 
 import { GenerateSasUrl } from "@/features/common/services/azure-storage";
-import { OpenAIDALLEInstance } from "@/features/common/services/openai";
+import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
+import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
 
 import {
@@ -49,6 +50,189 @@ async function resolveDocumentUrlForVision(
   threadId: string
 ): Promise<string> {
   try {
+    /*
+    if (sourceFileUrls.length > 1) {
+      const mergedSlides: Array<{
+        title: string;
+        bullets: string[];
+        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        tableRows?: string[][];
+        columns?: Array<{ header: string; bullets: string[] }>;
+      }> = [];
+      let mergedTotalPages = 0;
+
+      for (const currentFileUrl of sourceFileUrls) {
+        const resolvedFileUrl = await resolveDocumentUrlForVision(
+          currentFileUrl,
+          chatThread.id
+        );
+        console.log("[convert_doc_to_pptx] Analyzing document with Vision API:", {
+          sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
+          resolvedUrl: resolvedFileUrl.substring(0, 80),
+        });
+        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+        });
+
+        if (!analyzeRes.ok) {
+          const t = await analyzeRes.text().catch(() => "");
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
+          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
+        }
+
+        const analyzeResult = await analyzeRes.json();
+        if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
+        }
+
+        mergedSlides.push(...analyzeResult.slides);
+        mergedTotalPages += analyzeResult.totalPages ?? analyzeResult.slides.length;
+      }
+
+      const mergedTitle =
+        mergedSlides[0]?.title ||
+        derivedTitle ||
+        presentationTitle?.trim() ||
+        "プレゼンテーション";
+
+      console.log("[convert_doc_to_pptx] Title sources:", {
+        derivedTitle,
+        presentationTitle,
+        deckPreferences,
+        firstSlideTitle: mergedSlides[0]?.title,
+        finalTitle: mergedTitle,
+      });
+      console.log("[convert_doc_to_pptx] Aggregated deck:", {
+        fileCount: sourceFileUrls.length,
+        totalPages: mergedTotalPages,
+        slideCount: mergedSlides.length,
+      });
+
+      const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: mergedTitle,
+          slides: mergedSlides,
+          threadId: chatThread.id,
+          fontFace,
+          designInstruction: deckPreferences.designInstruction,
+          deckPreferences,
+        }),
+      });
+
+      if (!pptxRes.ok) {
+        const t = await pptxRes.text().catch(() => "");
+        console.error("[convert_doc_to_pptx] gen-pptx failed:", pptxRes.status, t);
+        return { error: `PowerPoint生成に失敗しました: HTTP ${pptxRes.status}` };
+      }
+
+      const pptxResult = await pptxRes.json();
+      if (!pptxResult?.downloadUrl) {
+        return { error: "ダウンロードURLを取得できませんでした。" };
+      }
+
+      return {
+        downloadUrl: pptxResult.downloadUrl,
+        fileName: pptxResult.fileName,
+        totalPages: mergedTotalPages,
+        message: `${sourceFileUrls.length}件の資料をまとめて${mergedTotalPages}ページ分を解析し、PowerPointを生成しました。`,
+      };
+    }
+    /*
+    if (sourceFileUrls.length > 1) {
+      const mergedSlides: Array<{
+        title: string;
+        bullets: string[];
+        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        tableRows?: string[][];
+        columns?: Array<{ header: string; bullets: string[] }>;
+      }> = [];
+      let mergedTotalPages = 0;
+
+      for (const currentFileUrl of sourceFileUrls) {
+        const resolvedFileUrl = await resolveDocumentUrlForVision(
+          currentFileUrl,
+          chatThread.id
+        );
+        console.log("[convert_doc_to_pptx] Analyzing document with Vision API:", {
+          sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
+          resolvedUrl: resolvedFileUrl.substring(0, 80),
+        });
+        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+        });
+
+        if (!analyzeRes.ok) {
+          const t = await analyzeRes.text().catch(() => "");
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
+          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
+        }
+
+        const analyzeResult = await analyzeRes.json();
+        if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
+        }
+
+        mergedSlides.push(...analyzeResult.slides);
+        mergedTotalPages += analyzeResult.totalPages ?? analyzeResult.slides.length;
+      }
+
+      const mergedTitle =
+        mergedSlides[0]?.title ||
+        derivedTitle ||
+        presentationTitle?.trim() ||
+        "プレゼンテーション";
+
+      console.log("[convert_doc_to_pptx] Title sources:", {
+        derivedTitle,
+        presentationTitle,
+        deckPreferences,
+        firstSlideTitle: mergedSlides[0]?.title,
+        finalTitle: mergedTitle,
+      });
+      console.log("[convert_doc_to_pptx] Aggregated deck:", {
+        fileCount: sourceFileUrls.length,
+        totalPages: mergedTotalPages,
+        slideCount: mergedSlides.length,
+      });
+
+      const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: mergedTitle,
+          slides: mergedSlides,
+          threadId: chatThread.id,
+          fontFace,
+          designInstruction: deckPreferences.designInstruction,
+          deckPreferences,
+        }),
+      });
+
+      if (!pptxRes.ok) {
+        const t = await pptxRes.text().catch(() => "");
+        console.error("[convert_doc_to_pptx] gen-pptx failed:", pptxRes.status, t);
+        return { error: `PowerPoint生成に失敗しました: HTTP ${pptxRes.status}` };
+      }
+
+      const pptxResult = await pptxRes.json();
+      if (!pptxResult?.downloadUrl) {
+        return { error: "ダウンロードURLを取得できませんでした。" };
+      }
+
+      return {
+        downloadUrl: pptxResult.downloadUrl,
+        fileName: pptxResult.fileName,
+        totalPages: mergedTotalPages,
+        message: `${sourceFileUrls.length}件の資料をまとめて${mergedTotalPages}ページ分を解析し、PowerPointを生成しました。`,
+      };
+    }
+    */
     const url = new URL(fileUrl);
     const isSharePointUrl = url.hostname.includes("sharepoint.com");
     const isAzureBlobWithoutSas =
@@ -58,7 +242,7 @@ async function resolveDocumentUrlForVision(
       return fileUrl;
     }
 
-    const fileName = decodeURIComponent(url.pathname.split("/").pop() ?? "").trim();
+    const fileName = extractFileNameFromDocumentUrl(fileUrl);
     if (!fileName) {
       return fileUrl;
     }
@@ -75,6 +259,200 @@ async function resolveDocumentUrlForVision(
   }
 
   return fileUrl;
+}
+
+function extractFileNameFromDocumentUrl(fileUrl: string): string | null {
+  try {
+    const url = new URL(fileUrl);
+    const sharePointFileName = url.searchParams.get("file");
+    if (sharePointFileName?.trim()) {
+      return decodeURIComponent(sharePointFileName).trim();
+    }
+
+    const pathFileName = decodeURIComponent(url.pathname.split("/").pop() ?? "").trim();
+    if (!pathFileName || pathFileName.toLowerCase() === "doc.aspx") {
+      return null;
+    }
+
+    return pathFileName;
+  } catch {
+    return null;
+  }
+}
+
+function extractPresentationTitleFromFileUrl(fileUrl: string): string | null {
+  const fileName = extractFileNameFromDocumentUrl(fileUrl);
+  if (!fileName) {
+    return null;
+  }
+
+  const title = fileName.replace(/\.[^.]+$/, "").trim();
+  return title || null;
+}
+
+type DeckPreferences = {
+  designInstruction?: string;
+  language?: "ja" | "en";
+  fontScale?: "small" | "medium" | "large" | "xlarge";
+  accentColor?: string;
+  avoidEnglishLabels?: boolean;
+  recentDesignNotes?: string[];
+};
+
+function detectLatestPreferenceOverrides(messages: string[]): Partial<DeckPreferences> {
+  const latest = messages[messages.length - 1]?.toLowerCase() ?? "";
+  const merged = messages.join("\n").toLowerCase();
+  const overrides: Partial<DeckPreferences> = {};
+
+  const colorSource = latest || merged;
+  if (colorSource.includes("blue") || colorSource.includes("青")) {
+    overrides.accentColor = "blue";
+  } else if (colorSource.includes("red") || colorSource.includes("赤")) {
+    overrides.accentColor = "red";
+  } else if (
+    colorSource.includes("green") ||
+    colorSource.includes("eco") ||
+    colorSource.includes("緑")
+  ) {
+    overrides.accentColor = "green";
+  } else if (colorSource.includes("gold") || colorSource.includes("金")) {
+    overrides.accentColor = "gold";
+  }
+
+  if (
+    latest.includes("日本語") ||
+    latest.includes("英語使わない") ||
+    latest.includes("英語を使わない")
+  ) {
+    overrides.language = "ja";
+    overrides.avoidEnglishLabels = true;
+  }
+
+  if (latest.includes("文字を大きく") || latest.includes("もう少し大きく")) {
+    overrides.fontScale = "large";
+  } else if (latest.includes("かなり大きく")) {
+    overrides.fontScale = "xlarge";
+  }
+
+  return overrides;
+}
+
+function extractRecentDesignNotes(messages: string[]): string[] {
+  const designKeywords = [
+    "デザイン",
+    "雰囲気",
+    "トーン",
+    "カラー",
+    "色",
+    "基調",
+    "パステル",
+    "pop",
+    "ポップ",
+    "eco",
+    "高級",
+    "洗練",
+    "やわらか",
+    "かわい",
+    "重厚",
+    "営業提案書",
+    "役員向け",
+    "図解",
+    "英語使わない",
+    "日本語",
+    "文字を大きく",
+  ];
+
+  return messages
+    .filter((message) => {
+      const lower = message.toLowerCase();
+      return designKeywords.some((keyword) => lower.includes(keyword.toLowerCase()));
+    })
+    .slice(-4);
+}
+
+async function resolveDeckPreferencesFromThread(
+  chatThreadId: string,
+  explicitInstruction?: string
+): Promise<DeckPreferences> {
+  const explicit = explicitInstruction?.trim();
+
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 12);
+    if (historyResponse.status !== "OK") {
+      return { designInstruction: explicit };
+    }
+
+    const userMessages = historyResponse.response
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .reverse();
+
+    if (userMessages.length === 0) {
+      return { designInstruction: explicit };
+    }
+
+    const latestOverrides = detectLatestPreferenceOverrides(userMessages);
+    const recentDesignNotes = extractRecentDesignNotes(userMessages);
+
+    const openai = OpenAIInstance();
+    const res = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Summarize the user's recurring PowerPoint design intent from recent chat messages. Focus on visual direction and persistent deck-edit preferences. Return JSON only with keys designInstruction, language, fontScale, accentColor, avoidEnglishLabels. language must be 'ja' or 'en' when known. fontScale must be one of small, medium, large, xlarge when known. accentColor should be a short color name like red, green, blue, gold when the user requests a base color. avoidEnglishLabels should be true if the user wants labels like Takeaway translated. If a field is unknown, omit it or return an empty string.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            explicitInstruction: explicit ?? "",
+            recentUserMessages: userMessages,
+          }),
+        },
+      ],
+      response_format: { type: "json_object" },
+      max_completion_tokens: 220,
+    });
+
+    const parsed = JSON.parse(res.choices[0]?.message?.content ?? "{}");
+    const summarized = String(parsed?.designInstruction ?? "").trim();
+    return {
+      designInstruction:
+        explicit && summarized
+          ? `${explicit} / Context from this thread: ${summarized}`
+          : explicit || summarized || undefined,
+      language:
+        latestOverrides.language ||
+        (parsed?.language === "ja" || parsed?.language === "en"
+          ? parsed.language
+          : undefined),
+      fontScale:
+        latestOverrides.fontScale ||
+        (parsed?.fontScale === "small" ||
+        parsed?.fontScale === "medium" ||
+        parsed?.fontScale === "large" ||
+        parsed?.fontScale === "xlarge"
+          ? parsed.fontScale
+          : undefined),
+      accentColor:
+        latestOverrides.accentColor ||
+        String(parsed?.accentColor ?? "").trim() ||
+        undefined,
+      avoidEnglishLabels:
+        typeof latestOverrides.avoidEnglishLabels === "boolean"
+          ? latestOverrides.avoidEnglishLabels
+          : typeof parsed?.avoidEnglishLabels === "boolean"
+          ? parsed.avoidEnglishLabels
+          : undefined,
+      recentDesignNotes,
+    };
+  } catch (error) {
+    console.warn("[convert_doc_to_pptx] design instruction fallback:", error);
+    return { designInstruction: explicit };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -488,6 +866,12 @@ export const GetDefaultExtensions = async (props: {
             description:
               "変換するファイルのURL（Azure BlobのURL）。会話コンテキストの file_url または fileUrl から取得すること。",
           },
+          fileUrls: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "追加で取り込む複数ファイルURLの配列。fileUrl と一緒に渡すと、1つのPPTにまとめて生成する。",
+          },
           presentationTitle: {
             type: "string",
             description:
@@ -497,12 +881,17 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
           },
+          designInstruction: {
+            type: "string",
+            description:
+              "User縺ｮ閾ｪ辟ｶ隱ｿ謨ｴ繧堤ｴｻ縺励※PPT縺ｮLook&Feeling繧剃ｿ・★縺溘ａ縺ｮ閾ｪ辟ｶ隱ｿ謨ｴ縲ゆｾ・ 'ecoで洗練された役員向け' 'ポップで親しみやすく図解多め' '高級感のある提案書トーン'",
+          },
           maxPages: {
             type: "number",
             description: "変換する最大ページ数（省略可能、デフォルト30）",
           },
         },
-        required: ["fileUrl"],
+        required: [],
       },
       description:
         "ユーザーがアップロードしたPDF・画像ファイルをPowerPoint（PPTX）に変換するツール。\n" +
@@ -511,6 +900,39 @@ export const GetDefaultExtensions = async (props: {
         "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_doc_to_pptx",
+    },
+  });
+
+  // ★ 既存 PPTX を指示に従って改良するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeEditPptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "編集対象のPPTXファイルのURL。会話コンテキストの file_url から取得すること。",
+          },
+          instruction: {
+            type: "string",
+            description:
+              "ユーザーの編集指示。例: '全体のトーンをより力強く', '3枚目のタイトルをXXXに変えて', '結論スライドを追加して'",
+          },
+        },
+        required: ["fileUrl", "instruction"],
+      },
+      description:
+        "ユーザーがアップロードした既存のPPTXファイルを、指示に従って改良するツール。\n" +
+        "デザイン・レイアウト・画像・背景は保持しつつ、テキスト内容のみを改変する。\n" +
+        "使用タイミング：ユーザーが既存PPTに対して「〜に変えて」「〜を追加して」「〜を改善して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
+        "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_pptx",
     },
   });
 
@@ -570,15 +992,29 @@ async function executeCreatePptx(
 async function executeConvertDocToPptx(
   args: {
     fileUrl: string;
+    fileUrls?: string[];
     presentationTitle?: string;
     fontFace?: string;
+    designInstruction?: string;
     maxPages?: number;
   },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, presentationTitle, fontFace, maxPages } = args ?? {};
+  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages } = args ?? {};
+  const sourceFileUrls = Array.from(
+    new Set(
+      [fileUrl, ...(Array.isArray(fileUrls) ? fileUrls : [])]
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+  const derivedTitle = sourceFileUrls[0] ? extractPresentationTitleFromFileUrl(sourceFileUrls[0]) : null;
+  const deckPreferences = await resolveDeckPreferencesFromThread(
+    chatThread.id,
+    designInstruction
+  );
 
-  if (!fileUrl?.trim()) {
+  if (sourceFileUrls.length === 0) {
     return { error: "fileUrl は必須です。" };
   }
 
@@ -588,6 +1024,96 @@ async function executeConvertDocToPptx(
   ).replace(/\/+$/, "");
 
   try {
+    if (sourceFileUrls.length > 1) {
+      const mergedSlides: Array<{
+        title: string;
+        bullets: string[];
+        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        tableRows?: string[][];
+        columns?: Array<{ header: string; bullets: string[] }>;
+      }> = [];
+      let mergedTotalPages = 0;
+
+      for (const currentFileUrl of sourceFileUrls) {
+        const resolvedFileUrl = await resolveDocumentUrlForVision(
+          currentFileUrl,
+          chatThread.id
+        );
+        console.log("[convert_doc_to_pptx] Analyzing document with Vision API:", {
+          sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
+          resolvedUrl: resolvedFileUrl.substring(0, 80),
+        });
+        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+        });
+
+        if (!analyzeRes.ok) {
+          const t = await analyzeRes.text().catch(() => "");
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
+          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
+        }
+
+        const analyzeResult = await analyzeRes.json();
+        if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
+        }
+
+        mergedSlides.push(...analyzeResult.slides);
+        mergedTotalPages += analyzeResult.totalPages ?? analyzeResult.slides.length;
+      }
+
+      const mergedTitle =
+        mergedSlides[0]?.title ||
+        derivedTitle ||
+        presentationTitle?.trim() ||
+        "プレゼンテーション";
+
+      console.log("[convert_doc_to_pptx] Title sources:", {
+        derivedTitle,
+        presentationTitle,
+        deckPreferences,
+        firstSlideTitle: mergedSlides[0]?.title,
+        finalTitle: mergedTitle,
+      });
+      console.log("[convert_doc_to_pptx] Aggregated deck:", {
+        fileCount: sourceFileUrls.length,
+        totalPages: mergedTotalPages,
+        slideCount: mergedSlides.length,
+      });
+
+      const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: mergedTitle,
+          slides: mergedSlides,
+          threadId: chatThread.id,
+          fontFace,
+          designInstruction: deckPreferences.designInstruction,
+          deckPreferences,
+        }),
+      });
+
+      if (!pptxRes.ok) {
+        const t = await pptxRes.text().catch(() => "");
+        console.error("[convert_doc_to_pptx] gen-pptx failed:", pptxRes.status, t);
+        return { error: `PowerPoint生成に失敗しました: HTTP ${pptxRes.status}` };
+      }
+
+      const pptxResult = await pptxRes.json();
+      if (!pptxResult?.downloadUrl) {
+        return { error: "ダウンロードURLを取得できませんでした。" };
+      }
+
+      return {
+        downloadUrl: pptxResult.downloadUrl,
+        fileName: pptxResult.fileName,
+        totalPages: mergedTotalPages,
+        message: `${sourceFileUrls.length}件の資料をまとめて${mergedTotalPages}ページ分を解析し、PowerPointを生成しました。`,
+      };
+    }
     // Step 1: Vision API でドキュメントを解析してスライド構造を取得
     const resolvedFileUrl = await resolveDocumentUrlForVision(
       fileUrl,
@@ -611,22 +1137,43 @@ async function executeConvertDocToPptx(
       return { error: analyzeResult?.error ?? "ドキュメントの解析結果が空でした。" };
     }
 
-    const slides: Array<{ title: string; bullets: string[] }> = analyzeResult.slides;
+    const slides: Array<{
+      title: string;
+      bullets: string[];
+      layoutType?: "title" | "bullets" | "table" | "multi-column";
+      tableRows?: string[][];
+      columns?: Array<{ header: string; bullets: string[] }>;
+    }> = analyzeResult.slides;
     const totalPages: number = analyzeResult.totalPages ?? slides.length;
 
     // タイトルを決定（指定がなければ最初のスライドのタイトルを使う）
     const title =
-      presentationTitle?.trim() ||
       slides[0]?.title ||
+      derivedTitle ||
+      presentationTitle?.trim() ||
       "プレゼンテーション";
 
+    console.log("[convert_doc_to_pptx] Title sources:", {
+      derivedTitle,
+      presentationTitle,
+      deckPreferences,
+      firstSlideTitle: slides[0]?.title,
+      finalTitle: title,
+    });
     console.log(`[convert_doc_to_pptx] Analyzed ${totalPages} pages → ${slides.length} slides`);
 
     // Step 2: 解析結果から PPTX を生成
     const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, slides, threadId: chatThread.id, fontFace }),
+      body: JSON.stringify({
+        title,
+        slides,
+        threadId: chatThread.id,
+        fontFace,
+        designInstruction: deckPreferences.designInstruction,
+        deckPreferences,
+      }),
     });
 
     if (!pptxRes.ok) {
@@ -649,6 +1196,53 @@ async function executeConvertDocToPptx(
   } catch (e: any) {
     console.error("[convert_doc_to_pptx] error:", e);
     return { error: "変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- 既存 PPTX 改良 ----------------
+async function executeEditPptx(
+  args: { fileUrl: string; instruction: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl, instruction } = args ?? {};
+
+  if (!fileUrl?.trim() || !instruction?.trim()) {
+    return { error: "fileUrl と instruction は必須です。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[edit_pptx] edit-pptx failed:", res.status, t);
+      return { error: `PPTX編集に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      changedSlides: result.changedSlides,
+      totalSlides: result.totalSlides,
+      message: `${result.changedSlides}枚のスライドを編集しました（全${result.totalSlides}枚）。`,
+    };
+  } catch (e: any) {
+    console.error("[edit_pptx] error:", e);
+    return { error: "PPTX編集中にエラーが発生しました: " + String(e?.message ?? e) };
   }
 }
 
