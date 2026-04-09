@@ -206,27 +206,81 @@ ${JSON.stringify(slideMaps, null, 2)}
 
 // ── Blob helpers ───────────────────────────────────────────────────────────
 
-async function downloadBlob(fileUrl: string): Promise<Buffer> {
+function parseAzureBlobUrl(fileUrl: string): {
+  containerName: string;
+  blobPath: string;
+} | null {
+  try {
+    const urlObj = new URL(fileUrl.split("?")[0]);
+    if (!urlObj.hostname.includes(".blob.core.windows.net")) return null;
+    const parts = urlObj.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    return {
+      containerName: parts[0],
+      blobPath: parts.slice(1).join("/"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function downloadBlobDirectFromStorage(
+  containerName: string,
+  blobPath: string
+): Promise<Buffer | null> {
+  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
+  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
+  if (!acc || !key) return null;
+
+  try {
+    const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
+    const svc = BlobServiceClient.fromConnectionString(connStr);
+    const cc = svc.getContainerClient(containerName);
+    return await cc.getBlockBlobClient(blobPath).downloadToBuffer();
+  } catch {
+    return null;
+  }
+}
+
+async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer> {
   // Try direct fetch first (SAS URL)
   const res = await fetch(fileUrl);
   if (res.ok) {
     return Buffer.from(await res.arrayBuffer());
   }
 
+  // Recovery flow: if SAS is broken but the blob path itself is valid,
+  // bypass the SAS URL and download directly with the server-side account key.
+  const blobRef = parseAzureBlobUrl(fileUrl);
+  if (blobRef && (res.status === 403 || res.status === 404)) {
+    const directBuffer = await downloadBlobDirectFromStorage(
+      blobRef.containerName,
+      blobRef.blobPath
+    );
+    if (directBuffer) {
+      console.warn(
+        `[edit-pptx] recovered blob download via account key: ${blobRef.containerName}/${blobRef.blobPath}`
+      );
+      return directBuffer;
+    }
+  }
+
   // Fallback: list blobs to find actual PPTX
-  if (res.status === 404 && fileUrl.includes(".blob.core.windows.net/dl-link/")) {
+  if (
+    (res.status === 403 || res.status === 404) &&
+    blobRef &&
+    (blobRef.containerName === "dl-link" || blobRef.containerName === "pptx")
+  ) {
     const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
     const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
     if (acc && key) {
-      const urlObj = new URL(fileUrl.split("?")[0]);
-      const parts = urlObj.pathname.split("/").filter(Boolean);
-      if (parts.length >= 2) {
-        const containerName = parts[0];
-        const threadId = parts[1];
+      const blobPathParts = blobRef.blobPath.split("/").filter(Boolean);
+      const effectiveThreadId = threadId?.trim() || blobPathParts[0];
+      if (effectiveThreadId) {
         const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
         const svc = BlobServiceClient.fromConnectionString(connStr);
-        const cc = svc.getContainerClient(containerName);
-        for await (const blob of cc.listBlobsFlat({ prefix: `${threadId}/` })) {
+        const cc = svc.getContainerClient(blobRef.containerName);
+        for await (const blob of cc.listBlobsFlat({ prefix: `${effectiveThreadId}/` })) {
           if (blob.name.toLowerCase().endsWith(".pptx")) {
             return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
           }
@@ -288,7 +342,7 @@ export async function POST(req: NextRequest) {
     console.log("[edit-pptx] instruction =", instruction.substring(0, 120));
 
     // 1. Download PPTX
-    const pptxBuffer = await downloadBlob(fileUrl);
+    const pptxBuffer = await downloadBlob(fileUrl, threadId);
 
     // 2. Open ZIP
     const zip = await JSZip.loadAsync(pptxBuffer);
