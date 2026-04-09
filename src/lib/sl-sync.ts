@@ -248,17 +248,24 @@ async function lookupSpItemByIdInDrive(
 
     const res = await fetch(
       `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}` +
-        `?$select=name,file,id,webUrl,parentReference`,
+        `?$select=name,file,id,webUrl,parentReference,deleted`,
       { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" }
     );
 
-    if (res.status === 404) return null; // ファイルが実際に削除済み
+    if (res.status === 404) return null; // ファイルが実際に削除済み（ゴミ箱も空）
     if (!res.ok) {
       console.warn(`[SL sync] lookupSpItemById failed (${res.status}): ${await res.text()}`);
       return null;
     }
 
     const item = await res.json();
+
+    // ★ ゴミ箱に入ったアイテムは deleted ファセットが付く → 削除済みとして扱いorphan化
+    if (item?.deleted) {
+      console.log(`[SL sync] lookupSpItemByIdInDrive: item in Recycle Bin, treating as deleted: itemId=${itemId}`);
+      return null;
+    }
+
     if (!item?.file || !item?.name) return null; // フォルダ等はスキップ
 
     // parentReference.path = "/drives/{id}/root:/folder/path" 形式

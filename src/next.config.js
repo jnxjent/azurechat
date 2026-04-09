@@ -5,7 +5,9 @@ const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: [
       "@azure/storage-blob",
-      "@napi-rs/canvas", // ← 追加
+      "@napi-rs/canvas",
+      "pdfjs-dist",
+      "xlsx",
     ],
   },
 
