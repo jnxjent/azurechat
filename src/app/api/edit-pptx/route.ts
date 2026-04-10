@@ -1,18 +1,12 @@
 export const runtime = "nodejs";
 
-/**
- * POST /api/edit-pptx
- *
- * 既存 PPTX ファイルをダウンロードし、ユーザーの指示に従ってテキスト内容だけを
- * GPT で書き換えて返す。背景・画像・レイアウト・フォント等のデザインは保持する。
- *
- * Body: { fileUrl: string; instruction: string; threadId: string }
- * Response: { ok: true; downloadUrl: string; fileName: string }
- *           | { ok: false; error: string }
- */
-
 import { NextRequest, NextResponse } from "next/server";
 import JSZip from "jszip";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   BlobSASPermissions,
   BlobServiceClient,
@@ -22,7 +16,27 @@ import {
 import { OpenAIInstance } from "@/features/common/services/openai";
 import { uniqueId } from "@/features/common/util";
 
-// ── XML helpers ────────────────────────────────────────────────────────────
+const execFileAsync = promisify(execFile);
+
+type SlideSummary = {
+  slideIndex: number;
+  texts: string[];
+};
+
+type EditPlan = {
+  deckEdits?: {
+    accentColor?: string | null;
+    fontFace?: string | null;
+    preserveTextColors?: boolean;
+  };
+  slideEdits?: Array<{
+    slideIndex: number;
+    replaceText?: Array<{
+      find: string;
+      replace: string;
+    }>;
+  }>;
+};
 
 function decodeXmlEntities(s: string): string {
   return s
@@ -33,79 +47,28 @@ function decodeXmlEntities(s: string): string {
     .replace(/&quot;/g, '"');
 }
 
-function encodeXmlEntities(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/'/g, "&apos;")
-    .replace(/"/g, "&quot;");
+function normalizeHexColor(value: string | undefined | null): string | undefined {
+  const normalized = String(value ?? "").replace("#", "").trim().toUpperCase();
+  return /^[0-9A-F]{6}$/.test(normalized) ? normalized : undefined;
 }
 
-/**
- * Extract shape text from a single <p:sp> block.
- * Each <a:p> paragraph becomes one line.
- * Within a paragraph, all <a:t> runs are concatenated (no separator).
- * Returns { paragraphs: string[], totalRuns: number }
- */
 function extractShapeTextByParagraph(shapeXml: string): string[] {
   const paragraphs: string[] = [];
   const paraRe = /<a:p(?:\s[^>]*)?>[\s\S]*?<\/a:p>/g;
   let pm: RegExpExecArray | null;
   while ((pm = paraRe.exec(shapeXml)) !== null) {
     const paraXml = pm[0];
-    // Collect all <a:t> texts within this paragraph (concatenate runs)
     const runRe = /<a:t(?:\s[^>]*)?>([^<]*)<\/a:t>/g;
     let rm: RegExpExecArray | null;
     let paraText = "";
     while ((rm = runRe.exec(paraXml)) !== null) {
       paraText += decodeXmlEntities(rm[1]);
     }
-    paragraphs.push(paraText);
+    if (paraText.trim()) paragraphs.push(paraText);
   }
   return paragraphs;
 }
 
-/**
- * Replace text in a single <p:sp> shape XML.
- * newParagraphs[i] maps to the i-th <a:p> that HAS runs.
- * Within each paragraph:
- *   - first <a:t> gets the new text
- *   - subsequent <a:t> in same paragraph are emptied
- * Paragraphs without runs (e.g. spacing-only) are preserved unchanged.
- */
-function replaceShapeText(shapeXml: string, newParagraphs: string[]): string {
-  let paraWithRunsIndex = 0;
-
-  return shapeXml.replace(
-    /(<a:p(?:\s[^>]*)?>)([\s\S]*?)(<\/a:p>)/g,
-    (full, open, body, close) => {
-      const hasRun = /<a:r[\s>]/.test(body);
-      if (!hasRun) return full; // spacing/format-only paragraph — keep as-is
-
-      const targetText = paraWithRunsIndex < newParagraphs.length
-        ? newParagraphs[paraWithRunsIndex]
-        : "";
-      paraWithRunsIndex++;
-
-      // First <a:t> in this paragraph gets the full text; rest emptied
-      let isFirst = true;
-      const newBody = body.replace(
-        /(<a:t(?:\s[^>]*)?>)([^<]*)(<\/a:t>)/g,
-        (_full: string, atOpen: string, _old: string, atClose: string) => {
-          if (isFirst) {
-            isFirst = false;
-            return `${atOpen}${encodeXmlEntities(targetText)}${atClose}`;
-          }
-          return `${atOpen}${atClose}`;
-        }
-      );
-      return `${open}${newBody}${close}`;
-    }
-  );
-}
-
-/** Split slide XML into <p:sp>…</p:sp> shape blocks, returning them in order. */
 function splitIntoShapes(slideXml: string): string[] {
   const shapes: string[] = [];
   const re = /<p:sp[\s>][\s\S]*?<\/p:sp>/g;
@@ -114,55 +77,75 @@ function splitIntoShapes(slideXml: string): string[] {
   return shapes;
 }
 
-/**
- * Apply revised texts back into the slide XML.
- * revisions: shapeIndex (in ALL shapes) → new paragraphs array
- */
-function applyRevisionsToSlide(
-  slideXml: string,
-  revisions: Map<number, string[]>
-): string {
-  if (revisions.size === 0) return slideXml;
-  let shapeIndex = 0;
-  return slideXml.replace(/<p:sp[\s>][\s\S]*?<\/p:sp>/g, (shapeXml) => {
-    const idx = shapeIndex++;
-    if (revisions.has(idx)) {
-      return replaceShapeText(shapeXml, revisions.get(idx)!);
-    }
-    return shapeXml;
-  });
+async function extractSlideSummaries(pptxBuffer: Buffer): Promise<SlideSummary[]> {
+  const zip = await JSZip.loadAsync(pptxBuffer);
+  const slideEntries = Object.keys(zip.files)
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+    .sort((a, b) => {
+      const numA = parseInt(a.match(/slide(\d+)/)?.[1] ?? "0", 10);
+      const numB = parseInt(b.match(/slide(\d+)/)?.[1] ?? "0", 10);
+      return numA - numB;
+    });
+
+  const summaries: SlideSummary[] = [];
+  for (let si = 0; si < slideEntries.length; si++) {
+    const xml = await zip.files[slideEntries[si]].async("string");
+    const shapes = splitIntoShapes(xml);
+    const texts = shapes
+      .flatMap((shapeXml) => extractShapeTextByParagraph(shapeXml))
+      .map((text) => text.trim())
+      .filter(Boolean);
+    summaries.push({ slideIndex: si, texts: texts.slice(0, 20) });
+  }
+  return summaries;
 }
 
-// ── GPT revision ───────────────────────────────────────────────────────────
+function parseDirectAccentColor(instruction: string): string | undefined {
+  const t = instruction.toLowerCase();
+  if (/(赤|red)/.test(t)) return "C00000";
+  if (/(青|blue)/.test(t)) return "2F5597";
+  if (/(緑|green)/.test(t)) return "548235";
+  if (/(紫|purple)/.test(t)) return "7030A0";
+  if (/(オレンジ|orange|橙)/.test(t)) return "C55A11";
+  if (/(黄|yellow)/.test(t)) return "BF9000";
+  if (/(ピンク|pink)/.test(t)) return "C0508A";
+  return undefined;
+}
 
-type SlideTextMap = {
-  slideIndex: number;
-  shapes: { shapeIndex: number; text: string }[];
-};
-
-async function reviseWithGPT(
-  slideMaps: SlideTextMap[],
-  instruction: string
-): Promise<SlideTextMap[]> {
+async function buildEditPlan(slides: SlideSummary[], instruction: string): Promise<EditPlan> {
   const openai = OpenAIInstance();
 
-  const systemPrompt = `あなたはPowerPointスライドのテキストを編集するエキスパートです。
-ユーザーの指示に従って、スライドのテキスト内容を改良してください。
+  const systemPrompt = `You convert a natural-language PowerPoint editing request into a safe JSON edit plan.
+Return JSON only in this shape:
+{
+  "deckEdits": {
+    "accentColor": "RRGGBB" | null,
+    "fontFace": string | null,
+    "preserveTextColors": boolean
+  },
+  "slideEdits": [
+    {
+      "slideIndex": number,
+      "replaceText": [{ "find": string, "replace": string }]
+    }
+  ]
+}
 
-必須ルール:
-- 必ず {"slides": [...]} 形式のJSONを返すこと（slides キーは必須）
-- 指示に無関係なスライド・テキストボックスも含め、全スライドをそのまま返すこと
-- テキストボックス内の改行（\\n）は維持すること
-- テキストを変更した場合のみ text フィールドを更新し、変更しない場合は元の text をそのまま返すこと`;
+Rules:
+- If the user asks to change the deck color or tone, set deckEdits.accentColor to a practical 6-digit hex.
+- Deck color change means accent shapes, fills, and lines. It does not mean changing body text color.
+- preserveTextColors should usually be true unless the user explicitly asks to recolor text.
+- Only emit text replacements when the user explicitly wants wording changed.
+- slideIndex is zero-based.
+- Keep the JSON minimal. Use null or [] when not needed.`;
 
-  const userPrompt = `以下のスライドテキスト構造に対して、次の指示を適用してください。
+  const userPrompt = `Instruction:
+${instruction}
 
-指示: ${instruction}
+Slides:
+${JSON.stringify(slides, null, 2)}
 
-スライドテキスト:
-${JSON.stringify(slideMaps, null, 2)}
-
-{"slides": [...]} 形式で全スライドを返してください。`;
+Return JSON only.`;
 
   const res = await openai.chat.completions.create({
     model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
@@ -171,40 +154,24 @@ ${JSON.stringify(slideMaps, null, 2)}
       { role: "user", content: userPrompt },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 4000,
+    max_completion_tokens: 1500,
   });
 
   const content = res.choices[0]?.message?.content ?? "{}";
-  console.log("[edit-pptx] GPT raw response (first 300):", content.substring(0, 300));
+  const parsed = JSON.parse(content) as EditPlan;
+  parsed.deckEdits ??= {};
+  parsed.slideEdits ??= [];
 
-  const parsed = JSON.parse(content);
-
-  // Must return { slides: [...] } — find the array regardless of wrapper key
-  let arr: unknown = null;
-  if (Array.isArray(parsed)) {
-    arr = parsed;
+  const directAccent = parseDirectAccentColor(instruction);
+  if (!normalizeHexColor(parsed.deckEdits.accentColor) && directAccent) {
+    parsed.deckEdits.accentColor = directAccent;
   } else {
-    // Try common wrapper keys
-    for (const key of ["slides", "result", "data", "output", "pptx"]) {
-      if (Array.isArray(parsed[key])) { arr = parsed[key]; break; }
-    }
-    // Last resort: first array-valued key
-    if (!arr) {
-      for (const val of Object.values(parsed)) {
-        if (Array.isArray(val)) { arr = val; break; }
-      }
-    }
+    parsed.deckEdits.accentColor = normalizeHexColor(parsed.deckEdits.accentColor) ?? null;
   }
+  parsed.deckEdits.preserveTextColors = parsed.deckEdits.preserveTextColors !== false;
 
-  if (!Array.isArray(arr) || arr.length === 0) {
-    console.warn("[edit-pptx] GPT returned no usable array, applying no changes");
-    return slideMaps;
-  }
-
-  return arr as SlideTextMap[];
+  return parsed;
 }
-
-// ── Blob helpers ───────────────────────────────────────────────────────────
 
 function parseAzureBlobUrl(fileUrl: string): {
   containerName: string;
@@ -243,14 +210,11 @@ async function downloadBlobDirectFromStorage(
 }
 
 async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer> {
-  // Try direct fetch first (SAS URL)
   const res = await fetch(fileUrl);
   if (res.ok) {
     return Buffer.from(await res.arrayBuffer());
   }
 
-  // Recovery flow: if SAS is broken but the blob path itself is valid,
-  // bypass the SAS URL and download directly with the server-side account key.
   const blobRef = parseAzureBlobUrl(fileUrl);
   if (blobRef && (res.status === 403 || res.status === 404)) {
     const directBuffer = await downloadBlobDirectFromStorage(
@@ -265,7 +229,6 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
     }
   }
 
-  // Fallback: list blobs to find actual PPTX
   if (
     (res.status === 403 || res.status === 404) &&
     blobRef &&
@@ -314,13 +277,57 @@ async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
   });
 
   const sas = generateBlobSASQueryParameters(
-    { containerName, blobName: fileName, expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000), permissions: BlobSASPermissions.parse("r") },
+    {
+      containerName,
+      blobName: fileName,
+      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      permissions: BlobSASPermissions.parse("r"),
+    },
     cred
   );
   return `${bbc.url}?${sas}`;
 }
 
-// ── Main handler ───────────────────────────────────────────────────────────
+async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
+  const inputPath = path.join(tempDir, "input.pptx");
+  const outputPath = path.join(tempDir, "output.pptx");
+  const planPath = path.join(tempDir, "plan.json");
+  const scriptPath = path.join(process.cwd(), "scripts", "edit_pptx.py");
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+    await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
+
+    const { stdout, stderr } = await execFileAsync("python", [
+      scriptPath,
+      "--input",
+      inputPath,
+      "--output",
+      outputPath,
+      "--plan",
+      planPath,
+    ]);
+
+    if (stderr?.trim()) {
+      console.warn("[edit-pptx] python stderr:", stderr.trim());
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.pptx`;
+    const downloadUrl = await uploadToBlob(outputBuffer, fileName);
+
+    return {
+      downloadUrl,
+      fileName,
+      changedSlides: Number(pythonResult.changedSlides ?? 0),
+      totalSlides: Number(pythonResult.totalSlides ?? 0),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -341,113 +348,17 @@ export async function POST(req: NextRequest) {
     console.log("[edit-pptx] fileUrl =", fileUrl.substring(0, 80));
     console.log("[edit-pptx] instruction =", instruction.substring(0, 120));
 
-    // 1. Download PPTX
     const pptxBuffer = await downloadBlob(fileUrl, threadId);
+    const slides = await extractSlideSummaries(pptxBuffer);
+    const plan = await buildEditPlan(slides, instruction);
 
-    // 2. Open ZIP
-    const zip = await JSZip.loadAsync(pptxBuffer);
+    console.log("[edit-pptx] plan:", JSON.stringify(plan));
 
-    // 3. Find all slide XMLs in order
-    const slideEntries = Object.keys(zip.files)
-      .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
-      .sort((a, b) => {
-        const numA = parseInt(a.match(/slide(\d+)/)?.[1] ?? "0", 10);
-        const numB = parseInt(b.match(/slide(\d+)/)?.[1] ?? "0", 10);
-        return numA - numB;
-      });
-
-    if (slideEntries.length === 0) {
-      return NextResponse.json({ ok: false, error: "スライドが見つかりませんでした。PATHが正しくない可能性があります。" }, { status: 400 });
-    }
-
-    console.log(`[edit-pptx] Found ${slideEntries.length} slides`);
-
-    // 4. Extract text per shape from each slide
-    //    text = paragraphs joined by "\n" (each paragraph = all runs concatenated)
-    const slideMaps: SlideTextMap[] = [];
-
-    for (let si = 0; si < slideEntries.length; si++) {
-      const entryName = slideEntries[si];
-      const xml = await zip.files[entryName].async("string");
-      const shapes = splitIntoShapes(xml);
-
-      const shapeTexts: { shapeIndex: number; text: string }[] = [];
-      for (let shi = 0; shi < shapes.length; shi++) {
-        const paragraphs = extractShapeTextByParagraph(shapes[shi]);
-        // Only include shapes that have actual text
-        const combined = paragraphs.join("\n").trim();
-        if (combined.length > 0) {
-          // Store as "\n"-joined string for GPT readability
-          shapeTexts.push({ shapeIndex: shi, text: combined });
-        }
-      }
-
-      if (shapeTexts.length > 0) {
-        slideMaps.push({ slideIndex: si, shapes: shapeTexts });
-      }
-    }
-
-    console.log(`[edit-pptx] Extracted text from ${slideMaps.length} slides with text`);
-
-    // 5. Call GPT for revision
-    const revised = await reviseWithGPT(slideMaps, instruction);
-
-    // 6. Build revision maps per slide
-    //    value = string[] (one entry per paragraph with runs)
-    const revisionsBySlide = new Map<number, Map<number, string[]>>();
-    for (const slideMap of revised) {
-      const shapeMap = new Map<number, string[]>();
-      for (const shape of slideMap.shapes) {
-        const original = slideMaps
-          .find((s) => s.slideIndex === slideMap.slideIndex)
-          ?.shapes.find((sh) => sh.shapeIndex === shape.shapeIndex)?.text;
-        if (original !== undefined && shape.text !== original) {
-          // Split back into paragraphs for replaceShapeText
-          shapeMap.set(shape.shapeIndex, shape.text.split("\n"));
-        }
-      }
-      if (shapeMap.size > 0) {
-        revisionsBySlide.set(slideMap.slideIndex, shapeMap);
-      }
-    }
-
-    const changedSlides = revisionsBySlide.size;
-    console.log(`[edit-pptx] ${changedSlides} slides will be modified`);
-
-    // 7. Apply revisions to slide XMLs in ZIP
-    for (let si = 0; si < slideEntries.length; si++) {
-      const revisions = revisionsBySlide.get(si);
-      if (!revisions || revisions.size === 0) continue;
-
-      const entryName = slideEntries[si];
-      const originalXml = await zip.files[entryName].async("string");
-      const revisedXml = applyRevisionsToSlide(originalXml, revisions);
-
-      // Use STORE (uncompressed) for modified XML entries.
-      // Office accepts mixed compression in a single PPTX ZIP.
-      zip.file(entryName, Buffer.from(revisedXml, "utf8"), {
-        compression: "STORE",
-        binary: false,
-      });
-    }
-
-    // 8. Re-package — use STORE globally to prevent JSZip from re-compressing
-    // entries it doesn't understand (e.g. already-compressed image streams).
-    // File size increases slightly but correctness is guaranteed.
-    const outputBuffer = await zip.generateAsync({
-      type: "nodebuffer",
-      compression: "STORE",
-    });
-
-    const fileName = `${threadId ?? uniqueId()}_edited_${uniqueId()}.pptx`;
-    const downloadUrl = await uploadToBlob(outputBuffer, fileName);
+    const result = await runPythonEdit(pptxBuffer, plan, threadId);
 
     return NextResponse.json({
       ok: true,
-      downloadUrl,
-      fileName,
-      changedSlides,
-      totalSlides: slideEntries.length,
+      ...result,
     });
   } catch (e: any) {
     console.error("[edit-pptx] error:", e);

@@ -2,13 +2,14 @@
 "use server";
 import "server-only";
 
-import { GenerateSasUrl } from "@/features/common/services/azure-storage";
+import { GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
 import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
+import { BlobServiceClient } from "@azure/storage-blob";
 
 import {
   buildSendOptionsFromMode,
@@ -55,9 +56,16 @@ async function resolveDocumentUrlForVision(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
+        conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+        conversationTurns?: Array<{
+          speakerRole: string;
+          speakerType?: "agent" | "customer" | "staff" | "other";
+          text: string;
+          turnIndex: number;
+        }>;
       }> = [];
       let mergedTotalPages = 0;
 
@@ -73,7 +81,7 @@ async function resolveDocumentUrlForVision(
         const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
         });
 
         if (!analyzeRes.ok) {
@@ -120,6 +128,7 @@ async function resolveDocumentUrlForVision(
           fontFace,
           designInstruction: deckPreferences.designInstruction,
           deckPreferences,
+          mode,
         }),
       });
 
@@ -146,9 +155,16 @@ async function resolveDocumentUrlForVision(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
+        conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+        conversationTurns?: Array<{
+          speakerRole: string;
+          speakerType?: "agent" | "customer" | "staff" | "other";
+          text: string;
+          turnIndex: number;
+        }>;
       }> = [];
       let mergedTotalPages = 0;
 
@@ -164,7 +180,7 @@ async function resolveDocumentUrlForVision(
         const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
         });
 
         if (!analyzeRes.ok) {
@@ -211,6 +227,7 @@ async function resolveDocumentUrlForVision(
           fontFace,
           designInstruction: deckPreferences.designInstruction,
           deckPreferences,
+          mode,
         }),
       });
 
@@ -247,18 +264,156 @@ async function resolveDocumentUrlForVision(
       return fileUrl;
     }
 
-    const sasResponse = await GenerateSasUrl("dl-link", `${threadId}/${fileName}`);
-    if (sasResponse.status === "OK" && sasResponse.response) {
-      console.log(
-        `[convert_doc_to_pptx] Resolved document URL to SAS for thread ${threadId}: ${fileName}`
+    const resolvedBlobPath = await findThreadDocumentBlobPath(threadId, fileName);
+    if (resolvedBlobPath) {
+      const sasResponse = await GenerateSasUrl("dl-link", resolvedBlobPath);
+      if (sasResponse.status === "OK" && sasResponse.response) {
+        console.log(
+          `[convert_doc_to_pptx] Resolved document URL to SAS for thread ${threadId}: ${resolvedBlobPath}`
+        );
+        return sasResponse.response;
+      }
+    }
+
+    // blob未キャッシュのSharePointファイル → Graph APIでダウンロードしてblobに保存
+    if (isSharePointUrl) {
+      const spSas = await downloadSharePointFileToBlob(fileUrl, threadId, fileName);
+      if (spSas) return spSas;
+      console.warn(
+        `[convert_doc_to_pptx] Graph API download failed for ${fileName}, falling back to direct URL`
       );
-      return sasResponse.response;
     }
   } catch (error) {
     console.warn("[convert_doc_to_pptx] Failed to resolve document URL for Vision:", error);
   }
 
   return fileUrl;
+}
+
+/**
+ * SharePoint ファイルを Graph API (app-only token) でダウンロードし、
+ * Azure Blob Storage の dl-link/${threadId}/${fileName} にキャッシュして SAS URL を返す。
+ */
+async function downloadSharePointFileToBlob(
+  sharePointUrl: string,
+  threadId: string,
+  fileName: string
+): Promise<string | null> {
+  try {
+    const tenantId = process.env.AZURE_AD_TENANT_ID?.trim();
+    const clientId = process.env.AZURE_AD_CLIENT_ID?.trim();
+    const clientSecret = process.env.AZURE_AD_CLIENT_SECRET?.trim();
+    if (!tenantId || !clientId || !clientSecret) {
+      console.warn("[convert_doc_to_pptx] Azure AD env vars not set, skipping Graph download");
+      return null;
+    }
+
+    // 1. app-only トークン取得
+    const tokenRes = await fetch(
+      `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          grant_type: "client_credentials",
+          scope: "https://graph.microsoft.com/.default",
+        }),
+      }
+    );
+    const tokenData: any = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenData.access_token) {
+      console.warn("[convert_doc_to_pptx] Graph token fetch failed:", tokenData.error_description ?? tokenData.error);
+      return null;
+    }
+    const accessToken: string = tokenData.access_token;
+
+    // 2. SharePoint URL を分解して site + file path を取得
+    const urlObj = new URL(sharePointUrl);
+    const hostname = urlObj.hostname;
+    const decodedPath = decodeURIComponent(urlObj.pathname);
+    const pathParts = decodedPath.split("/").filter(Boolean);
+    // 例: ["sites", "AzureChatxSharepointTestSite", "Shared Documents", "SL", "j.nomoto", "file.pdf"]
+    const siteIndex = pathParts.indexOf("sites");
+    if (siteIndex < 0 || siteIndex + 1 >= pathParts.length) return null;
+    const siteName = pathParts[siteIndex + 1];
+
+    // 3. Graph API でサイト ID を解決
+    const siteRes = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${hostname}:/sites/${siteName}:`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const siteData: any = await siteRes.json().catch(() => ({}));
+    if (!siteRes.ok || !siteData.id) {
+      console.warn("[convert_doc_to_pptx] Graph site resolve failed:", siteData.error?.message ?? siteRes.status);
+      return null;
+    }
+    const siteId: string = siteData.id;
+
+    // 4. サイト以下の相対パス（ライブラリ名含む）でファイルをダウンロード
+    const relativeFilePath = pathParts.slice(siteIndex + 2).join("/");
+    const fileRes = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${siteId}/drive/root:/${relativeFilePath}:/content`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (!fileRes.ok) {
+      console.warn("[convert_doc_to_pptx] Graph file download failed:", fileRes.status);
+      return null;
+    }
+
+    // 5. Azure Blob Storage にキャッシュ
+    const fileBuffer = Buffer.from(await fileRes.arrayBuffer());
+    const blobPath = `${threadId}/${fileName}`;
+    const uploadResult = await UploadBlob("dl-link", blobPath, fileBuffer);
+    if (uploadResult.status !== "OK") {
+      console.warn("[convert_doc_to_pptx] Blob upload failed after Graph download");
+      return null;
+    }
+
+    // 6. SAS URL 生成
+    const sasResponse = await GenerateSasUrl("dl-link", blobPath);
+    if (sasResponse.status === "OK" && sasResponse.response) {
+      console.log(`[convert_doc_to_pptx] SP file cached to blob via Graph: ${blobPath}`);
+      return sasResponse.response;
+    }
+
+    return null;
+  } catch (e) {
+    console.warn("[convert_doc_to_pptx] downloadSharePointFileToBlob error:", e);
+    return null;
+  }
+}
+
+async function findThreadDocumentBlobPath(
+  threadId: string,
+  fileName: string
+): Promise<string | null> {
+  const directPath = `${threadId}/${fileName}`;
+  const direct = await GenerateSasUrl("dl-link", directPath);
+  if (direct.status === "OK" && direct.response) {
+    const headRes = await fetch(direct.response, { method: "HEAD" }).catch(() => null);
+    if (headRes?.ok) {
+      return directPath;
+    }
+  }
+
+  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
+  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
+  if (!acc || !key) return null;
+
+  const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
+  const svc = BlobServiceClient.fromConnectionString(connStr);
+  const cc = svc.getContainerClient("dl-link");
+  const target = fileName.trim().toLowerCase();
+  for await (const blob of cc.listBlobsFlat({ prefix: `${threadId}/` })) {
+    const blobName = blob.name.split("/").pop()?.trim().toLowerCase();
+    if (blobName === target) {
+      return blob.name;
+    }
+  }
+
+  return null;
 }
 
 function extractFileNameFromDocumentUrl(fileUrl: string): string | null {
@@ -288,6 +443,30 @@ function extractPresentationTitleFromFileUrl(fileUrl: string): string | null {
 
   const title = fileName.replace(/\.[^.]+$/, "").trim();
   return title || null;
+}
+
+function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
+  const urlPattern = /https?:\/\/[^\s)\]]+\.pptx(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    const matches = message.match(urlPattern);
+    if (matches?.length) {
+      return matches[matches.length - 1];
+    }
+  }
+  return null;
+}
+
+async function resolveLatestPptxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestPptxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
 }
 
 type DeckPreferences = {
@@ -884,11 +1063,19 @@ export const GetDefaultExtensions = async (props: {
           designInstruction: {
             type: "string",
             description:
-              "User縺ｮ閾ｪ辟ｶ隱ｿ謨ｴ繧堤ｴｻ縺励※PPT縺ｮLook&Feeling繧剃ｿ・★縺溘ａ縺ｮ閾ｪ辟ｶ隱ｿ謨ｴ縲ゆｾ・ 'ecoで洗練された役員向け' 'ポップで親しみやすく図解多め' '高級感のある提案書トーン'",
+              "ユーザーの自然言語指示を反映してPPTのLook&Feelingを整えるための自然言語指示。例: 'ecoで洗練された役員向け' 'ポップで親しみやすく図解多め' '高級感のある提案書トーン'",
           },
           maxPages: {
             type: "number",
             description: "変換する最大ページ数（省略可能、デフォルト30）",
+          },
+          mode: {
+            type: "string",
+            enum: ["faithful", "redesign"],
+            description:
+              "変換モード。'faithful'=忠実変換（元ページ数維持・自動タイトルスライドなし・デザインAI最小化）。" +
+              "「そのまま」「忠実に」「原本に近く」「ページ数を変えずに」などの場合は 'faithful' を指定。" +
+              "デフォルトは 'redesign'（デザイン自動改善）。",
           },
         },
         required: [],
@@ -898,6 +1085,7 @@ export const GetDefaultExtensions = async (props: {
         "Vision APIを使って各ページを視覚的に解析するため、グラフ・表・図も含めて高精度に変換できる。\n" +
         "使用タイミング：ユーザーが「PPTに変換して」「スライドにして」「PPT化して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
         "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_doc_to_pptx",
     },
@@ -908,7 +1096,16 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) =>
-        await executeEditPptx(args, props.chatThread),
+        await executeEditPptx(
+          {
+            ...args,
+            fileUrl:
+              String(args?.fileUrl ?? "").trim() ||
+              (await resolveLatestPptxUrlFromThread(props.chatThread.id)) ||
+              "",
+          },
+          props.chatThread
+        ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -916,21 +1113,24 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "編集対象のPPTXファイルのURL。会話コンテキストの file_url から取得すること。",
+              "編集対象のPPTXファイルのURL（省略可能）。省略した場合はこのスレッドで直近に生成・編集したPPTXを自動的に使用する。",
           },
           instruction: {
             type: "string",
             description:
-              "ユーザーの編集指示。例: '全体のトーンをより力強く', '3枚目のタイトルをXXXに変えて', '結論スライドを追加して'",
+              "ユーザーの編集指示。例: '色を青に変えて', 'フォントを游ゴシックに', '全体のトーンを力強く', '3枚目のタイトルをXXXに変えて'",
           },
         },
-        required: ["fileUrl", "instruction"],
+        required: ["instruction"],
       },
       description:
-        "ユーザーがアップロードした既存のPPTXファイルを、指示に従って改良するツール。\n" +
-        "デザイン・レイアウト・画像・背景は保持しつつ、テキスト内容のみを改変する。\n" +
-        "使用タイミング：ユーザーが既存PPTに対して「〜に変えて」「〜を追加して」「〜を改善して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
-        "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "このスレッドで生成・編集した既存PPTXを自然言語の指示に従って改良するツール。\n" +
+        "【重要】fileUrlは省略可能。省略するとスレッド内の最新PPTXを自動で参照する。\n" +
+        "使用タイミング：\n" +
+        "- ユーザーが「色を変えて」「フォントを変えて」「青にして」「もっとポップに」などデザイン変更を求める場合\n" +
+        "- ユーザーが「〜に変えて」「〜を修正して」「〜を追加して」などテキスト編集を求める場合\n" +
+        "- 会話中にすでにPPTXが生成・編集された実績がある場合（fileUrlを明示しなくてよい）\n" +
+        "色・フォント・トーン変更も対応。ユーザーがファイルをアップしていなくても、スレッド内PPTXに対して呼び出せる。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_pptx",
     },
@@ -951,7 +1151,7 @@ async function executeCreatePptx(
   const { title, slides, fontFace } = args ?? {};
 
   if (!title || !slides?.length) {
-    return { error: "title と slides は必須です。" };
+    return { error: "titleとslidesは必須です。" };
   }
 
   const baseUrl = (
@@ -997,10 +1197,11 @@ async function executeConvertDocToPptx(
     fontFace?: string;
     designInstruction?: string;
     maxPages?: number;
+    mode?: "faithful" | "redesign";
   },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages } = args ?? {};
+  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages, mode } = args ?? {};
   const sourceFileUrls = Array.from(
     new Set(
       [fileUrl, ...(Array.isArray(fileUrls) ? fileUrls : [])]
@@ -1028,9 +1229,16 @@ async function executeConvertDocToPptx(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
+        conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+        conversationTurns?: Array<{
+          speakerRole: string;
+          speakerType?: "agent" | "customer" | "staff" | "other";
+          text: string;
+          turnIndex: number;
+        }>;
       }> = [];
       let mergedTotalPages = 0;
 
@@ -1046,7 +1254,7 @@ async function executeConvertDocToPptx(
         const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
         });
 
         if (!analyzeRes.ok) {
@@ -1093,6 +1301,7 @@ async function executeConvertDocToPptx(
           fontFace,
           designInstruction: deckPreferences.designInstruction,
           deckPreferences,
+          mode,
         }),
       });
 
@@ -1123,7 +1332,7 @@ async function executeConvertDocToPptx(
     const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30 }),
+      body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
     });
 
     if (!analyzeRes.ok) {
@@ -1140,9 +1349,16 @@ async function executeConvertDocToPptx(
     const slides: Array<{
       title: string;
       bullets: string[];
-      layoutType?: "title" | "bullets" | "table" | "multi-column";
+      layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
       tableRows?: string[][];
       columns?: Array<{ header: string; bullets: string[] }>;
+      conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+      conversationTurns?: Array<{
+        speakerRole: string;
+        speakerType?: "agent" | "customer" | "staff" | "other";
+        text: string;
+        turnIndex: number;
+      }>;
     }> = analyzeResult.slides;
     const totalPages: number = analyzeResult.totalPages ?? slides.length;
 
@@ -1173,6 +1389,7 @@ async function executeConvertDocToPptx(
         fontFace,
         designInstruction: deckPreferences.designInstruction,
         deckPreferences,
+        mode,
       }),
     });
 
@@ -1201,13 +1418,24 @@ async function executeConvertDocToPptx(
 
 // ---------------- 既存 PPTX 改良 ----------------
 async function executeEditPptx(
-  args: { fileUrl: string; instruction: string },
+  args: { fileUrl?: string; instruction: string },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, instruction } = args ?? {};
+  let { fileUrl, instruction } = args ?? {};
 
-  if (!fileUrl?.trim() || !instruction?.trim()) {
-    return { error: "fileUrl と instruction は必須です。" };
+  if (!instruction?.trim()) {
+    return { error: "instructionは必須です。編集内容を指定してください。" };
+  }
+
+  if (!fileUrl?.trim()) {
+    fileUrl = (await resolveLatestPptxUrlFromThread(chatThread.id)) ?? "";
+  }
+
+  if (!fileUrl?.trim()) {
+    return {
+      error:
+        "編集対象のPPTXが見つかりませんでした。このスレッドでPPTXを生成するか、PPTのURLを指定してください。",
+    };
   }
 
   const baseUrl = (

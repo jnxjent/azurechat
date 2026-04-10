@@ -33,14 +33,23 @@ export type PptxConnector = {
   relationshipType?: "flow" | "compare" | "annotation" | "support";
 };
 
+export type PptxConversationTurn = {
+  speakerRole: string;
+  speakerType?: "agent" | "customer" | "staff" | "other";
+  text: string;
+  turnIndex: number;
+};
+
 export type PptxSlide = {
   title: string;
   bullets: string[];
-  layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram";
+  layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
   tableRows?: string[][];
   columns?: PptxColumn[];
   visualBlocks?: PptxVisualBlock[];
   connectors?: PptxConnector[];
+  conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+  conversationTurns?: PptxConversationTurn[];
 };
 
 export type DeckPreferencesInput = {
@@ -59,6 +68,8 @@ export type GenPptxRequest = {
   fontFace?: string;
   designInstruction?: string;
   deckPreferences?: DeckPreferencesInput;
+  /** "faithful": 元ページ数維持・タイトルスライド追加なし・デザインAI最小化 */
+  mode?: "faithful" | "redesign";
 };
 
 type Palette = {
@@ -226,7 +237,9 @@ function createFallbackBrief(
             ? "comparison"
             : slide.layoutType === "diagram"
               ? "process"
-              : visualCycle[index % visualCycle.length],
+              : slide.layoutType === "conversation"
+                ? "editorial"
+                : visualCycle[index % visualCycle.length],
       emphasis: slide.bullets[0] ?? slide.title,
     })),
   };
@@ -596,12 +609,13 @@ function buildDiagramSlide(
   pptx: PptxGenJS,
   slide: PptxSlide,
   theme: Theme,
-  visual: SlideVisualHint
+  visual: SlideVisualHint,
+  faithfulMode?: boolean
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
-  addVisualAccent(s, visual, theme);
+  addVisualAccent(s, visual, theme, faithfulMode);
 
   const blocks = slide.visualBlocks ?? [];
   const connectors = slide.connectors ?? [];
@@ -614,10 +628,12 @@ function buildDiagramSlide(
     (conn) => blocks[conn.from] && blocks[conn.to] && conn.from !== conn.to
   );
 
+  // faithfulModeではメインエリアを全幅に拡張、右サマリーパネルをスキップ
+  const mainContainerW = faithfulMode ? W - 0.84 : 9.55;
   s.addShape("roundRect", {
     x: 0.42,
     y: HEADER_H + 0.18,
-    w: 9.55,
+    w: mainContainerW,
     h: H - HEADER_H - 0.48,
     rectRadius: 0.05,
     fill: { color: theme.palette.surface, transparency: 2 },
@@ -627,78 +643,80 @@ function buildDiagramSlide(
   buildDiagramGroupCards(s, blocks, theme);
   buildDiagramRowBands(s, blocks, theme);
 
-  s.addShape("roundRect", {
-    x: 10.12,
-    y: HEADER_H + 0.18,
-    w: 2.78,
-    h: H - HEADER_H - 0.48,
-    rectRadius: 0.05,
-    fill: { color: theme.palette.sectionBg },
-    line: { color: theme.palette.border, width: 0.9 },
-  });
-
-  s.addText(localizeLabel("summary", theme), {
-    x: 10.34,
-    y: HEADER_H + 0.38,
-    w: 2.2,
-    h: 0.24,
-    fontSize: theme.smallFontSize,
-    fontFace: theme.fontFace,
-    bold: true,
-    color: theme.palette.mutedText,
-  });
-
-  if (primaryBlock) {
+  if (!faithfulMode) {
     s.addShape("roundRect", {
-      x: 10.34,
-      y: HEADER_H + 0.76,
-      w: 2.18,
-      h: 0.82,
+      x: 10.12,
+      y: HEADER_H + 0.18,
+      w: 2.78,
+      h: H - HEADER_H - 0.48,
       rectRadius: 0.05,
-      fill: { color: theme.palette.accentA, transparency: theme.execMode ? 8 : 0 },
-      line: { color: theme.palette.accentA, width: 0 },
+      fill: { color: theme.palette.sectionBg },
+      line: { color: theme.palette.border, width: 0.9 },
     });
-    s.addText(primaryBlock.text, {
-      x: 10.52,
-      y: HEADER_H + 0.93,
-      w: 1.82,
-      h: 0.48,
-      fontSize: Math.max(theme.bodyFontSize - 1, 12),
+
+    s.addText(localizeLabel("summary", theme), {
+      x: 10.34,
+      y: HEADER_H + 0.38,
+      w: 2.2,
+      h: 0.24,
+      fontSize: theme.smallFontSize,
       fontFace: theme.fontFace,
       bold: true,
-      color: theme.palette.headerText,
-      align: "center",
-      valign: "middle",
-      fit: "shrink",
-      margin: 0.04,
+      color: theme.palette.mutedText,
+    });
+
+    if (primaryBlock) {
+      s.addShape("roundRect", {
+        x: 10.34,
+        y: HEADER_H + 0.76,
+        w: 2.18,
+        h: 0.82,
+        rectRadius: 0.05,
+        fill: { color: theme.palette.accentA, transparency: theme.execMode ? 8 : 0 },
+        line: { color: theme.palette.accentA, width: 0 },
+      });
+      s.addText(primaryBlock.text, {
+        x: 10.52,
+        y: HEADER_H + 0.93,
+        w: 1.82,
+        h: 0.48,
+        fontSize: Math.max(theme.bodyFontSize - 1, 12),
+        fontFace: theme.fontFace,
+        bold: true,
+        color: theme.palette.headerText,
+        align: "center",
+        valign: "middle",
+        fit: "shrink",
+        margin: 0.04,
+      });
+    }
+
+    const summaryItems = slide.bullets.slice(0, 4);
+    summaryItems.forEach((item, index) => {
+      const y = HEADER_H + 1.8 + index * 0.88;
+      s.addShape("roundRect", {
+        x: 10.34,
+        y,
+        w: 2.18,
+        h: 0.68,
+        rectRadius: 0.04,
+        fill: { color: "FFFFFF", transparency: 6 },
+        line: { color: theme.palette.border, width: 0.8 },
+      });
+      s.addText(item, {
+        x: 10.5,
+        y: y + 0.1,
+        w: 1.86,
+        h: 0.46,
+        fontSize: Math.max(theme.smallFontSize - 1, 9),
+        fontFace: theme.fontFace,
+        color: theme.palette.bodyText,
+        valign: "middle",
+        fit: "shrink",
+        margin: 0.02,
+      });
     });
   }
-
-  const summaryItems = slide.bullets.slice(0, 4);
-  summaryItems.forEach((item, index) => {
-    const y = HEADER_H + 1.8 + index * 0.88;
-    s.addShape("roundRect", {
-      x: 10.34,
-      y,
-      w: 2.18,
-      h: 0.68,
-      rectRadius: 0.04,
-      fill: { color: "FFFFFF", transparency: 6 },
-      line: { color: theme.palette.border, width: 0.8 },
-    });
-    s.addText(item, {
-      x: 10.5,
-      y: y + 0.1,
-      w: 1.86,
-      h: 0.46,
-      fontSize: Math.max(theme.smallFontSize - 1, 9),
-      fontFace: theme.fontFace,
-      color: theme.palette.bodyText,
-      valign: "middle",
-      fit: "shrink",
-      margin: 0.02,
-    });
-  });
 
   for (const connector of validConnectors) {
     drawDiagramConnector(s, blocks[connector.from], blocks[connector.to], connector, theme);
@@ -822,7 +840,8 @@ function addAmbientShapes(s: PptxGenJS.Slide, theme: Theme) {
   }
 }
 
-function addVisualAccent(s: PptxGenJS.Slide, visual: SlideVisualHint, theme: Theme) {
+function addVisualAccent(s: PptxGenJS.Slide, visual: SlideVisualHint, theme: Theme, faithfulMode?: boolean) {
+  if (faithfulMode) return;
   const emphasis = truncateText(visual.emphasis || "", 48);
   const x = 9.3;
   const y = 1.45;
@@ -1106,17 +1125,19 @@ function buildBulletsSlide(
   slide: PptxSlide,
   theme: Theme,
   visual: SlideVisualHint,
-  illustration?: GeneratedIllustration | null
+  illustration?: GeneratedIllustration | null,
+  faithfulMode?: boolean
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
-  addVisualAccent(s, visual, theme);
-  const showIllustration = Boolean(illustration?.dataUri) && !theme.execMode;
+  addVisualAccent(s, visual, theme, faithfulMode);
+  const showIllustration = Boolean(illustration?.dataUri) && !theme.execMode && !faithfulMode;
   const textWidth = showIllustration ? 6.85 : 8.15;
 
   const { hasSections, sections } = parseSections(slide.bullets);
-  if (theme.execMode) {
+  // faithfulMode では execMode による内容圧縮（キーメッセージ1件＋最大3件）をスキップ
+  if (theme.execMode && !faithfulMode) {
     const allBullets = sections.flatMap((section) => section.items);
     const keyMessage = allBullets[0] ?? slide.bullets[0] ?? "";
     const rest = allBullets.slice(1, 4);
@@ -1257,16 +1278,201 @@ function buildBulletsSlide(
   addChrome(s, theme);
 }
 
+function chunkConversationTurns(turns: PptxConversationTurn[], chunkSize: number): PptxConversationTurn[][] {
+  const chunks: PptxConversationTurn[][] = [];
+  for (let i = 0; i < turns.length; i += chunkSize) {
+    chunks.push(turns.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+function buildConversationSlide(
+  pptx: PptxGenJS,
+  slide: PptxSlide,
+  theme: Theme
+) {
+  const turns = [...(slide.conversationTurns ?? [])].sort((a, b) => a.turnIndex - b.turnIndex);
+  const style = slide.conversationStyle ?? "chat-ui";
+  const chunks = chunkConversationTurns(turns, style === "chat-ui" ? 8 : 10);
+  const pages = chunks.length > 0 ? chunks : [[]];
+
+  pages.forEach((pageTurns, pageIndex) => {
+    const s = pptx.addSlide();
+    s.background = { color: theme.palette.canvas };
+    addHeaderBand(s, pages.length > 1 ? `${slide.title} (${pageIndex + 1}/${pages.length})` : slide.title, theme);
+
+    if (pageTurns.length === 0) {
+      addChrome(s, theme);
+      return;
+    }
+
+    const contentTop = HEADER_H + 0.18;
+    const contentBottom = H - 0.24;
+    const availH = contentBottom - contentTop;
+    const turnH = availH / pageTurns.length;
+
+    pageTurns.forEach((turn, idx) => {
+      const y = contentTop + idx * turnH;
+      const label = turn.speakerRole.trim() || `Speaker ${idx + 1}`;
+      const type = turn.speakerType ?? "other";
+
+      if (style === "chat-ui") {
+        const alignLeft = type === "agent" || type === "staff";
+        const bubbleX = alignLeft ? 0.52 : 4.18;
+        const bubbleW = 8.63;
+        const labelX = alignLeft ? bubbleX : bubbleX + bubbleW - 2.0;
+        const labelAlign = alignLeft ? "left" : "right";
+        const bubbleFill = alignLeft ? theme.palette.accentA : theme.palette.surface;
+        const bubbleLine = alignLeft ? theme.palette.accentA : theme.palette.border;
+        const textColor = alignLeft ? theme.palette.headerText : theme.palette.bodyText;
+        const labelColor = alignLeft ? theme.palette.accentA : theme.palette.mutedText;
+        const labelH = Math.min(0.22, turnH * 0.26);
+        const bubbleH = Math.max(0.42, turnH - labelH - 0.12);
+
+        s.addText(label, {
+          x: labelX,
+          y,
+          w: 2.0,
+          h: labelH,
+          fontSize: Math.max(theme.smallFontSize - 1, 9),
+          fontFace: theme.fontFace,
+          bold: true,
+          color: labelColor,
+          align: labelAlign,
+          valign: "middle",
+          fit: "shrink",
+        });
+        s.addShape("roundRect", {
+          x: bubbleX,
+          y: y + labelH,
+          w: bubbleW,
+          h: bubbleH,
+          rectRadius: 0.06,
+          fill: { color: bubbleFill },
+          line: { color: bubbleLine, width: alignLeft ? 0 : 1 },
+          shadow: alignLeft ? undefined : { type: "outer", color: "C8D4E0", blur: 1, angle: 45, opacity: 0.15 },
+        });
+        s.addText(turn.text, {
+          x: bubbleX + 0.14,
+          y: y + labelH + 0.06,
+          w: bubbleW - 0.28,
+          h: bubbleH - 0.12,
+          fontSize: Math.max(theme.bodyFontSize - 2, 11),
+          fontFace: theme.fontFace,
+          color: textColor,
+          valign: "middle",
+          fit: "shrink",
+          margin: 0.04,
+        });
+        return;
+      }
+
+      if (style === "interview") {
+        const roleW = 2.2;
+        const bubbleX = 2.85;
+        const bubbleW = W - bubbleX - 0.55;
+        const boxH = Math.max(0.5, turnH - 0.08);
+        const roleFill =
+          type === "agent" || type === "staff" ? theme.palette.sectionBg :
+          type === "customer" ? theme.palette.tableAltBg :
+          "F7F9FC";
+
+        s.addShape("roundRect", {
+          x: 0.48,
+          y,
+          w: roleW,
+          h: boxH,
+          rectRadius: 0.05,
+          fill: { color: roleFill },
+          line: { color: theme.palette.border, width: 0.8 },
+        });
+        s.addText(label, {
+          x: 0.62,
+          y: y + 0.08,
+          w: roleW - 0.28,
+          h: boxH - 0.16,
+          fontSize: Math.max(theme.bodyFontSize - 2, 11),
+          fontFace: theme.fontFace,
+          bold: true,
+          color: theme.palette.bodyText,
+          align: "center",
+          valign: "middle",
+          fit: "shrink",
+        });
+        s.addShape("roundRect", {
+          x: bubbleX,
+          y,
+          w: bubbleW,
+          h: boxH,
+          rectRadius: 0.04,
+          fill: { color: theme.palette.surface },
+          line: { color: theme.palette.border, width: 0.8 },
+        });
+        s.addText(turn.text, {
+          x: bubbleX + 0.16,
+          y: y + 0.08,
+          w: bubbleW - 0.32,
+          h: boxH - 0.16,
+          fontSize: Math.max(theme.bodyFontSize - 2, 11),
+          fontFace: theme.fontFace,
+          color: theme.palette.bodyText,
+          valign: "middle",
+          fit: "shrink",
+          margin: 0.03,
+        });
+        return;
+      }
+
+      const cardH = Math.max(0.56, turnH - 0.08);
+      s.addShape("roundRect", {
+        x: 0.48,
+        y,
+        w: W - 0.96,
+        h: cardH,
+        rectRadius: 0.04,
+        fill: { color: idx % 2 === 0 ? theme.palette.surface : theme.palette.tableAltBg },
+        line: { color: theme.palette.border, width: 0.8 },
+      });
+      s.addText(label, {
+        x: 0.7,
+        y: y + 0.08,
+        w: 2.0,
+        h: 0.2,
+        fontSize: Math.max(theme.smallFontSize - 1, 9),
+        fontFace: theme.fontFace,
+        bold: true,
+        color: theme.palette.mutedText,
+        fit: "shrink",
+      });
+      s.addText(turn.text, {
+        x: 0.7,
+        y: y + 0.28,
+        w: W - 1.4,
+        h: cardH - 0.34,
+        fontSize: Math.max(theme.bodyFontSize - 2, 11),
+        fontFace: theme.fontFace,
+        color: theme.palette.bodyText,
+        valign: "middle",
+        fit: "shrink",
+        margin: 0.02,
+      });
+    });
+
+    addChrome(s, theme);
+  });
+}
+
 function buildTableSlide(
   pptx: PptxGenJS,
   slide: PptxSlide,
   theme: Theme,
-  visual: SlideVisualHint
+  visual: SlideVisualHint,
+  faithfulMode?: boolean
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
-  addVisualAccent(s, visual, theme);
+  addVisualAccent(s, visual, theme, faithfulMode);
 
   const rows = slide.tableRows ?? [];
   if (rows.length === 0) {
@@ -1311,17 +1517,18 @@ function buildMultiColumnSlide(
   pptx: PptxGenJS,
   slide: PptxSlide,
   theme: Theme,
-  visual: SlideVisualHint
+  visual: SlideVisualHint,
+  faithfulMode?: boolean
 ) {
   if (!slide.columns || slide.columns.length === 0) {
-    buildBulletsSlide(pptx, slide, theme, visual);
+    buildBulletsSlide(pptx, slide, theme, visual, null, faithfulMode);
     return;
   }
 
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
-  addVisualAccent(s, visual, theme);
+  addVisualAccent(s, visual, theme, faithfulMode);
 
   const columns = slide.columns;
   const totalW = 8.4;
@@ -1382,18 +1589,24 @@ function buildMultiColumnSlide(
 export async function POST(req: NextRequest) {
   try {
     const body: GenPptxRequest = await req.json();
-    const { title, slides, threadId, fontFace, designInstruction, deckPreferences } = body;
+    const { title, slides, threadId, fontFace, designInstruction, deckPreferences, mode } = body;
     if (!title || !slides || slides.length === 0) {
       return NextResponse.json({ error: "title and slides are required" }, { status: 400 });
     }
+
+    const faithfulMode = mode === "faithful";
 
     const instructionText = [designInstruction, deckPreferences?.designInstruction, ...(deckPreferences?.recentDesignNotes ?? [])]
       .filter(Boolean)
       .join(" / ");
 
-    const designBrief = await generateDesignBrief(title, slides, instructionText, deckPreferences);
+    // faithfulモード: デザインAIをスキップしてフォールバックブリーフを直接使用
+    const designBrief = faithfulMode
+      ? createFallbackBrief(title, slides, instructionText, deckPreferences)
+      : await generateDesignBrief(title, slides, instructionText, deckPreferences);
     const theme = resolveTheme(designBrief, instructionText, deckPreferences, fontFace);
-    const coverIllustration = await generateCoverIllustration(title, instructionText, theme);
+    // faithfulモード: イラスト生成をスキップ
+    const coverIllustration = faithfulMode ? null : await generateCoverIllustration(title, instructionText, theme);
 
     console.log("[gen-pptx] theme:", {
       instruction: truncateText(instructionText, 80),
@@ -1411,9 +1624,17 @@ export async function POST(req: NextRequest) {
     pptx.subject = title;
     pptx.title = title;
 
-    buildTitleSlide(pptx, title, designBrief, theme, slides.length, coverIllustration);
+    // faithfulモード: 自動タイトルスライドを追加しない（元ページ数を維持）
+    if (!faithfulMode) {
+      buildTitleSlide(pptx, title, designBrief, theme, slides.length, coverIllustration);
+    }
     let illustrationPlaced = false;
-    slides.forEach((slide, index) => {
+    // スライドタイトルから誤って付いた [H] プレフィックスを除去
+    const sanitizedSlides = slides.map((slide) => ({
+      ...slide,
+      title: slide.title.replace(/^\[H\]\s*/i, "").trim(),
+    }));
+    sanitizedSlides.forEach((slide, index) => {
       const visual = designBrief.visualHints[index] ?? {
         title: slide.title,
         visualType:
@@ -1437,16 +1658,19 @@ export async function POST(req: NextRequest) {
           buildSectionSlide(pptx, slide.title, theme);
           break;
         case "table":
-          buildTableSlide(pptx, slide, theme, visual);
+          buildTableSlide(pptx, slide, theme, visual, faithfulMode);
           break;
         case "multi-column":
-          buildMultiColumnSlide(pptx, slide, theme, visual);
+          buildMultiColumnSlide(pptx, slide, theme, visual, faithfulMode);
           break;
         case "diagram":
-          buildDiagramSlide(pptx, slide, theme, visual);
+          buildDiagramSlide(pptx, slide, theme, visual, faithfulMode);
+          break;
+        case "conversation":
+          buildConversationSlide(pptx, slide, theme);
           break;
         default:
-          buildBulletsSlide(pptx, slide, theme, visual, slideIllustration);
+          buildBulletsSlide(pptx, slide, theme, visual, slideIllustration, faithfulMode);
           if (slideIllustration) illustrationPlaced = true;
           break;
       }
