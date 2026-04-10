@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import JSZip from "jszip";
 import { promises as fs } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -288,12 +289,32 @@ async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
   return `${bbc.url}?${sas}`;
 }
 
+async function resolveEditPptxScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "edit_pptx.py"),
+    path.join(process.cwd(), "scripts", "edit_pptx.py"),
+    "/home/site/wwwroot/src/scripts/edit_pptx.py",
+    "/home/site/wwwroot/scripts/edit_pptx.py",
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
+}
+
 async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
   const inputPath = path.join(tempDir, "input.pptx");
   const outputPath = path.join(tempDir, "output.pptx");
   const planPath = path.join(tempDir, "plan.json");
-  const scriptPath = path.join(process.cwd(), "scripts", "edit_pptx.py");
+  const scriptPath = await resolveEditPptxScriptPath();
 
   try {
     await fs.writeFile(inputPath, inputBuffer);

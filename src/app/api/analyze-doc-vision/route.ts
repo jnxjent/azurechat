@@ -437,6 +437,7 @@ async function renderPdfPages(
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
     canvasFactory: NodeCanvasFactory,
+    disableWorker: true,
     disableFontFace: true,
     nativeImageDecoderSupport: "none",
   });
