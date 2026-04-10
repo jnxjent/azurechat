@@ -8,6 +8,8 @@ import { ExtensionSimilaritySearch } from "../azure-ai-search/azure-ai-search";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { ChatCitationModel, ChatThreadModel } from "../models";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
+import { FindAllChatDocuments } from "../chat-document-service";
+import { GenerateSasUrl } from "@/features/common/services/azure-storage";
 
 // dept判定ユーティリティ
 import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
@@ -89,6 +91,22 @@ function getRequiredEnv(name: string): string {
   return value.trim();
 }
 
+async function resolveThreadDocumentBlobUrls(chatThreadId: string): Promise<string[]> {
+  const docsResponse = await FindAllChatDocuments(chatThreadId);
+  if (docsResponse.status !== "OK") {
+    return [];
+  }
+
+  const urls = await Promise.all(
+    docsResponse.response.map(async (doc) => {
+      const sas = await GenerateSasUrl("dl-link", `${chatThreadId}/${doc.name}`);
+      return sas.status === "OK" ? sas.response : null;
+    })
+  );
+
+  return Array.from(new Set(urls.filter((url): url is string => Boolean(url))));
+}
+
 export const ChatApiRAG = async (props: {
   chatThread: ChatThreadModel;
   userMessage: string;
@@ -123,6 +141,7 @@ export const ChatApiRAG = async (props: {
   });
 
   const documents: ChatCitationModel[] = [];
+  const uploadedBlobUrls = await resolveThreadDocumentBlobUrls(chatThread.id);
 
   if (documentResponse.status === "OK") {
     const withoutEmbedding = FormatCitations(documentResponse.response);
@@ -139,13 +158,14 @@ export const ChatApiRAG = async (props: {
   const content = documents
     .map((result, index) => {
       const page = result.content.document.pageContent;
-      // effectiveFileUrl はSP URLの場合が多く認証が必要なため、citationリンク用
-      // Vision APIダウンロード用にはBlob URLである fileUrl を使う
       const displayUrl =
         result.content.document.effectiveFileUrl ??
         result.content.document.fileUrl ??
         "";
-      const blobUrl = result.content.document.fileUrl ?? displayUrl;
+      // このスレッドにアップロードされたファイルのみ file_url を出す
+      // 他スレッド由来のSLドキュメントは認証が必要なため除外（convert_doc_to_pptxで誤使用防止）
+      const isThisThread = result.content.document.chatThreadId === chatThread.id;
+      const blobUrl = isThisThread ? (result.content.document.fileUrl ?? displayUrl) : null;
       return `[${index}]. file name: ${result.content.document.metadata}
 file id: ${result.id}${blobUrl ? `\nfile_url: ${blobUrl}` : ""}
 ${page}`;
@@ -153,10 +173,8 @@ ${page}`;
     .join("\n------\n");
 
   // ファイルURLリスト（convert_doc_to_pptx ツールに渡すため）
-  // ★ fileUrl (Blob URL) を使う。effectiveFileUrl はSP URLで認証必要なため不可
-  const fileUrls = documents
-    .map((r) => r.content.document.fileUrl)
-    .filter(Boolean);
+  // このスレッドにアップロードされたファイルのみを対象にする
+  const fileUrls = uploadedBlobUrls;
   const fileUrlHint =
     fileUrls.length > 0
       ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.`

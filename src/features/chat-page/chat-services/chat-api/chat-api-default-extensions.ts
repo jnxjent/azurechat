@@ -10,6 +10,7 @@ import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
+import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
 
 import {
   buildSendOptionsFromMode,
@@ -78,20 +79,10 @@ async function resolveDocumentUrlForVision(
           sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
           resolvedUrl: resolvedFileUrl.substring(0, 80),
         });
-        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
-        });
+        const analyzeResult = await analyzeDocVision(resolvedFileUrl, maxPages ?? 30, mode);
 
-        if (!analyzeRes.ok) {
-          const t = await analyzeRes.text().catch(() => "");
-          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
-          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
-        }
-
-        const analyzeResult = await analyzeRes.json();
         if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeResult?.error);
           return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
         }
 
@@ -177,20 +168,10 @@ async function resolveDocumentUrlForVision(
           sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
           resolvedUrl: resolvedFileUrl.substring(0, 80),
         });
-        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
-        });
+        const analyzeResult = await analyzeDocVision(resolvedFileUrl, maxPages ?? 30, mode);
 
-        if (!analyzeRes.ok) {
-          const t = await analyzeRes.text().catch(() => "");
-          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
-          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
-        }
-
-        const analyzeResult = await analyzeRes.json();
         if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeResult?.error);
           return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
         }
 
@@ -329,15 +310,17 @@ async function downloadSharePointFileToBlob(
     }
     const accessToken: string = tokenData.access_token;
 
-    // 2. SharePoint URL を分解して site + file path を取得
+    // 2. SharePoint URL を分解して site + library + file path を取得
     const urlObj = new URL(sharePointUrl);
     const hostname = urlObj.hostname;
     const decodedPath = decodeURIComponent(urlObj.pathname);
     const pathParts = decodedPath.split("/").filter(Boolean);
-    // 例: ["sites", "AzureChatxSharepointTestSite", "Shared Documents", "SL", "j.nomoto", "file.pdf"]
+    // 例: ["sites", "AzureChatxSharepointTestSite", "SL", "j.nomoto", "file.pdf"]
     const siteIndex = pathParts.indexOf("sites");
-    if (siteIndex < 0 || siteIndex + 1 >= pathParts.length) return null;
+    if (siteIndex < 0 || siteIndex + 2 >= pathParts.length) return null;
     const siteName = pathParts[siteIndex + 1];
+    const librarySegment = pathParts[siteIndex + 2]; // ライブラリのURLセグメント (例: "SL")
+    const filePathWithinLibrary = pathParts.slice(siteIndex + 3).join("/"); // ライブラリ内のパス
 
     // 3. Graph API でサイト ID を解決
     const siteRes = await fetch(
@@ -351,18 +334,39 @@ async function downloadSharePointFileToBlob(
     }
     const siteId: string = siteData.id;
 
-    // 4. サイト以下の相対パス（ライブラリ名含む）でファイルをダウンロード
-    const relativeFilePath = pathParts.slice(siteIndex + 2).join("/");
+    // 4. ドライブ一覧からライブラリに対応するドライブを特定
+    const drivesRes = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const drivesData: any = await drivesRes.json().catch(() => ({}));
+    if (!drivesRes.ok || !drivesData.value?.length) {
+      console.warn("[convert_doc_to_pptx] Graph drives fetch failed:", drivesData.error?.message ?? drivesRes.status);
+      return null;
+    }
+    const matchedDrive = drivesData.value.find((d: any) => {
+      const webUrlSlug = decodeURIComponent(String(d.webUrl ?? "").split("/").pop() ?? "");
+      return d.name === librarySegment || webUrlSlug === librarySegment;
+    });
+    if (!matchedDrive) {
+      console.warn(
+        `[convert_doc_to_pptx] Drive not found for library "${librarySegment}". Available: ${drivesData.value.map((d: any) => d.name).join(", ")}`
+      );
+      return null;
+    }
+    const driveId: string = matchedDrive.id;
+
+    // 5. ライブラリ内のパスでファイルをダウンロード
     const fileRes = await fetch(
-      `https://graph.microsoft.com/v1.0/sites/${siteId}/drive/root:/${relativeFilePath}:/content`,
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePathWithinLibrary}:/content`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!fileRes.ok) {
-      console.warn("[convert_doc_to_pptx] Graph file download failed:", fileRes.status);
+      console.warn("[convert_doc_to_pptx] Graph file download failed:", fileRes.status, `(drive=${matchedDrive.name}, path=${filePathWithinLibrary})`);
       return null;
     }
 
-    // 5. Azure Blob Storage にキャッシュ
+    // 6. Azure Blob Storage にキャッシュ
     const fileBuffer = Buffer.from(await fileRes.arrayBuffer());
     const blobPath = `${threadId}/${fileName}`;
     const uploadResult = await UploadBlob("dl-link", blobPath, fileBuffer);
@@ -371,7 +375,7 @@ async function downloadSharePointFileToBlob(
       return null;
     }
 
-    // 6. SAS URL 生成
+    // 7. SAS URL 生成
     const sasResponse = await GenerateSasUrl("dl-link", blobPath);
     if (sasResponse.status === "OK" && sasResponse.response) {
       console.log(`[convert_doc_to_pptx] SP file cached to blob via Graph: ${blobPath}`);
@@ -443,6 +447,33 @@ function extractPresentationTitleFromFileUrl(fileUrl: string): string | null {
 
   const title = fileName.replace(/\.[^.]+$/, "").trim();
   return title || null;
+}
+
+function normalizeDocumentUrlInput(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  const labelMatch = raw.match(/^(?:file_url|fileUrl)\s*:\s*(.+)$/i);
+  const candidate = labelMatch?.[1]?.trim() ?? raw;
+  const firstHttpIndex = candidate.search(/https?:\/\//i);
+  const normalized = firstHttpIndex >= 0 ? candidate.slice(firstHttpIndex).trim() : candidate;
+
+  try {
+    return new URL(normalized).toString();
+  } catch {
+    return normalized;
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
@@ -1084,7 +1115,8 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーがアップロードしたPDF・画像ファイルをPowerPoint（PPTX）に変換するツール。\n" +
         "Vision APIを使って各ページを視覚的に解析するため、グラフ・表・図も含めて高精度に変換できる。\n" +
         "使用タイミング：ユーザーが「PPTに変換して」「スライドにして」「PPT化して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
-        "file_urlは会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
+        "検索結果・引用（citation）に含まれるSharePointのURLは絶対に使わないこと。あくまでユーザーがアップロードしたファイルのURLのみを使うこと。\n" +
         "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_doc_to_pptx",
@@ -1151,7 +1183,7 @@ async function executeCreatePptx(
   const { title, slides, fontFace } = args ?? {};
 
   if (!title || !slides?.length) {
-    return { error: "titleとslidesは必須です。" };
+    return { error: "title and slides are required." };
   }
 
   const baseUrl = (
@@ -1180,7 +1212,7 @@ async function executeCreatePptx(
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
-      message: `PowerPointファイルを生成しました。以下のリンクからダウンロードできます。`,
+      message: "PowerPoint file created successfully.",
     };
   } catch (e: any) {
     console.error("[create_pptx] error:", e);
@@ -1205,7 +1237,7 @@ async function executeConvertDocToPptx(
   const sourceFileUrls = Array.from(
     new Set(
       [fileUrl, ...(Array.isArray(fileUrls) ? fileUrls : [])]
-        .map((value) => String(value ?? "").trim())
+        .map((value) => normalizeDocumentUrlInput(value))
         .filter(Boolean)
     )
   );
@@ -1216,7 +1248,14 @@ async function executeConvertDocToPptx(
   );
 
   if (sourceFileUrls.length === 0) {
-    return { error: "fileUrl は必須です。" };
+    return { error: "fileUrl is required." };
+  }
+
+  const invalidFileUrl = sourceFileUrls.find((value) => !isHttpUrl(value));
+  if (invalidFileUrl) {
+    return {
+      error: `fileUrl ??????'file_url:' ? 'fileUrl:' ?????????URL ????????????: ${invalidFileUrl}`,
+    };
   }
 
   const baseUrl = (
@@ -1251,20 +1290,10 @@ async function executeConvertDocToPptx(
           sourceFile: extractFileNameFromDocumentUrl(currentFileUrl),
           resolvedUrl: resolvedFileUrl.substring(0, 80),
         });
-        const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
-        });
+        const analyzeResult = await analyzeDocVision(resolvedFileUrl, maxPages ?? 30, mode);
 
-        if (!analyzeRes.ok) {
-          const t = await analyzeRes.text().catch(() => "");
-          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
-          return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
-        }
-
-        const analyzeResult = await analyzeRes.json();
         if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+          console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeResult?.error);
           return { error: analyzeResult?.error ?? "ドキュメント解析結果を取得できませんでした。" };
         }
 
@@ -1329,20 +1358,10 @@ async function executeConvertDocToPptx(
       chatThread.id
     );
     console.log("[convert_doc_to_pptx] Analyzing document with Vision API:", resolvedFileUrl.substring(0, 80));
-    const analyzeRes = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl: resolvedFileUrl, maxPages: maxPages ?? 30, mode }),
-    });
+    const analyzeResult = await analyzeDocVision(resolvedFileUrl, maxPages ?? 30, mode);
 
-    if (!analyzeRes.ok) {
-      const t = await analyzeRes.text().catch(() => "");
-      console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeRes.status, t);
-      return { error: `ドキュメント解析に失敗しました: HTTP ${analyzeRes.status}` };
-    }
-
-    const analyzeResult = await analyzeRes.json();
     if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+      console.error("[convert_doc_to_pptx] analyze-doc-vision failed:", analyzeResult?.error);
       return { error: analyzeResult?.error ?? "ドキュメントの解析結果が空でした。" };
     }
 

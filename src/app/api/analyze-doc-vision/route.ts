@@ -407,7 +407,11 @@ async function renderPdfPages(
 ): Promise<number> {
   /* eslint-disable */
   const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
-  const { createCanvas } = require("@napi-rs/canvas");
+  const { createCanvas, DOMMatrix: NapiDOMMatrix } = require("@napi-rs/canvas");
+  // pdf.js が RadialAxialShading 等で DOMMatrix を使うが Node.js には存在しないためポリフィル
+  if (typeof globalThis.DOMMatrix === "undefined") {
+    (globalThis as any).DOMMatrix = NapiDOMMatrix;
+  }
   /* eslint-enable */
 
   const NodeCanvasFactory = {
@@ -439,9 +443,11 @@ async function renderPdfPages(
 
   const pdf = await loadingTask.promise;
   const totalPages = Math.min(pdf.numPages, maxPages);
+  console.log(`[analyze-doc-vision] PDF totalPages=${totalPages} (raw=${pdf.numPages})`);
 
   try {
     for (let i = 1; i <= totalPages; i++) {
+      console.log(`[analyze-doc-vision] rendering page ${i}/${totalPages}`);
       const page = await pdf.getPage(i);
       const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
       const { canvas, context } = NodeCanvasFactory.create(
@@ -457,7 +463,9 @@ async function renderPdfPages(
         }).promise;
 
         const pngBuffer = canvas.toBuffer("image/png");
+        console.log(`[analyze-doc-vision] page ${i} rendered (${pngBuffer.length} bytes), calling Vision API`);
         await onPage(pngBuffer.toString("base64"), i - 1, totalPages);
+        console.log(`[analyze-doc-vision] page ${i} Vision API done`);
       } finally {
         page.cleanup();
         NodeCanvasFactory.destroy({ canvas, context });
@@ -582,100 +590,85 @@ export type AnalyzeDocVisionResponse = {
   error?: string;
 };
 
+export async function analyzeDocVision(
+  fileUrl: string,
+  maxPages: number = MAX_PAGES,
+  mode?: "faithful" | "redesign"
+): Promise<AnalyzeDocVisionResponse> {
+  if (!fileUrl?.trim()) {
+    return { ok: false, error: "fileUrl is required" };
+  }
+
+  console.log("[analyze-doc-vision] fileUrl =", fileUrl.substring(0, 80));
+
+  const { buffer, effectiveUrl } = await downloadFile(fileUrl);
+  const mimeType = detectMimeType(effectiveUrl, buffer);
+
+  console.log("[analyze-doc-vision] mimeType =", mimeType);
+
+  const slides: Array<{
+    title: string;
+    bullets: string[];
+    layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
+    tableRows?: string[][];
+    columns?: Array<{ header: string; bullets: string[] }>;
+    visualBlocks?: VisualBlock[];
+    connectors?: Connector[];
+    conversationStyle?: "chat-ui" | "interview" | "dialog-list";
+    conversationTurns?: ConversationTurn[];
+  }> = [];
+  let totalPages = 0;
+
+  if (mimeType === "pdf") {
+    totalPages = await renderPdfPages(
+      buffer,
+      maxPages,
+      async (base64Image, pageIndex, pageCount) => {
+        const result = await analyzePageWithVision(base64Image, pageIndex, pageCount, mode);
+        slides.push({
+          title: result.slideTitle,
+          bullets: result.bullets,
+          layoutType: result.layoutType,
+          tableRows: result.tableRows,
+          columns: result.columns,
+          visualBlocks: result.visualBlocks,
+          connectors: result.connectors,
+          conversationStyle: result.conversationStyle,
+          conversationTurns: result.conversationTurns,
+        });
+      }
+    );
+    console.log("[analyze-doc-vision] PDF pages analyzed:", totalPages);
+  } else if (mimeType === "image") {
+    totalPages = 1;
+    const result = await analyzePageWithVision(imageBufferToBase64(buffer), 0, 1, mode);
+    slides.push({
+      title: result.slideTitle,
+      bullets: result.bullets,
+      layoutType: result.layoutType,
+      tableRows: result.tableRows,
+      columns: result.columns,
+      visualBlocks: result.visualBlocks,
+      connectors: result.connectors,
+      conversationStyle: result.conversationStyle,
+      conversationTurns: result.conversationTurns,
+    });
+    console.log("[analyze-doc-vision] Single image analyzed");
+  } else {
+    return { ok: false, error: "Unsupported file type. Supported: PDF, PNG, JPG, WEBP, GIF" };
+  }
+
+  return { ok: true, slides, totalPages };
+}
+
 export async function POST(
   req: NextRequest
 ): Promise<NextResponse<AnalyzeDocVisionResponse>> {
   try {
     const body: AnalyzeDocVisionRequest = await req.json();
     const { fileUrl, maxPages = MAX_PAGES, mode } = body;
-
-    if (!fileUrl?.trim()) {
-      return NextResponse.json(
-        { ok: false, error: "fileUrl is required" },
-        { status: 400 }
-      );
-    }
-
-    console.log("[analyze-doc-vision] fileUrl =", fileUrl.substring(0, 80));
-
-    const { buffer, effectiveUrl } = await downloadFile(fileUrl);
-    const mimeType = detectMimeType(effectiveUrl, buffer);
-
-    console.log("[analyze-doc-vision] mimeType =", mimeType);
-
-    const slides: Array<{
-      title: string;
-      bullets: string[];
-      layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
-      tableRows?: string[][];
-      columns?: Array<{ header: string; bullets: string[] }>;
-      visualBlocks?: VisualBlock[];
-      connectors?: Connector[];
-      conversationStyle?: "chat-ui" | "interview" | "dialog-list";
-      conversationTurns?: ConversationTurn[];
-    }> = [];
-    let totalPages = 0;
-
-    if (mimeType === "pdf") {
-      totalPages = await renderPdfPages(
-        buffer,
-        maxPages,
-        async (base64Image, pageIndex, pageCount) => {
-          const result = await analyzePageWithVision(
-            base64Image,
-            pageIndex,
-            pageCount,
-            mode
-          );
-          slides.push({
-            title: result.slideTitle,
-            bullets: result.bullets,
-            layoutType: result.layoutType,
-            tableRows: result.tableRows,
-            columns: result.columns,
-            visualBlocks: result.visualBlocks,
-            connectors: result.connectors,
-            conversationStyle: result.conversationStyle,
-            conversationTurns: result.conversationTurns,
-          });
-        }
-      );
-      console.log("[analyze-doc-vision] PDF pages analyzed:", totalPages);
-    } else if (mimeType === "image") {
-      totalPages = 1;
-      const result = await analyzePageWithVision(
-        imageBufferToBase64(buffer),
-        0,
-        1,
-        mode
-      );
-      slides.push({
-        title: result.slideTitle,
-        bullets: result.bullets,
-        layoutType: result.layoutType,
-        tableRows: result.tableRows,
-        columns: result.columns,
-        visualBlocks: result.visualBlocks,
-        connectors: result.connectors,
-        conversationStyle: result.conversationStyle,
-        conversationTurns: result.conversationTurns,
-      });
-      console.log("[analyze-doc-vision] Single image analyzed");
-    } else {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Unsupported file type. Supported: PDF, PNG, JPG, WEBP, GIF",
-        },
-        { status: 400 }
-      );
-    }
-
-    return NextResponse.json({
-      ok: true,
-      slides,
-      totalPages,
-    });
+    const result = await analyzeDocVision(fileUrl, maxPages, mode);
+    return NextResponse.json(result, { status: result.ok ? 200 : (result.error === "fileUrl is required" ? 400 : 500) });
   } catch (e: any) {
     console.error("[analyze-doc-vision] error:", e);
     return NextResponse.json(

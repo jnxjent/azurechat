@@ -299,7 +299,9 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     await fs.writeFile(inputPath, inputBuffer);
     await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
 
-    const { stdout, stderr } = await execFileAsync("python", [
+    // Azure App Service (Linux) は python3、Windows ローカルは python
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
       scriptPath,
       "--input",
       inputPath,

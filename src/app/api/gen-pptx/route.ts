@@ -214,7 +214,7 @@ function localizeLabel(
 }
 
 function createFallbackBrief(
-  title: string,
+  _title: string,
   slides: PptxSlide[],
   instructionText: string,
   prefs?: DeckPreferencesInput
@@ -283,9 +283,13 @@ async function generateDesignBrief(
         },
       ],
       response_format: { type: "json_object" },
-      max_completion_tokens: 900,
+      max_completion_tokens: 1600,
     });
 
+    if (res.choices[0]?.finish_reason === "length") {
+      console.warn("[gen-pptx] design brief truncated (finish_reason=length), using fallback");
+      return fallback;
+    }
     const parsed = JSON.parse(res.choices[0]?.message?.content ?? "{}");
     const palette: Palette = {
       canvas: normalizeHex(parsed?.palette?.canvas, fallback.palette.canvas),
