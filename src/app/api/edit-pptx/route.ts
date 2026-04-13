@@ -340,15 +340,20 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     const pythonBin = process.platform === "win32" ? "python" : "python3";
 
     // Linux 環境では python-pptx / lxml が未インストールの可能性があるため事前確認・インストール
+    // pip3 コマンドは環境によって存在しないため python3 -m pip を使用する
     if (process.platform !== "win32") {
       try {
         await execFileAsync(pythonBin, ["-c", "import pptx, lxml"]);
       } catch {
-        console.log("[edit-pptx] python-pptx not found, installing...");
-        await execFileAsync("pip3", ["install", "--quiet", "python-pptx", "lxml"], {
-          timeout: 60000,
-        });
-        console.log("[edit-pptx] python-pptx installed.");
+        console.log("[edit-pptx] python-pptx not found, installing via python3 -m pip...");
+        try {
+          await execFileAsync(pythonBin, ["-m", "pip", "install", "--quiet", "--user", "python-pptx", "lxml"], {
+            timeout: 120000,
+          });
+          console.log("[edit-pptx] python-pptx installed.");
+        } catch (pipErr: any) {
+          throw new Error(`python-pptxがサーバーにインストールされていません。(${String(pipErr?.message ?? pipErr)})`);
+        }
       }
     }
 

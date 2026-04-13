@@ -413,17 +413,22 @@ async function renderPdfPages(
   if (typeof globalThis.DOMMatrix === "undefined") {
     (globalThis as any).DOMMatrix = NapiDOMMatrix;
   }
-  // standalone ビルドでは require.resolve がモジュールIDに変換されて文字列にならないため
-  // 候補パスを順に試して存在するものを workerSrc に設定する
+  // standalone ビルドでは node_modules の場所が環境によって異なるため
+  // pdf.js が実際にロードされたパスから worker パスを導く（最も確実）
   if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    const workerCandidates = [
-      // standalone ビルド: /home/site/wwwroot/.next/standalone 配下
-      path.join(process.cwd(), "node_modules", "pdfjs-dist", "legacy", "build", "pdf.worker.js"),
-      // Azure App Service wwwroot 直下
-      "/home/site/wwwroot/node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
-    ];
     const { existsSync } = require("node:fs");
+    // pdf.js の実ファイルパスを取得して同ディレクトリの pdf.worker.js を参照
+    const pdfJsResolvedPath: string = require.resolve("pdfjs-dist/legacy/build/pdf.js");
+    const workerFromResolved = path.join(path.dirname(pdfJsResolvedPath), "pdf.worker.js");
+    const workerCandidates = [
+      workerFromResolved,
+      // フォールバック候補
+      "/node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
+      path.join(process.cwd(), "node_modules", "pdfjs-dist", "legacy", "build", "pdf.worker.js"),
+    ];
     const found = workerCandidates.find((p) => existsSync(p));
+    console.log("[analyze-doc-vision] pdf.worker candidates:", workerCandidates.slice(0, 2));
+    console.log("[analyze-doc-vision] pdf.worker resolved:", found ?? "(none found, using first)");
     pdfjsLib.GlobalWorkerOptions.workerSrc = found ?? workerCandidates[0];
   }
   /* eslint-enable */
