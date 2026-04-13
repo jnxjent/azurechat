@@ -205,7 +205,8 @@ async function downloadBlobDirectFromStorage(
     const svc = BlobServiceClient.fromConnectionString(connStr);
     const cc = svc.getContainerClient(containerName);
     return await cc.getBlockBlobClient(blobPath).downloadToBuffer();
-  } catch {
+  } catch (e) {
+    console.warn(`[edit-pptx] downloadBlobDirectFromStorage failed (${containerName}/${blobPath}):`, String((e as any)?.message ?? e));
     return null;
   }
 }
@@ -238,15 +239,30 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
     const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
     const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
     if (acc && key) {
-      const blobPathParts = blobRef.blobPath.split("/").filter(Boolean);
-      const effectiveThreadId = threadId?.trim() || blobPathParts[0];
-      if (effectiveThreadId) {
-        const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
-        const svc = BlobServiceClient.fromConnectionString(connStr);
-        const cc = svc.getContainerClient(blobRef.containerName);
-        for await (const blob of cc.listBlobsFlat({ prefix: `${effectiveThreadId}/` })) {
-          if (blob.name.toLowerCase().endsWith(".pptx")) {
-            return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
+      const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
+      const svc = BlobServiceClient.fromConnectionString(connStr);
+      const cc = svc.getContainerClient(blobRef.containerName);
+
+      if (blobRef.containerName === "dl-link") {
+        // dl-link は {threadId}/{filename} 構造
+        const blobPathParts = blobRef.blobPath.split("/").filter(Boolean);
+        const effectiveThreadId = threadId?.trim() || blobPathParts[0];
+        if (effectiveThreadId) {
+          for await (const blob of cc.listBlobsFlat({ prefix: `${effectiveThreadId}/` })) {
+            if (blob.name.toLowerCase().endsWith(".pptx")) {
+              return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
+            }
+          }
+        }
+      } else {
+        // pptx コンテナは {threadId}_edited_{uniqueId}.pptx などフラット構造
+        // threadId プレフィックスで前方一致検索（スラッシュなし）
+        const effectiveThreadId = threadId?.trim();
+        if (effectiveThreadId) {
+          for await (const blob of cc.listBlobsFlat({ prefix: effectiveThreadId })) {
+            if (blob.name.toLowerCase().endsWith(".pptx")) {
+              return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
+            }
           }
         }
       }

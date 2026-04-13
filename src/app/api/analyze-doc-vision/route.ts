@@ -408,9 +408,16 @@ async function renderPdfPages(
   /* eslint-disable */
   const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
   const { createCanvas, DOMMatrix: NapiDOMMatrix } = require("@napi-rs/canvas");
-  // pdf.js が RadialAxialShading 等で DOMMatrix を使うが Node.js には存在しないためポリフィル
+  // Node.js には DOMMatrix がないためポリフィル（RadialAxialShading 描画時に必要）
   if (typeof globalThis.DOMMatrix === "undefined") {
     (globalThis as any).DOMMatrix = NapiDOMMatrix;
+  }
+  // standalone ビルドでは相対 require('./pdf.worker.js') が失敗するため workerSrc を明示設定
+  // require.resolve により Next.js の outputFileTracing がワーカーファイルを検出できる
+  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
+      "pdfjs-dist/legacy/build/pdf.worker.js"
+    );
   }
   /* eslint-enable */
 

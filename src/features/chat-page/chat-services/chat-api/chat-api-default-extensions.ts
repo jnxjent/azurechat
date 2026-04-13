@@ -3,7 +3,7 @@
 import "server-only";
 
 import { GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
-import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
+import { OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
@@ -509,162 +509,6 @@ type DeckPreferences = {
   recentDesignNotes?: string[];
 };
 
-function detectLatestPreferenceOverrides(messages: string[]): Partial<DeckPreferences> {
-  const latest = messages[messages.length - 1]?.toLowerCase() ?? "";
-  const merged = messages.join("\n").toLowerCase();
-  const overrides: Partial<DeckPreferences> = {};
-
-  const colorSource = latest || merged;
-  if (colorSource.includes("blue") || colorSource.includes("青")) {
-    overrides.accentColor = "blue";
-  } else if (colorSource.includes("red") || colorSource.includes("赤")) {
-    overrides.accentColor = "red";
-  } else if (
-    colorSource.includes("green") ||
-    colorSource.includes("eco") ||
-    colorSource.includes("緑")
-  ) {
-    overrides.accentColor = "green";
-  } else if (colorSource.includes("gold") || colorSource.includes("金")) {
-    overrides.accentColor = "gold";
-  }
-
-  if (
-    latest.includes("日本語") ||
-    latest.includes("英語使わない") ||
-    latest.includes("英語を使わない")
-  ) {
-    overrides.language = "ja";
-    overrides.avoidEnglishLabels = true;
-  }
-
-  if (latest.includes("文字を大きく") || latest.includes("もう少し大きく")) {
-    overrides.fontScale = "large";
-  } else if (latest.includes("かなり大きく")) {
-    overrides.fontScale = "xlarge";
-  }
-
-  return overrides;
-}
-
-function extractRecentDesignNotes(messages: string[]): string[] {
-  const designKeywords = [
-    "デザイン",
-    "雰囲気",
-    "トーン",
-    "カラー",
-    "色",
-    "基調",
-    "パステル",
-    "pop",
-    "ポップ",
-    "eco",
-    "高級",
-    "洗練",
-    "やわらか",
-    "かわい",
-    "重厚",
-    "営業提案書",
-    "役員向け",
-    "図解",
-    "英語使わない",
-    "日本語",
-    "文字を大きく",
-  ];
-
-  return messages
-    .filter((message) => {
-      const lower = message.toLowerCase();
-      return designKeywords.some((keyword) => lower.includes(keyword.toLowerCase()));
-    })
-    .slice(-4);
-}
-
-async function resolveDeckPreferencesFromThread(
-  chatThreadId: string,
-  explicitInstruction?: string
-): Promise<DeckPreferences> {
-  const explicit = explicitInstruction?.trim();
-
-  try {
-    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 12);
-    if (historyResponse.status !== "OK") {
-      return { designInstruction: explicit };
-    }
-
-    const userMessages = historyResponse.response
-      .filter((message) => message.role === "user")
-      .map((message) => String(message.content ?? "").trim())
-      .filter(Boolean)
-      .slice(0, 6)
-      .reverse();
-
-    if (userMessages.length === 0) {
-      return { designInstruction: explicit };
-    }
-
-    const latestOverrides = detectLatestPreferenceOverrides(userMessages);
-    const recentDesignNotes = extractRecentDesignNotes(userMessages);
-
-    const openai = OpenAIInstance();
-    const res = await openai.chat.completions.create({
-      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Summarize the user's recurring PowerPoint design intent from recent chat messages. Focus on visual direction and persistent deck-edit preferences. Return JSON only with keys designInstruction, language, fontScale, accentColor, avoidEnglishLabels. language must be 'ja' or 'en' when known. fontScale must be one of small, medium, large, xlarge when known. accentColor should be a short color name like red, green, blue, gold when the user requests a base color. avoidEnglishLabels should be true if the user wants labels like Takeaway translated. If a field is unknown, omit it or return an empty string.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            explicitInstruction: explicit ?? "",
-            recentUserMessages: userMessages,
-          }),
-        },
-      ],
-      response_format: { type: "json_object" },
-      max_completion_tokens: 220,
-    });
-
-    const parsed = JSON.parse(res.choices[0]?.message?.content ?? "{}");
-    const summarized = String(parsed?.designInstruction ?? "").trim();
-    return {
-      designInstruction:
-        explicit && summarized
-          ? `${explicit} / Context from this thread: ${summarized}`
-          : explicit || summarized || undefined,
-      language:
-        latestOverrides.language ||
-        (parsed?.language === "ja" || parsed?.language === "en"
-          ? parsed.language
-          : undefined),
-      fontScale:
-        latestOverrides.fontScale ||
-        (parsed?.fontScale === "small" ||
-        parsed?.fontScale === "medium" ||
-        parsed?.fontScale === "large" ||
-        parsed?.fontScale === "xlarge"
-          ? parsed.fontScale
-          : undefined),
-      accentColor:
-        latestOverrides.accentColor ||
-        String(parsed?.accentColor ?? "").trim() ||
-        undefined,
-      avoidEnglishLabels:
-        typeof latestOverrides.avoidEnglishLabels === "boolean"
-          ? latestOverrides.avoidEnglishLabels
-          : typeof parsed?.avoidEnglishLabels === "boolean"
-          ? parsed.avoidEnglishLabels
-          : undefined,
-      recentDesignNotes,
-    };
-  } catch (error) {
-    console.warn("[convert_doc_to_pptx] design instruction fallback:", error);
-    return { designInstruction: explicit };
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* NL スタイルヒント → パラメータ変換                                  */
 /* ------------------------------------------------------------------ */
@@ -1049,6 +893,10 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
           },
+          designInstruction: {
+            type: "string",
+            description: "デザイン・色調の指示。例: '赤いトーンで力強く', '青を基調にしたシンプルなデザイン', 'ポップで明るい印象'",
+          },
         },
         required: ["title", "slides"],
       },
@@ -1056,6 +904,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーがテーマや内容を指定してPowerPoint（PPTX）を新規作成するツール。\n" +
         "テキストベースでスライド構成を作る場合に使用する。\n" +
         "ファイル（PDF・画像）をPPTに変換する場合は、代わりに convert_doc_to_pptx ツールを使うこと。\n" +
+        "ユーザーが色やデザインを指定した場合は designInstruction に渡すこと（例：「赤いトーン」→ designInstruction='赤いトーンで力強く'）。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "create_pptx",
     },
@@ -1177,14 +1026,21 @@ async function executeCreatePptx(
     title: string;
     slides: Array<{ title: string; bullets: string[] }>;
     fontFace?: string;
+    designInstruction?: string;
   },
   chatThread: ChatThreadModel
 ) {
-  const { title, slides, fontFace } = args ?? {};
+  const { title, slides, fontFace, designInstruction } = args ?? {};
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
   }
+
+  // Each PPT creation is independent — do not accumulate style from thread history.
+  const explicitInstruction = designInstruction?.trim() || undefined;
+  const deckPreferences: DeckPreferences = explicitInstruction
+    ? { designInstruction: explicitInstruction }
+    : {};
 
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
@@ -1195,7 +1051,14 @@ async function executeCreatePptx(
     const res = await fetch(`${baseUrl}/api/gen-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, slides, threadId: chatThread.id, fontFace }),
+      body: JSON.stringify({
+        title,
+        slides,
+        threadId: chatThread.id,
+        fontFace,
+        designInstruction: explicitInstruction,
+        deckPreferences,
+      }),
     });
 
     if (!res.ok) {
@@ -1242,10 +1105,11 @@ async function executeConvertDocToPptx(
     )
   );
   const derivedTitle = sourceFileUrls[0] ? extractPresentationTitleFromFileUrl(sourceFileUrls[0]) : null;
-  const deckPreferences = await resolveDeckPreferencesFromThread(
-    chatThread.id,
-    designInstruction
-  );
+  // PDF→PPT変換はスレッド履歴からスタイルを引き継がない（各変換が独立）
+  const explicitInstruction = designInstruction?.trim() || undefined;
+  const deckPreferences: DeckPreferences = explicitInstruction
+    ? { designInstruction: explicitInstruction }
+    : {};
 
   if (sourceFileUrls.length === 0) {
     return { error: "fileUrl is required." };
