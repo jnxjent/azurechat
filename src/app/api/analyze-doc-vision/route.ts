@@ -1,6 +1,7 @@
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
+import path from "node:path";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { OpenAIVisionInstance } from "@/features/common/services/openai";
 
@@ -412,12 +413,18 @@ async function renderPdfPages(
   if (typeof globalThis.DOMMatrix === "undefined") {
     (globalThis as any).DOMMatrix = NapiDOMMatrix;
   }
-  // standalone ビルドでは相対 require('./pdf.worker.js') が失敗するため workerSrc を明示設定
-  // require.resolve により Next.js の outputFileTracing がワーカーファイルを検出できる
+  // standalone ビルドでは require.resolve がモジュールIDに変換されて文字列にならないため
+  // 候補パスを順に試して存在するものを workerSrc に設定する
   if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
-      "pdfjs-dist/legacy/build/pdf.worker.js"
-    );
+    const workerCandidates = [
+      // standalone ビルド: /home/site/wwwroot/.next/standalone 配下
+      path.join(process.cwd(), "node_modules", "pdfjs-dist", "legacy", "build", "pdf.worker.js"),
+      // Azure App Service wwwroot 直下
+      "/home/site/wwwroot/node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
+    ];
+    const { existsSync } = require("node:fs");
+    const found = workerCandidates.find((p) => existsSync(p));
+    pdfjsLib.GlobalWorkerOptions.workerSrc = found ?? workerCandidates[0];
   }
   /* eslint-enable */
 

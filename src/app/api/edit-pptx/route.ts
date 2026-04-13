@@ -338,6 +338,20 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 
     // Azure App Service (Linux) は python3、Windows ローカルは python
     const pythonBin = process.platform === "win32" ? "python" : "python3";
+
+    // Linux 環境では python-pptx / lxml が未インストールの可能性があるため事前確認・インストール
+    if (process.platform !== "win32") {
+      try {
+        await execFileAsync(pythonBin, ["-c", "import pptx, lxml"]);
+      } catch {
+        console.log("[edit-pptx] python-pptx not found, installing...");
+        await execFileAsync("pip3", ["install", "--quiet", "python-pptx", "lxml"], {
+          timeout: 60000,
+        });
+        console.log("[edit-pptx] python-pptx installed.");
+      }
+    }
+
     const { stdout, stderr } = await execFileAsync(pythonBin, [
       scriptPath,
       "--input",

@@ -160,7 +160,8 @@ function resolvePaletteKeyFromPrompt(input: string): keyof typeof DEFAULT_PALETT
   if (containsAny(hint, ["pop", "playful", "vivid", "colorful", "ポップ", "元気"])) return "pop";
   if (containsAny(hint, ["red", "crimson", "scarlet", "赤"])) return "red";
   if (containsAny(hint, ["green", "eco", "natural", "organic", "緑", "エコ"])) return "green";
-  if (containsAny(hint, ["gold", "yellow", "luxury", "premium", "golden", "金", "高級"])) return "gold";
+  if (containsAny(hint, ["gold", "yellow", "黄色", "黄", "luxury", "premium", "golden", "金", "高級", "オレンジ", "orange", "橙"])) return "gold";
+  if (containsAny(hint, ["blue", "青", "navy", "ネイビー", "水色", "indigo"])) return "blue";
   return "blue";
 }
 
