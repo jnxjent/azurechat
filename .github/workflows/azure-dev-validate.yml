@@ -52,6 +52,17 @@ jobs:
             cp -f ./src/scripts/edit_pptx.py ./site-deploy/src/scripts/edit_pptx.py
           fi
 
+          # pdf.worker.js を明示的に同梱（standalone では自動コピーされないため）
+          WORKER_SRC="./src/node_modules/pdfjs-dist/legacy/build/pdf.worker.js"
+          WORKER_DST="./site-deploy/node_modules/pdfjs-dist/legacy/build/pdf.worker.js"
+          if [ -f "$WORKER_SRC" ]; then
+            mkdir -p "$(dirname $WORKER_DST)"
+            cp -f "$WORKER_SRC" "$WORKER_DST"
+            echo "✅ pdf.worker.js copied to site-deploy"
+          else
+            echo "⚠️ pdf.worker.js not found at $WORKER_SRC"
+          fi
+
       # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
       - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
         run: |

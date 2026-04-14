@@ -412,10 +412,17 @@ async function renderPdfPages(
   if (typeof globalThis.DOMMatrix === "undefined") {
     (globalThis as any).DOMMatrix = NapiDOMMatrix;
   }
-  // サーバー側（Node.js）では worker を使わない。
-  // workerSrc を指定すると pdfjs がファイルパスでモジュール解決しようとして失敗する。
-  // fake worker（メインスレッド同期処理）で動作させる。
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+  // サーバー側（Node.js）: process.cwd() から worker の絶対パスを構築する。
+  // workerSrc="" → pdfjs が "./pdf.worker.js" として相対解決 → 失敗
+  // require.resolve() → Next.js webpack がコンパイル時に解決してしまう可能性あり → 不安定
+  // process.cwd() はランタイム値のため standalone ビルドでも確実に動作する。
+  //   local dev  : <repo>/src/node_modules/pdfjs-dist/legacy/build/pdf.worker.js
+  //   Azure 本番  : /home/site/wwwroot/node_modules/pdfjs-dist/legacy/build/pdf.worker.js
+  const _nodePath = require("node:path");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = _nodePath.join(
+    process.cwd(),
+    "node_modules/pdfjs-dist/legacy/build/pdf.worker.js"
+  );
   /* eslint-enable */
 
   const NodeCanvasFactory = {
