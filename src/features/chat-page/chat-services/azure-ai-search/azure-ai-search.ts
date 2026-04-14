@@ -48,7 +48,11 @@ function combineFilters(a?: string, b?: string): string | undefined {
   if (!aa) return bb || undefined;
   if (!bb) return aa || undefined;
 
-  return `(${aa}) and (${bb})`;
+  const combined = `(${aa}) and (${bb})`;
+  console.log("[SEARCH] combineFilters base =", aa || "(none)");
+  console.log("[SEARCH] combineFilters acl =", bb || "(none)");
+  console.log("[SEARCH] combineFilters result =", combined);
+  return combined;
 }
 
 type UploadScope = "global_common" | "dept_common" | "personal";
@@ -111,7 +115,7 @@ async function buildSearchAclFilter(
     `(isSlDoc eq true and dept eq '${d}' and slScope eq 'personal' and slOwner eq '${u}')`;
 
   const slLegacyFilter =
-    `(isSlDoc eq true and dept eq '${d}' and (slScope eq null or slScope eq ''))`;
+    `(isSlDoc eq true and dept eq '${d}' and (slScope eq null or slScope eq '' or (slScope eq 'personal' and slOwner eq null)))`;
 
   console.log("[ACL] resolvedUserHash =", resolvedUserHash);
   console.log("[ACL] normalizedDept =", normalizedDept);
@@ -254,6 +258,8 @@ export const ExtensionSimilaritySearch = async (props: {
     const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
     const finalFilter = combineFilters(filter, scopeFilter);
 
+    console.log("[SEARCH:Extension] inputFilter =", filter ?? "(none)");
+    console.log("[SEARCH:Extension] scopeFilter =", scopeFilter ?? "(none)");
     console.log("[SEARCH:Extension] deptLower =", deptLower);
     console.log("[SEARCH:Extension] userHash =", userHash ? "***" : "(none)");
     console.log("[SEARCH:Extension] finalFilter =", finalFilter);

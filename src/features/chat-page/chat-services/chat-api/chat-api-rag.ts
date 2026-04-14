@@ -66,6 +66,13 @@ async function resolveUserContext(): Promise<UserContext> {
 
     const userHash = email ? hashValue(email) : null;
 
+    console.log("[RAG-EXT:resolveUserContext] email =", email);
+    console.log("[RAG-EXT:resolveUserContext] deptLower =", deptLower);
+    console.log(
+      "[RAG-EXT:resolveUserContext] userHash =",
+      userHash ? "***" : "(none)"
+    );
+
     return {
       email,
       deptLower,
@@ -74,6 +81,10 @@ async function resolveUserContext(): Promise<UserContext> {
   } catch {
     const deptLower =
       (process.env.SL_DEPT_DEFAULT ?? "cp").toLowerCase().trim() || "cp";
+
+    console.log("[RAG-EXT:resolveUserContext] fallback email = (none)");
+    console.log("[RAG-EXT:resolveUserContext] fallback deptLower =", deptLower);
+    console.log("[RAG-EXT:resolveUserContext] fallback userHash = (none)");
 
     return {
       email: null,
