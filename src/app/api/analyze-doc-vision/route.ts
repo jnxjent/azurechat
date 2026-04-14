@@ -1,7 +1,6 @@
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
-import path from "node:path";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { OpenAIVisionInstance } from "@/features/common/services/openai";
 
@@ -413,20 +412,10 @@ async function renderPdfPages(
   if (typeof globalThis.DOMMatrix === "undefined") {
     (globalThis as any).DOMMatrix = NapiDOMMatrix;
   }
-  // require.resolve はこのコードパスでは webpack にバンドルされてモジュールID(数値)を返すため使用不可
-  // エラーログより standalone の node_modules は /node_modules/（ルート直下）に配置される
-  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    const { existsSync } = require("node:fs");
-    const workerCandidates = [
-      // standalone ビルド: ルート直下 /node_modules/（最優先）
-      "/node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
-      // 通常の Node.js 実行（ローカル dev など）
-      path.join(process.cwd(), "node_modules", "pdfjs-dist", "legacy", "build", "pdf.worker.js"),
-    ];
-    const found = workerCandidates.find((p) => existsSync(p));
-    console.log("[analyze-doc-vision] pdf.worker resolved:", found ?? "(none found, using fallback)");
-    pdfjsLib.GlobalWorkerOptions.workerSrc = found ?? workerCandidates[1];
-  }
+  // サーバー側（Node.js）では worker を使わない。
+  // workerSrc を指定すると pdfjs がファイルパスでモジュール解決しようとして失敗する。
+  // fake worker（メインスレッド同期処理）で動作させる。
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "";
   /* eslint-enable */
 
   const NodeCanvasFactory = {
