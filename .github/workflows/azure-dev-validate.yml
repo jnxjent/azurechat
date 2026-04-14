@@ -186,11 +186,11 @@ jobs:
             APP_NAME=${{ secrets.AZURE_APP_SERVICE_NAME }}
             RG=$(az webapp list --query "[?name=='$APP_NAME'].resourceGroup" --output tsv)
 
-            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=true"
+            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=false"
             az webapp config appsettings set \
               -n $APP_NAME \
               -g $RG \
-              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
               -o none
 
             echo "Setting startup file to 'startup.sh'"
