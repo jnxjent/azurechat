@@ -339,21 +339,16 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     // Azure App Service (Linux) は python3、Windows ローカルは python
     const pythonBin = process.platform === "win32" ? "python" : "python3";
 
-    // Linux 環境では python-pptx / lxml が未インストールの可能性があるため事前確認・インストール
-    // pip3 コマンドは環境によって存在しないため python3 -m pip を使用する
+    // python-pptx / lxml は startup.sh でインストール済みであることを前提とする
+    // runtime install は行わず、未インストールの場合は明示エラーを返す
     if (process.platform !== "win32") {
       try {
         await execFileAsync(pythonBin, ["-c", "import pptx, lxml"]);
       } catch {
-        console.log("[edit-pptx] python-pptx not found, installing via python3 -m pip...");
-        try {
-          await execFileAsync(pythonBin, ["-m", "pip", "install", "--quiet", "--user", "python-pptx", "lxml"], {
-            timeout: 120000,
-          });
-          console.log("[edit-pptx] python-pptx installed.");
-        } catch (pipErr: any) {
-          throw new Error(`python-pptxがサーバーにインストールされていません。(${String(pipErr?.message ?? pipErr)})`);
-        }
+        throw new Error(
+          "python-pptx または lxml がサーバーにインストールされていません。" +
+          "サーバー管理者に startup.sh の設定を確認してください。"
+        );
       }
     }
 

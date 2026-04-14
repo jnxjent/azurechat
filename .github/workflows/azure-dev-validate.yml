@@ -40,6 +40,18 @@ jobs:
           # ✅ ★重要: .next ディレクトリ全体を上書きコピー（server/, BUILD_ID, *.json すべて含む）
           cp -R ./src/.next ./site-deploy/
 
+          # startup.sh を同梱（python-pptx インストール用）
+          if [ -f ./startup.sh ]; then
+            cp -f ./startup.sh ./site-deploy/startup.sh
+            chmod +x ./site-deploy/startup.sh
+          fi
+
+          # edit_pptx.py を同梱
+          if [ -f ./src/scripts/edit_pptx.py ]; then
+            mkdir -p ./site-deploy/src/scripts
+            cp -f ./src/scripts/edit_pptx.py ./site-deploy/src/scripts/edit_pptx.py
+          fi
+
       # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
       - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
         run: |
@@ -174,16 +186,16 @@ jobs:
             APP_NAME=${{ secrets.AZURE_APP_SERVICE_NAME }}
             RG=$(az webapp list --query "[?name=='$APP_NAME'].resourceGroup" --output tsv)
 
-            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=false"
+            echo "Setting SCM_DO_BUILD_DURING_DEPLOYMENT=true"
             az webapp config appsettings set \
               -n $APP_NAME \
               -g $RG \
-              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true \
               -o none
 
-            echo "Setting startup file to 'node server.js'"
+            echo "Setting startup file to 'startup.sh'"
             az webapp config set \
-              --startup-file="node server.js" \
+              --startup-file="/home/site/wwwroot/startup.sh" \
               -n $APP_NAME \
               -g $RG \
               -o none
