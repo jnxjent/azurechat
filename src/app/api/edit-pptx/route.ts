@@ -14,7 +14,7 @@ import {
   StorageSharedKeyCredential,
   generateBlobSASQueryParameters,
 } from "@azure/storage-blob";
-import { OpenAIInstance } from "@/features/common/services/openai";
+import { OpenAIInstance, OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { uniqueId } from "@/features/common/util";
 
 const execFileAsync = promisify(execFile);
@@ -22,6 +22,16 @@ const execFileAsync = promisify(execFile);
 type SlideSummary = {
   slideIndex: number;
   texts: string[];
+};
+
+type ImageInsert = {
+  slideIndex: number;
+  imagePrompt: string;
+  position?: "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center";
+  nearText?: string;   // このテキストを含む Shape の隣に配置（指定時は position より優先）
+  anchorSide?: "left" | "right" | "above" | "below"; // nearText Shape のどちら側か（default: "right"）
+  widthPct?: number;
+  imagePath?: string; // set after DALL-E generation, before Python call
 };
 
 type EditPlan = {
@@ -37,6 +47,7 @@ type EditPlan = {
       replace: string;
     }>;
   }>;
+  imageInserts?: ImageInsert[];
 };
 
 function decodeXmlEntities(s: string): string {
@@ -129,6 +140,16 @@ Return JSON only in this shape:
       "slideIndex": number,
       "replaceText": [{ "find": string, "replace": string }]
     }
+  ],
+  "imageInserts": [
+    {
+      "slideIndex": number,
+      "imagePrompt": string,
+      "nearText": string,
+      "anchorSide": "left" | "right" | "above" | "below",
+      "position": "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center",
+      "widthPct": number
+    }
   ]
 }
 
@@ -138,6 +159,13 @@ Rules:
 - preserveTextColors should usually be true unless the user explicitly asks to recolor text.
 - Only emit text replacements when the user explicitly wants wording changed.
 - slideIndex is zero-based.
+- If the user asks to add an icon, illustration, image, or mark to a slide, populate imageInserts[].
+  - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background").
+  - nearText: if the user says "next to X", "beside X", "横に", "〇〇の横" etc., set nearText to the shortest unique text string found in the slide (e.g. "ボット" not the full sentence). The image will be placed adjacent to the shape containing that text.
+  - anchorSide: which side of the nearText shape to place the image. Use "right" for "横に/右に", "left" for "左に", "above" for "上に", "below" for "下に". Default "right".
+  - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons. Never use "top-left" as it may overlap slide content.
+  - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons next to text labels, 12-15 for decorative corner icons, 30-50 for large illustrations. Default 8 when nearText is set, 13 otherwise.
+- Only emit imageInserts when the user explicitly requests an image or visual element.
 - Keep the JSON minimal. Use null or [] when not needed.`;
 
   const userPrompt = `Instruction:
@@ -164,7 +192,11 @@ Return JSON only.`;
   parsed.slideEdits ??= [];
 
   const directAccent = parseDirectAccentColor(instruction);
-  if (!normalizeHexColor(parsed.deckEdits.accentColor) && directAccent) {
+  // imageInserts がある場合は画像プロンプト内の色指定（「青系アイコン」等）を
+  // デッキ全体の色変更と誤認しないよう parseDirectAccentColor を適用しない。
+  // LLM が明示的に accentColor を返した場合のみデッキ色を変更する。
+  const hasImageInserts = (parsed.imageInserts?.length ?? 0) > 0;
+  if (!normalizeHexColor(parsed.deckEdits.accentColor) && directAccent && !hasImageInserts) {
     parsed.deckEdits.accentColor = directAccent;
   } else {
     parsed.deckEdits.accentColor = normalizeHexColor(parsed.deckEdits.accentColor) ?? null;
@@ -305,6 +337,42 @@ async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
   return `${bbc.url}?${sas}`;
 }
 
+async function generateDalleImage(prompt: string): Promise<Buffer | null> {
+  try {
+    const openai = OpenAIDALLEInstance();
+    // gpt-image-1 は response_format 非対応のため省略。
+    // レスポンスは b64_json または url のどちらかで返る。
+    const response = await openai.images.generate({
+      prompt,
+      n: 1,
+      size: "1024x1024",
+    } as Parameters<typeof openai.images.generate>[0]);
+
+    const item = response.data?.[0] as any;
+
+    // b64_json で返ってきた場合
+    if (item?.b64_json) {
+      return Buffer.from(item.b64_json, "base64");
+    }
+
+    // url で返ってきた場合
+    if (item?.url) {
+      const imageRes = await fetch(item.url);
+      if (!imageRes.ok) {
+        console.warn("[edit-pptx] Failed to fetch generated image:", imageRes.status);
+        return null;
+      }
+      return Buffer.from(await imageRes.arrayBuffer());
+    }
+
+    console.warn("[edit-pptx] DALL-E returned no image data. raw:", JSON.stringify(response));
+    return null;
+  } catch (e: any) {
+    console.warn("[edit-pptx] DALL-E image generation failed:", String(e?.message ?? e));
+    return null;
+  }
+}
+
 async function resolveEditPptxScriptPath(): Promise<string> {
   const candidates = [
     path.join(process.cwd(), "src", "scripts", "edit_pptx.py"),
@@ -334,6 +402,27 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 
   try {
     await fs.writeFile(inputPath, inputBuffer);
+
+    // imageInserts がある場合は DALL-E で画像生成し、一時ファイルパスをプランに追記
+    const requestedImages = plan.imageInserts?.length ?? 0;
+    let generatedImages = 0;
+    if (requestedImages > 0) {
+      for (let i = 0; i < plan.imageInserts!.length; i++) {
+        const insert = plan.imageInserts![i];
+        console.log(`[edit-pptx] generating image ${i}: "${insert.imagePrompt}"`);
+        const imageBuffer = await generateDalleImage(insert.imagePrompt);
+        if (imageBuffer) {
+          const imagePath = path.join(tempDir, `image_${i}.png`);
+          await fs.writeFile(imagePath, imageBuffer);
+          insert.imagePath = imagePath;
+          generatedImages++;
+          console.log(`[edit-pptx] image ${i} generated`);
+        } else {
+          console.warn(`[edit-pptx] image ${i} skipped: DALL-E failed`);
+        }
+      }
+    }
+
     await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
 
     // Azure App Service (Linux) は python3、Windows ローカルは python
@@ -371,11 +460,20 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.pptx`;
     const downloadUrl = await uploadToBlob(outputBuffer, fileName);
 
+    const insertedImages = Number(pythonResult.insertedImages ?? 0);
+    const imageWarning =
+      requestedImages > 0 && insertedImages < requestedImages
+        ? `画像挿入: ${requestedImages}件要求 / ${insertedImages}件成功`
+        : undefined;
+
     return {
       downloadUrl,
       fileName,
       changedSlides: Number(pythonResult.changedSlides ?? 0),
       totalSlides: Number(pythonResult.totalSlides ?? 0),
+      requestedImages,
+      insertedImages,
+      ...(imageWarning ? { imageWarning } : {}),
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });

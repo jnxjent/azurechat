@@ -175,8 +175,11 @@ export const ChatApiRAG = async (props: {
         "";
       // このスレッドにアップロードされたファイルのみ file_url を出す
       // 他スレッド由来のSLドキュメントは認証が必要なため除外（convert_doc_to_pptxで誤使用防止）
+      // SLファイルは fileUrl=SP webUrl / effectiveFileUrl=Blob URL なので、Blob URLを優先する
       const isThisThread = result.content.document.chatThreadId === chatThread.id;
-      const blobUrl = isThisThread ? (result.content.document.fileUrl ?? displayUrl) : null;
+      const blobUrl = isThisThread
+        ? (result.content.document.effectiveFileUrl ?? result.content.document.fileUrl ?? displayUrl)
+        : null;
       return `[${index}]. file name: ${result.content.document.metadata}
 file id: ${result.id}${blobUrl ? `\nfile_url: ${blobUrl}` : ""}
 ${page}`;
@@ -186,10 +189,11 @@ ${page}`;
   // ファイルURLリスト（convert_doc_to_pptx ツールに渡すため）
   // このスレッドにアップロードされたファイルのみを対象にする
   const fileUrls = uploadedBlobUrls;
-  const fileUrlHint =
-    fileUrls.length > 0
-      ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.`
-      : "";
+  const hasUploadedFile = fileUrls.length > 0;
+
+  const fileUrlHint = hasUploadedFile
+    ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.`
+    : "\n- 【重要】このスレッドにアップロードされたファイルは存在しません。ユーザーがSharePoint/SLの資料名を挙げてPPT変換を要求した場合は、必ず convert_sp_to_pptx ツールを使うこと。convert_doc_to_pptx は使わないこと。";
 
   const _userMessage = `
 - Review the following content from documents uploaded by the user and create a final answer.

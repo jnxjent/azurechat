@@ -11,6 +11,8 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
+import { SimpleSearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
+import { userSession } from "@/features/auth-page/helpers";
 
 import {
   buildSendOptionsFromMode,
@@ -965,11 +967,45 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーがアップロードしたPDF・画像ファイルをPowerPoint（PPTX）に変換するツール。\n" +
         "Vision APIを使って各ページを視覚的に解析するため、グラフ・表・図も含めて高精度に変換できる。\n" +
         "使用タイミング：ユーザーが「PPTに変換して」「スライドにして」「PPT化して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
-        "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること。\n" +
-        "検索結果・引用（citation）に含まれるSharePointのURLは絶対に使わないこと。あくまでユーザーがアップロードしたファイルのURLのみを使うこと。\n" +
+        "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること（blob.core.windows.net のURLを優先）。\n" +
+        "検索結果の引用（citation本文中）に含まれるSharePointのリンクは使わないこと。'file_url:' 行から得たBlobURLであれば使ってよい。\n" +
         "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_doc_to_pptx",
+    },
+  });
+
+  // ★ SharePoint SL文書をPPTに変換するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeConvertSpToPptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileQuery: {
+            type: "string",
+            description: "変換したいSharePointファイルの名前またはキーワード。例: '営業資料2024.pdf'",
+          },
+          mode: {
+            type: "string",
+            enum: ["faithful", "redesign"],
+            description:
+              "変換モード。'faithful'=忠実変換（ページ数維持）。'redesign'=デザイン自動改善（デフォルト）。",
+          },
+        },
+        required: ["fileQuery"],
+      },
+      description:
+        "SharePointのSLライブラリにある文書（PDF）をPowerPoint（PPTX）に変換するツール。\n" +
+        "使用タイミング：会話コンテキストに file_url が存在しない状態で、ユーザーがSP/SLの資料名を挙げてPPT変換を求めた場合。\n" +
+        "例: 「SPの営業資料2024.pdfをPPTにして」「SLにある〇〇をスライドにして」\n" +
+        "【重要】会話コンテキストに file_url が既にある場合は convert_doc_to_pptx を使うこと（このツールは不要）。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。\n" +
+        "複数候補がある場合はリストを提示してユーザーに選ばせること。",
+      name: "convert_sp_to_pptx",
     },
   });
 
@@ -1346,16 +1382,177 @@ async function executeEditPptx(
       return { error: "ダウンロードURLが取得できませんでした。" };
     }
 
+    const baseMessage = `${result.changedSlides}枚のスライドを編集しました（全${result.totalSlides}枚）。`;
+    const imageMessage =
+      result.requestedImages > 0
+        ? result.insertedImages === result.requestedImages
+          ? `画像${result.insertedImages}件を挿入しました。`
+          : `⚠️ ${result.imageWarning}`
+        : "";
+
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
       changedSlides: result.changedSlides,
       totalSlides: result.totalSlides,
-      message: `${result.changedSlides}枚のスライドを編集しました（全${result.totalSlides}枚）。`,
+      message: imageMessage ? `${baseMessage} ${imageMessage}` : baseMessage,
     };
   } catch (e: any) {
     console.error("[edit_pptx] error:", e);
     return { error: "PPTX編集中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- SharePoint SL文書 → PPT変換 ----------------
+async function executeConvertSpToPptx(
+  args: { fileQuery: string; mode?: "faithful" | "redesign" },
+  chatThread: ChatThreadModel
+) {
+  const { fileQuery, mode } = args ?? {};
+  console.log(`[convert_sp_to_pptx] called with fileQuery="${fileQuery}" mode=${mode}`);
+
+  if (!fileQuery?.trim()) {
+    return { error: "fileQuery（ファイル名またはキーワード）を指定してください。" };
+  }
+
+  // 現在ユーザーの部署情報を取得してACLフィルタに渡す
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+
+  // AI Search でアクセス可能な全SL文書を取得（"*"検索）し、クライアント側でファイル名フィルタ
+  // ※ fileQuery をページ本文テキスト検索に使うとファイル名がヒットしない場合があるため
+  const searchResult = await SimpleSearch("*", "isSlDoc eq true", deptLower);
+  const searchCount =
+    searchResult.status === "OK" ? searchResult.response.length : 0;
+  console.log(
+    `[convert_sp_to_pptx] SimpleSearch returned status=${searchResult.status} count=${searchCount}`
+  );
+
+  if (searchResult.status !== "OK" || !searchResult.response.length) {
+    return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
+  }
+
+  const allDocs = searchResult.response;
+
+  // ファイル名でクライアント側フィルタリング（部分一致・大文字小文字無視）
+  const queryLower = fileQuery.trim().toLowerCase();
+  const matched = allDocs.filter(({ document: doc }) => {
+    const name = (doc.metadata ?? "").toLowerCase();
+    return name.includes(queryLower) || queryLower.includes(name.replace(/\.pdf$/i, ""));
+  });
+
+  console.log(`[convert_sp_to_pptx] name-matched count=${matched.length} (query="${fileQuery}")`);
+
+  if (!matched.length) {
+    // フォールバック: 全候補を提示
+    const allFiles = Array.from(
+      new Map(
+        allDocs.map(({ document: doc }) => [
+          doc.effectiveFileUrl || doc.fileUrl,
+          doc.metadata || "不明",
+        ])
+      ).entries()
+    );
+    const list = allFiles.map(([, name], i) => `${i + 1}. ${name}`).join("\n");
+    return {
+      multipleFiles: true,
+      message: `「${fileQuery}」に一致するファイルが見つかりませんでした。\nアクセス可能なSLファイル一覧です：\n\n${list}\n\nファイル名を指定してください。`,
+    };
+  }
+
+  // URLをキーにしてユニークファイルを抽出（同名ファイルが別フォルダにある場合を考慮）
+  const seen = new Map<string, { fileName: string; url: string }>();
+  for (const { document: doc } of matched) {
+    const url = doc.effectiveFileUrl || doc.fileUrl;
+    const name = doc.metadata || url.split("/").pop() || "file";
+    if (!seen.has(url)) seen.set(url, { fileName: name, url });
+  }
+
+  const candidates = Array.from(seen.values());
+
+  // 複数ファイルがヒットした場合はリスト返却
+  if (candidates.length > 1) {
+    const list = candidates
+      .map((c, i) => `${i + 1}. ${c.fileName}`)
+      .join("\n");
+    return {
+      multipleFiles: true,
+      message: `「${fileQuery}」で複数のファイルが見つかりました。どれを変換しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+    };
+  }
+
+  const { fileName, url } = candidates[0];
+
+  // PDF以外は変換不可
+  if (!fileName.toLowerCase().endsWith(".pdf")) {
+    const ext = fileName.split(".").pop()?.toUpperCase() ?? "不明";
+    const hint =
+      ext === "PPTX" || ext === "PPT"
+        ? "（すでにPowerPointファイルです）"
+        : ext === "DOCX" || ext === "DOC"
+        ? "（WordファイルはPPT変換に対応していません）"
+        : "";
+    return { error: `「${fileName}」はPDFファイルではないため、PPTに変換できません。${hint}` };
+  }
+
+  console.log(`[convert_sp_to_pptx] Converting SP file: ${fileName}`);
+  console.log("[convert_sp_to_pptx] original url =", url.substring(0, 100));
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    // Step 1: SP URL → Blob SAS URL に解決（Graph API経由キャッシュ含む）
+    const resolvedUrl = await resolveDocumentUrlForVision(url, chatThread.id);
+    console.log("[convert_sp_to_pptx] resolved url =", resolvedUrl.substring(0, 100));
+
+    // Step 2: Vision API でPDF解析
+    const analyzeResult = await analyzeDocVision(resolvedUrl, 30, mode);
+    if (!analyzeResult?.ok || !analyzeResult.slides?.length) {
+      console.error("[convert_sp_to_pptx] analyze-doc-vision failed:", analyzeResult?.error);
+      return { error: analyzeResult?.error ?? "PDFの解析に失敗しました。" };
+    }
+
+    const { slides, totalPages } = analyzeResult;
+    const title = slides[0]?.title || fileName.replace(/\.pdf$/i, "");
+
+    console.log(`[convert_sp_to_pptx] Analyzed ${totalPages} pages → ${slides.length} slides`);
+
+    // Step 2: PPTX 生成
+    const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        slides,
+        title,
+        threadId: chatThread.id,
+        deckPreferences: {},
+        mode,
+      }),
+    });
+
+    if (!pptxRes.ok) {
+      const t = await pptxRes.text().catch(() => "");
+      console.error("[convert_sp_to_pptx] gen-pptx failed:", pptxRes.status, t);
+      return { error: `PowerPoint生成に失敗しました: HTTP ${pptxRes.status}` };
+    }
+
+    const pptxResult = await pptxRes.json();
+    if (!pptxResult?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: pptxResult.downloadUrl,
+      fileName: pptxResult.fileName,
+      totalPages,
+      message: `SharePointの「${fileName}」（${totalPages}ページ）をPowerPointに変換しました。`,
+    };
+  } catch (e: any) {
+    console.error("[convert_sp_to_pptx] error:", e);
+    return { error: "変換中にエラーが発生しました: " + String(e?.message ?? e) };
   }
 }
 

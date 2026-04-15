@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 import zipfile
@@ -8,6 +9,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.util import Emu
 from lxml import etree
 
 
@@ -261,6 +263,95 @@ def update_theme_colors(pptx_path: Path, target_hex: str) -> None:
             zout.writestr(filename, data)
 
 
+def find_shape_by_text(slide, near_text: str):
+    """near_text を含む Shape を返す（見つからなければ None）。"""
+    near_lower = near_text.lower()
+    for shape in iter_shapes(slide.shapes):
+        if getattr(shape, "has_text_frame", False):
+            if near_lower in shape.text_frame.text.lower():
+                return shape
+    return None
+
+
+def insert_image(
+    slide,
+    image_path: str,
+    position: str,
+    width_pct: float,
+    slide_width: int,
+    slide_height: int,
+    near_text: str = "",
+    anchor_side: str = "right",
+) -> bool:
+    """DALL-E で生成した画像をスライドに挿入する。
+    near_text が指定されていればその Shape の隣に配置し、見つからなければ固定 position を使う。
+    """
+    try:
+        # widthPct をクランプ（5〜50%）
+        width_pct = max(5.0, min(50.0, width_pct))
+        width = int(slide_width * width_pct / 100)
+        height = width  # アイコンは正方形
+        margin = int(slide_width * 0.015)
+
+        # anchorSide バリデーション
+        if anchor_side not in {"left", "right", "above", "below"}:
+            print(f"[edit_pptx] invalid anchorSide '{anchor_side}', defaulting to 'right'", file=sys.stderr)
+            anchor_side = "right"
+
+        # ヘッダー下限：スライド高さの20%以上に強制（タイトルバーへの被りを防ぐ）
+        header_bottom = int(slide_height * 0.20)
+
+        # nearText が指定されていれば Shape 相対配置を試みる
+        if near_text:
+            anchor_shape = find_shape_by_text(slide, near_text)
+            if anchor_shape:
+                s = anchor_shape
+
+                # 左端シェイプの左に置こうとすると見切れる → 右に自動flip
+                if anchor_side == "left" and s.left < width + margin * 2:
+                    anchor_side = "right"
+
+                if anchor_side == "right":
+                    left = s.left + s.width + margin
+                    top = s.top + (s.height - height) // 2
+                elif anchor_side == "left":
+                    left = s.left - width - margin
+                    top = s.top + (s.height - height) // 2
+                elif anchor_side == "above":
+                    left = s.left + (s.width - width) // 2
+                    top = s.top - height - margin
+                else:  # below
+                    left = s.left + (s.width - width) // 2
+                    top = s.top + s.height + margin
+
+                # ヘッダー回避 + スライド範囲内クランプ
+                left = max(0, min(slide_width - width, left))
+                top = max(header_bottom, min(slide_height - height, top))
+                slide.shapes.add_picture(image_path, left, top, width, height)
+                return True
+            else:
+                print(f"[edit_pptx] nearText '{near_text}' not found, falling back to position", file=sys.stderr)
+
+        # 固定位置（フォールバック）：top系はヘッダー下から配置
+        valid_positions = {"top-right", "top-left", "bottom-right", "bottom-left", "center"}
+        if position not in valid_positions:
+            position = "top-right"
+
+        pos_map = {
+            "top-right":    (slide_width - width - margin, header_bottom),
+            "top-left":     (margin, header_bottom),
+            "bottom-right": (slide_width - width - margin, slide_height - height - margin),
+            "bottom-left":  (margin, slide_height - height - margin),
+            "center":       ((slide_width - width) // 2, (slide_height - height) // 2),
+        }
+        left, top = pos_map[position]
+        slide.shapes.add_picture(image_path, left, top, width, height)
+        return True
+    except Exception as e:
+        print(f"[edit_pptx] insert_image failed: {e}", file=sys.stderr)
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -285,7 +376,15 @@ def main() -> None:
         if item.get("slideIndex") is not None
     }
 
+    # imageInserts: slideIndex → list of inserts
+    image_insert_map: dict[int, list[dict]] = {}
+    for item in (plan.get("imageInserts") or []):
+        si = item.get("slideIndex")
+        if si is not None:
+            image_insert_map.setdefault(int(si), []).append(item)
+
     changed_slides: set[int] = set()
+    inserted_images: int = 0
 
     for slide_index, slide in enumerate(prs.slides):
         slide_changed = False
@@ -309,6 +408,29 @@ def main() -> None:
             if replacements and replace_text(shape, replacements):
                 slide_changed = True
 
+        # 画像挿入
+        for img_item in image_insert_map.get(slide_index, []):
+            image_path = img_item.get("imagePath")
+            if image_path and Path(image_path).exists():
+                try:
+                    width_pct = float(img_item.get("widthPct", 15))
+                except (TypeError, ValueError):
+                    width_pct = 15.0
+                if insert_image(
+                    slide,
+                    image_path,
+                    img_item.get("position", "top-right"),
+                    width_pct,
+                    prs.slide_width,
+                    prs.slide_height,
+                    near_text=img_item.get("nearText", ""),
+                    anchor_side=img_item.get("anchorSide", "right"),
+                ):
+                    slide_changed = True
+                    inserted_images += 1
+            else:
+                print(f"[edit_pptx] image not found, skipping: {image_path}", file=sys.stderr)
+
         if slide_changed:
             changed_slides.add(slide_index)
 
@@ -319,6 +441,7 @@ def main() -> None:
     result = {
       "changedSlides": len(changed_slides),
       "totalSlides": len(prs.slides),
+      "insertedImages": inserted_images,
     }
     print(json.dumps(result, ensure_ascii=False))
 
