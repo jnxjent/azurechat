@@ -8,6 +8,10 @@ CLI: python pdf_to_excel.py --input <path> --output <path>
 stdout: JSON {"sheets": N, "tables": N, "pages": N}
 """
 
+import os
+os.environ['FLAGS_use_mkldnn'] = '0'   # PaddlePaddle oneDNN を無効化（Azure非対応CPUの回避）
+os.environ['FLAGS_use_onednn'] = '0'   # 同上（バージョン差異の吸収）
+
 import argparse
 import json
 import io
