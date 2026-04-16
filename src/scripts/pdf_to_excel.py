@@ -50,16 +50,35 @@ def _ocr_result_to_rows(ocr_result) -> list[list[str]]:
     """PaddleOCR の出力をセルのリスト（行 × 列）に変換する。
 
     同じ Y 帯に属するテキストを同一行とみなし、X 座標でソートしてセルとする。
+    PaddleOCR v3.x の predict() 形式と旧 ocr() 形式の両方に対応。
     """
-    if not ocr_result or not ocr_result[0]:
+    if not ocr_result:
         return []
 
     items: list[tuple[float, float, str]] = []
-    for line in ocr_result[0]:
-        box, (text, _conf) = line
-        y_center = (box[0][1] + box[2][1]) / 2
-        x_left = min(p[0] for p in box)
-        items.append((y_center, x_left, text))
+
+    # v3.x: predict() が返す list[dict] 形式
+    if isinstance(ocr_result, list) and ocr_result and isinstance(ocr_result[0], dict):
+        for res in ocr_result:
+            boxes = res.get("dt_boxes", [])
+            texts = res.get("rec_texts", [])
+            scores = res.get("rec_scores", [])
+            for box, text, score in zip(boxes, texts, scores):
+                if score < 0.3:
+                    continue
+                y_center = (box[0][1] + box[2][1]) / 2
+                x_left = min(p[0] for p in box)
+                items.append((y_center, x_left, text))
+    else:
+        # 旧形式: ocr() が返す list[list] 形式
+        first = ocr_result[0] if ocr_result else []
+        if not first:
+            return []
+        for line in first:
+            box, (text, _conf) = line
+            y_center = (box[0][1] + box[2][1]) / 2
+            x_left = min(p[0] for p in box)
+            items.append((y_center, x_left, text))
 
     if not items:
         return []
@@ -181,7 +200,7 @@ def main() -> None:
             if ocr_engine is not None and HAS_PYMUPDF:
                 try:
                     img = _pdf_page_to_numpy(args.input, page_num - 1)
-                    ocr_result = ocr_engine.ocr(img, cls=True)
+                    ocr_result = list(ocr_engine.predict(img))
                     lines = _ocr_result_to_rows(ocr_result)
                     print(f"[pdf_to_excel] p{page_num} PaddleOCR: {len(lines)} rows", file=sys.stderr)
                 except Exception as e:
