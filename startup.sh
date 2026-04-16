@@ -37,7 +37,7 @@ if ! PYTHONPATH="$PDIR" python3 -c "import easyocr" 2>/dev/null; then
   echo "[startup] EasyOCR not found, attempting install..."
   install_pip_if_needed
   if [ -f "$PIP_CMD" ]; then
-    "$PIP_CMD" install --quiet --target="$PDIR" easyocr \
+    "$PIP_CMD" install --quiet --target="$PDIR" torch easyocr \
       && echo "[startup] EasyOCR installed." \
       || echo "[startup] WARNING: EasyOCR install failed. PDF→Excel will use pymupdf fallback."
   fi
