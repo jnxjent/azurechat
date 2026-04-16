@@ -141,7 +141,8 @@ async function buildSearchAclFilter(
 export const SimpleSearch = async (
   searchText?: string,
   filter?: string,
-  deptLower?: string | null
+  deptLower?: string | null,
+  top?: number
 ): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
@@ -151,6 +152,7 @@ export const SimpleSearch = async (
 
     const searchResults = await instance.search(searchText ?? "*", {
       filter: finalFilter,
+      ...(top !== undefined ? { top } : {}),
     });
 
     const results: Array<DocumentSearchResponse> = [];

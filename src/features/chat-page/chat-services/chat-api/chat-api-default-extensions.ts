@@ -49,6 +49,27 @@ function buildExternalImageUrl(threadId: string, fileName: string): string {
   return GetImageUrl(threadId, fileName);
 }
 
+/**
+ * SAS なし Azure Blob URL を {container, path} に分解する。
+ * SAS 付き・非 Blob URL は null を返す。
+ */
+function parseBlobRawUrl(rawUrl: string | null | undefined): { container: string; path: string } | null {
+  if (!rawUrl?.trim()) return null;
+  try {
+    const obj = new URL(rawUrl);
+    const isAzureBlob =
+      obj.hostname.endsWith(".blob.core.windows.net") ||
+      obj.host === "127.0.0.1:10000" ||
+      obj.host === "localhost:10000";
+    if (!isAzureBlob || obj.searchParams.has("sig")) return null;
+    const parts = obj.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    return { container: parts[0], path: parts.slice(1).join("/") };
+  } catch {
+    return null;
+  }
+}
+
 async function resolveDocumentUrlForVision(
   fileUrl: string,
   threadId: string
@@ -312,8 +333,82 @@ async function downloadSharePointFileToBlob(
     }
     const accessToken: string = tokenData.access_token;
 
-    // 2. SharePoint URL を分解して site + library + file path を取得
+    // 2. SharePoint URL を分解
     const urlObj = new URL(sharePointUrl);
+
+    // 2a. _layouts/15/Doc.aspx?sourcedoc={GUID} 形式の場合: Graph API でファイル名検索してダウンロード
+    // SP REST API は Sites.ReadAll (Graph) 権限のみでは使えないため、Graph drive search を使う
+    if (urlObj.pathname.includes("/_layouts/")) {
+      // URL の file= パラメータからファイル名を取得（なければ引数の fileName を使う）
+      const fileNameParam = urlObj.searchParams.get("file") ?? fileName;
+
+      // /_layouts より前のパスがサイトパス
+      const layoutsIdx = urlObj.pathname.indexOf("/_layouts");
+      const sitePath = urlObj.pathname.substring(0, layoutsIdx); // e.g. "/sites/SiteName"
+      const sitePathParts = sitePath.split("/").filter(Boolean);
+      const siteIdx = sitePathParts.indexOf("sites");
+      if (siteIdx < 0) {
+        console.warn("[downloadSharePointFileToBlob] Cannot extract site name from _layouts URL");
+        return null;
+      }
+      const siteName2 = sitePathParts[siteIdx + 1];
+
+      // Graph API でサイト ID 解決
+      const siteRes2 = await fetch(
+        `https://graph.microsoft.com/v1.0/sites/${urlObj.hostname}:/sites/${siteName2}:`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const siteData2: any = await siteRes2.json().catch(() => ({}));
+      if (!siteRes2.ok || !siteData2.id) {
+        console.warn("[downloadSharePointFileToBlob] site resolve failed for _layouts URL:", siteData2.error?.message ?? siteRes2.status);
+        return null;
+      }
+      const siteId2: string = siteData2.id;
+
+      // ファイル名で Graph API drive 検索
+      const driveSearchRes = await fetch(
+        `https://graph.microsoft.com/v1.0/sites/${siteId2}/drive/search(q='${encodeURIComponent(fileNameParam)}')`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const driveSearchData: any = await driveSearchRes.json().catch(() => ({}));
+      const foundItem = (driveSearchData.value ?? []).find(
+        (item: any) =>
+          item.name?.toLowerCase() === fileNameParam.toLowerCase() && item.file
+      );
+      if (!foundItem) {
+        console.warn("[downloadSharePointFileToBlob] Graph drive search: no match for", fileNameParam);
+        return null;
+      }
+      const driveId2: string = foundItem.parentReference?.driveId;
+      const itemId2: string = foundItem.id;
+      if (!driveId2 || !itemId2) return null;
+
+      // driveItem content をダウンロード
+      const contentRes = await fetch(
+        `https://graph.microsoft.com/v1.0/drives/${driveId2}/items/${itemId2}/content`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!contentRes.ok) {
+        console.warn("[downloadSharePointFileToBlob] Graph driveItem download failed:", contentRes.status, fileNameParam);
+        return null;
+      }
+
+      const fileBuffer2 = Buffer.from(await contentRes.arrayBuffer());
+      const blobPath2 = `${threadId}/${fileName}`;
+      const upResult2 = await UploadBlob("dl-link", blobPath2, fileBuffer2);
+      if (upResult2.status !== "OK") {
+        console.warn("[downloadSharePointFileToBlob] Blob upload failed after Graph search download");
+        return null;
+      }
+      const sasRes2 = await GenerateSasUrl("dl-link", blobPath2);
+      if (sasRes2.status === "OK" && sasRes2.response) {
+        console.log(`[edit_sp_pptx] SP file cached via Graph drive search: ${blobPath2}`);
+        return sasRes2.response;
+      }
+      return null;
+    }
+
+    // 2b. 通常 SP パス URL の場合: site + library + file path を取得
     const hostname = urlObj.hostname;
     const decodedPath = decodeURIComponent(urlObj.pathname);
     const pathParts = decodedPath.split("/").filter(Boolean);
@@ -1055,6 +1150,123 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
+  // ★ SharePoint SL の PPTX を指示に従って編集するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeEditSpPptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileQuery: {
+            type: "string",
+            description: "編集したいSharePointのPPTXファイルの名前またはキーワード。例: '営業資料2024.pptx'",
+          },
+          instruction: {
+            type: "string",
+            description: "編集指示。例: 'Matrix映画風の色味に変えて'、'フォントを游ゴシックに'、'表紙のタイトルをXXXに変更して'",
+          },
+        },
+        required: ["fileQuery", "instruction"],
+      },
+      description:
+        "SharePointのSLライブラリにあるPPTXファイルを自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ユーザーがSP/SL上のPPTXの色・フォント・テキストを変更したい場合。\n" +
+        "例: 「SPにある営業資料をMatrix風の色にして」「SLの〇〇.pptxのフォントを変えて」\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_sp_pptx",
+    },
+  });
+
+  // ★ アップロードされた Excel ファイルを指示に従って編集するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeEditExcel(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "編集対象のExcelファイルのURL。このスレッドでアップロードされたxlsx/xls/xlsmのURLを指定する。",
+          },
+          instruction: {
+            type: "string",
+            description:
+              "ユーザーの編集指示。例: 'A1セルを「売上合計」に変えて', '1行目を太字・背景色を青に', '「旧社名」を「新社名」に置換して'",
+          },
+        },
+        required: ["fileUrl", "instruction"],
+      },
+      description:
+        "このスレッドでアップロードされたExcelファイル（xlsx/xls/xlsm）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ユーザーがExcelファイルをアップロードし、セル値の変更・テキスト置換・書式変更（太字・色）を求める場合。\n" +
+        "fileUrl は会話コンテキストのアップロードURLを使用する。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_excel",
+    },
+  });
+
+  // ★ アップロードされた Word ファイルを指示に従って編集するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeEditWord(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "編集対象のWordファイルのURL。このスレッドでアップロードされた.docxのURLを指定する。",
+          },
+          instruction: {
+            type: "string",
+            description:
+              "ユーザーの編集指示。例: '「旧社名」を「新社名」に置換して', 'タイトルを太字・赤色にして', '第1章の見出しを16ptにして'",
+          },
+        },
+        required: ["fileUrl", "instruction"],
+      },
+      description:
+        "このスレッドでアップロードされたWordファイル（.docx）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ユーザーがWordファイルをアップロードし、テキスト置換・書式変更（太字・色・フォントサイズ）を求める場合。\n" +
+        "fileUrl は会話コンテキストのアップロードURLを使用する。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_word",
+    },
+  });
+
+  // ★ アップロードされた PDF ファイルを Excel に変換するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+          },
+        },
+        required: ["fileUrl"],
+      },
+      description:
+        "このスレッドでアップロードされたPDFファイルをExcel（.xlsx）に変換するツール。\n" +
+        "使用タイミング：ユーザーがPDFをExcelに変換したいと言った場合。\n" +
+        "PDFのテーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "convert_pdf_to_excel",
+    },
+  });
+
   return { status: "OK", response: defaultExtensions };
 };
 
@@ -1403,6 +1615,169 @@ async function executeEditPptx(
   }
 }
 
+// ---------------- Excel 編集 ----------------
+async function executeEditExcel(
+  args: { fileUrl?: string; instruction: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl, instruction } = args ?? {};
+
+  if (!instruction?.trim()) {
+    return { error: "instructionは必須です。編集内容を指定してください。" };
+  }
+
+  if (!fileUrl?.trim()) {
+    return {
+      error:
+        "編集対象のExcelファイルが見つかりませんでした。このスレッドでExcelファイルをアップロードしてください。",
+    };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[edit_excel] edit-pptx route failed:", res.status, t);
+      return { error: `Excel編集に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      changedSheets: result.changedSheets,
+      totalSheets: result.totalSheets,
+      message: `${result.changedSheets}シートを編集しました（全${result.totalSheets}シート）。`,
+    };
+  } catch (e: any) {
+    console.error("[edit_excel] error:", e);
+    return { error: "Excel編集中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- Word 編集 ----------------
+async function executeEditWord(
+  args: { fileUrl?: string; instruction: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl, instruction } = args ?? {};
+
+  if (!instruction?.trim()) {
+    return { error: "instructionは必須です。編集内容を指定してください。" };
+  }
+
+  if (!fileUrl?.trim()) {
+    return {
+      error:
+        "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
+    };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[edit_word] edit-pptx route failed:", res.status, t);
+      return { error: `Word編集に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      changedParagraphs: result.changedParagraphs,
+      totalParagraphs: result.totalParagraphs,
+      message: `${result.changedParagraphs}箇所を編集しました（全${result.totalParagraphs}段落）。`,
+    };
+  } catch (e: any) {
+    console.error("[edit_word] error:", e);
+    return { error: "Word編集中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- PDF → Excel 変換 ----------------
+async function executeConvertPdfToExcel(
+  args: { fileUrl?: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl } = args ?? {};
+
+  if (!fileUrl?.trim()) {
+    return {
+      error:
+        "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+    };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_excel" }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[convert_pdf_to_excel] route failed:", res.status, t);
+      return { error: `PDF→Excel変換に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    const tableInfo = result.tables > 0
+      ? `テーブル${result.tables}個を${result.sheets}シートに変換`
+      : `テキストを「Text」シートに出力`;
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      sheets: result.sheets,
+      tables: result.tables,
+      pages: result.pages,
+      message: `${result.pages}ページのPDFを変換しました（${tableInfo}）。`,
+    };
+  } catch (e: any) {
+    console.error("[convert_pdf_to_excel] error:", e);
+    return { error: "PDF→Excel変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
 // ---------------- SharePoint SL文書 → PPT変換 ----------------
 async function executeConvertSpToPptx(
   args: { fileQuery: string; mode?: "faithful" | "redesign" },
@@ -1421,7 +1796,8 @@ async function executeConvertSpToPptx(
 
   // AI Search でアクセス可能な全SL文書を取得（"*"検索）し、クライアント側でファイル名フィルタ
   // ※ fileQuery をページ本文テキスト検索に使うとファイル名がヒットしない場合があるため
-  const searchResult = await SimpleSearch("*", "isSlDoc eq true", deptLower);
+  // top: 200 でページネーション無限ループ・接続 aborted を防止
+  const searchResult = await SimpleSearch("*", "isSlDoc eq true", deptLower, 200);
   const searchCount =
     searchResult.status === "OK" ? searchResult.response.length : 0;
   console.log(
@@ -1554,6 +1930,101 @@ async function executeConvertSpToPptx(
     console.error("[convert_sp_to_pptx] error:", e);
     return { error: "変換中にエラーが発生しました: " + String(e?.message ?? e) };
   }
+}
+
+// ---------------- SharePoint SL の PPTX を編集 ----------------
+async function executeEditSpPptx(
+  args: { fileQuery: string; instruction: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileQuery, instruction } = args ?? {};
+
+  if (!fileQuery?.trim()) return { error: "fileQuery（ファイル名またはキーワード）を指定してください。" };
+  if (!instruction?.trim()) return { error: "instruction（編集内容）を指定してください。" };
+
+  // 1. AI Search でアクセス可能な全 SL 文書を取得し、クライアント側でフィルタ
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+
+  const searchResult = await SimpleSearch("*", "isSlDoc eq true", deptLower, 200);
+  if (searchResult.status !== "OK" || !searchResult.response.length) {
+    return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
+  }
+
+  // 2. PPTX ファイルをファイル名でフィルタ
+  const queryLower = fileQuery.trim().toLowerCase();
+  const matched = searchResult.response.filter(({ document: doc }) => {
+    const name = (doc.metadata ?? "").toLowerCase();
+    return (
+      name.endsWith(".pptx") &&
+      (name.includes(queryLower) || queryLower.includes(name.replace(/\.pptx$/i, "")))
+    );
+  });
+
+  console.log(`[edit_sp_pptx] pptx-matched count=${matched.length} (query="${fileQuery}")`);
+
+  if (!matched.length) {
+    return { error: `「${fileQuery}」に一致するPPTXファイルが見つかりませんでした。` };
+  }
+
+  // 3. URL でユニーク化（同一ファイルが複数チャンクとして登録されている場合を考慮）
+  const seen = new Map<string, { fileName: string; sourceUrl: string; effectiveFileUrl: string | null }>();
+  for (const { document: doc } of matched) {
+    const key = doc.effectiveFileUrl || doc.fileUrl;
+    if (key && !seen.has(key)) {
+      seen.set(key, {
+        fileName: doc.metadata ?? "",
+        sourceUrl: doc.fileUrl,
+        effectiveFileUrl: doc.effectiveFileUrl ?? null,
+      });
+    }
+  }
+
+  const candidates = Array.from(seen.values());
+
+  if (candidates.length > 1) {
+    const list = candidates.map((c, i) => `${i + 1}. ${c.fileName}`).join("\n");
+    return {
+      multipleFiles: true,
+      message: `「${fileQuery}」で複数のファイルが見つかりました。どれを編集しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+    };
+  }
+
+  const { fileName, sourceUrl, effectiveFileUrl } = candidates[0];
+  console.log(`[edit_sp_pptx] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
+
+  // 4. SAS URL を解決する
+  //    優先順位: ① effectiveFileUrl が Blob raw URL → GenerateSasUrl
+  //             ② SP 直パス URL → downloadSharePointFileToBlob (Graph API)
+  let resolvedUrl: string | null = null;
+
+  // ① effectiveFileUrl が SAS なし Blob URL の場合
+  const blobParsed = parseBlobRawUrl(effectiveFileUrl);
+  if (blobParsed) {
+    const sasRes = await GenerateSasUrl(blobParsed.container, blobParsed.path);
+    if (sasRes.status === "OK" && sasRes.response) {
+      resolvedUrl = sasRes.response;
+      console.log(`[edit_sp_pptx] Resolved via GenerateSasUrl: ${blobParsed.path}`);
+    }
+  }
+
+  // ② SP URL → Graph API でダウンロードしてキャッシュ
+  if (!resolvedUrl) {
+    const urlForDownload = effectiveFileUrl || sourceUrl;
+    const spSas = await downloadSharePointFileToBlob(urlForDownload, chatThread.id, fileName);
+    if (spSas) {
+      resolvedUrl = spSas;
+      console.log(`[edit_sp_pptx] Resolved via Graph API download`);
+    }
+  }
+
+  if (!resolvedUrl) {
+    console.warn(`[edit_sp_pptx] Could not resolve to blob URL:`, sourceUrl);
+    return { error: `「${fileName}」のダウンロードURLを取得できませんでした。` };
+  }
+
+  // 5. edit-pptx API に委託
+  return executeEditPptx({ fileUrl: resolvedUrl, instruction }, chatThread);
 }
 
 // ---------------- 画像生成（NEW image 用） ----------------

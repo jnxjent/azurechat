@@ -5,29 +5,46 @@
 PDIR=/home/site/python-packages
 PIP_CMD=/home/.local/bin/pip
 
-# python-pptx が PDIR に入っているか確認
-if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml" 2>/dev/null; then
-  echo "[startup] python-pptx not found in $PDIR, installing..."
-  mkdir -p "$PDIR"
-
-  # pip が /home/.local/bin になければブートストラップ
+install_pip_if_needed() {
   if [ ! -f "$PIP_CMD" ]; then
     echo "[startup] pip not found, bootstrapping with get-pip.py..."
     curl -sS https://bootstrap.pypa.io/get-pip.py \
       | python3 - --user --break-system-packages 2>/dev/null \
       && echo "[startup] pip bootstrapped." \
-      || echo "[startup] WARNING: pip bootstrap failed. PPT edit unavailable."
+      || echo "[startup] WARNING: pip bootstrap failed."
   fi
+}
 
+mkdir -p "$PDIR"
+
+# ── Step 1: コア Office 編集ライブラリ ──────────────────────────────────
+# python-pptx / openpyxl / docx / pdfplumber が入っていなければインストール
+if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml, openpyxl, docx, pdfplumber, fitz" 2>/dev/null; then
+  echo "[startup] Core libs not found, installing..."
+  install_pip_if_needed
   if [ -f "$PIP_CMD" ]; then
-    "$PIP_CMD" install --quiet --target="$PDIR" python-pptx lxml \
-      && echo "[startup] python-pptx installed." \
-      || echo "[startup] WARNING: Install failed. PPT edit unavailable."
-  else
-    echo "[startup] WARNING: pip not available. PPT edit unavailable."
+    "$PIP_CMD" install --quiet --target="$PDIR" \
+      python-pptx lxml openpyxl xlrd python-docx pdfplumber pymupdf \
+      && echo "[startup] Core libs installed." \
+      || echo "[startup] WARNING: Core lib install failed."
   fi
 else
-  echo "[startup] python-pptx already available in $PDIR. Skipping."
+  echo "[startup] Core libs already available. Skipping."
+fi
+
+# ── Step 2: PaddleOCR（任意。ディスク容量に余裕がある場合のみ） ──────────
+# paddleocr が入っていなければインストールを試みる。
+# 失敗してもアプリ起動は継続する（pymupdf フォールバックあり）。
+if ! PYTHONPATH="$PDIR" python3 -c "import paddleocr" 2>/dev/null; then
+  echo "[startup] PaddleOCR not found, attempting install (may take several minutes)..."
+  install_pip_if_needed
+  if [ -f "$PIP_CMD" ]; then
+    "$PIP_CMD" install --quiet --target="$PDIR" paddlepaddle paddleocr \
+      && echo "[startup] PaddleOCR installed." \
+      || echo "[startup] WARNING: PaddleOCR install failed. PDF→Excel will use pymupdf fallback."
+  fi
+else
+  echo "[startup] PaddleOCR already available. Skipping."
 fi
 
 # PYTHONPATH を node プロセスに継承させる

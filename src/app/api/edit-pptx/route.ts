@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import * as XLSX from "xlsx";
 import {
   BlobSASPermissions,
   BlobServiceClient,
@@ -337,6 +338,554 @@ async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
   return `${bbc.url}?${sas}`;
 }
 
+// ─────────────────────────────────────────────
+// Excel サポート
+// ─────────────────────────────────────────────
+
+const EXCEL_EXTENSIONS = new Set([".xlsx", ".xls", ".xlsm"]);
+
+function getFileExtension(url: string): string {
+  try {
+    const pathname = new URL(url.split("?")[0]).pathname;
+    return path.extname(pathname).toLowerCase();
+  } catch {
+    return path.extname(url.split("?")[0]).toLowerCase();
+  }
+}
+
+function isExcelFile(ext: string): boolean {
+  return EXCEL_EXTENSIONS.has(ext);
+}
+
+type SheetSummary = {
+  sheetName: string;
+  rowCount: number;
+  colCount: number;
+  columns: Array<{ letter: string; header: string }>; // 列記号とヘッダー名のペア
+  sampleRows: Array<Record<string, string>>;
+};
+
+type ExcelEditPlan = {
+  sheetEdits?: Array<{
+    sheetName: string;
+    setCells?: Array<{ address: string; value: string | number }>;
+    replaceText?: Array<{ find: string; replace: string }>;
+  }>;
+  formatEdits?: Array<{
+    sheetName: string;
+    range: string;
+    bold?: boolean;
+    fontColor?: string;
+    fillColor?: string;
+  }>;
+  copyRowColorEdits?: Array<{
+    sheetName: string;
+    targetColumn: string;   // 列記号 ("G") またはヘッダー名 ("対応")
+    referenceColumn: string; // 色を参照する列記号またはヘッダー名
+    startRow?: number;       // デフォルト 2（ヘッダー行をスキップ）
+  }>;
+};
+
+function extractSheetSummaries(buffer: Buffer): SheetSummary[] {
+  const wb = XLSX.read(buffer, { type: "buffer", sheetStubs: false });
+  return wb.SheetNames.map((sheetName) => {
+    const ws = wb.Sheets[sheetName];
+    const rows: string[][] = XLSX.utils.sheet_to_json(ws, {
+      header: 1,
+      defval: "",
+      blankrows: false,
+    }) as string[][];
+
+    const headerRow = (rows[0] ?? []).map(String);
+    // 列記号（A, B, C...）とヘッダー名のペアを生成
+    const columns = headerRow.map((header, i) => ({
+      letter: XLSX.utils.encode_col(i), // 0→"A", 1→"B", ...
+      header,
+    }));
+    const sampleRows = rows.slice(1, 6).map((row) => {
+      const obj: Record<string, string> = {};
+      columns.forEach(({ letter, header }, i) => {
+        const key = header ? `${letter}(${header})` : letter;
+        obj[key] = String(row[i] ?? "");
+      });
+      return obj;
+    });
+    const ref = ws["!ref"];
+    const range = ref ? XLSX.utils.decode_range(ref) : null;
+
+    return {
+      sheetName,
+      rowCount: range ? range.e.r + 1 : rows.length,
+      colCount: range ? range.e.c + 1 : columns.length,
+      columns,
+      sampleRows,
+    };
+  });
+}
+
+async function buildExcelEditPlan(
+  sheets: SheetSummary[],
+  instruction: string
+): Promise<ExcelEditPlan> {
+  const openai = OpenAIInstance();
+
+  const systemPrompt = `You convert a natural-language Excel editing request into a safe JSON edit plan.
+Return JSON only in this shape:
+{
+  "sheetEdits": [
+    {
+      "sheetName": string,
+      "setCells": [{ "address": "A1", "value": "new value" }],
+      "replaceText": [{ "find": "old", "replace": "new" }]
+    }
+  ],
+  "formatEdits": [
+    {
+      "sheetName": string,
+      "range": "A1:D1",
+      "bold": true | false,
+      "fontColor": "RRGGBB",
+      "fillColor": "RRGGBB"
+    }
+  ],
+  "copyRowColorEdits": [
+    {
+      "sheetName": string,
+      "targetColumn": "G",   // MUST be a column letter (A, B, C...) from the columns list
+      "referenceColumn": "A", // MUST be a column letter (A, B, C...) from the columns list
+      "startRow": 2           // first row to copy (default 2, skip header)
+    }
+  ]
+}
+
+Rules:
+- sheetName must match one of the provided sheet names exactly.
+- The "columns" array in each sheet lists column letters AND header names. Always use the column LETTER (e.g. "D") in setCells addresses, copyRowColorEdits, and formatEdits ranges — never use the header name as a substitute for a column letter.
+- Use setCells when the user specifies exact cell addresses or wants to set specific values. Derive the column letter from the "columns" list.
+- Use replaceText ONLY when the user explicitly asks to find and replace text content. NEVER use replaceText for formatting operations.
+- Use formatEdits for bold/color changes. fontColor and fillColor are 6-digit hex (no #).
+- Use copyRowColorEdits when the user wants a column's background colors to match those of another column row-by-row. targetColumn and referenceColumn MUST be column letters from the "columns" list.
+- NEVER set a cell value to an empty string unless the user explicitly asks to clear that cell.
+- NEVER modify header row values (row 1) unless the user explicitly asks to change column names.
+- Only emit the operations the user actually requested. Keep the JSON minimal.`;
+
+  const userPrompt = `Instruction: ${instruction}
+
+Sheets:
+${JSON.stringify(sheets, null, 2)}
+
+Return JSON only.`;
+
+  const res = await openai.chat.completions.create({
+    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    response_format: { type: "json_object" },
+    max_completion_tokens: 1500,
+  });
+
+  const content = res.choices[0]?.message?.content ?? "{}";
+  const parsed = JSON.parse(content) as ExcelEditPlan;
+  parsed.sheetEdits ??= [];
+  parsed.formatEdits ??= [];
+  parsed.copyRowColorEdits ??= [];
+  return parsed;
+}
+
+async function resolveEditExcelScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "edit_excel.py"),
+    path.join(process.cwd(), "scripts", "edit_excel.py"),
+    "/home/site/wwwroot/src/scripts/edit_excel.py",
+    "/home/site/wwwroot/scripts/edit_excel.py",
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`edit_excel.py not found. Checked: ${candidates.join(", ")}`);
+}
+
+async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<string> {
+  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
+  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
+  const containerName = "xlsx";
+
+  const cred = new StorageSharedKeyCredential(acc, key);
+  const svc = BlobServiceClient.fromConnectionString(
+    `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+  );
+  const cc = svc.getContainerClient(containerName);
+  await cc.createIfNotExists({ access: "blob" });
+
+  const bbc = cc.getBlockBlobClient(fileName);
+  await bbc.uploadData(buffer, {
+    blobHTTPHeaders: {
+      blobContentType:
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      blobContentDisposition: `attachment; filename="${fileName}"`,
+    },
+  });
+
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName,
+      blobName: fileName,
+      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      permissions: BlobSASPermissions.parse("r"),
+    },
+    cred
+  );
+  return `${bbc.url}?${sas}`;
+}
+
+async function runPythonEditExcel(
+  inputBuffer: Buffer,
+  inputExt: string,
+  plan: ExcelEditPlan,
+  threadId: string
+) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-xlsx-"));
+  const inputPath = path.join(tempDir, `input${inputExt}`);
+  const outputPath = path.join(tempDir, "output.xlsx");
+  const planPath = path.join(tempDir, "plan.json");
+  const scriptPath = await resolveEditExcelScriptPath();
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+    await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
+
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+
+    if (process.platform !== "win32") {
+      try {
+        await execFileAsync(pythonBin, ["-c", "import openpyxl"]);
+      } catch {
+        throw new Error(
+          "openpyxl がサーバーにインストールされていません。" +
+          "startup.sh の設定を確認してください。"
+        );
+      }
+    }
+
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
+      scriptPath,
+      "--input", inputPath,
+      "--output", outputPath,
+      "--plan", planPath,
+    ]);
+
+    if (stderr?.trim()) {
+      console.warn("[edit-excel] python stderr:", stderr.trim());
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.xlsx`;
+    const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
+
+    return {
+      downloadUrl,
+      fileName,
+      changedSheets: Number(pythonResult.changedSheets ?? 0),
+      totalSheets: Number(pythonResult.totalSheets ?? 0),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// ─────────────────────────────────────────────
+// PDF → Excel 変換
+// ─────────────────────────────────────────────
+
+async function resolveConvertPdfScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "pdf_to_excel.py"),
+    path.join(process.cwd(), "scripts", "pdf_to_excel.py"),
+    "/home/site/wwwroot/src/scripts/pdf_to_excel.py",
+    "/home/site/wwwroot/scripts/pdf_to_excel.py",
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`pdf_to_excel.py not found. Checked: ${candidates.join(", ")}`);
+}
+
+async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2xl-"));
+  const inputPath = path.join(tempDir, "input.pdf");
+  const outputPath = path.join(tempDir, "output.xlsx");
+  const scriptPath = await resolveConvertPdfScriptPath();
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+
+    if (process.platform !== "win32") {
+      try {
+        await execFileAsync(pythonBin, ["-c", "import pdfplumber"]);
+      } catch {
+        throw new Error(
+          "pdfplumber がサーバーにインストールされていません。" +
+          "startup.sh の設定を確認してください。"
+        );
+      }
+    }
+
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
+      scriptPath,
+      "--input", inputPath,
+      "--output", outputPath,
+    ]);
+
+    if (stderr?.trim()) {
+      console.warn("[pdf-to-excel] python stderr:", stderr.trim());
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.xlsx`;
+    const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
+
+    return {
+      downloadUrl,
+      fileName,
+      sheets: Number(pythonResult.sheets ?? 0),
+      tables: Number(pythonResult.tables ?? 0),
+      pages: Number(pythonResult.pages ?? 0),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// ─────────────────────────────────────────────
+// Word サポート
+// ─────────────────────────────────────────────
+
+const WORD_EXTENSIONS = new Set([".docx"]);
+
+function isWordFile(ext: string): boolean {
+  return WORD_EXTENSIONS.has(ext);
+}
+
+type DocParagraph = { style: string; text: string };
+
+type WordDocSummary = {
+  paragraphs: DocParagraph[];
+  totalParagraphs: number;
+};
+
+type WordEditPlan = {
+  replaceText?: Array<{ find: string; replace: string }>;
+  formatRuns?: Array<{
+    matchText: string;
+    bold?: boolean;
+    italic?: boolean;
+    fontSize?: number;
+    fontColor?: string;
+  }>;
+};
+
+async function extractDocSummary(buffer: Buffer): Promise<WordDocSummary> {
+  const zip = await JSZip.loadAsync(buffer);
+  const docXml = await zip.files["word/document.xml"].async("string");
+
+  const paraRe = /<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g;
+  const paragraphs: DocParagraph[] = [];
+  let pm: RegExpExecArray | null;
+  while ((pm = paraRe.exec(docXml)) !== null) {
+    const paraXml = pm[0];
+    const styleMatch = /<w:pStyle\s+w:val="([^"]+)"/.exec(paraXml);
+    const style = styleMatch ? styleMatch[1] : "Normal";
+    const textRe = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+    let text = "";
+    let tm: RegExpExecArray | null;
+    while ((tm = textRe.exec(paraXml)) !== null) {
+      text += decodeXmlEntities(tm[1]);
+    }
+    if (text.trim()) paragraphs.push({ style, text: text.trim() });
+  }
+
+  return { paragraphs: paragraphs.slice(0, 50), totalParagraphs: paragraphs.length };
+}
+
+async function buildWordEditPlan(
+  summary: WordDocSummary,
+  instruction: string
+): Promise<WordEditPlan> {
+  const openai = OpenAIInstance();
+
+  const systemPrompt = `You convert a natural-language Word document editing request into a safe JSON edit plan.
+Return JSON only in this shape:
+{
+  "replaceText": [{ "find": "old text", "replace": "new text" }],
+  "formatRuns": [
+    {
+      "matchText": "paragraph text to find",
+      "bold": true | false,
+      "italic": true | false,
+      "fontSize": 14,
+      "fontColor": "RRGGBB"
+    }
+  ]
+}
+
+Rules:
+- Use replaceText when the user wants to change specific wording.
+- Use formatRuns when the user wants to apply bold/italic/font size/color to paragraphs. matchText must be a substring found in the paragraph.
+- fontColor is a 6-digit hex string without #.
+- fontSize is in points (e.g. 12, 14, 16).
+- Only emit operations the user actually requested. Keep JSON minimal.
+- Do not add, remove, or invent paragraphs beyond what was requested.`;
+
+  const userPrompt = `Instruction: ${instruction}
+
+Document summary:
+${JSON.stringify(summary, null, 2)}
+
+Return JSON only.`;
+
+  const res = await openai.chat.completions.create({
+    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    response_format: { type: "json_object" },
+    max_completion_tokens: 1000,
+  });
+
+  const content = res.choices[0]?.message?.content ?? "{}";
+  const parsed = JSON.parse(content) as WordEditPlan;
+  parsed.replaceText ??= [];
+  parsed.formatRuns ??= [];
+  return parsed;
+}
+
+async function resolveEditWordScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "edit_word.py"),
+    path.join(process.cwd(), "scripts", "edit_word.py"),
+    "/home/site/wwwroot/src/scripts/edit_word.py",
+    "/home/site/wwwroot/scripts/edit_word.py",
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`edit_word.py not found. Checked: ${candidates.join(", ")}`);
+}
+
+async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<string> {
+  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
+  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
+  const containerName = "docx";
+
+  const cred = new StorageSharedKeyCredential(acc, key);
+  const svc = BlobServiceClient.fromConnectionString(
+    `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+  );
+  const cc = svc.getContainerClient(containerName);
+  await cc.createIfNotExists({ access: "blob" });
+
+  const bbc = cc.getBlockBlobClient(fileName);
+  await bbc.uploadData(buffer, {
+    blobHTTPHeaders: {
+      blobContentType:
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      blobContentDisposition: `attachment; filename="${fileName}"`,
+    },
+  });
+
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName,
+      blobName: fileName,
+      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      permissions: BlobSASPermissions.parse("r"),
+    },
+    cred
+  );
+  return `${bbc.url}?${sas}`;
+}
+
+async function runPythonEditWord(
+  inputBuffer: Buffer,
+  plan: WordEditPlan,
+  threadId: string
+) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-docx-"));
+  const inputPath = path.join(tempDir, "input.docx");
+  const outputPath = path.join(tempDir, "output.docx");
+  const planPath = path.join(tempDir, "plan.json");
+  const scriptPath = await resolveEditWordScriptPath();
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+    await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
+
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+
+    if (process.platform !== "win32") {
+      try {
+        await execFileAsync(pythonBin, ["-c", "import docx"]);
+      } catch {
+        throw new Error(
+          "python-docx がサーバーにインストールされていません。" +
+          "startup.sh の設定を確認してください。"
+        );
+      }
+    }
+
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
+      scriptPath,
+      "--input", inputPath,
+      "--output", outputPath,
+      "--plan", planPath,
+    ]);
+
+    if (stderr?.trim()) {
+      console.warn("[edit-word] python stderr:", stderr.trim());
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.docx`;
+    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
+
+    return {
+      downloadUrl,
+      fileName,
+      changedParagraphs: Number(pythonResult.changedParagraphs ?? 0),
+      totalParagraphs: Number(pythonResult.totalParagraphs ?? 0),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// ─────────────────────────────────────────────
+// DALL-E (PPTX 用)
+// ─────────────────────────────────────────────
+
 async function generateDalleImage(prompt: string): Promise<Buffer | null> {
   try {
     const openai = OpenAIDALLEInstance();
@@ -483,22 +1032,57 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId } = body as {
+    const { fileUrl, instruction, threadId, action } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
+      action?: string;
     };
 
-    if (!fileUrl?.trim() || !instruction?.trim()) {
+    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel")) {
       return NextResponse.json(
         { ok: false, error: "fileUrl and instruction are required" },
         { status: 400 }
       );
     }
 
-    console.log("[edit-pptx] fileUrl =", fileUrl.substring(0, 80));
-    console.log("[edit-pptx] instruction =", instruction.substring(0, 120));
+    const ext = getFileExtension(fileUrl);
+    console.log(`[edit-pptx] fileUrl =`, fileUrl.substring(0, 80));
+    console.log(`[edit-pptx] ext =`, ext, "action =", action ?? "(none)", "instruction =", instruction.substring(0, 120));
 
+    // PDF → Excel 変換
+    if (action === "pdf_to_excel") {
+      const pdfBuffer = await downloadBlob(fileUrl, threadId);
+      const result = await runPythonPdfToExcel(pdfBuffer, threadId);
+      console.log("[pdf-to-excel] result:", JSON.stringify(result));
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    // Excel ファイル (.xlsx / .xls / .xlsm) の場合は Excel 専用フローへ
+    if (isExcelFile(ext)) {
+      const excelBuffer = await downloadBlob(fileUrl, threadId);
+      const sheets = extractSheetSummaries(excelBuffer);
+      const plan = await buildExcelEditPlan(sheets, instruction);
+
+      console.log("[edit-excel] plan:", JSON.stringify(plan));
+
+      const result = await runPythonEditExcel(excelBuffer, ext, plan, threadId);
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    // Word ファイル (.docx) の場合は Word 専用フローへ
+    if (isWordFile(ext)) {
+      const wordBuffer = await downloadBlob(fileUrl, threadId);
+      const summary = await extractDocSummary(wordBuffer);
+      const plan = await buildWordEditPlan(summary, instruction);
+
+      console.log("[edit-word] plan:", JSON.stringify(plan));
+
+      const result = await runPythonEditWord(wordBuffer, plan, threadId);
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    // PPTX フロー（既存）
     const pptxBuffer = await downloadBlob(fileUrl, threadId);
     const slides = await extractSlideSummaries(pptxBuffer);
     const plan = await buildEditPlan(slides, instruction);
