@@ -18,31 +18,19 @@ install_pip_if_needed() {
 mkdir -p "$PDIR"
 
 # ── Step 1: コア Office 編集ライブラリ ──────────────────────────────────
-# python-pptx / openpyxl / docx / pdfplumber が入っていなければインストール
-if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml, openpyxl, docx, pdfplumber, fitz" 2>/dev/null; then
+# python-pptx / openpyxl / docx / pdfplumber / Doc Intelligence SDK
+if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml, openpyxl, docx, pdfplumber, fitz, azure.ai.documentintelligence" 2>/dev/null; then
   echo "[startup] Core libs not found, installing..."
   install_pip_if_needed
   if [ -f "$PIP_CMD" ]; then
     "$PIP_CMD" install --quiet --target="$PDIR" \
       python-pptx lxml openpyxl xlrd python-docx pdfplumber pymupdf \
+      azure-ai-documentintelligence \
       && echo "[startup] Core libs installed." \
       || echo "[startup] WARNING: Core lib install failed."
   fi
 else
   echo "[startup] Core libs already available. Skipping."
-fi
-
-# ── Step 2: EasyOCR（任意。失敗してもアプリ起動は継続する） ──────────────
-if ! PYTHONPATH="$PDIR" python3 -c "import easyocr" 2>/dev/null; then
-  echo "[startup] EasyOCR not found, attempting install..."
-  install_pip_if_needed
-  if [ -f "$PIP_CMD" ]; then
-    "$PIP_CMD" install --quiet --target="$PDIR" torch easyocr \
-      && echo "[startup] EasyOCR installed." \
-      || echo "[startup] WARNING: EasyOCR install failed. PDF→Excel will use pymupdf fallback."
-  fi
-else
-  echo "[startup] EasyOCR already available. Skipping."
 fi
 
 # PYTHONPATH を node プロセスに継承させる
