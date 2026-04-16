@@ -152,7 +152,7 @@ def main() -> None:
     ocr_engine = None
     if HAS_PADDLE and HAS_PYMUPDF:
         try:
-            ocr_engine = PaddleOCR(use_angle_cls=True, lang="japan", show_log=False)
+            ocr_engine = PaddleOCR(use_textline_orientation=True, lang="japan")
             print("[pdf_to_excel] PaddleOCR engine initialized.", file=sys.stderr)
         except Exception as e:
             print(f"[pdf_to_excel] PaddleOCR init failed: {e}", file=sys.stderr)

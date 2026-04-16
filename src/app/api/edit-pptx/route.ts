@@ -629,27 +629,24 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string) {
   const outputPath = path.join(tempDir, "output.xlsx");
   const scriptPath = await resolveConvertPdfScriptPath();
 
+  // PYTHONPATH を明示的に設定（startup.sh が動いていない環境でも動作させるため）
+  const pyEnv = process.platform !== "win32"
+    ? {
+        ...process.env,
+        PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+      }
+    : process.env;
+
   try {
     await fs.writeFile(inputPath, inputBuffer);
 
     const pythonBin = process.platform === "win32" ? "python" : "python3";
 
-    if (process.platform !== "win32") {
-      try {
-        await execFileAsync(pythonBin, ["-c", "import pdfplumber"]);
-      } catch {
-        throw new Error(
-          "pdfplumber がサーバーにインストールされていません。" +
-          "startup.sh の設定を確認してください。"
-        );
-      }
-    }
-
     const { stdout, stderr } = await execFileAsync(pythonBin, [
       scriptPath,
       "--input", inputPath,
       "--output", outputPath,
-    ]);
+    ], { env: pyEnv });
 
     if (stderr?.trim()) {
       console.warn("[pdf-to-excel] python stderr:", stderr.trim());
