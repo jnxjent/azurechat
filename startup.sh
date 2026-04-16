@@ -32,19 +32,17 @@ else
   echo "[startup] Core libs already available. Skipping."
 fi
 
-# ── Step 2: PaddleOCR（任意。ディスク容量に余裕がある場合のみ） ──────────
-# paddleocr が入っていなければインストールを試みる。
-# 失敗してもアプリ起動は継続する（pymupdf フォールバックあり）。
-if ! PYTHONPATH="$PDIR" python3 -c "import paddleocr" 2>/dev/null; then
-  echo "[startup] PaddleOCR not found, attempting install (may take several minutes)..."
+# ── Step 2: EasyOCR（任意。失敗してもアプリ起動は継続する） ──────────────
+if ! PYTHONPATH="$PDIR" python3 -c "import easyocr" 2>/dev/null; then
+  echo "[startup] EasyOCR not found, attempting install..."
   install_pip_if_needed
   if [ -f "$PIP_CMD" ]; then
-    "$PIP_CMD" install --quiet --target="$PDIR" paddlepaddle paddleocr \
-      && echo "[startup] PaddleOCR installed." \
-      || echo "[startup] WARNING: PaddleOCR install failed. PDF→Excel will use pymupdf fallback."
+    "$PIP_CMD" install --quiet --target="$PDIR" easyocr \
+      && echo "[startup] EasyOCR installed." \
+      || echo "[startup] WARNING: EasyOCR install failed. PDF→Excel will use pymupdf fallback."
   fi
 else
-  echo "[startup] PaddleOCR already available. Skipping."
+  echo "[startup] EasyOCR already available. Skipping."
 fi
 
 # PYTHONPATH を node プロセスに継承させる

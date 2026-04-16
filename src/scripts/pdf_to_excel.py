@@ -1,22 +1,19 @@
 """
 pdf_to_excel.py  –  PDF→Excel 変換スクリプト
 優先順位:
-  1. PaddleOCR + PyMuPDF（最高品質。縦書き・スキャンPDF対応）
-  2. PyMuPDF テキスト抽出（フォールバック）
-  3. pdfplumber テキスト抽出（最終フォールバック）
+  1. pdfplumber テーブル検出（線ありPDF）
+  2. EasyOCR + PyMuPDF（スキャンPDF・縦書き対応）
+  3. PyMuPDF テキスト抽出（フォールバック）
+  4. pdfplumber テキスト抽出（最終フォールバック）
 CLI: python pdf_to_excel.py --input <path> --output <path>
 stdout: JSON {"sheets": N, "tables": N, "pages": N}
 """
 
-import os
-os.environ['FLAGS_use_mkldnn'] = '0'   # PaddlePaddle oneDNN を無効化（Azure非対応CPUの回避）
-os.environ['FLAGS_use_onednn'] = '0'   # 同上（バージョン差異の吸収）
-
 import argparse
 import json
 import io
+import sys
 from collections import defaultdict
-from pathlib import Path
 
 import openpyxl
 import pdfplumber
@@ -31,15 +28,15 @@ except ImportError:
     HAS_PYMUPDF = False
 
 try:
-    from paddleocr import PaddleOCR
-    HAS_PADDLE = True
+    import easyocr
+    HAS_EASYOCR = True
 except ImportError:
-    HAS_PADDLE = False
+    HAS_EASYOCR = False
 
 
-# ── PaddleOCR パス ──────────────────────────────────────────────────────
+# ── ページ画像変換 ────────────────────────────────────────────────────
 
-def _pdf_page_to_numpy(pdf_path: str, page_index: int, dpi: int = 200):
+def _pdf_page_to_numpy(pdf_path: str, page_index: int, dpi: int = 150):
     """PyMuPDF でページを NumPy 配列（RGB）に変換する。"""
     doc = fitz.open(pdf_path)
     page = doc[page_index]
@@ -50,47 +47,30 @@ def _pdf_page_to_numpy(pdf_path: str, page_index: int, dpi: int = 200):
     return np.array(img)
 
 
-def _ocr_result_to_rows(ocr_result) -> list[list[str]]:
-    """PaddleOCR の出力をセルのリスト（行 × 列）に変換する。
+# ── EasyOCR 結果→行変換 ──────────────────────────────────────────────
 
+def _easyocr_result_to_rows(ocr_result) -> list[list[str]]:
+    """EasyOCR の出力をセルのリスト（行 × 列）に変換する。
+    各要素は (bbox, text, confidence)。
     同じ Y 帯に属するテキストを同一行とみなし、X 座標でソートしてセルとする。
-    PaddleOCR v3.x の predict() 形式と旧 ocr() 形式の両方に対応。
     """
     if not ocr_result:
         return []
 
     items: list[tuple[float, float, str]] = []
-
-    # v3.x: predict() が返す list[dict] 形式
-    if isinstance(ocr_result, list) and ocr_result and isinstance(ocr_result[0], dict):
-        for res in ocr_result:
-            boxes = res.get("dt_boxes", [])
-            texts = res.get("rec_texts", [])
-            scores = res.get("rec_scores", [])
-            for box, text, score in zip(boxes, texts, scores):
-                if score < 0.3:
-                    continue
-                y_center = (box[0][1] + box[2][1]) / 2
-                x_left = min(p[0] for p in box)
-                items.append((y_center, x_left, text))
-    else:
-        # 旧形式: ocr() が返す list[list] 形式
-        first = ocr_result[0] if ocr_result else []
-        if not first:
-            return []
-        for line in first:
-            box, (text, _conf) = line
-            y_center = (box[0][1] + box[2][1]) / 2
-            x_left = min(p[0] for p in box)
-            items.append((y_center, x_left, text))
+    for bbox, text, conf in ocr_result:
+        if conf < 0.3:
+            continue
+        # bbox は [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] 形式
+        y_center = (bbox[0][1] + bbox[2][1]) / 2
+        x_left = min(p[0] for p in bbox)
+        items.append((y_center, x_left, text))
 
     if not items:
         return []
 
-    # Y でソートしてクラスタリング
     items.sort(key=lambda t: t[0])
     y_values = [t[0] for t in items]
-    # 行高さの中央値をクラスタリング閾値に使用（最低 8px）
     if len(y_values) > 1:
         gaps = [y_values[i + 1] - y_values[i] for i in range(len(y_values) - 1)]
         gaps_positive = [g for g in gaps if g > 0]
@@ -110,7 +90,7 @@ def _ocr_result_to_rows(ocr_result) -> list[list[str]]:
 
     rows: list[list[str]] = []
     for cluster in clusters:
-        cluster.sort(key=lambda t: t[1])   # X でソート
+        cluster.sort(key=lambda t: t[1])
         rows.append([t[2] for t in cluster])
     return rows
 
@@ -168,17 +148,16 @@ def main() -> None:
     total_tables = 0
     text_rows: list[list[str]] = []
 
-    import sys
-    print(f"[pdf_to_excel] HAS_PYMUPDF={HAS_PYMUPDF} HAS_PADDLE={HAS_PADDLE}", file=sys.stderr)
+    print(f"[pdf_to_excel] HAS_PYMUPDF={HAS_PYMUPDF} HAS_EASYOCR={HAS_EASYOCR}", file=sys.stderr)
 
-    # PaddleOCR エンジンを初期化（初回はモデルをダウンロード）
-    ocr_engine = None
-    if HAS_PADDLE and HAS_PYMUPDF:
+    # EasyOCR エンジンを初期化
+    ocr_reader = None
+    if HAS_EASYOCR and HAS_PYMUPDF:
         try:
-            ocr_engine = PaddleOCR(use_textline_orientation=True, lang="japan", enable_mkldnn=False)
-            print("[pdf_to_excel] PaddleOCR engine initialized.", file=sys.stderr)
+            ocr_reader = easyocr.Reader(['ja', 'en'], gpu=False, verbose=False)
+            print("[pdf_to_excel] EasyOCR engine initialized.", file=sys.stderr)
         except Exception as e:
-            print(f"[pdf_to_excel] PaddleOCR init failed: {e}", file=sys.stderr)
+            print(f"[pdf_to_excel] EasyOCR init failed: {e}", file=sys.stderr)
 
     with pdfplumber.open(args.input) as pdf:
         total_pages = len(pdf.pages)
@@ -197,18 +176,17 @@ def main() -> None:
                         ws.append([str(cell) if cell is not None else "" for cell in row])
                 continue
 
-            # テーブルが検出されなかった場合: テキスト抽出
             lines: list[list[str]] = []
 
-            # 1. PaddleOCR（最高品質）
-            if ocr_engine is not None and HAS_PYMUPDF:
+            # 1. EasyOCR
+            if ocr_reader is not None and HAS_PYMUPDF:
                 try:
                     img = _pdf_page_to_numpy(args.input, page_num - 1)
-                    ocr_result = list(ocr_engine.predict(img))
-                    lines = _ocr_result_to_rows(ocr_result)
-                    print(f"[pdf_to_excel] p{page_num} PaddleOCR: {len(lines)} rows", file=sys.stderr)
+                    ocr_result = ocr_reader.readtext(img)
+                    lines = _easyocr_result_to_rows(ocr_result)
+                    print(f"[pdf_to_excel] p{page_num} EasyOCR: {len(lines)} rows", file=sys.stderr)
                 except Exception as e:
-                    print(f"[pdf_to_excel] PaddleOCR page {page_num} failed: {e}", file=sys.stderr)
+                    print(f"[pdf_to_excel] EasyOCR page {page_num} failed: {e}", file=sys.stderr)
 
             # 2. PyMuPDF テキスト抽出
             if not lines and HAS_PYMUPDF:
@@ -238,8 +216,8 @@ def main() -> None:
         "pages": total_pages,
         "textRows": len(text_rows),
         "hasPymupdf": HAS_PYMUPDF,
-        "hasPaddle": HAS_PADDLE,
-        "usedOcr": ocr_engine is not None,
+        "hasEasyocr": HAS_EASYOCR,
+        "usedOcr": ocr_reader is not None,
     }))
 
 
