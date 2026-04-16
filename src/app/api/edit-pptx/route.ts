@@ -629,11 +629,12 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string) {
   const outputPath = path.join(tempDir, "output.xlsx");
   const scriptPath = await resolveConvertPdfScriptPath();
 
-  // PYTHONPATH を明示的に設定（startup.sh が動いていない環境でも動作させるため）
+  // PYTHONPATH・LD_LIBRARY_PATH を明示的に設定（startup.sh が動いていない環境でも動作させるため）
   const pyEnv = process.platform !== "win32"
     ? {
         ...process.env,
         PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        LD_LIBRARY_PATH: `/home/site/python-packages${process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""}`,
       }
     : process.env;
 
