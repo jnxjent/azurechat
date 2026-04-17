@@ -1,10 +1,13 @@
 """
-pdf_to_excel.py  –  PDF→Excel 変換スクリプト
-優先順位:
+pdf_to_excel.py  –  PDF/Word→Excel 変換スクリプト
+優先順位（PDF）:
   1. Azure Document Intelligence (prebuilt-layout) - 縦書き・複雑表・スキャン対応
   2. pdfplumber テーブル検出（線ありPDF・フォールバック）
   3. PyMuPDF テキスト抽出（フォールバック）
   4. pdfplumber テキスト抽出（最終フォールバック）
+優先順位（Word .docx）:
+  1. Azure Document Intelligence (prebuilt-layout)
+  2. python-docx（テーブル・段落抽出フォールバック）
 CLI: python pdf_to_excel.py --input <path> --output <path>
 stdout: JSON {"sheets": N, "tables": N, "pages": N, "engine": "..."}
 """
@@ -32,6 +35,12 @@ try:
     HAS_DOC_INTEL = True
 except ImportError:
     HAS_DOC_INTEL = False
+
+try:
+    import docx as python_docx
+    HAS_PYTHON_DOCX = True
+except ImportError:
+    HAS_PYTHON_DOCX = False
 
 
 # ── Doc Intelligence クライアント ─────────────────────────────────────────
@@ -82,13 +91,19 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
         print("[pdf_to_excel] Doc Intelligence: not configured, skipping.", file=sys.stderr)
         return None
 
-    print("[pdf_to_excel] Using Azure Document Intelligence (prebuilt-layout).", file=sys.stderr)
+    input_ext = os.path.splitext(pdf_path)[1].lower()
+    content_type_map = {
+        ".pdf":  "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    content_type = content_type_map.get(input_ext, "application/octet-stream")
+    print(f"[pdf_to_excel] Using Azure Document Intelligence (prebuilt-layout) ext={input_ext}.", file=sys.stderr)
     try:
         with open(pdf_path, "rb") as f:
             poller = client.begin_analyze_document(
                 "prebuilt-layout",
                 body=f,
-                content_type="application/octet-stream",
+                content_type=content_type,
             )
         result = poller.result()
     except Exception as e:
@@ -155,6 +170,69 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
     }
 
 
+# ── LibreOffice: DOCX → PDF 変換（EMF 画像型 Word 対策） ────────────────
+
+def _docx_to_pdf_with_libreoffice(docx_path: str) -> str | None:
+    """LibreOffice --headless で .docx を .pdf に変換して返す。失敗時は None。"""
+    import subprocess
+    import tempfile
+    out_dir = tempfile.mkdtemp()
+    try:
+        result = subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        print(f"[pdf_to_excel] LibreOffice rc={result.returncode} {result.stderr[:200]}", file=sys.stderr)
+        if result.returncode != 0:
+            return None
+        base = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(out_dir, base + ".pdf")
+        return pdf_path if os.path.exists(pdf_path) else None
+    except FileNotFoundError:
+        print("[pdf_to_excel] libreoffice not found.", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("[pdf_to_excel] LibreOffice conversion timed out.", file=sys.stderr)
+        return None
+
+
+# ── python-docx フォールバック（Word専用） ───────────────────────────────
+
+def _process_with_python_docx(docx_path: str, wb: openpyxl.Workbook) -> dict:
+    """python-docx で .docx のテーブルと段落をExcelに変換する。"""
+    if not HAS_PYTHON_DOCX:
+        print("[pdf_to_excel] python-docx not available.", file=sys.stderr)
+        return {"tables": 0, "pages": 1, "engine": "none"}
+
+    print("[pdf_to_excel] Falling back to python-docx.", file=sys.stderr)
+    doc = python_docx.Document(docx_path)
+    total_tables = 0
+    text_rows: list[list[str]] = []
+
+    # テーブル抽出
+    for t_idx, table in enumerate(doc.tables):
+        total_tables += 1
+        sheet_name = f"Table{t_idx + 1}"
+        ws = wb.create_sheet(title=sheet_name[:31])
+        for row in table.rows:
+            ws.append([cell.text.strip() for cell in row.cells])
+        print(f"[pdf_to_excel] python-docx table {t_idx+1}: {len(table.rows)} rows", file=sys.stderr)
+
+    # 段落テキスト（テーブルがない場合のみ）
+    if total_tables == 0:
+        for para in doc.paragraphs:
+            if para.text.strip():
+                text_rows.append([para.text.strip()])
+        if text_rows:
+            ws = wb.create_sheet(title="Text")
+            for row in text_rows:
+                ws.append(row)
+
+    return {"tables": total_tables, "pages": 1, "engine": "python_docx"}
+
+
 # ── pdfplumber テキストフォールバック ────────────────────────────────────
 
 def _pdfplumber_text_lines(page) -> list[list[str]]:
@@ -208,11 +286,75 @@ def main() -> None:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    # ── 1. Azure Document Intelligence ──────────────────────────────────
+    input_ext = os.path.splitext(args.input)[1].lower()
+
+    # ── .docx: python-docx を優先（DI が空成功を返す EMF 画像型 Word 対策） ──
+    if input_ext == ".docx":
+        docx_result = _process_with_python_docx(args.input, wb)
+        got_content = docx_result["tables"] > 0 or any(
+            ws.max_row and ws.max_row > 0 for ws in wb.worksheets
+        )
+        if got_content:
+            if not wb.sheetnames:
+                wb.create_sheet(title="Sheet1")
+            wb.save(str(args.output))
+            print(json.dumps({
+                "sheets": len(wb.sheetnames),
+                "tables": docx_result["tables"],
+                "pages": docx_result["pages"],
+                "engine": docx_result["engine"],
+            }))
+            return
+
+        # python-docx で取れなかった → DI で再試行（テキスト型 DOCX への保険）
+        print("[pdf_to_excel] python-docx found nothing, trying Doc Intelligence.", file=sys.stderr)
+        wb2 = openpyxl.Workbook()
+        wb2.remove(wb2.active)
+        doc_intel_result = _process_with_doc_intel(args.input, wb2)
+        if doc_intel_result is not None and (doc_intel_result["tables"] > 0 or doc_intel_result.get("paragraphs", 0) > 0):
+            if not wb2.sheetnames:
+                wb2.create_sheet(title="Sheet1")
+            wb2.save(str(args.output))
+            print(json.dumps({
+                "sheets": len(wb2.sheetnames),
+                "tables": doc_intel_result["tables"],
+                "pages": doc_intel_result["pages"],
+                "engine": "doc_intelligence",
+            }))
+            return
+
+        # python-docx も DI も空 → LibreOffice で DOCX→PDF に変換して再度 DI を試みる
+        print("[pdf_to_excel] Trying LibreOffice DOCX→PDF conversion.", file=sys.stderr)
+        pdf_path = _docx_to_pdf_with_libreoffice(args.input)
+        if pdf_path:
+            wb3 = openpyxl.Workbook()
+            wb3.remove(wb3.active)
+            di_pdf_result = _process_with_doc_intel(pdf_path, wb3)
+            if di_pdf_result is not None and (di_pdf_result["tables"] > 0 or di_pdf_result.get("paragraphs", 0) > 0):
+                if not wb3.sheetnames:
+                    wb3.create_sheet(title="Sheet1")
+                wb3.save(str(args.output))
+                print(json.dumps({
+                    "sheets": len(wb3.sheetnames),
+                    "tables": di_pdf_result["tables"],
+                    "pages": di_pdf_result["pages"],
+                    "engine": "doc_intelligence_via_pdf",
+                }))
+                return
+
+        # 全手段で失敗 = LibreOffice 未インストールか変換不可
+        print("[pdf_to_excel] All extraction methods failed for DOCX.", file=sys.stderr)
+        ws_msg = wb.create_sheet(title="注意")
+        ws_msg.append(["このWordファイルは画像埋め込み型のため、表データを抽出できませんでした。"])
+        ws_msg.append(["PDFとして保存してからアップロードしてください。"])
+        wb.save(str(args.output))
+        print(json.dumps({"sheets": 1, "tables": 0, "pages": 1, "engine": "none"}))
+        return
+
+    # ── 1. Azure Document Intelligence（PDF 等） ─────────────────────────
     doc_intel_result = _process_with_doc_intel(args.input, wb)
 
     if doc_intel_result is not None:
-        # Doc Intelligence が成功した場合はそのまま保存
         if not wb.sheetnames:
             wb.create_sheet(title="Sheet1")
         wb.save(str(args.output))
@@ -224,7 +366,16 @@ def main() -> None:
         }))
         return
 
-    # ── 2. フォールバック: pdfplumber / PyMuPDF ─────────────────────────
+    # ── 2. フォールバック（PDF） ──────────────────────────────────────────
+
+    # PDF 以外（想定外拡張子）は空Excelで終了（.docx は上で処理済み）
+    if input_ext not in (".pdf",):
+        print(f"[pdf_to_excel] No fallback for {input_ext}.", file=sys.stderr)
+        wb.create_sheet(title="Sheet1")
+        wb.save(str(args.output))
+        print(json.dumps({"sheets": 1, "tables": 0, "pages": 0, "engine": "none"}))
+        return
+
     print("[pdf_to_excel] Falling back to pdfplumber/PyMuPDF.", file=sys.stderr)
     total_tables = 0
     text_rows: list[list[str]] = []

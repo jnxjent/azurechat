@@ -584,6 +584,54 @@ function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
   return null;
 }
 
+function extractLatestXlsxUrlFromMessages(messages: string[]): string | null {
+  const urlPattern = /https?:\/\/[^\s)\]]+\.xlsx(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    const matches = message.match(urlPattern);
+    if (matches?.length) {
+      return matches[matches.length - 1];
+    }
+  }
+  return null;
+}
+
+async function resolveLatestXlsxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestXlsxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
+function extractLatestDocxUrlFromMessages(messages: string[]): string | null {
+  const urlPattern = /https?:\/\/[^\s)\]]+\.docx(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    const matches = message.match(urlPattern);
+    if (matches?.length) {
+      return matches[matches.length - 1];
+    }
+  }
+  return null;
+}
+
+async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestDocxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
 async function resolveLatestPptxUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
@@ -1179,11 +1227,57 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
+  // ★ テキスト・表データから Excel ファイルを新規作成するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeCreateExcel(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description:
+              "Excelに出力するデータ全文。テキスト・表・数値をそのまま渡す。タブ区切り・CSV・箇条書き等いずれでも可。",
+          },
+          title: {
+            type: "string",
+            description:
+              "ブック/シートのタイトル。省略時はcontentから自動推定する。",
+          },
+          instruction: {
+            type: "string",
+            description:
+              "書式・構成の指示。例: '1行目をヘッダーにして' '複数シートに分けて' '合計行を追加して'",
+          },
+        },
+        required: ["content"],
+      },
+      description:
+        "ユーザーが指定したテキストや表データからExcelファイル（.xlsx）を新規作成するツール。\n" +
+        "使用タイミング：ユーザーが「Excelにして」「Excelで出力して」「表をExcelにして」「xlsx にして」と言い、かつアップロードファイルがない場合。\n" +
+        "既存Excelファイルの編集は edit_excel ツールを使うこと（このツールは新規作成専用）。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "create_excel",
+    },
+  });
+
   // ★ アップロードされた Excel ファイルを指示に従って編集するツール
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeEditExcel(args, props.chatThread),
+      function: async (args: any) =>
+        await executeEditExcel(
+          {
+            ...args,
+            fileUrl:
+              String(args?.fileUrl ?? "").trim() ||
+              (await resolveLatestXlsxUrlFromThread(props.chatThread.id)) ||
+              "",
+          },
+          props.chatThread
+        ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1191,7 +1285,7 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "編集対象のExcelファイルのURL。このスレッドでアップロードされたxlsx/xls/xlsmのURLを指定する。",
+              "編集対象のExcelファイルのURL。アップロードまたはこのスレッドで作成されたxlsx/xls/xlsmのURL。省略時はスレッド内の最新Excelを自動解決する。",
           },
           instruction: {
             type: "string",
@@ -1199,14 +1293,54 @@ export const GetDefaultExtensions = async (props: {
               "ユーザーの編集指示。例: 'A1セルを「売上合計」に変えて', '1行目を太字・背景色を青に', '「旧社名」を「新社名」に置換して'",
           },
         },
-        required: ["fileUrl", "instruction"],
+        required: ["instruction"],
       },
       description:
-        "このスレッドでアップロードされたExcelファイル（xlsx/xls/xlsm）を自然言語の指示に従って編集するツール。\n" +
-        "使用タイミング：ユーザーがExcelファイルをアップロードし、セル値の変更・テキスト置換・書式変更（太字・色）を求める場合。\n" +
-        "fileUrl は会話コンテキストのアップロードURLを使用する。\n" +
+        "このスレッドのExcelファイル（アップロードまたはcreate_excelで作成）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ExcelファイルへのセルA値変更・テキスト置換・書式変更（太字・色・罫線・枠・border）・整形・見やすくする等を求める場合。\n" +
+        "fileUrl が省略された場合はスレッド内の最新Excelを自動的に使用する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_excel",
+    },
+  });
+
+  // ★ テキストから Word ファイルを新規作成するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeCreateWord(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description:
+              "Wordドキュメントに記載するテキスト全文。ユーザーが指定した内容をそのまま渡す。",
+          },
+          title: {
+            type: "string",
+            description:
+              "ドキュメントのタイトル。省略時はcontentから自動推定する。",
+          },
+          instruction: {
+            type: "string",
+            description:
+              "書式・スタイルの指示。例: '見出しを使って整理して' '箇条書きにして' '表形式でまとめて'",
+          },
+          fontFace: {
+            type: "string",
+            description: "使用フォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'（省略時: Meiryo）",
+          },
+        },
+        required: ["content"],
+      },
+      description:
+        "ユーザーが指定したテキストや内容からWordファイル（.docx）を新規作成するツール。\n" +
+        "使用タイミング：ユーザーが「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合。\n" +
+        "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "create_word",
     },
   });
 
@@ -1214,7 +1348,17 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeEditWord(args, props.chatThread),
+      function: async (args: any) =>
+        await executeEditWord(
+          {
+            ...args,
+            fileUrl:
+              String(args?.fileUrl ?? "").trim() ||
+              (await resolveLatestDocxUrlFromThread(props.chatThread.id)) ||
+              "",
+          },
+          props.chatThread
+        ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1222,7 +1366,7 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "編集対象のWordファイルのURL。このスレッドでアップロードされた.docxのURLを指定する。",
+              "編集対象のWordファイルのURL。アップロードまたはこのスレッドで作成された.docxのURL。省略時はスレッド内の最新Wordを自動解決する。",
           },
           instruction: {
             type: "string",
@@ -1230,14 +1374,47 @@ export const GetDefaultExtensions = async (props: {
               "ユーザーの編集指示。例: '「旧社名」を「新社名」に置換して', 'タイトルを太字・赤色にして', '第1章の見出しを16ptにして'",
           },
         },
-        required: ["fileUrl", "instruction"],
+        required: ["instruction"],
       },
       description:
-        "このスレッドでアップロードされたWordファイル（.docx）を自然言語の指示に従って編集するツール。\n" +
-        "使用タイミング：ユーザーがWordファイルをアップロードし、テキスト置換・書式変更（太字・色・フォントサイズ）を求める場合。\n" +
-        "fileUrl は会話コンテキストのアップロードURLを使用する。\n" +
+        "このスレッドのWordファイル（アップロードまたはcreate_wordで作成）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：Wordファイルへのテキスト置換・書式変更（太字・色・フォントサイズ）を求める場合。\n" +
+        "fileUrl が省略された場合はスレッド内の最新Wordを自動的に使用する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_word",
+    },
+  });
+
+  // ★ アップロードされた PDF ファイルを Word に変換するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeConvertPdfToWord(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+          },
+          mode: {
+            type: "string",
+            enum: ["layout", "editable"],
+            description:
+              "layout: 見た目・レイアウト再現優先（pdf2docx使用）。editable: テキスト・表を編集可能な形で抽出優先（Doc Intelligence使用）。",
+          },
+        },
+        required: ["fileUrl"],
+      },
+      description:
+        "このスレッドでアップロードされたPDFファイルをWord（.docx）に変換するツール。\n" +
+        "使用タイミング：ユーザーがPDFをWordに変換したいと言った場合。\n" +
+        "mode=layout: 「WordにしてWordに変換して」など見た目重視の場合。\n" +
+        "mode=editable: 「編集可能なWordに」「表を編集できるWordに」「テキストとして抽出」など編集重視の場合。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "convert_pdf_to_word",
     },
   });
 
@@ -1259,9 +1436,9 @@ export const GetDefaultExtensions = async (props: {
         required: ["fileUrl"],
       },
       description:
-        "このスレッドでアップロードされたPDFファイルをExcel（.xlsx）に変換するツール。\n" +
-        "使用タイミング：ユーザーがPDFをExcelに変換したいと言った場合。\n" +
-        "PDFのテーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
+        "このスレッドでアップロードされたPDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
+        "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。\n" +
+        "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_excel",
     },
@@ -1669,6 +1846,111 @@ async function executeEditExcel(
   }
 }
 
+// ---------------- Excel 新規作成 ----------------
+async function executeCreateExcel(
+  args: { content: string; title?: string; instruction?: string },
+  chatThread: ChatThreadModel
+) {
+  const { content, title, instruction } = args ?? {};
+
+  if (!content?.trim() && !title?.trim()) {
+    return { error: "content を指定してください。作成するデータを入力してください。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/gen-excel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: content ?? "",
+        title: title ?? "",
+        instruction: instruction ?? "",
+        threadId: chatThread.id,
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[create_excel] gen-excel failed:", res.status, t);
+      return { error: `Excel作成に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      sheets: result.sheets,
+      totalRows: result.totalRows,
+      message: `Excelファイルを作成しました（${result.sheets}シート、${result.totalRows}行）。`,
+    };
+  } catch (e: any) {
+    console.error("[create_excel] error:", e);
+    return { error: "Excel作成中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- Word 新規作成 ----------------
+async function executeCreateWord(
+  args: { content: string; title?: string; instruction?: string; fontFace?: string },
+  chatThread: ChatThreadModel
+) {
+  const { content, title, instruction, fontFace } = args ?? {};
+
+  if (!content?.trim() && !title?.trim()) {
+    return { error: "content を指定してください。作成する内容を入力してください。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/gen-word`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: content ?? "",
+        title: title ?? "",
+        instruction: instruction ?? "",
+        fontFace: fontFace ?? "Meiryo",
+        threadId: chatThread.id,
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[create_word] gen-word failed:", res.status, t);
+      return { error: `Word作成に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      paragraphs: result.paragraphs,
+      tables: result.tables,
+      message: `Wordファイルを作成しました（${result.paragraphs}段落、テーブル${result.tables}個）。`,
+    };
+  } catch (e: any) {
+    console.error("[create_word] error:", e);
+    return { error: "Word作成中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
 // ---------------- Word 編集 ----------------
 async function executeEditWord(
   args: { fileUrl?: string; instruction: string },
@@ -1756,6 +2038,16 @@ async function executeConvertPdfToExcel(
     }
 
     const result = await res.json();
+
+    // 画像埋め込み型 Word（EMF 等）で抽出不可だった場合
+    if (result?.engine === "none") {
+      return {
+        error:
+          "このWordファイルは画像埋め込み型のため、表データを抽出できませんでした。\n" +
+          "WordをPDF形式で保存してからアップロードし、再度「Excelに変換して」とお試しください。",
+      };
+    }
+
     if (!result?.downloadUrl) {
       return { error: "ダウンロードURLが取得できませんでした。" };
     }
@@ -1770,11 +2062,67 @@ async function executeConvertPdfToExcel(
       sheets: result.sheets,
       tables: result.tables,
       pages: result.pages,
-      message: `${result.pages}ページのPDFを変換しました（${tableInfo}）。`,
+      message: `${result.pages}ページを変換しました（${tableInfo}）。`,
     };
   } catch (e: any) {
     console.error("[convert_pdf_to_excel] error:", e);
     return { error: "PDF→Excel変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- PDF → Word 変換 ----------------
+async function executeConvertPdfToWord(
+  args: { fileUrl?: string; mode?: "layout" | "editable" },
+  chatThread: ChatThreadModel
+) {
+  const { fileUrl, mode = "layout" } = args ?? {};
+
+  if (!fileUrl?.trim()) {
+    return {
+      error: "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+    };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_word", mode }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[convert_pdf_to_word] route failed:", res.status, t);
+      return { error: `PDF→Word変換に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+
+    if (result?.engine === "none") {
+      return {
+        error: "PDFの変換に失敗しました。スキャン画像のみのPDFの場合はテキスト抽出ができません。",
+      };
+    }
+
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      paragraphs: result.paragraphs,
+      tables: result.tables,
+      message: `PDFをWordに変換しました（段落${result.paragraphs}件、表${result.tables}件）。`,
+    };
+  } catch (e: any) {
+    console.error("[convert_pdf_to_word] error:", e);
+    return { error: "PDF→Word変換中にエラーが発生しました: " + String(e?.message ?? e) };
   }
 }
 

@@ -58,35 +58,72 @@ def apply_replace_text(doc, replacements: list) -> int:
 
 
 def apply_format_runs(doc, formats: list) -> int:
-    """matchText を含む段落のランに書式を適用。変更した段落数を返す。"""
+    """formatRuns を段落に適用。matchText 省略時は全段落に適用。変更した段落数を返す。"""
     changed = 0
     for fmt in formats:
         match_text = str(fmt.get("matchText") or "").strip()
+        apply_all = not match_text  # matchText が空 → 全段落対象
         bold = fmt.get("bold")
         italic = fmt.get("italic")
         font_size = fmt.get("fontSize")
         font_color = parse_hex_color(fmt.get("fontColor"))
 
-        if not match_text:
-            continue
         if bold is None and italic is None and font_size is None and font_color is None:
             continue
 
         for para in iter_all_paragraphs(doc):
-            if match_text not in para.text:
+            if not apply_all and match_text not in para.text:
                 continue
-            for run in para.runs:
+            runs = para.runs
+            # runがない段落（空段落や特殊段落）には新しいrunを作って書式だけ設定
+            if not runs and para.text:
+                run = para.add_run(para.text)
+                # 元のテキストをrunに移したので元の直接テキストは除去不要（add_runで追加）
+                runs = [run]
+            for run in runs:
                 if bold is not None:
                     run.bold = bold
                 if italic is not None:
                     run.italic = italic
                 if font_size is not None:
-                    run.font.size = Pt(font_size)
+                    run.font.size = Pt(float(font_size))
                 if font_color is not None:
                     run.font.color.rgb = font_color
             changed += 1
 
     return changed
+
+
+def apply_add_paragraphs(doc, paragraphs: list) -> int:
+    """addParagraphs をドキュメント末尾に追加。追加した段落数を返す。"""
+    added = 0
+    for para_def in paragraphs:
+        text = str(para_def.get("text") or "").strip()
+        if not text:
+            continue
+        style = str(para_def.get("style") or "Normal").strip()
+        bold = para_def.get("bold")
+        italic = para_def.get("italic")
+        font_size = para_def.get("fontSize")
+        font_color = parse_hex_color(para_def.get("fontColor"))
+
+        try:
+            para = doc.add_paragraph(text, style=style)
+        except Exception:
+            para = doc.add_paragraph(text)
+
+        for run in para.runs:
+            if bold is not None:
+                run.bold = bold
+            if italic is not None:
+                run.italic = italic
+            if font_size is not None:
+                run.font.size = Pt(float(font_size))
+            if font_color is not None:
+                run.font.color.rgb = font_color
+        added += 1
+
+    return added
 
 
 def main() -> None:
@@ -107,6 +144,7 @@ def main() -> None:
 
     changed += apply_replace_text(doc, plan.get("replaceText") or [])
     changed += apply_format_runs(doc, plan.get("formatRuns") or [])
+    changed += apply_add_paragraphs(doc, plan.get("addParagraphs") or [])
 
     doc.save(str(output_path))
     print(json.dumps({"changedParagraphs": changed, "totalParagraphs": total_paragraphs}))

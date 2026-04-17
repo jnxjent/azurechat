@@ -25,7 +25,7 @@ if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml, openpyxl, docx, pdfplumbe
   if [ -f "$PIP_CMD" ]; then
     "$PIP_CMD" install --quiet --target="$PDIR" \
       python-pptx lxml openpyxl xlrd python-docx pdfplumber pymupdf \
-      azure-ai-documentintelligence \
+      azure-ai-documentintelligence pdf2docx \
       && echo "[startup] Core libs installed." \
       || echo "[startup] WARNING: Core lib install failed."
   fi

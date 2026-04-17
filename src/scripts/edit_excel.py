@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import column_index_from_string
 
 
@@ -166,6 +166,67 @@ def resolve_column_index(ws, col_spec: str) -> int | None:
     return None
 
 
+def apply_border_edits(ws, border_edit: dict) -> int:
+    """指定範囲に罫線を適用する。
+    edges: "all" | "outer" | "inner" | "top" | "bottom" | "left" | "right"
+    style: "thin" | "medium" | "thick" | "hair" | "dashed" (デフォルト "thin")
+    """
+    range_str = str(border_edit.get("range") or "").strip()
+    if not range_str:
+        return 0
+    style = str(border_edit.get("style") or "thin")
+    edges = str(border_edit.get("edges") or "all").lower()
+    side = Side(style=style)
+    no_side = Side(style=None)
+
+    try:
+        cell_range = ws[range_str]
+        if not isinstance(cell_range, (list, tuple)):
+            cell_range = [[cell_range]]
+        # 範囲の行数・列数を把握
+        rows = cell_range
+        max_r = len(rows) - 1
+        changed = 0
+        for ri, row in enumerate(rows):
+            row_cells = row if isinstance(row, (list, tuple)) else [row]
+            max_c = len(row_cells) - 1
+            for ci, cell in enumerate(row_cells):
+                b = cell.border.copy() if cell.border else Border()
+                top = b.top
+                bottom = b.bottom
+                left = b.left
+                right = b.right
+
+                is_top_edge = ri == 0
+                is_bottom_edge = ri == max_r
+                is_left_edge = ci == 0
+                is_right_edge = ci == max_c
+
+                if edges == "all":
+                    top = bottom = left = right = side
+                elif edges == "outer":
+                    if is_top_edge:    top = side
+                    if is_bottom_edge: bottom = side
+                    if is_left_edge:   left = side
+                    if is_right_edge:  right = side
+                elif edges == "inner":
+                    if not is_top_edge:    top = side
+                    if not is_bottom_edge: bottom = side
+                    if not is_left_edge:   left = side
+                    if not is_right_edge:  right = side
+                elif edges == "top":    top = side
+                elif edges == "bottom": bottom = side
+                elif edges == "left":   left = side
+                elif edges == "right":  right = side
+
+                cell.border = Border(top=top, bottom=bottom, left=left, right=right)
+                changed += 1
+        return changed
+    except Exception as e:
+        print(f"[edit_excel] border range '{range_str}' failed: {e}", file=sys.stderr)
+        return 0
+
+
 def apply_copy_row_color(ws, target_col_spec: str, reference_col_spec: str, start_row: int = 2) -> int:
     """reference 列の各行の背景色を target 列の同じ行にコピーする。
     col_spec は列記号（"A"）またはヘッダー名（"対応"）のどちらでもよい。
@@ -241,6 +302,17 @@ def main() -> None:
             print(f"[edit_excel] formatEdits: sheet '{sheet_name}' not found", file=sys.stderr)
             continue
         n = apply_format_edits(ws, fmt)
+        if n > 0:
+            changed_sheets.add(ws.title)
+
+    # borderEdits
+    for be in plan.get("borderEdits") or []:
+        sheet_name = str(be.get("sheetName") or "").strip()
+        ws = resolve_sheet(wb, sheet_name)
+        if ws is None:
+            print(f"[edit_excel] borderEdits: sheet '{sheet_name}' not found", file=sys.stderr)
+            continue
+        n = apply_border_edits(ws, be)
         if n > 0:
             changed_sheets.add(ws.title)
 

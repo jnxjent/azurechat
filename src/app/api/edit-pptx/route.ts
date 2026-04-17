@@ -384,6 +384,12 @@ type ExcelEditPlan = {
     referenceColumn: string; // 色を参照する列記号またはヘッダー名
     startRow?: number;       // デフォルト 2（ヘッダー行をスキップ）
   }>;
+  borderEdits?: Array<{
+    sheetName: string;
+    range: string;           // "A1:D10" など
+    style?: string;          // "thin" | "medium" | "thick" | "hair" | "dashed"
+    edges?: string;          // "all" | "outer" | "inner" | "top" | "bottom" | "left" | "right"
+  }>;
 };
 
 function extractSheetSummaries(buffer: Buffer): SheetSummary[] {
@@ -455,6 +461,14 @@ Return JSON only in this shape:
       "referenceColumn": "A", // MUST be a column letter (A, B, C...) from the columns list
       "startRow": 2           // first row to copy (default 2, skip header)
     }
+  ],
+  "borderEdits": [
+    {
+      "sheetName": string,
+      "range": "A1:D10",     // cell range to apply borders
+      "style": "thin",        // "thin" | "medium" | "thick" | "hair" | "dashed" (default "thin")
+      "edges": "all"          // "all" | "outer" | "inner" | "top" | "bottom" | "left" | "right" (default "all")
+    }
   ]
 }
 
@@ -465,6 +479,7 @@ Rules:
 - Use replaceText ONLY when the user explicitly asks to find and replace text content. NEVER use replaceText for formatting operations.
 - Use formatEdits for bold/color changes. fontColor and fillColor are 6-digit hex (no #).
 - Use copyRowColorEdits when the user wants a column's background colors to match those of another column row-by-row. targetColumn and referenceColumn MUST be column letters from the "columns" list.
+- Use borderEdits when the user asks to add borders (枠・罫線・border), frame cells, or make the sheet look cleaner. Infer the data range from the sheet summary. Use edges="all" for full grid, "outer" for outer frame only.
 - NEVER set a cell value to an empty string unless the user explicitly asks to clear that cell.
 - NEVER modify header row values (row 1) unless the user explicitly asks to change column names.
 - Only emit the operations the user actually requested. Keep the JSON minimal.`;
@@ -491,6 +506,7 @@ Return JSON only.`;
   parsed.sheetEdits ??= [];
   parsed.formatEdits ??= [];
   parsed.copyRowColorEdits ??= [];
+  parsed.borderEdits ??= [];
   return parsed;
 }
 
@@ -605,6 +621,75 @@ async function runPythonEditExcel(
 // PDF → Excel 変換
 // ─────────────────────────────────────────────
 
+async function resolveConvertPdfToWordScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "pdf_to_word.py"),
+    path.join(process.cwd(), "scripts", "pdf_to_word.py"),
+    "/home/site/wwwroot/src/scripts/pdf_to_word.py",
+    "/home/site/wwwroot/scripts/pdf_to_word.py",
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`pdf_to_word.py not found. Checked: ${candidates.join(", ")}`);
+}
+
+async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "layout" | "editable" = "layout") {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2docx-"));
+  const inputPath = path.join(tempDir, "input.pdf");
+  const outputPath = path.join(tempDir, "output.docx");
+  const scriptPath = await resolveConvertPdfToWordScriptPath();
+
+  const pyEnv = process.platform !== "win32"
+    ? {
+        ...process.env,
+        PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        LD_LIBRARY_PATH: `/home/site/python-packages${process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""}`,
+      }
+    : process.env;
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
+      scriptPath,
+      "--input", inputPath,
+      "--output", outputPath,
+      "--mode", mode,
+    ], { env: pyEnv });
+
+    if (stderr?.trim()) {
+      console.warn("[pdf-to-word] python stderr:", stderr.trim());
+    }
+
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+
+    if (pythonResult.engine === "none") {
+      return { engine: "none" as const };
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
+    const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.docx`;
+    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
+
+    return {
+      downloadUrl,
+      fileName,
+      paragraphs: Number(pythonResult.paragraphs ?? 0),
+      tables: Number(pythonResult.tables ?? 0),
+      engine: String(pythonResult.engine ?? ""),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function resolveConvertPdfScriptPath(): Promise<string> {
   const candidates = [
     path.join(process.cwd(), "src", "scripts", "pdf_to_excel.py"),
@@ -623,9 +708,10 @@ async function resolveConvertPdfScriptPath(): Promise<string> {
   throw new Error(`pdf_to_excel.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string) {
+async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUrl?: string) {
+  const inputExt = fileUrl ? (getFileExtension(fileUrl) || ".pdf") : ".pdf";
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2xl-"));
-  const inputPath = path.join(tempDir, "input.pdf");
+  const inputPath = path.join(tempDir, `input${inputExt}`);
   const outputPath = path.join(tempDir, "output.xlsx");
   const scriptPath = await resolveConvertPdfScriptPath();
 
@@ -664,6 +750,7 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string) {
       sheets: Number(pythonResult.sheets ?? 0),
       tables: Number(pythonResult.tables ?? 0),
       pages: Number(pythonResult.pages ?? 0),
+      engine: String(pythonResult.engine ?? ""),
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -690,7 +777,15 @@ type WordDocSummary = {
 type WordEditPlan = {
   replaceText?: Array<{ find: string; replace: string }>;
   formatRuns?: Array<{
-    matchText: string;
+    matchText?: string;   // omit to apply to ALL paragraphs
+    bold?: boolean;
+    italic?: boolean;
+    fontSize?: number;
+    fontColor?: string;
+  }>;
+  addParagraphs?: Array<{
+    text: string;
+    style?: string;       // "Normal" | "Heading1" | "Heading2" | "List Bullet"
     bold?: boolean;
     italic?: boolean;
     fontSize?: number;
@@ -733,22 +828,33 @@ Return JSON only in this shape:
   "replaceText": [{ "find": "old text", "replace": "new text" }],
   "formatRuns": [
     {
-      "matchText": "paragraph text to find",
-      "bold": true | false,
-      "italic": true | false,
+      "matchText": "paragraph text to find (omit to apply to ALL paragraphs)",
+      "bold": true,
+      "italic": false,
       "fontSize": 14,
       "fontColor": "RRGGBB"
+    }
+  ],
+  "addParagraphs": [
+    {
+      "text": "paragraph text to append",
+      "style": "Normal",
+      "bold": false,
+      "fontSize": 12
     }
   ]
 }
 
 Rules:
-- Use replaceText when the user wants to change specific wording.
-- Use formatRuns when the user wants to apply bold/italic/font size/color to paragraphs. matchText must be a substring found in the paragraph.
-- fontColor is a 6-digit hex string without #.
-- fontSize is in points (e.g. 12, 14, 16).
-- Only emit operations the user actually requested. Keep JSON minimal.
-- Do not add, remove, or invent paragraphs beyond what was requested.`;
+- replaceText: use when the user wants to change specific wording.
+- formatRuns: use when the user wants to apply bold/italic/font size/color.
+  - matchText: substring found in the target paragraph. OMIT matchText entirely (do not include the key) when the user wants to format ALL paragraphs or the whole document.
+  - fontSize: points. If the user says "4倍" or "4x", multiply the likely current size (11pt default) by 4 → 44. "2倍" → 22. "大きく" → 18.
+  - fontColor: 6-digit hex without #.
+- addParagraphs: use when the user wants to INSERT or APPEND new text to the document.
+  - style: "Normal" | "Heading1" | "Heading2" | "List Bullet" (default "Normal").
+  - Paragraphs are appended at the end of the document.
+- Only emit operations the user actually requested. Keep JSON minimal.`;
 
   const userPrompt = `Instruction: ${instruction}
 
@@ -771,6 +877,7 @@ Return JSON only.`;
   const parsed = JSON.parse(content) as WordEditPlan;
   parsed.replaceText ??= [];
   parsed.formatRuns ??= [];
+  parsed.addParagraphs ??= [];
   return parsed;
 }
 
@@ -836,6 +943,15 @@ async function runPythonEditWord(
   const planPath = path.join(tempDir, "plan.json");
   const scriptPath = await resolveEditWordScriptPath();
 
+  // Explicitly set Python paths for App Service (startup.sh installs to /home/site/python-packages)
+  const pyEnv = process.platform !== "win32"
+    ? {
+        ...process.env,
+        PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        LD_LIBRARY_PATH: `/home/site/python-packages${process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""}`,
+      }
+    : process.env;
+
   try {
     await fs.writeFile(inputPath, inputBuffer);
     await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
@@ -844,7 +960,7 @@ async function runPythonEditWord(
 
     if (process.platform !== "win32") {
       try {
-        await execFileAsync(pythonBin, ["-c", "import docx"]);
+        await execFileAsync(pythonBin, ["-c", "import docx"], { env: pyEnv });
       } catch {
         throw new Error(
           "python-docx がサーバーにインストールされていません。" +
@@ -858,7 +974,7 @@ async function runPythonEditWord(
       "--input", inputPath,
       "--output", outputPath,
       "--plan", planPath,
-    ]);
+    ], { env: pyEnv });
 
     if (stderr?.trim()) {
       console.warn("[edit-word] python stderr:", stderr.trim());
@@ -1030,14 +1146,15 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action } = body as {
+    const { fileUrl, instruction, threadId, action, mode } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
       action?: string;
+      mode?: string;
     };
 
-    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel")) {
+    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word")) {
       return NextResponse.json(
         { ok: false, error: "fileUrl and instruction are required" },
         { status: 400 }
@@ -1051,8 +1168,17 @@ export async function POST(req: NextRequest) {
     // PDF → Excel 変換
     if (action === "pdf_to_excel") {
       const pdfBuffer = await downloadBlob(fileUrl, threadId);
-      const result = await runPythonPdfToExcel(pdfBuffer, threadId);
+      const result = await runPythonPdfToExcel(pdfBuffer, threadId, fileUrl);
       console.log("[pdf-to-excel] result:", JSON.stringify(result));
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    // PDF → Word 変換
+    if (action === "pdf_to_word") {
+      const pdfBuffer = await downloadBlob(fileUrl, threadId);
+      const wordMode = mode === "editable" ? "editable" : "layout";
+      const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode);
+      console.log("[pdf-to-word] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
     }
 

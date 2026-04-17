@@ -138,6 +138,7 @@ const DEFAULT_PALETTES: Record<string, Palette> = {
   gold: { canvas: "FFFBEF", surface: "FFFFFF", titleBg: "5B4212", headerBg: "7B5A18", accentA: "C6922D", accentB: "F0D99A", headerText: "FFF8E5", bodyText: "36280E", mutedText: "746344", sectionBg: "FFF6DD", tableHeaderBg: "C6922D", tableHeaderText: "FFFFFF", tableAltBg: "FFF9EA", border: "EADDAE" },
   pastel: { canvas: "FFF9FD", surface: "FFFFFF", titleBg: "8A6BBE", headerBg: "A085D6", accentA: "F39BCB", accentB: "CBB7F7", headerText: "FFFFFF", bodyText: "3B3150", mutedText: "7B7091", sectionBg: "F7F1FF", tableHeaderBg: "A085D6", tableHeaderText: "FFFFFF", tableAltBg: "FBF7FF", border: "E6DBFB" },
   pop: { canvas: "FFFDF1", surface: "FFFFFF", titleBg: "8B0D57", headerBg: "D61F69", accentA: "FF9F1C", accentB: "FFE066", headerText: "FFFFFF", bodyText: "2D2230", mutedText: "7F6570", sectionBg: "FFF4DB", tableHeaderBg: "FF9F1C", tableHeaderText: "FFFFFF", tableAltBg: "FFF9E6", border: "FFE2A8" },
+  dark: { canvas: "0A0F1A", surface: "111827", titleBg: "000D1A", headerBg: "0D1B2A", accentA: "00FF88", accentB: "00C87A", headerText: "00FF88", bodyText: "D0F0E8", mutedText: "6DBFA0", sectionBg: "0D1F2D", tableHeaderBg: "003D26", tableHeaderText: "00FF88", tableAltBg: "0A1A14", border: "1A4D3A" },
 };
 
 function normalizeHex(input: string, fallback: string): string {
@@ -156,6 +157,7 @@ function containsAny(value: string, tokens: string[]): boolean {
 
 function resolvePaletteKeyFromPrompt(input: string): keyof typeof DEFAULT_PALETTES {
   const hint = input.toLowerCase();
+  if (containsAny(hint, ["dark", "matrix", "マトリックス", "cyber", "サイバー", "future", "未来", "クール", "cool", "近未来", "sf", "noir", "ノワール", "black", "ブラック", "futuristic", "techno", "テクノ", "night", "夜"])) return "dark";
   if (containsAny(hint, ["pastel", "soft", "gentle", "sweet", "やわらか", "パステル"])) return "pastel";
   if (containsAny(hint, ["pop", "playful", "vivid", "colorful", "ポップ", "元気"])) return "pop";
   if (containsAny(hint, ["red", "crimson", "scarlet", "赤"])) return "red";
@@ -180,6 +182,7 @@ function getFontScaleMultiplier(fontScale?: DeckPreferencesInput["fontScale"]): 
 
 function applyAccentOverride(palette: Palette, accentColor?: string): Palette {
   const key = String(accentColor ?? "").toLowerCase();
+  if (containsAny(key, ["dark", "matrix", "cyber", "black", "night"])) return DEFAULT_PALETTES.dark;
   if (containsAny(key, ["blue", "青"])) return DEFAULT_PALETTES.blue;
   if (containsAny(key, ["red", "赤"])) return DEFAULT_PALETTES.red;
   if (containsAny(key, ["green", "eco", "緑", "エコ"])) return DEFAULT_PALETTES.green;
@@ -270,7 +273,7 @@ async function generateDesignBrief(
         {
           role: "system",
           content:
-            "You are a presentation art director. Return JSON only. Prioritize the user's natural-language request over generic defaults. Explicit corrections such as color changes, font changes, Japanese labels, executive tone, pastel, pop, soft, premium, minimal, eco, or bold should be reflected directly in the visual system. Suggested visualType values: editorial, process, comparison, spotlight, cards, timeline, table.",
+            "You are a presentation art director. Return JSON only. Prioritize the user's natural-language request over generic defaults. Explicit corrections such as color changes, font changes, Japanese labels, executive tone, pastel, pop, soft, premium, minimal, eco, or bold should be reflected directly in the visual system. For dark/futuristic/matrix/cyber/noir themes use a dark palette: canvas near 0A0F1A, titleBg near 000D1A, accentA a vivid neon like 00FF88 or 00D4FF, bodyText near D0F0E8, headerText matching accentA. Suggested visualType values: editorial, process, comparison, spotlight, cards, timeline, table.",
         },
         {
           role: "user",
