@@ -619,6 +619,17 @@ function extractLatestDocxUrlFromMessages(messages: string[]): string | null {
   return null;
 }
 
+function extractLatestPdfOrDocxUrlFromMessages(messages: string[]): string | null {
+  const urlPattern = /https?:\/\/[^\s)\]]+\.(?:pdf|docx)(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    const matches = message.match(urlPattern);
+    if (matches?.length) {
+      return matches[matches.length - 1];
+    }
+  }
+  return null;
+}
+
 async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
@@ -627,6 +638,19 @@ async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<str
       .map((message) => String(message.content ?? "").trim())
       .filter(Boolean);
     return extractLatestDocxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
+async function resolveLatestPdfOrDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestPdfOrDocxUrlFromMessages(messages);
   } catch {
     return null;
   }
@@ -1422,7 +1446,17 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
+      function: async (args: any) =>
+        await executeConvertPdfToExcel(
+          {
+            ...args,
+            fileUrl:
+              String(args?.fileUrl ?? "").trim() ||
+              (await resolveLatestPdfOrDocxUrlFromThread(props.chatThread.id)) ||
+              "",
+          },
+          props.chatThread
+        ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1430,14 +1464,15 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+              "変換対象のPDF/WordファイルのURL。このスレッドでアップロードされた.pdf/.docxのURL。省略時はスレッド内の最新PDF/Wordを自動解決する。",
           },
         },
-        required: ["fileUrl"],
+        required: [],
       },
       description:
         "このスレッドでアップロードされたPDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
         "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。\n" +
+        "fileUrl は省略可能。省略するとスレッド内の最新PDF/Wordを自動的に使用する。\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_excel",
@@ -2010,12 +2045,16 @@ async function executeConvertPdfToExcel(
   args: { fileUrl?: string },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl } = args ?? {};
+  let { fileUrl } = args ?? {};
+
+  if (!fileUrl?.trim()) {
+    fileUrl = (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
+  }
 
   if (!fileUrl?.trim()) {
     return {
       error:
-        "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+        "変換対象のPDF/Wordファイルが見つかりませんでした。このスレッドでPDFまたはWordファイルをアップロードしてください。",
     };
   }
 

@@ -18,9 +18,26 @@ export const OpenAIStream = (props: {
 
   const readableStream = new ReadableStream({
     async start(controller) {
+      let controllerClosed = false;
+
+      const closeController = () => {
+        if (controllerClosed) return;
+        controllerClosed = true;
+        try {
+          controller.close();
+        } catch {
+          // already closed by client disconnect
+        }
+      };
+
       const streamResponse = (event: string, value: string) => {
-        controller.enqueue(encoder.encode(`event: ${event} \n`));
-        controller.enqueue(encoder.encode(`data: ${value} \n\n`));
+        if (controllerClosed) return;
+        try {
+          controller.enqueue(encoder.encode(`event: ${event} \n`));
+          controller.enqueue(encoder.encode(`data: ${value} \n\n`));
+        } catch {
+          controllerClosed = true;
+        }
       };
 
       let lastMessage = "";
@@ -85,7 +102,7 @@ export const OpenAIStream = (props: {
             response: "Chat aborted",
           };
           streamResponse(response.type, JSON.stringify(response));
-          controller.close();
+          closeController();
         })
         .on("error", async (error: any) => {
           console.log("🔴 error", error);
@@ -104,7 +121,7 @@ export const OpenAIStream = (props: {
           }
 
           streamResponse(response.type, JSON.stringify(response));
-          controller.close();
+          closeController();
         })
         .on("finalContent", async (content: string) => {
           await CreateChatMessage({
@@ -119,7 +136,7 @@ export const OpenAIStream = (props: {
             response: content,
           };
           streamResponse(response.type, JSON.stringify(response));
-          controller.close();
+          closeController();
         });
     },
   });
