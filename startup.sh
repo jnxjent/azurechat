@@ -19,18 +19,28 @@ mkdir -p "$PDIR"
 
 # ── Step 1: コア Office 編集ライブラリ ──────────────────────────────────
 # python-pptx / openpyxl / docx / pdfplumber / Doc Intelligence SDK
-if ! PYTHONPATH="$PDIR" python3 -c "import pptx, lxml, openpyxl, docx, pdfplumber, fitz, azure.ai.documentintelligence" 2>/dev/null; then
-  echo "[startup] Core libs not found, installing..."
-  install_pip_if_needed
+install_pip_if_needed
+
+MISSING=""
+PYTHONPATH="$PDIR" python3 -c "import pptx"                        2>/dev/null || MISSING="$MISSING python-pptx lxml"
+PYTHONPATH="$PDIR" python3 -c "import openpyxl"                    2>/dev/null || MISSING="$MISSING openpyxl xlrd"
+PYTHONPATH="$PDIR" python3 -c "import docx"                        2>/dev/null || MISSING="$MISSING python-docx"
+PYTHONPATH="$PDIR" python3 -c "import pdfplumber"                  2>/dev/null || MISSING="$MISSING pdfplumber"
+PYTHONPATH="$PDIR" python3 -c "import fitz"                        2>/dev/null || MISSING="$MISSING pymupdf"
+PYTHONPATH="$PDIR" python3 -c "import azure.ai.documentintelligence" 2>/dev/null || MISSING="$MISSING azure-ai-documentintelligence"
+PYTHONPATH="$PDIR" python3 -c "import pdf2docx"                    2>/dev/null || MISSING="$MISSING pdf2docx"
+
+if [ -n "$MISSING" ]; then
+  echo "[startup] Installing missing packages:$MISSING"
   if [ -f "$PIP_CMD" ]; then
-    "$PIP_CMD" install --quiet --target="$PDIR" \
-      python-pptx lxml openpyxl xlrd python-docx pdfplumber pymupdf \
-      azure-ai-documentintelligence pdf2docx \
-      && echo "[startup] Core libs installed." \
-      || echo "[startup] WARNING: Core lib install failed."
+    "$PIP_CMD" install --quiet --target="$PDIR" $MISSING \
+      && echo "[startup] Packages installed." \
+      || echo "[startup] WARNING: Some packages failed to install."
+  else
+    echo "[startup] WARNING: pip not found, cannot install packages."
   fi
 else
-  echo "[startup] Core libs already available. Skipping."
+  echo "[startup] All Python packages already available. Skipping."
 fi
 
 # PYTHONPATH を node プロセスに継承させる
