@@ -782,6 +782,7 @@ type WordEditPlan = {
     italic?: boolean;
     fontSize?: number;
     fontColor?: string;
+    fontFace?: string;
   }>;
   addParagraphs?: Array<{
     text: string;
@@ -832,7 +833,8 @@ Return JSON only in this shape:
       "bold": true,
       "italic": false,
       "fontSize": 14,
-      "fontColor": "RRGGBB"
+      "fontColor": "RRGGBB",
+      "fontFace": "Yu Gothic"
     }
   ],
   "addParagraphs": [
@@ -847,10 +849,11 @@ Return JSON only in this shape:
 
 Rules:
 - replaceText: use when the user wants to change specific wording.
-- formatRuns: use when the user wants to apply bold/italic/font size/color.
+- formatRuns: use when the user wants to apply bold/italic/font size/color/font face.
   - matchText: substring found in the target paragraph. OMIT matchText entirely (do not include the key) when the user wants to format ALL paragraphs or the whole document.
   - fontSize: points. If the user says "4倍" or "4x", multiply the likely current size (11pt default) by 4 → 44. "2倍" → 22. "大きく" → 18.
   - fontColor: 6-digit hex without #.
+  - fontFace: font name string. "ゴシック" → "Yu Gothic", "明朝" → "Yu Mincho", "メイリオ" → "Meiryo". Use the exact font name as a string.
 - addParagraphs: use when the user wants to INSERT or APPEND new text to the document.
   - style: "Normal" | "Heading1" | "Heading2" | "List Bullet" (default "Normal").
   - Paragraphs are appended at the end of the document.

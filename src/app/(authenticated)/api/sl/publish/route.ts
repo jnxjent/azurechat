@@ -164,7 +164,8 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { fileName, fileBase64 } = body;
+    const fileName = String(body.fileName ?? "").replace(/^[\s\u3000]+|[\s\u3000]+$/g, "");
+    const { fileBase64 } = body;
 
     if (!fileName || !fileBase64) {
       return NextResponse.json(

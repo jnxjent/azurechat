@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from docx import Document
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 
 
@@ -67,8 +69,9 @@ def apply_format_runs(doc, formats: list) -> int:
         italic = fmt.get("italic")
         font_size = fmt.get("fontSize")
         font_color = parse_hex_color(fmt.get("fontColor"))
+        font_face = str(fmt.get("fontFace") or "").strip() or None
 
-        if bold is None and italic is None and font_size is None and font_color is None:
+        if bold is None and italic is None and font_size is None and font_color is None and font_face is None:
             continue
 
         for para in iter_all_paragraphs(doc):
@@ -89,6 +92,16 @@ def apply_format_runs(doc, formats: list) -> int:
                     run.font.size = Pt(float(font_size))
                 if font_color is not None:
                     run.font.color.rgb = font_color
+                if font_face is not None:
+                    rPr = run._r.get_or_add_rPr()
+                    rFonts = rPr.find(qn("w:rFonts"))
+                    if rFonts is None:
+                        rFonts = OxmlElement("w:rFonts")
+                        rPr.insert(0, rFonts)
+                    rFonts.set(qn("w:ascii"), font_face)
+                    rFonts.set(qn("w:hAnsi"), font_face)
+                    rFonts.set(qn("w:eastAsia"), font_face)
+                    rFonts.set(qn("w:cs"), font_face)
             changed += 1
 
     return changed
