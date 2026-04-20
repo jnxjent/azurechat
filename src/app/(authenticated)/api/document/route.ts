@@ -1,27 +1,51 @@
 // app/api/document/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
-import { decideDept, getUserEmailFromJwtToken } from "@/lib/sl-dept";
+import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
 import { SearchAzureAISimilarDocuments } from "@/features/chat-page/chat-services/chat-api/chat-api-rag-extension";
+import { hashValue } from "@/features/auth-page/helpers";
+import { userSession } from "@/features/auth-page/helpers";
 
 export async function POST(req: NextRequest) {
   try {
-    const token = await getToken({ req });
-    let email = token ? getUserEmailFromJwtToken(token) : null;
+    let email: string | null = null;
 
-    if (!email && process.env.SL_LOCAL_EMAIL) {
-      email = process.env.SL_LOCAL_EMAIL;
+    // 優先①: executeFunction が付けた x-user-email ヘッダー
+    const headerEmail = req.headers.get("x-user-email") ?? null;
+
+    // 優先②: JWTトークン
+    const token = await getToken({ req }).catch(() => null);
+    const tokenEmail = token ? getUserEmailFromJwtToken(token) : null;
+
+    // 優先③: サーバーセッション
+    let sessionEmail: string | null = null;
+    let sessionDept: string | null = null;
+    try {
+      const session = await userSession();
+      sessionEmail = session?.email ?? null;
+      sessionDept = session?.slDept ?? null;
+    } catch (e) {
+      console.log("[DOC] userSession() failed");
     }
 
-    const deptLower = decideDept({
-      requestedDept: undefined,
-      userEmail: email,
-    });
+    email =
+      headerEmail ||
+      tokenEmail ||
+      sessionEmail ||
+      (process.env.SL_LOCAL_DEFAULT_EMAIL ?? null);
+    email = getEffectiveSlUserEmail(email);
+
+    const deptLower = email
+      ? resolveSlAccess(email).dept
+      : sessionDept?.trim().toLowerCase() ||
+        decideDept({ requestedDept: undefined, userEmail: email });
+    const userHash = email ? hashValue(email) : null;
 
     console.log("[DOC] email =", email);
     console.log("[DOC] deptLower =", deptLower);
+    console.log("[DOC] userHash =", userHash ? "***" : "(none)");
 
-    const results = await SearchAzureAISimilarDocuments(req, deptLower);
+    const results = await SearchAzureAISimilarDocuments(req, deptLower, userHash);
 
     let data: any;
     if (results instanceof Response) {
@@ -40,18 +64,11 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json(
       { error: true, message: err?.message ?? "Internal error" },
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-      }
+      { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
     );
   }
 }
 
 function safeParse(t: string) {
-  try {
-    return JSON.parse(t);
-  } catch {
-    return { raw: t };
-  }
+  try { return JSON.parse(t); } catch { return { raw: t }; }
 }

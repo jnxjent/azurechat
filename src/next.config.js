@@ -2,10 +2,21 @@
 const nextConfig = {
   output: "standalone",
 
+  // standalone ビルドに含めるファイルを明示（pdfjs worker と Python スクリプト）
+  outputFileTracingIncludes: {
+    "/*": [
+      "./node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
+      "./src/scripts/**/*.py",
+      "./scripts/**/*.py",
+    ],
+  },
+
   experimental: {
     serverComponentsExternalPackages: [
       "@azure/storage-blob",
-      "@napi-rs/canvas", // ← 追加
+      "@napi-rs/canvas",
+      "pdfjs-dist",
+      "xlsx",
     ],
   },
 
