@@ -11,7 +11,10 @@ import { uniqueId } from "@/features/common/util";
 import { SqlQuerySpec } from "@azure/cosmos";
 import { EnsureIndexIsCreated } from "./azure-ai-search/azure-ai-search";
 import { CHAT_DOCUMENT_ATTRIBUTE, ChatDocumentModel } from "./models";
-import { UploadBlob } from "@/features/common/services/azure-storage";
+import {
+  GenerateSasUrl,
+  UploadBlob,
+} from "@/features/common/services/azure-storage";
 
 // ─────────────────────────────────────────────
 // アップロード上限（バイト）
@@ -46,11 +49,16 @@ const CHUNK_OVERLAP = CHUNK_SIZE * 0.25;
 const DOCUMENT_CONTAINER_NAME = "dl-link";
 
 export const UploadDocumentToStore = async (
-  threadId: string,
+  _threadId: string,
   fileName: string,
   fileData: Buffer
 ): Promise<ServerActionResponse<string>> => {
-  return await UploadBlob(DOCUMENT_CONTAINER_NAME, fileName, fileData);
+  const uploadResponse = await UploadBlob(DOCUMENT_CONTAINER_NAME, fileName, fileData);
+  if (uploadResponse.status !== "OK") {
+    return uploadResponse;
+  }
+
+  return await GenerateSasUrl(DOCUMENT_CONTAINER_NAME, fileName);
 };
 
 export const UploadDocument = async (formData: FormData) => {
@@ -101,6 +109,112 @@ export const CrackDocument = async (
   }
 };
 
+// ---------- Excel (.xlsx / .xlsm) テキスト抽出 ----------
+async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const XLSX = require("xlsx");
+
+  const workbook = XLSX.read(Buffer.from(buffer), {
+    type: "buffer",
+    cellFormula: false, // 数式は読まない（値のみ）
+    cellHTML: false,
+    cellNF: false,
+    sheetStubs: false,
+  });
+
+  const docs: string[] = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+
+    // シート全体をJSON（行の配列）に変換
+    const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,          // 1-based配列形式（ヘッダー行も含む）
+      defval: "",         // 空セルは空文字
+      blankrows: false,   // 完全空行はスキップ
+    });
+
+    if (!rows.length) continue;
+
+    const lines: string[] = [`=== シート: ${sheetName} ===`];
+
+    for (const row of rows) {
+      // undefined/null を空文字に変換し、区切り文字「|」で結合
+      const cells = row.map((cell) => {
+        if (cell === null || cell === undefined) return "";
+        // Dateオブジェクトは日付文字列に変換
+        if (cell instanceof Date) return cell.toLocaleDateString("ja-JP");
+        return String(cell).trim();
+      });
+      // 全セルが空の行はスキップ
+      if (cells.every((c) => c === "")) continue;
+      lines.push(cells.join(" | "));
+    }
+
+    if (lines.length > 1) {
+      docs.push(lines.join("\n"));
+    }
+  }
+
+  return docs;
+}
+
+// Excel拡張子判定
+function isExcelFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return lower.endsWith(".xlsx") || lower.endsWith(".xlsm");
+}
+
+// Word拡張子判定（.docx のみ対応。旧形式 .doc は非対応）
+function isWordFile(fileName: string): boolean {
+  return fileName.toLowerCase().endsWith(".docx");
+}
+
+function _decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"');
+}
+
+async function extractWordText(buffer: ArrayBuffer): Promise<string[]> {
+  try {
+    const JSZipModule = await import("jszip");
+    const JSZip = JSZipModule.default ?? JSZipModule;
+    const zip = await (JSZip as any).loadAsync(Buffer.from(new Uint8Array(buffer)));
+
+    const fileKeys = Object.keys(zip.files);
+    console.log(`[extractWordText] zip entries (first 10):`, fileKeys.slice(0, 10));
+
+    const docXml = await zip.files["word/document.xml"]?.async("string");
+    if (!docXml) {
+      console.warn(`[extractWordText] word/document.xml not found in zip`);
+      return [];
+    }
+
+    const paragraphs: string[] = [];
+    const paraRe = /<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g;
+    let pm: RegExpExecArray | null;
+    while ((pm = paraRe.exec(docXml)) !== null) {
+      const paraXml = pm[0];
+      const textRe = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+      let text = "";
+      let tm: RegExpExecArray | null;
+      while ((tm = textRe.exec(paraXml)) !== null) {
+        text += _decodeXmlEntities(tm[1]);
+      }
+      if (text.trim()) paragraphs.push(text.trim());
+    }
+    console.log(`[extractWordText] extracted ${paragraphs.length} paragraphs`);
+    return paragraphs;
+  } catch (e: any) {
+    console.error(`[extractWordText] failed:`, String(e?.message ?? e));
+    return [];
+  }
+}
+
 const LoadFile = async (
   formData: FormData
 ): Promise<ServerActionResponse<string[]>> => {
@@ -108,13 +222,46 @@ const LoadFile = async (
     const file: File | null = formData.get("file") as unknown as File;
 
     if (file && file.size < MAX_UPLOAD_DOCUMENT_SIZE) {
-      const client = DocumentIntelligenceInstance();
+      const buffer = await file.arrayBuffer();
 
-      const blob = new Blob([file], { type: file.type });
+      // Excel ファイル (.xlsx / .xlsm) は SheetJS で全シート抽出
+      if (isExcelFile(file.name)) {
+        console.log(`[LoadFile] Excel extraction: ${file.name}`);
+        const docs = await extractExcelText(buffer);
+        if (!docs.length) {
+          return {
+            status: "ERROR",
+            errors: [{ message: "Excelファイルの内容が空か読み取れませんでした。" }],
+          };
+        }
+        return { status: "OK", response: docs };
+      }
+
+      // Word ファイル (.docx) は JSZip でテキスト抽出を試みる
+      if (isWordFile(file.name)) {
+        console.log(`[LoadFile] Word extraction: ${file.name}`);
+        const docs = await extractWordText(buffer);
+        if (docs.length > 0) {
+          return { status: "OK", response: docs };
+        }
+        // テキスト0件 = 画像埋め込み型Word（EMF等）
+        // 旧SDK (ai-form-recognizer) はDOCX非対応のためDIには渡さず、案内メッセージを返す
+        console.log(`[LoadFile] Word has no text (image-based docx). Returning guidance.`);
+        return {
+          status: "OK",
+          response: [
+            "このWordファイルは画像埋め込み型のため、テキストとして読み取ることができませんでした。",
+            "PDFとして保存してアップロードするか、「このWordをExcelに変換して」と指示することで表データを抽出できます。",
+          ],
+        };
+      }
+
+      // その他のファイルは Azure Document Intelligence で抽出
+      const client = DocumentIntelligenceInstance();
 
       const poller = await client.beginAnalyzeDocument(
         "prebuilt-read",
-        await blob.arrayBuffer()
+        buffer
       );
       const { paragraphs } = await poller.pollUntilDone();
 

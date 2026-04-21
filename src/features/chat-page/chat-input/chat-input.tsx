@@ -33,13 +33,9 @@ import {
   useTextToSpeech,
 } from "./speech/use-text-to-speech";
 
-// ★ 思考モードトグル（3段階：標準→熟考→即答）
-//import {
-//ModeCycleButton,
-//type ThinkingMode,
-//} from "@/components/chatModeToggle";
+type UploadScope = "common" | "personal";
 
-export const ChatInput = () => {
+export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
   const { loading, input, chatThreadId } = useChat();
   const { uploadButtonLabel } = useFileStore();
   const { isPlaying } = useTextToSpeech();
@@ -49,20 +45,13 @@ export const ChatInput = () => {
   const submitButton = React.useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
-  // ★ モードは ChatInput 側で保持（hidden input で route に渡す）
   const mode = "standard";
 
-  // ★ 管理者判定
+  // ★ 管理者判定（セッションのisAdminを使用 - ビルド時env不要）
   const { data: session } = useSession();
-  const adminEmails = (process.env.NEXT_PUBLIC_SL_ADMIN_EMAILS ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  const me = (session?.user as any)?.email?.toLowerCase?.() ?? "";
-  const isAdmin = adminEmails.includes(me);
+  const isAdmin = isAdminProp ?? Boolean((session?.user as any)?.isAdmin);
 
-
-  const [uploadTarget, setUploadTarget] = useState<"cp" | "common" | "others">("cp");
+  const [uploadScope, setUploadScope] = useState<UploadScope>("personal");
 
   const submit = () => {
     if (formRef.current) {
@@ -79,7 +68,6 @@ export const ChatInput = () => {
       }}
       status={uploadButtonLabel}
     >
-      {/* ★ サーバに確実に届くよう hidden input を同送 */}
       <input type="hidden" name="thinkingMode" value={mode} />
 
       <ChatTextInput
@@ -108,35 +96,40 @@ export const ChatInput = () => {
               fileStore.onFileChange({
                 formData,
                 chatThreadId,
-                dept: isAdmin ? uploadTarget : undefined,
+                uploadScope: isAdmin ? uploadScope : undefined,
               })
             }
           />
+
           <PromptSlider />
 
-          {/* ★ 管理者のみ：アップロード先トグル */}
+          {/* ★ 管理者のみ：アップロード先トグル（共通 / 個人） */}
           {isAdmin && (
             <div className="flex items-center gap-1 text-xs text-muted-foreground">
               <span>UP先:</span>
-              {(["cp", "common", "others"] as const).map((t) => (
+
+              {(
+                [
+                  { value: "common" as const, label: "共通" },
+                  { value: "personal" as const, label: "個人" },
+                ] as const
+              ).map((item) => (
                 <button
-                  key={t}
+                  key={item.value}
                   type="button"
-                  onClick={() => setUploadTarget(t)}
+                  onClick={() => setUploadScope(item.value)}
                   className={`px-2 py-0.5 rounded border text-xs transition-colors ${
-                    uploadTarget === t
+                    uploadScope === item.value
                       ? "bg-primary text-primary-foreground border-primary"
                       : "border-muted-foreground hover:bg-muted"
                   }`}
+                  aria-pressed={uploadScope === item.value}
                 >
-                  {t.toUpperCase()}
+                  {item.label}
                 </button>
               ))}
             </div>
           )}
-
-          {/* ★ 思考モードトグル（標準→熟考→即答→…） */}
-          {/*<ModeCycleButton value={mode} onChange={setMode} />*/}
         </ChatInputSecondaryActionArea>
 
         <ChatInputPrimaryActionArea>

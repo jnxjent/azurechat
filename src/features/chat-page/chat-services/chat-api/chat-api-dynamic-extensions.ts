@@ -2,7 +2,7 @@
 import "server-only";
 
 import { ServerActionResponse } from "@/features/common/server-action-response";
-import { userHashedId } from "@/features/auth-page/helpers";
+import { userHashedId, userSession } from "@/features/auth-page/helpers";
 import {
   FindAllExtensionForCurrentUser,
   FindSecureHeaderValue,
@@ -23,18 +23,16 @@ function looksJsonContentType(ct?: string | null) {
 
 async function parseJsonSafe(res: Response): Promise<any> {
   const ct = res.headers.get("content-type");
-  const raw = await res.text(); // 先にテキストで読む（デバッグしやすさ優先）
+  const raw = await res.text();
   if (looksJsonContentType(ct)) {
     try {
       return JSON.parse(raw);
     } catch (e) {
-      // JSON宣言だが壊れている
       throw new Error(
         `Failed to parse JSON (declared as JSON). ParseError=${(e as Error).message}. BodySnippet=${raw.slice(0, 500)}`
       );
     }
   }
-  // JSON以外（HTMLなど）
   throw new Error(
     `Non-JSON response. Content-Type="${ct ?? "unknown"}". BodySnippet=${raw
       .replace(/\s+/g, " ")
@@ -108,26 +106,38 @@ async function executeFunction(props: {
       value: await userHashedId(),
     });
 
-    // 3) ヘッダ辞書化
+    // 3) ログインユーザーのemailをヘッダーに付与
+    const currentUser = await userSession().catch(() => null);
+    const loginEmail = currentUser?.email ?? "";
+    if (loginEmail) {
+      headerItems.push({
+        id: "x-user-email",
+        key: "x-user-email",
+        value: loginEmail,
+      });
+      console.log("[EXT] Attaching x-user-email:", loginEmail);
+    } else {
+      console.log("[EXT] x-user-email not available");
+    }
+
+    // 4) ヘッダ辞書化
     const headers: Record<string, string> = headerItems.reduce(
       (acc, h) => ((acc[h.key] = h.value), acc),
       {} as Record<string, string>
     );
 
-    // 4) クエリ置換（エンドポイント文字列をコピーしてから置換）
+    // 5) クエリ置換
     let endpoint = functionModel.endpoint;
     if (args?.query && typeof args.query === "object") {
       for (const key of Object.keys(args.query)) {
-        // {city} のようなテンプレートを想定： "…?q={city}" -> 値に置換
         const val = String(args.query[key] ?? "");
         const safe = encodeURIComponent(val);
         endpoint = endpoint.replace(new RegExp(`{${key}}`, "g"), safe);
-        // 後方互換：単純な key マッチにも対応（既存実装踏襲）
         endpoint = endpoint.replace(new RegExp(`${key}`, "g"), safe);
       }
     }
 
-    // 5) リクエスト構築
+    // 6) リクエスト構築
     const requestInit: RequestInit = {
       method: functionModel.endpointType,
       headers,
@@ -135,17 +145,16 @@ async function executeFunction(props: {
     };
     if (args?.body) {
       requestInit.body = JSON.stringify(args.body);
-      // JSON 送信であることを明示（既に付いているなら上書きしない）
       if (!Object.keys(headers).some((k) => k.toLowerCase() === "content-type")) {
         (requestInit.headers as Record<string, string>)["content-type"] =
           "application/json";
       }
     }
 
-    // 6) 呼び出し
+    // 7) 呼び出し
     const response = await fetch(endpoint, requestInit);
 
-    // 7) ステータスエラーは本文をスニペットで返す（HTMLでも可視化）
+    // 8) ステータスエラー
     if (!response.ok) {
       const ct = response.headers.get("content-type");
       const body = await response.text();
@@ -163,7 +172,6 @@ async function executeFunction(props: {
       return `There was an error calling the api: ${response.status} ${response.statusText}. URL=${endpoint}. Snippet=${hint}`;
     }
 
-    // 8) JSON以外の本文（HTMLなど）に対する保護：JSONとして読めなければ詳細を投げる
     const result = await parseJsonSafe(response);
 
     return {
@@ -171,7 +179,6 @@ async function executeFunction(props: {
       result,
     };
   } catch (e: any) {
-    // 9) ランタイム例外（<!DOCTYPE…>含む）を安全に文字列化
     const msg = e?.message || String(e);
     console.error("🔴 executeFunction error:", msg);
     return `There was an error calling the api: ${msg}`;
