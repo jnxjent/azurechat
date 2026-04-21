@@ -3,8 +3,9 @@ import NextAuth, { NextAuthOptions } from "next-auth";
 import AzureADProvider from "next-auth/providers/azure-ad";
 import CredentialsProvider from "next-auth/providers/credentials";
 import GitHubProvider from "next-auth/providers/github";
-import type { Provider } from "next-auth/providers/index";
+import type { Provider } from "next-auth/providers/index";  // ← 修正
 import { hashValue } from "@/features/auth-page/helpers";
+import { getEffectiveSlUserEmail, resolveSlAccess } from "@/lib/sl-dept";
 
 const AAD_SCOPE = [
   "openid",
@@ -15,12 +16,22 @@ const AAD_SCOPE = [
   "Files.ReadWrite",
 ].join(" ");
 
+function resolveLocalDevEmail(username?: string | null): string {
+  const fallbackUsername = (username ?? "dev").trim() || "dev";
+  return (
+    process.env.SL_LOCAL_DEFAULT_EMAIL ??
+    process.env.NEXT_PUBLIC_DEV_USER_EMAIL ??
+    `${fallbackUsername}@localhost`
+  );
+}
+
 const configureIdentityProvider = () => {
   const providers: Array<Provider> = [];
 
-  const adminEmails = process.env.ADMIN_EMAIL_ADDRESS
-    ?.split(",")
-    .map((email) => email.toLowerCase().trim());
+  const adminEmails = [
+    ...(process.env.SL_ADMIN_EMAILS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+    ...(process.env.ADMIN_EMAIL_ADDRESS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+  ];
 
   if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
     providers.push(
@@ -76,12 +87,17 @@ const configureIdentityProvider = () => {
         },
         async authorize(credentials) {
           const username = credentials?.username || "dev";
-          const email = `${username}@localhost`;
+          // NEXT_PUBLIC_DEV_USER_EMAIL が設定されていればそのメールを使う（SL ロール判定のため）
+          const email = resolveLocalDevEmail(username);
+          const adminEmails = [
+            ...(process.env.SL_ADMIN_EMAILS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+            ...(process.env.ADMIN_EMAIL_ADDRESS?.split(",").map((e) => e.toLowerCase().trim()).filter(Boolean) ?? []),
+          ];
           const user = {
             id: hashValue(email),
             name: username,
             email,
-            isAdmin: false,
+            isAdmin: adminEmails.includes(email.toLowerCase()),
             image: "",
           };
           console.log("=== DEV USER LOGGED IN ===\n", JSON.stringify(user, null, 2));
@@ -139,7 +155,6 @@ async function refreshAzureADAccessToken(token: any) {
   }
 }
 
-// ✅ options のみ export（NextAuth の呼び出しは route.ts で行う）
 export const options: NextAuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
   providers: [...configureIdentityProvider()],
@@ -151,6 +166,18 @@ export const options: NextAuthOptions = {
         token.email = (user as any).email ?? token.email;
         token.name = (user as any).name ?? token.name;
         (token as any).picture = (user as any).image ?? (token as any).picture;
+
+        // ★ SlRole / SlDept をトークンに保存（サインイン時に1回計算）
+        try {
+          const emailForRole = getEffectiveSlUserEmail(
+            String((user as any).email ?? token.email ?? "")
+          );
+          const access = resolveSlAccess(emailForRole);
+          (token as any).slRole = access.role;
+          (token as any).slDept = access.dept;
+        } catch {
+          // SL_DEPTS / SL_DEPT_DEFAULT 未設定時はスキップ（バッジ非表示）
+        }
       }
 
       const p: any = profile ?? {};
@@ -185,6 +212,8 @@ export const options: NextAuthOptions = {
         session.user.email = token.email as string;
         session.user.name = token.name as string;
         (session.user as any).image = (token as any).picture as string;
+        session.user.slRole = (token as any).slRole;
+        session.user.slDept = (token as any).slDept;
       }
       (session as any).accessToken = (token as any).accessToken;
       (session as any).accessTokenExpiresAt = (token as any).accessTokenExpiresAt;
@@ -192,9 +221,7 @@ export const options: NextAuthOptions = {
       return session;
     },
   },
-
   session: {
     strategy: "jwt",
   },
 };
-// ↑ ここで終わり。末尾の export const { auth } = NextAuth(options); は削除済み
