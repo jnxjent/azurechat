@@ -124,8 +124,11 @@ async function buildSearchAclFilter(
   console.log("[ACL] slPersonalFilter =", slPersonalFilter);
   console.log("[ACL] slLegacyFilter =", slLegacyFilter);
 
-  // SharePoint対応ユーザーは SharePoint由来の文書のみ検索対象にする。
-  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
+  // 自分自身がアップした非SL Blob文書（isSlDoc=false, user=自分）も常に含める。
+  // SP対応部署でも global_admin のような部署メアドなしユーザーが Blob アップした場合に対応。
+  const blobOwnFilter = `(isSlDoc ne true and user eq '${u}')`;
+
+  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter} or ${blobOwnFilter})`;
     console.log("[ACL] FINAL FILTER =", finalAcl);
     return finalAcl;
 
