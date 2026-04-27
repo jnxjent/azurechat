@@ -97,10 +97,10 @@ async function buildSearchAclFilter(
   const resolvedUserHash = userHash ?? (await userHashedId());
   const u = escapeODataValue(resolvedUserHash);
 
-  // 非SP部署（others等）はSL文書を検索対象外
+  // 非SP部署（others等）は自分のBlobと全社共通SL文書のみ
   if (!isSharePointEnabledDept(normalizedDept)) {
-    console.log("[ACL] non-SP dept, SL docs excluded:", normalizedDept);
-    return `((isSlDoc ne true and user eq '${u}'))`;
+    console.log("[ACL] non-SP dept, only personal Blob + global_common:", normalizedDept);
+    return `((isSlDoc ne true and user eq '${u}') or (isSlDoc eq true and slScope eq 'global_common'))`;
   }
 
   const d = escapeODataValue(normalizedDept);
