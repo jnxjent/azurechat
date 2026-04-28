@@ -22,19 +22,12 @@ interface ChatPageProps {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
-  isAdmin?: boolean; // ★ 追加
+  isAdmin: boolean; // ← 追加
 }
 
 // ChatMessageArea が受け取れるロール（UI 用）
 type ChatUiRole = "user" | "system" | "assistant" | "tool";
 
-/**
- * ChatMessageModel の role（ChatRole）を
- * UI 用のロールに正規化する。
- *
- * - "function" は UI では "assistant" として扱う
- * - それ以外はそのまま通す
- */
 function toUiRole(role: ChatMessageModel["role"]): ChatUiRole {
   if (role === "function") {
     return "assistant";
@@ -45,13 +38,8 @@ function toUiRole(role: ChatMessageModel["role"]): ChatUiRole {
 export const ChatPage: FC<ChatPageProps> = (props) => {
   const { data: session } = useSession();
 
-  // ★ 管理者判定
-  const adminEmails = (process.env.NEXT_PUBLIC_SL_ADMIN_EMAILS ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  const me = (session?.user as any)?.email?.toLowerCase?.() ?? "";
-  const isAdmin = adminEmails.includes(me);
+  // Server Component 側で確定済みの isAdmin を使う
+  const isAdmin = props.isAdmin;
 
   useEffect(() => {
     chatStore.initChatSession({
@@ -73,7 +61,7 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
         chatThread={props.chatThread}
         chatDocuments={props.chatDocuments}
         extensions={props.extensions}
-        isAdmin={isAdmin} // ★ 追加
+        isAdmin={isAdmin}
       />
       <ChatMessageContainer ref={current}>
         <ChatMessageContentArea>
@@ -99,7 +87,7 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
           {loading === "loading" && <ChatLoading />}
         </ChatMessageContentArea>
       </ChatMessageContainer>
-      <ChatInput />
+      <ChatInput isAdmin={isAdmin} />
     </main>
   );
 };
