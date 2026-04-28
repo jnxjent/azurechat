@@ -184,7 +184,7 @@ class FileStore {
         let index = 0;
         const documentIndexResponses: Array<ServerActionResponse<boolean>> = [];
         const searchableFileUrl = spWebUrl ?? uploadResponse.response;
-        const downloadableFileUrl = uploadResponse.response;
+        const effectiveFileUrl = spWebUrl ?? uploadResponse.response;
 
         for (const doc of crackingResponse.response) {
           this.uploadButtonLabel = `Indexing document [${index + 1}]/[${
@@ -202,7 +202,7 @@ class FileStore {
             actualDept,
             actualIsSlDoc,
             actualUploadScope,
-            downloadableFileUrl,
+            effectiveFileUrl,
             spItemId
           );
 
