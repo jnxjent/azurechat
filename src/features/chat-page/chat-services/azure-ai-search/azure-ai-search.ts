@@ -1,7 +1,7 @@
 "use server";
 import "server-only";
-
 import { userHashedId } from "@/features/auth-page/helpers";
+import { isSharePointEnabledDept } from "@/lib/sl-dept";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import {
   AzureAISearchIndexClientInstance,
@@ -23,8 +23,13 @@ export interface AzureSearchDocumentIndex {
   chatThreadId: string;
   metadata: string;
   fileUrl: string;
+  effectiveFileUrl?: string | null;
   dept: string;
   isSlDoc: boolean | null;
+  slScope?: "global_common" | "dept_common" | "personal" | null;
+  slOwner?: string | null;
+  /** SharePoint drive item ID。ファイル移動後もIDは不変のため、sync時の追跡に使用 */
+  spItemId?: string | null;
 }
 
 export type DocumentSearchResponse = {
@@ -43,19 +48,42 @@ function combineFilters(a?: string, b?: string): string | undefined {
   if (!aa) return bb || undefined;
   if (!bb) return aa || undefined;
 
-  return `(${aa}) and (${bb})`;
+  const combined = `(${aa}) and (${bb})`;
+  console.log("[SEARCH] combineFilters base =", aa || "(none)");
+  console.log("[SEARCH] combineFilters acl =", bb || "(none)");
+  console.log("[SEARCH] combineFilters result =", combined);
+  return combined;
+}
+
+type UploadScope = "global_common" | "dept_common" | "personal";
+
+function normalizeUploadScope(value?: string | null): UploadScope {
+  const v = (value ?? "").toLowerCase().trim();
+
+  if (v === "global_common") return "global_common";
+  if (v === "dept_common") return "dept_common";
+  if (v === "personal") return "personal";
+
+  // 旧値互換
+  if (v === "common") return "dept_common";
+  if (v === "cp") return "personal";
+
+  return "personal";
 }
 
 /**
- * ACL統一関数
- * - 個人文書: isSlDoc != true かつ user一致
- * - SL文書  : isSlDoc == true かつ dept一致 or common
+ * ACL統一関数（3Scope版）
  *
- * 使い分け:
- * - deptLower === null      → ACLを付けない（明示的無効化）
- * - deptLower === undefined → fallbackで "others"
- * - userHash が渡された場合はそれを使う（Route Handler経由）
- * - userHash が未指定の場合は userHashedId() を呼ぶ（Server Action経由）
+ * 非SL文書:
+ *   isSlDoc != true and user == 自分
+ *
+ * SL文書:
+ *   global_common : 全員
+ *   dept_common   : 自部署
+ *   personal      : 自部署 + 自分
+ *
+ * 旧SL文書互換:
+ *   slScope/slOwner 未設定なら dept一致で暫定許可
  */
 async function buildSearchAclFilter(
   deptLower?: string | null,
@@ -64,14 +92,49 @@ async function buildSearchAclFilter(
   if (deptLower === null) return undefined;
 
   const normalizedDept = (deptLower ?? "others").toLowerCase().trim();
-  const d = escapeODataValue(normalizedDept);
+  console.log("[ACL] buildSearchAclFilter called, normalizedDept =", normalizedDept);
 
   const resolvedUserHash = userHash ?? (await userHashedId());
+  const u = escapeODataValue(resolvedUserHash);
 
-  const userFilter = `(isSlDoc ne true and user eq '${escapeODataValue(resolvedUserHash)}')`;
-  const deptFilter = `(isSlDoc eq true and (dept eq '${d}' or dept eq 'common'))`;
+  // 非SP部署（others等）は自分のBlobと全社共通SL文書のみ
+  if (!isSharePointEnabledDept(normalizedDept)) {
+    console.log("[ACL] non-SP dept, only personal Blob + global_common:", normalizedDept);
+    return `((isSlDoc ne true and user eq '${u}') or (isSlDoc eq true and slScope eq 'global_common'))`;
+  }
 
-  return `(${userFilter} or ${deptFilter})`;
+  const d = escapeODataValue(normalizedDept);
+
+  const slGlobalCommonFilter =
+    `(isSlDoc eq true and slScope eq 'global_common')`;
+
+  const slDeptCommonFilter =
+    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'dept_common')`;
+
+  const slPersonalFilter =
+    `(isSlDoc eq true and dept eq '${d}' and slScope eq 'personal' and slOwner eq '${u}')`;
+
+  const slLegacyFilter =
+    `(isSlDoc eq true and dept eq '${d}' and (slScope eq null or slScope eq '' or (slScope eq 'personal' and slOwner eq null)))`;
+
+  console.log("[ACL] resolvedUserHash =", resolvedUserHash);
+  console.log("[ACL] normalizedDept =", normalizedDept);
+  console.log("[ACL] slGlobalCommonFilter =", slGlobalCommonFilter);
+  console.log("[ACL] slDeptCommonFilter =", slDeptCommonFilter);
+  console.log("[ACL] slPersonalFilter =", slPersonalFilter);
+  console.log("[ACL] slLegacyFilter =", slLegacyFilter);
+
+  // 自分自身がアップした非SL Blob文書（isSlDoc=false, user=自分）も常に含める。
+  // SP対応部署でも global_admin のような部署メアドなしユーザーが Blob アップした場合に対応。
+  const blobOwnFilter = `(isSlDoc ne true and user eq '${u}')`;
+
+  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter} or ${blobOwnFilter})`;
+    console.log("[ACL] FINAL FILTER =", finalAcl);
+    return finalAcl;
+
+  
+
+  
 }
 
 // -------------------------------------------------------
@@ -81,7 +144,8 @@ async function buildSearchAclFilter(
 export const SimpleSearch = async (
   searchText?: string,
   filter?: string,
-  deptLower?: string | null
+  deptLower?: string | null,
+  top?: number
 ): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
@@ -91,6 +155,7 @@ export const SimpleSearch = async (
 
     const searchResults = await instance.search(searchText ?? "*", {
       filter: finalFilter,
+      ...(top !== undefined ? { top } : {}),
     });
 
     const results: Array<DocumentSearchResponse> = [];
@@ -165,7 +230,7 @@ export const ExtensionSimilaritySearch = async (props: {
   indexName: string;
   filter?: string;
   deptLower?: string | null;
-  userHash?: string; // Route Handler経由で渡すuserHash
+  userHash?: string;
 }): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const openai = OpenAIEmbeddingInstance();
@@ -195,10 +260,11 @@ export const ExtensionSimilaritySearch = async (props: {
       { allowInsecureConnection: process.env.NODE_ENV === "development" }
     );
 
-    // userHash を外から受け取り buildSearchAclFilter に渡す
     const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
     const finalFilter = combineFilters(filter, scopeFilter);
 
+    console.log("[SEARCH:Extension] inputFilter =", filter ?? "(none)");
+    console.log("[SEARCH:Extension] scopeFilter =", scopeFilter ?? "(none)");
     console.log("[SEARCH:Extension] deptLower =", deptLower);
     console.log("[SEARCH:Extension] userHash =", userHash ? "***" : "(none)");
     console.log("[SEARCH:Extension] finalFilter =", finalFilter);
@@ -252,11 +318,18 @@ export const IndexDocuments = async (
   docs: string[],
   chatThreadId: string,
   dept: string,
-  isSlDoc: boolean
+  isSlDoc: boolean,
+  uploadScope?: string,
+  effectiveFileUrl?: string,
+  spItemId?: string | null
 ): Promise<Array<ServerActionResponse<boolean>>> => {
   try {
     const documentsToIndex: AzureSearchDocumentIndex[] = [];
     const currentUserHash = await userHashedId();
+    const normalizedDept = (dept ?? "others").toLowerCase().trim();
+    // "common" dept は global_admin が全社共有 SP にアップしたもの → global_common 扱い
+    const normalizedScope =
+      normalizedDept === "common" ? "global_common" : normalizeUploadScope(uploadScope);
 
     for (const doc of docs) {
       documentsToIndex.push({
@@ -266,9 +339,14 @@ export const IndexDocuments = async (
         pageContent: doc,
         metadata: fileName,
         fileUrl,
+        effectiveFileUrl: effectiveFileUrl ?? fileUrl,
         embedding: [],
-        dept: (dept ?? "others").toLowerCase().trim(),
+        dept: normalizedDept,
         isSlDoc,
+        slScope: isSlDoc ? normalizedScope : null,
+        slOwner:
+          isSlDoc && normalizedScope === "personal" ? currentUserHash : null,
+        spItemId: spItemId ?? null,
       });
     }
 

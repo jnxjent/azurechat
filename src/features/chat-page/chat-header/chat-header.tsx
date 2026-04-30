@@ -1,7 +1,8 @@
 "use client";
+
 import { ExtensionModel } from "@/features/extensions-page/extension-services/models";
 import { CHAT_DEFAULT_PERSONA } from "@/features/theme/theme-config";
-import { VenetianMask, RefreshCw } from "lucide-react";
+import { RefreshCw, VenetianMask } from "lucide-react";
 import { FC, useState } from "react";
 import { ChatDocumentModel, ChatThreadModel } from "../chat-services/models";
 import { DocumentDetail } from "./document-detail";
@@ -12,8 +13,15 @@ interface Props {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
-  isAdmin?: boolean; // 管理者のみ同期ボタンを表示
+  isAdmin?: boolean;
 }
+
+type SyncRow = {
+  deleted?: number;
+  error?: string;
+  skipped?: string;
+  urlUpdated?: number;
+};
 
 export const ChatHeader: FC<Props> = (props) => {
   const [syncing, setSyncing] = useState(false);
@@ -28,28 +36,53 @@ export const ChatHeader: FC<Props> = (props) => {
   const handleSync = async () => {
     setSyncing(true);
     setSyncResult(null);
+
     try {
-      const res = await fetch("/api/sl/sync-check", {
+      const res = await fetch("/api/sl/sync-check?apply=true", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
+
       const data = await res.json();
       if (data.ok) {
-        // 削除件数の合計を集計
-        const total = Object.values(data.results as Record<string, any>)
-          .filter((r) => !r.error)
-          .reduce((sum, r) => sum + (r.deleted ?? 0), 0);
-        setSyncResult(`✅ 同期完了（${total}件削除）`);
+        const allRows = Object.entries(data.results as Record<string, SyncRow>);
+        const errorDepts = allRows
+          .filter(([, row]) => row.error)
+          .map(([dept]) => dept);
+        const skippedDepts = allRows
+          .filter(([, row]) => row.skipped)
+          .map(([dept, row]) => `${dept}:${row.skipped}`);
+        const okRows = allRows
+          .filter(([, row]) => !row.error)
+          .map(([, row]) => row);
+
+        const updated = okRows.reduce(
+          (sum, row) => sum + (row.urlUpdated ?? 0),
+          0
+        );
+        const deleted = okRows.reduce(
+          (sum, row) => sum + (row.deleted ?? 0),
+          0
+        );
+
+        const parts = [`更新:${updated}件`, `削除:${deleted}件`];
+        if (errorDepts.length > 0) {
+          parts.push(`エラー:${errorDepts.join(",")}`);
+        }
+        if (skippedDepts.length > 0) {
+          parts.push(`スキップ:${skippedDepts.join(",")}`);
+        }
+
+        setSyncResult(parts.join(" "));
       } else {
-        setSyncResult(`❌ エラー: ${data.error}`);
+        setSyncResult(`エラー: ${data.error}`);
       }
     } catch (e: any) {
-      setSyncResult(`❌ エラー: ${e.message}`);
+      setSyncResult(`エラー: ${e.message}`);
     } finally {
       setSyncing(false);
-      // 3秒後にメッセージを消す
-      setTimeout(() => setSyncResult(null), 3000);
+      setTimeout(() => setSyncResult(null), 5000);
     }
   };
 
@@ -64,7 +97,6 @@ export const ChatHeader: FC<Props> = (props) => {
           </span>
         </div>
         <div className="flex gap-2 items-center">
-          {/* 管理者のみIndex同期ボタンを表示 */}
           {props.isAdmin && (
             <div className="flex items-center gap-2">
               {syncResult && (

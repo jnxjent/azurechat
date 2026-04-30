@@ -11,6 +11,8 @@ export const userSession = async (): Promise<UserModel | null> => {
       image: session.user.image!,
       email: session.user.email!,
       isAdmin: session.user.isAdmin!,
+      slRole: session.user.slRole,
+      slDept: session.user.slDept,
     };
   }
 
@@ -36,7 +38,7 @@ export const userHashedId = async (): Promise<string> => {
 
 export const hashValue = (value: string): string => {
   const hash = createHash("sha256");
-  hash.update(value);
+  hash.update(value.trim().toLowerCase());
   return hash.digest("hex");
 };
 
@@ -52,4 +54,6 @@ export type UserModel = {
   image: string;
   email: string;
   isAdmin: boolean;
+  slRole?: "global_admin" | "dept_admin" | "dept_member";
+  slDept?: string;
 };

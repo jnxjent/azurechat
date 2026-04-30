@@ -25,41 +25,41 @@ async function fileToBase64(file: File): Promise<string> {
   });
 }
 
-function normalizeDept(value?: string | null): string {
-  const d = (value ?? "").toLowerCase().trim();
-  return d || "cp";
+type UploadScope = "common" | "personal";
+
+/**
+ * uploadScope の正規化
+ * - common / personal を正式値とする
+ * - 旧値 cp は personal として吸収
+ * - 未指定も personal 扱い
+ */
+function normalizeUploadScope(value?: string | null): UploadScope {
+  const v = (value ?? "").toLowerCase().trim();
+
+  if (v === "common") return "common";
+  if (v === "personal") return "personal";
+  if (v === "cp") return "personal";
+
+  return "personal";
 }
 
 /**
- * アップロード先 dept の決定
- * 優先順位: props.dept（トグル選択） > NEXT_PUBLIC_SL_DEPT（従来） > "cp"
+ * フロント側の希望 uploadScope
+ * 優先順位:
+ * 1) props.uploadScope
+ * 2) 旧 env 値（互換）
+ * 3) personal
  */
-function resolveUploadDept(propsDept?: string): string {
-  const fromProps = normalizeDept(propsDept);
-  if (propsDept && fromProps) return fromProps;
+function resolveRequestedUploadScope(propsUploadScope?: string): UploadScope {
+  const fromProps = normalizeUploadScope(propsUploadScope);
+  if (propsUploadScope) return fromProps;
 
-  const fromEnv = normalizeDept(process.env.NEXT_PUBLIC_SL_DEPT);
-  return fromEnv || "cp";
+  const fromEnv = normalizeUploadScope(process.env.NEXT_PUBLIC_SL_DEPT);
+  return fromEnv;
 }
 
-/**
- * SL文書かどうかの判定
- * NEXT_PUBLIC_SL_DEPT_NON_SP に設定された dept は SP未対応 → isSlDoc=false
- * それ以外は SP対応部署 → isSlDoc=true
- */
-function resolveIsSlDoc(uploadDept: string): boolean {
-  const nonSpDept = (process.env.NEXT_PUBLIC_SL_DEPT_NON_SP ?? "others")
-    .toLowerCase()
-    .trim();
-  return uploadDept !== nonSpDept;
-}
-
-// SharePointへ同期コピー
-// 戻り値: null = SL無効（スキップ）, オブジェクト = 成功, throw = エラー
-async function publishToSharePoint(
-  file: File,
-  dept: string
-): Promise<{ ok: true; dept?: string; webUrl?: string; name?: string } | null> {
+// SharePointへ同期コピー（失敗したらthrow）
+async function publishToSharePoint(file: File, uploadScope: UploadScope) {
   const fileBase64 = await fileToBase64(file);
 
   const r = await fetch("/api/sl/publish", {
@@ -68,29 +68,26 @@ async function publishToSharePoint(
     body: JSON.stringify({
       fileName: file.name,
       fileBase64,
-      dept,
+      uploadScope,
     }),
   });
-
-  // ★ SL無効時（NEXT_PUBLIC_SL_ENABLED=false）はサーバが404を返す
-  // → エラーにせずnullを返してスキップ
-  if (r.status === 404) {
-    console.log("[SL] publish disabled, skipping SharePoint sync");
-    return null;
-  }
 
   const json = await r.json().catch(() => ({}));
 
   if (!r.ok || !json?.ok) {
-    const msg = json?.error || `SharePoint publish failed (status=${r.status})`;
+    const msg =
+      json?.error || `SharePoint publish failed (status=${r.status})`;
     throw new Error(msg);
   }
 
   return json as {
     ok: true;
     dept?: string;
+    uploadScope?: UploadScope;
+    isSharePointEnabled?: boolean;
     webUrl?: string;
     name?: string;
+    spItemId?: string | null;
   };
 }
 
@@ -100,9 +97,9 @@ class FileStore {
   public async onFileChange(props: {
     formData: FormData;
     chatThreadId: string;
-    dept?: string;
+    uploadScope?: string; // トグルから渡す
   }) {
-    const { formData, chatThreadId, dept: requestedDept } = props;
+    const { formData, chatThreadId, uploadScope: requestedScopeRaw } = props;
 
     try {
       chatStore.updateLoading("file upload");
@@ -115,8 +112,8 @@ class FileStore {
         return;
       }
 
-      const requestedUploadDept = resolveUploadDept(requestedDept);
-      const requestedIsSlDoc = resolveIsSlDoc(requestedUploadDept);
+      // フロント側の希望値（最終決定はサーバ側）
+      const requestedUploadScope = resolveRequestedUploadScope(requestedScopeRaw);
 
       this.uploadButtonLabel = "Processing document";
       formData.append("fileName", file.name);
@@ -125,61 +122,88 @@ class FileStore {
       const crackingResponse = await CrackDocument(formData);
 
       if (crackingResponse.status === "OK" && uploadResponse.status === "OK") {
-        let actualDept = requestedUploadDept;
-        let actualIsSlDoc = requestedIsSlDoc;
-        let sp:
-          | { ok: true; dept?: string; webUrl?: string; name?: string }
-          | null
-          | undefined;
+        let actualDept = "";
+        let actualIsSlDoc = false;
+        let actualUploadScope: UploadScope = requestedUploadScope;
+        // ★ SP webUrl を保持する変数（SPアップ成功時のみ設定される）
+        let spWebUrl: string | undefined;
+        // ★ SP item ID（移動後もindexと紐付けるための不変ID）
+        let spItemId: string | null = null;
 
-        if (requestedIsSlDoc) {
-          try {
-            this.uploadButtonLabel = "Syncing to SharePoint";
-            sp = await publishToSharePoint(file, requestedUploadDept);
+        try {
+          this.uploadButtonLabel = "Syncing to SharePoint";
 
-            if (sp === null) {
-              // ★ SL無効 → SP syncスキップ、通常indexingへ
-              actualDept = requestedUploadDept;
-              actualIsSlDoc = false;
-              console.log("[SL] SP sync skipped (disabled). Proceeding with normal indexing.");
-            } else {
-              // SP sync成功
-              actualDept = normalizeDept(sp.dept || requestedUploadDept);
-              actualIsSlDoc = resolveIsSlDoc(actualDept);
+          const sp = await publishToSharePoint(file, requestedUploadScope);
 
-              showSuccess({
-                title: "SharePoint sync",
-                description: sp.webUrl
-                  ? `Synced to SharePoint (${actualDept}): ${sp.webUrl}`
-                  : `Synced to SharePoint (${actualDept}): ${sp.name || file.name}`,
-              });
-            }
-          } catch (e: any) {
-            showError(
-              `SharePoint sync failed (index skipped): ${String(
-                e?.message ?? e
-              )}`
-            );
+          // ★ SP webUrl を取得（Index の fileUrl に使う）
+          if (sp.isSharePointEnabled === true && !sp.webUrl) {
+            throw new Error("SharePoint publish succeeded but webUrl was empty.");
+          }
+          spWebUrl = sp.webUrl;
+          spItemId = sp.spItemId ?? null;
+          actualDept = String(sp.dept ?? "").toLowerCase().trim();
+          actualUploadScope = normalizeUploadScope(
+            sp.uploadScope ?? requestedUploadScope
+          );
+          actualIsSlDoc = sp.isSharePointEnabled === true;
+
+          showSuccess({
+            title: "SharePoint sync",
+            description: sp.webUrl
+              ? `Synced to SharePoint (${actualDept || "unknown"} / ${actualUploadScope}): ${sp.webUrl}`
+              : `Synced to SharePoint (${actualDept || "unknown"} / ${actualUploadScope}): ${sp.name || file.name}`,
+          });
+        } catch (e: any) {
+          const msg = String(e?.message ?? e);
+
+          // SP非対応部署は新仕様上ありうる
+          if (
+            msg.includes("not SharePoint-enabled") ||
+            msg.includes("Use Blob upload flow instead")
+          ) {
+            showSuccess({
+              title: "Blob upload",
+              description:
+                `${file.name} uploaded to Blob. ` +
+                `This department is not SharePoint-enabled, so SharePoint sync was skipped.`,
+            });
+
+            // 従来どおり Blob インデックス用
+            actualDept = (
+              process.env.NEXT_PUBLIC_SL_DEPT_NON_SP ?? "others"
+            ).toLowerCase().trim();
+            actualIsSlDoc = false;
+            actualUploadScope = "personal";
+          } else {
+            showError(`SharePoint sync failed (index skipped): ${msg}`);
             return;
           }
         }
 
-        // SharePoint 確定後の dept で Index 作成
+        // SharePoint / Blob の最終状態確定後に Index 作成
         let index = 0;
         const documentIndexResponses: Array<ServerActionResponse<boolean>> = [];
+        const searchableFileUrl = spWebUrl ?? uploadResponse.response;
+        const effectiveFileUrl = spWebUrl ?? uploadResponse.response;
 
         for (const doc of crackingResponse.response) {
           this.uploadButtonLabel = `Indexing document [${index + 1}]/[${
             crackingResponse.response.length
           }]`;
 
+          // ★ SPアップ成功時は SP webUrl を使う。それ以外は従来通り Blob URL。
+          // SL documents use SP webUrl as fileUrl so that deleted SP files
+          // are no longer reachable, avoiding stale Blob links in search results.
           const indexResponses = await IndexDocuments(
             file.name,
-            uploadResponse.response,
+            searchableFileUrl,
             [doc],
             chatThreadId,
             actualDept,
-            actualIsSlDoc
+            actualIsSlDoc,
+            actualUploadScope,
+            effectiveFileUrl,
+            spItemId
           );
 
           documentIndexResponses.push(...indexResponses);

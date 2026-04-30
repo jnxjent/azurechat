@@ -5,13 +5,18 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
 import {
+  buildUploadFolder,
+  decideDept,
   getDeptConfig,
+  getEffectiveSlUserEmail,
   getUserEmailFromJwtToken,
+  isSharePointEnabledDept,
+  normalizeUploadScope,
+  resolveSlAccess,
+  resolveSlUploadTarget,
+  type UploadScope,
 } from "@/lib/sl-dept";
 
-// -------------------------------------------------------
-// Token refresh helper
-// -------------------------------------------------------
 async function getValidAccessToken(req: NextRequest): Promise<string | null> {
   const token = await getToken({ req });
   if (!token) return null;
@@ -56,7 +61,6 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
       return accessToken;
     }
 
-    console.log("[SL publish] Token refreshed successfully");
     return data.access_token as string;
   } catch (e) {
     console.error("[SL publish] Token refresh error:", e);
@@ -64,60 +68,6 @@ async function getValidAccessToken(req: NextRequest): Promise<string | null> {
   }
 }
 
-// -------------------------------------------------------
-// Helpers
-// -------------------------------------------------------
-function parseCsvLower(value?: string | null) {
-  return (value ?? "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function normalizeEmail(email?: string | null) {
-  return (email ?? "").trim().toLowerCase();
-}
-
-function normalizeDept(value?: string | null) {
-  return (value ?? "").trim().toLowerCase();
-}
-
-// commonアップロード許可用
-function isAdminEmail(email: string | null) {
-  if (!email) return false;
-  const admins = parseCsvLower(process.env.SL_ADMIN_EMAILS);
-  return admins.includes(email.toLowerCase());
-}
-
-// env実名に合わせる
-function getDeptEmailsFromEnv(envName: string): string[] {
-  return parseCsvLower(process.env[envName]);
-}
-
-function getDefaultDept(): "cp" | "ss" | "others" {
-  const raw = normalizeDept(process.env.SL_DEPT_DEFAULT);
-  if (raw === "cp" || raw === "ss" || raw === "others") {
-    return raw;
-  }
-  return "others";
-}
-
-function decideDeptByEmail(email: string | null): "cp" | "ss" | "others" {
-  const e = normalizeEmail(email);
-  if (!e) return getDefaultDept();
-
-  const ssEmails = getDeptEmailsFromEnv("SL_DEPT_BY_EMAIL_SS");
-  const cpEmails = getDeptEmailsFromEnv("SL_DEPT_BY_EMAIL_CP");
-
-  if (ssEmails.includes(e)) return "ss";
-  if (cpEmails.includes(e)) return "cp";
-
-  return getDefaultDept();
-}
-
-// -------------------------------------------------------
-// Graph API helpers
-// -------------------------------------------------------
 async function resolveSiteAndDrive(
   accessToken: string,
   siteUrl: string,
@@ -132,8 +82,7 @@ async function resolveSiteAndDrive(
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   if (!siteRes.ok) {
-    const err = await siteRes.text();
-    throw new Error(`Failed to get site: ${err}`);
+    throw new Error(`Failed to get site: ${await siteRes.text()}`);
   }
   const siteJson = await siteRes.json();
   const siteId: string = siteJson.id;
@@ -143,8 +92,7 @@ async function resolveSiteAndDrive(
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   if (!drivesRes.ok) {
-    const err = await drivesRes.text();
-    throw new Error(`Failed to get drives: ${err}`);
+    throw new Error(`Failed to get drives: ${await drivesRes.text()}`);
   }
   const drivesJson = await drivesRes.json();
   const drive = drivesJson.value.find((d: any) => d.name === driveName);
@@ -156,7 +104,7 @@ async function resolveSiteAndDrive(
     );
   }
 
-  return { siteId: siteJson.id, driveId: drive.id };
+  return { siteId, driveId: drive.id };
 }
 
 async function graphPutBinary(
@@ -165,46 +113,48 @@ async function graphPutBinary(
   buffer: Buffer,
   mimeType: string
 ): Promise<any> {
-  // ★ SharedArrayBuffer問題を回避：Buffer を Uint8Array に変換
-  const uint8 = new Uint8Array(buffer);
-
   const res = await fetch(uploadUrl, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": mimeType,
     },
-    body: uint8,
+    body: new Uint8Array(buffer),
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${err}`);
+    throw new Error(`Upload failed (${res.status}): ${await res.text()}`);
   }
   return res.json();
 }
 
-// -------------------------------------------------------
-// Route handlers
-// -------------------------------------------------------
+function getMimeType(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+
+  const mimeMap: Record<string, string> = {
+    pdf: "application/pdf",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    txt: "text/plain",
+  };
+
+  return mimeMap[ext] ?? "application/octet-stream";
+}
+
+function resolveRequestedUploadScope(body: any): UploadScope {
+  return normalizeUploadScope(body?.uploadScope ?? body?.dept);
+}
+
 export async function OPTIONS() {
   return NextResponse.json({}, { status: 200 });
 }
 
 export async function POST(req: NextRequest) {
   try {
-    // ---------------------------------------------------
-    // SL機能の有効/無効を最初に判定
-    // false / 未設定 / 空文字 の場合は SharePoint 処理へ入らない
-    // ---------------------------------------------------
-    if (process.env.NEXT_PUBLIC_SL_ENABLED !== "true") {
-      console.log("[SL publish] disabled by NEXT_PUBLIC_SL_ENABLED");
-      return NextResponse.json(
-        { ok: false, disabled: true, error: "SL publish is disabled" },
-        { status: 404 }
-      );
-    }
-
     const accessToken = await getValidAccessToken(req);
     if (!accessToken) {
       return NextResponse.json(
@@ -214,9 +164,8 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const fileName = String(body?.fileName ?? "");
-    const fileBase64 = String(body?.fileBase64 ?? "");
-    const requestedDept = normalizeDept(body?.dept);
+    const fileName = String(body.fileName ?? "").replace(/^[\s\u3000]+|[\s\u3000]+$/g, "");
+    const { fileBase64 } = body;
 
     if (!fileName || !fileBase64) {
       return NextResponse.json(
@@ -226,71 +175,74 @@ export async function POST(req: NextRequest) {
     }
 
     const token = await getToken({ req });
-    const userEmail = token ? getUserEmailFromJwtToken(token) : null;
-    const userEmailLower = normalizeEmail(userEmail);
+    const rawUserEmail = token ? getUserEmailFromJwtToken(token) : null;
+    const userEmail = getEffectiveSlUserEmail(rawUserEmail);
 
-    const admin = isAdminEmail(userEmailLower);
-    const allowedDepts = ["cp", "ss", "others", "common"];
-
-    let deptLower: "cp" | "ss" | "others" | "common";
-
-    // 管理者だけ toggle を使える
-    if (admin && requestedDept) {
-      if (!allowedDepts.includes(requestedDept)) {
-        return NextResponse.json(
-          { ok: false, error: `Invalid dept: ${requestedDept}` },
-          { status: 400 }
-        );
-      }
-      deptLower = requestedDept as "cp" | "ss" | "others" | "common";
-    } else {
-      // 非管理者は常にメアド優先
-      deptLower = decideDeptByEmail(userEmailLower);
-    }
-
-    // common は管理者のみ
-    if (deptLower === "common" && !admin) {
+    if (!userEmail) {
       return NextResponse.json(
-        { ok: false, error: "You are not allowed to upload to COMMON." },
-        { status: 403 }
+        { ok: false, error: "Failed to identify current user email." },
+        { status: 401 }
       );
     }
 
-    const { siteUrl, driveName, folder } = getDeptConfig(deptLower);
+    const requestedUploadScope = resolveRequestedUploadScope(body);
+    const preferredDept = decideDept({
+      requestedDept:
+        typeof body?.requestedDept === "string" ? body.requestedDept : undefined,
+      userEmail,
+    });
+
+    const access = resolveSlAccess(userEmail, preferredDept);
+    const admin =
+      access.role === "global_admin" || access.role === "dept_admin";
+    const actualUploadScope: UploadScope = admin
+      ? requestedUploadScope
+      : "personal";
+
+    const uploadTarget = resolveSlUploadTarget(
+      userEmail,
+      actualUploadScope,
+      preferredDept
+    );
+    const targetDept = uploadTarget.dept;
+
+    const isSpDept =
+      targetDept === "common" ? true : isSharePointEnabledDept(targetDept);
+
+    if (!isSpDept) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Your department is not SharePoint-enabled. Use Blob upload flow instead.",
+          dept: targetDept,
+          isSharePointEnabled: false,
+        },
+        { status: 400 }
+      );
+    }
+
+    const { siteUrl, driveName, folder: baseFolder } = getDeptConfig(targetDept);
+    const uploadFolder =
+      targetDept === "common" && actualUploadScope === "common"
+        ? baseFolder
+        : buildUploadFolder({
+            baseFolder,
+            uploadScope: actualUploadScope,
+            userEmail,
+          });
 
     console.log(
-      `[SL publish] requestedDept=${requestedDept || "(empty)"} resolvedDept=${deptLower} admin=${admin} user=${userEmailLower || "unknown"}`
-    );
-    console.log(
-      `[SL publish] env SS=${process.env.SL_DEPT_BY_EMAIL_SS || "(empty)"} CP=${process.env.SL_DEPT_BY_EMAIL_CP || "(empty)"} DEFAULT=${process.env.SL_DEPT_DEFAULT || "(empty)"}`
-    );
-    console.log(
-      `[SL publish] dept=${deptLower} user=${userEmailLower || "unknown"} site=${siteUrl} drive=${driveName} folder=${folder}`
+      `[SL publish] preferredDept=${preferredDept} targetDept=${targetDept} user=${userEmail} role=${access.role} requestedScope=${requestedUploadScope} actualScope=${actualUploadScope} site=${siteUrl} drive=${driveName} folder=${uploadFolder}`
     );
 
     const fileBuffer = Buffer.from(fileBase64, "base64");
+    const mimeType = getMimeType(fileName);
+    const { driveId } = await resolveSiteAndDrive(accessToken, siteUrl, driveName);
 
-    const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
-    const mimeMap: Record<string, string> = {
-      pdf: "application/pdf",
-      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      txt: "text/plain",
-    };
-    const mimeType = mimeMap[ext] ?? "application/octet-stream";
-
-    const { driveId } = await resolveSiteAndDrive(
-      accessToken,
-      siteUrl,
-      driveName
-    );
-
-    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${folder}/${fileName}:/content`;
-    console.log(`[SL publish] Uploading to: ${uploadUrl}`);
+    const uploadUrl =
+      `https://graph.microsoft.com/v1.0/drives/${driveId}` +
+      `/root:/${uploadFolder}/${fileName}:/content`;
 
     const result = await graphPutBinary(
       uploadUrl,
@@ -299,13 +251,14 @@ export async function POST(req: NextRequest) {
       mimeType
     );
 
-    console.log(`[SL publish] Upload success: ${result.webUrl}`);
-
     return NextResponse.json({
       ok: true,
-      dept: deptLower,
+      dept: targetDept,
+      uploadScope: actualUploadScope,
+      isSharePointEnabled: true,
       name: result.name,
       webUrl: result.webUrl,
+      spItemId: result.id ?? null,
     });
   } catch (e: any) {
     console.error("[SL publish] Error:", e);

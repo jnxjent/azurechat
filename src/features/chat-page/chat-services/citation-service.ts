@@ -96,20 +96,56 @@ export const FindCitationByID = async (
   }
 };
 
+function isBlobUrl(value?: string | null): boolean {
+  if (!value) return false;
+  try {
+    return new URL(value).hostname.endsWith(".blob.core.windows.net");
+  } catch {
+    return value.includes(".blob.core.windows.net");
+  }
+}
+
+function resolveCitationUrl(d: DocumentSearchResponse): string {
+  const fileUrl = d.document.fileUrl ?? "";
+  const effectiveFileUrl = d.document.effectiveFileUrl ?? "";
+
+  if (d.document.isSlDoc && isBlobUrl(effectiveFileUrl) && fileUrl) {
+    return fileUrl;
+  }
+
+  return effectiveFileUrl || fileUrl;
+}
+
 export const FormatCitations = (citation: DocumentSearchResponse[]) => {
   const withoutEmbedding: DocumentSearchResponse[] = [];
+
   citation.forEach((d) => {
+    const citationUrl = resolveCitationUrl(d);
+
+    console.log(
+      "[CITATION] effectiveFileUrl=",
+      d.document.effectiveFileUrl,
+      "fileUrl=",
+      d.document.fileUrl,
+      "citationUrl=",
+      citationUrl
+    );
+
     withoutEmbedding.push({
       score: d.score,
       document: {
         metadata: d.document.metadata,
         pageContent: d.document.pageContent,
         chatThreadId: d.document.chatThreadId,
-        fileUrl: d.document.fileUrl,
+
+        // ★★★ ここが修正ポイント ★★★
+        fileUrl: citationUrl,
+
+        effectiveFileUrl: citationUrl || null,
         id: "",
         user: "",
-        dept: d.document.dept ?? "",        // ★ 追加
-        isSlDoc: d.document.isSlDoc ?? false, // ★ 追加
+        dept: d.document.dept ?? "",
+        isSlDoc: d.document.isSlDoc ?? null,
       },
     });
   });
