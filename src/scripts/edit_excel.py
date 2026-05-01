@@ -6,6 +6,7 @@ stdout: JSON {"changedSheets": N, "totalSheets": N}
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,49 @@ from typing import Any
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import column_index_from_string
+
+
+def _replace_stdev_with_sqrt_sumproduct(formula: str) -> str:
+    """STDEVP(range) / STDEV.P(range) \u3092\u5168Excel\u30d0\u30fc\u30b8\u30e7\u30f3\u4e92\u63db\u306e
+    SQRT(SUMPRODUCT((range-AVERAGE(range))^2)/COUNT(range)) \u306b\u7f6e\u63db\u3059\u308b\u3002
+    range \u90e8\u5206\u306f\u62ec\u5f27\u306e\u6df1\u3055\u3092\u8ffd\u3063\u3066\u6b63\u78ba\u306b\u53d6\u308a\u51fa\u3059\u3002"""
+    pattern = re.compile(r"\bSTDEV(?:\.P|P)\s*\(", re.IGNORECASE)
+    result = []
+    i = 0
+    while i < len(formula):
+        m = pattern.search(formula, i)
+        if not m:
+            result.append(formula[i:])
+            break
+        result.append(formula[i:m.start()])
+        # \u62ec\u5f27\u5185\u306e range \u3092\u53d6\u308a\u51fa\u3059
+        depth = 1
+        j = m.end()
+        while j < len(formula) and depth > 0:
+            if formula[j] == "(":
+                depth += 1
+            elif formula[j] == ")":
+                depth -= 1
+            j += 1
+        rng = formula[m.end():j - 1]
+        avg = f"AVERAGE({rng})"
+        replacement = f"SQRT(SUMPRODUCT(({rng}-{avg})^2)/COUNT({rng}))"
+        result.append(replacement)
+        i = j
+    return "".join(result)
+
+
+def normalize_excel_formula(value: str) -> str:
+    """Normalize LLM-generated Excel formulas before writing them with openpyxl."""
+    if not value.startswith("="):
+        return value
+
+    # \u5168\u89d2@\u3068\u534a\u89d2@\u306e\u6697\u9ed9\u4ea4\u5dee\u6f14\u7b97\u5b50\u3092\u9664\u53bb
+    normalized = value.replace("\uff20", "@")
+    normalized = re.sub(r"@(?=[A-Za-z_])", "", normalized)
+    # STDEV.P / STDEVP \u2192 SQRT(SUMPRODUCT(...)) \u306b\u5909\u63db\uff08\u5168Excel\u30d0\u30fc\u30b8\u30e7\u30f3\u5bfe\u5fdc\uff09
+    normalized = _replace_stdev_with_sqrt_sumproduct(normalized)
+    return normalized
 
 
 def parse_hex_color(value: str | None) -> str | None:
@@ -33,6 +77,9 @@ def apply_sheet_edits(ws, edits: dict) -> int:
         address = str(cell_edit.get("address") or "").strip()
         value = cell_edit.get("value")
         if address and value is not None:
+            # Excel数式中の @ (暗黙交差演算子) を除去。LLMが誤って付けることがある
+            if isinstance(value, str) and value.startswith("="):
+                value = normalize_excel_formula(value)
             ws[address] = value
             changed += 1
 
@@ -275,6 +322,10 @@ def main() -> None:
 
     plan: dict[str, Any] = json.loads(plan_path.read_text(encoding="utf-8"))
     wb = load_workbook_any(input_path)
+    if wb.calculation is not None:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
     total_sheets = len(wb.sheetnames)
     changed_sheets: set[str] = set()
 

@@ -135,6 +135,7 @@ function getMimeType(fileName: string): string {
     pdf: "application/pdf",
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
     pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     png: "image/png",
     jpg: "image/jpeg",

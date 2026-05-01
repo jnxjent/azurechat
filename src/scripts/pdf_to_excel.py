@@ -104,6 +104,7 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
                 "prebuilt-layout",
                 body=f,
                 content_type=content_type,
+                locale="ja-JP",
             )
         result = poller.result()
     except Exception as e:

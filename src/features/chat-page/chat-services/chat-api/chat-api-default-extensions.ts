@@ -10,7 +10,6 @@ import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
-import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
 import { SimpleSearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -21,6 +20,43 @@ import {
 } from "@/features/chat-page/chat-services/chat-api/reasoning-utils";
 
 type ThinkingModeAPI = "normal" | "thinking" | "fast";
+
+async function analyzeDocVision(
+  fileUrl: string,
+  maxPages: number = 30,
+  mode?: "faithful" | "redesign"
+) {
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME
+      ? `https://${process.env.WEBSITE_HOSTNAME}`
+      : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  const res = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify({ fileUrl, maxPages, mode }),
+  });
+
+  const text = await res.text();
+  let parsed: any = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = null;
+  }
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: parsed?.error ?? parsed?.message ?? text.slice(0, 500) ?? `HTTP ${res.status}`,
+    };
+  }
+
+  return parsed;
+}
 
 /** standard を normal へ、その他はそのまま（保険） */
 function normalizeThinkingMode(

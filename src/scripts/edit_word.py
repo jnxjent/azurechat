@@ -119,6 +119,7 @@ def apply_add_paragraphs(doc, paragraphs: list) -> int:
         italic = para_def.get("italic")
         font_size = para_def.get("fontSize")
         font_color = parse_hex_color(para_def.get("fontColor"))
+        font_face = str(para_def.get("fontFace") or "").strip() or None
 
         try:
             para = doc.add_paragraph(text, style=style)
@@ -134,6 +135,16 @@ def apply_add_paragraphs(doc, paragraphs: list) -> int:
                 run.font.size = Pt(float(font_size))
             if font_color is not None:
                 run.font.color.rgb = font_color
+            if font_face is not None:
+                rPr = run._r.get_or_add_rPr()
+                rFonts = rPr.find(qn("w:rFonts"))
+                if rFonts is None:
+                    rFonts = OxmlElement("w:rFonts")
+                    rPr.insert(0, rFonts)
+                rFonts.set(qn("w:ascii"), font_face)
+                rFonts.set(qn("w:hAnsi"), font_face)
+                rFonts.set(qn("w:eastAsia"), font_face)
+                rFonts.set(qn("w:cs"), font_face)
         added += 1
 
     return added
