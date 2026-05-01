@@ -38,7 +38,7 @@ export const userHashedId = async (): Promise<string> => {
 
 export const hashValue = (value: string): string => {
   const hash = createHash("sha256");
-  hash.update(value);
+  hash.update(value.trim().toLowerCase());
   return hash.digest("hex");
 };
 

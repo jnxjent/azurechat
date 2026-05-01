@@ -97,10 +97,10 @@ async function buildSearchAclFilter(
   const resolvedUserHash = userHash ?? (await userHashedId());
   const u = escapeODataValue(resolvedUserHash);
 
-  // 非SP部署（others等）はSL文書を検索対象外
+  // 非SP部署（others等）は自分のBlobと全社共通SL文書のみ
   if (!isSharePointEnabledDept(normalizedDept)) {
-    console.log("[ACL] non-SP dept, SL docs excluded:", normalizedDept);
-    return `((isSlDoc ne true and user eq '${u}'))`;
+    console.log("[ACL] non-SP dept, only personal Blob + global_common:", normalizedDept);
+    return `((isSlDoc ne true and user eq '${u}') or (isSlDoc eq true and slScope eq 'global_common'))`;
   }
 
   const d = escapeODataValue(normalizedDept);
@@ -124,8 +124,11 @@ async function buildSearchAclFilter(
   console.log("[ACL] slPersonalFilter =", slPersonalFilter);
   console.log("[ACL] slLegacyFilter =", slLegacyFilter);
 
-  // SharePoint対応ユーザーは SharePoint由来の文書のみ検索対象にする。
-  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter})`;
+  // 自分自身がアップした非SL Blob文書（isSlDoc=false, user=自分）も常に含める。
+  // SP対応部署でも global_admin のような部署メアドなしユーザーが Blob アップした場合に対応。
+  const blobOwnFilter = `(isSlDoc ne true and user eq '${u}')`;
+
+  const finalAcl = `(${slGlobalCommonFilter} or ${slDeptCommonFilter} or ${slPersonalFilter} or ${slLegacyFilter} or ${blobOwnFilter})`;
     console.log("[ACL] FINAL FILTER =", finalAcl);
     return finalAcl;
 

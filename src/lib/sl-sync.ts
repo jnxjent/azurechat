@@ -780,13 +780,21 @@ export async function runSlSync({
 
       const orphanIds = matchedDocs
         .filter(({ doc }) => doc.slScope !== "global_common")
+        .filter(({ doc }) => !doc.spItemId)
         .filter(({ spItem }) => !spItem)
         .map(({ doc }) => doc.id);
 
+      const gcExcluded = matchedDocs.filter(({ doc, spItem }) => doc.slScope === "global_common" && !spItem).length;
+      if (gcExcluded > 0) {
+        console.log(`[SL sync] dept=${dept} global_common docs outside scan (excluded from orphan): ${gcExcluded}`);
+      }
       console.log(`[SL sync] dept=${dept} orphans=${orphanIds.length} apply=${apply}`);
 
+      // global_common ドキュメントは global_common ブロックが管理する。
+      // dept ループで slScope を上書きするとドキュメントが消失するため除外する。
       const docUpdates = matchedDocs
         .filter((entry): entry is { doc: IndexDoc; spItem: SpFileItem } => Boolean(entry.spItem))
+        .filter(({ doc }) => doc.slScope !== "global_common")
         .filter(({ doc, spItem }) => {
           const desiredScope = resolveScopeFromLocation({
             webUrl: spItem.webUrl,
@@ -852,23 +860,62 @@ export async function runSlSync({
 
       if (!globalScan.fetchFailed) {
         const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon);
+        console.log(`[SL sync] global_common SP files=${globalScan.inventory.allItems.length} indexed docs=${globalIndexDocs.length}`);
         const matchedDocs = globalIndexDocs.map((doc) => ({
           doc,
           spItem: findMatchingSpItem(doc, globalScan.inventory),
         }));
 
+        // scan 範囲外（Common フォルダ外）へ移動したファイルを Graph API で直接追跡
+        const globalScanMissed = matchedDocs.filter(
+          (entry) => !entry.spItem && entry.doc.spItemId
+        );
+        if (globalScanMissed.length > 0) {
+          console.log(`[SL sync] global_common looking up ${globalScanMissed.length} scan-missed items by spItemId`);
+          for (const entry of globalScanMissed) {
+            const found = await lookupSpItemByIdInDrive(
+              accessToken,
+              globalCommon.siteUrl,
+              globalCommon.driveName,
+              entry.doc.spItemId!
+            );
+            if (found) {
+              entry.spItem = found;
+              console.log(`[SL sync] global_common found outside scan scope: ${entry.doc.fileName} → ${found.webUrl}`);
+            }
+          }
+        }
+
         const globalOrphanIds = matchedDocs
           .filter(({ spItem }) => !spItem)
           .map(({ doc }) => doc.id);
 
-        if (apply && globalOrphanIds.length > 0) {
-          await deleteIndexDocs(globalOrphanIds);
+        const docUpdates = matchedDocs
+          .filter(
+            (entry): entry is { doc: IndexDoc; spItem: SpFileItem } =>
+              Boolean(entry.spItem)
+          )
+          .filter(({ doc, spItem }) => doc.effectiveFileUrl !== spItem.webUrl)
+          .map(({ doc, spItem }) => ({
+            id: doc.id,
+            effectiveFileUrl: spItem.webUrl,
+          }));
+
+        if (globalOrphanIds.length > 0) {
+          console.log(
+            `[SL sync] global_common orphans=${globalOrphanIds.length}; keeping index docs because files may have been moved outside Common temporarily.`
+          );
+        }
+
+        if (apply) {
+          if (docUpdates.length > 0) await updateIndexDocs(docUpdates);
         }
 
         results["global_common"] = {
           spFileNames: globalScan.inventory.allItems.length,
           indexDocs: globalIndexDocs.length,
-          deleted: apply ? globalOrphanIds.length : 0,
+          deleted: 0,
+          urlUpdated: docUpdates.length,
           orphanIds: globalOrphanIds,
         };
       } else {
