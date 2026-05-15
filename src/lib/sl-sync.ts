@@ -1,6 +1,9 @@
 // src/lib/sl-sync.ts
 
+import { createHash, randomUUID } from "crypto";
 import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
+import { OpenAIEmbeddingInstance } from "@/features/common/services/openai";
+import { extractTextFromBuffer, chunkWithOverlap } from "./document-extract";
 
 export type SpFileItem = {
   id: string;
@@ -16,6 +19,9 @@ export type SlSyncDeptResult = {
   orphanIds?: string[];
   deleted: number;
   urlUpdated?: number;
+  newIndexed?: number;
+  newSkipped?: number;
+  unindexedCount?: number;
   skipped?: string;
   error?: string;
 };
@@ -29,6 +35,8 @@ export type SlSyncResult = {
 export type RunSlSyncParams = {
   accessToken: string;
   apply?: boolean;
+  indexNew?: boolean;
+  batchSize?: number;
 };
 
 type IndexDoc = {
@@ -38,6 +46,22 @@ type IndexDoc = {
   effectiveFileUrl: string;
   slScope: string | null;
   relativePath: string | null;
+  spItemId: string | null;
+};
+
+type NewIndexDoc = {
+  id: string;
+  pageContent: string;
+  embedding: number[];
+  metadata: string;
+  fileUrl: string;
+  effectiveFileUrl: string;
+  chatThreadId: string;
+  user: string;
+  dept: string;
+  isSlDoc: true;
+  slScope: "global_common" | "dept_common" | "personal";
+  slOwner: string | null;
   spItemId: string | null;
 };
 
@@ -54,6 +78,10 @@ type SpInventory = {
   byName: Map<string, SpFileItem[]>;
   byId: Map<string, SpFileItem>;
 };
+
+function hashValue(value: string): string {
+  return createHash("sha256").update(value.trim().toLowerCase()).digest("hex");
+}
 
 function encodeGraphPath(path: string): string {
   return (path ?? "")
@@ -76,10 +104,11 @@ function normalizeSiteUrl(siteUrl: string): string {
 }
 
 function normalizeFolderPath(path: string): string {
-  return (path ?? "")
+  const normalized = (path ?? "")
     .replace(/\\/g, "/")
     .replace(/^\/+/, "")
     .replace(/\/+$/, "");
+  return normalized === "." ? "" : normalized;
 }
 
 function pathStartsWith(path: string, prefix: string): boolean {
@@ -107,7 +136,9 @@ function getGlobalCommonConfig(): GlobalCommonConfig | null {
 }
 
 function deriveDeptCommonFolder(baseFolder: string): string {
-  return `${normalizeFolderPath(baseFolder)}/Common`;
+  const base = normalizeFolderPath(baseFolder);
+  const commonSub = process.env.SL_COMMON_SUBFOLDER ?? "Common";
+  return base ? `${base}/${commonSub}` : commonSub;
 }
 
 function isWithinFolderByWebUrl(webUrl: string, folderPath: string): boolean {
@@ -125,6 +156,7 @@ function resolveScopeFromLocation(params: {
   sourceSiteUrl: string;
   deptSiteUrl: string;
   deptBaseFolder: string;
+  itemRelativePath?: string;
   globalCommonSiteUrl?: string | null;
   globalCommonFolder?: string | null;
 }): ScopeKind {
@@ -133,6 +165,7 @@ function resolveScopeFromLocation(params: {
     sourceSiteUrl,
     deptSiteUrl,
     deptBaseFolder,
+    itemRelativePath,
     globalCommonSiteUrl,
     globalCommonFolder,
   } = params;
@@ -153,6 +186,18 @@ function resolveScopeFromLocation(params: {
 
   if (sourceSite === deptSite && isWithinFolderByWebUrl(webUrl, deptCommonFolder)) {
     return "dept_common";
+  }
+
+  // Files directly in baseFolder (not in a user subfolder) are dept_common
+  if (itemRelativePath !== undefined) {
+    const normalizedBase = normalizeFolderPath(deptBaseFolder).toLowerCase();
+    const normalizedRel = normalizeFolderPath(itemRelativePath).toLowerCase();
+    const rest = normalizedBase
+      ? normalizedRel.startsWith(normalizedBase + "/")
+        ? normalizedRel.slice(normalizedBase.length + 1)
+        : ""
+      : normalizedRel;
+    if (!rest.includes("/")) return "dept_common";
   }
 
   return "personal";
@@ -241,7 +286,7 @@ async function lookupSpItemByIdInDrive(
   siteUrl: string,
   driveName: string,
   itemId: string
-): Promise<SpFileItem | null> {
+): Promise<SpFileItem | null | "error"> {
   try {
     const siteId = await resolveSiteId(accessToken, siteUrl);
     const driveId = await resolveDriveId(accessToken, siteId, driveName);
@@ -255,7 +300,7 @@ async function lookupSpItemByIdInDrive(
     if (res.status === 404) return null; // ファイルが実際に削除済み（ゴミ箱も空）
     if (!res.ok) {
       console.warn(`[SL sync] lookupSpItemById failed (${res.status}): ${await res.text()}`);
-      return null;
+      return "error"; // スロットリング等の一時エラー → 孤立扱いしない
     }
 
     const item = await res.json();
@@ -289,7 +334,7 @@ async function lookupSpItemByIdInDrive(
     };
   } catch (e) {
     console.warn(`[SL sync] lookupSpItemByIdInDrive error:`, e);
-    return null;
+    return "error"; // ネットワークエラー等 → 孤立扱いしない
   }
 }
 
@@ -356,9 +401,9 @@ async function collectFileItemsRecursive(
   isRoot = false
 ): Promise<{ fetchFailed: boolean; rootMissing: boolean }> {
   const encoded = encodeGraphPath(currentFolderPath);
-  let nextUrl: string | null =
-    `https://graph.microsoft.com/v1.0/drives/${driveId}` +
-    `/root:/${encoded}:/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`;
+  let nextUrl: string | null = encoded
+    ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encoded}:/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`
+    : `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -651,6 +696,225 @@ async function deleteIndexDocs(ids: string[]): Promise<void> {
   console.log(`[SL sync] Deleted ${ids.length} index docs`);
 }
 
+async function addNewIndexDocs(docs: NewIndexDoc[]): Promise<void> {
+  if (docs.length === 0) return;
+
+  const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
+  const apiKey = process.env.AZURE_SEARCH_API_KEY;
+  const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
+
+  if (!endpoint || !apiKey || !indexName) {
+    throw new Error("Missing Azure Search env vars");
+  }
+
+  const body = {
+    value: docs.map((doc) => ({ "@search.action": "upload", ...doc })),
+  };
+
+  const res = await fetch(
+    `${endpoint}/indexes/${indexName}/docs/index?api-version=2024-07-01`,
+    {
+      method: "POST",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    }
+  );
+
+  if (!res.ok) throw new Error(`Index upload failed: ${await res.text()}`);
+  console.log(`[SL sync] Indexed ${docs.length} new docs`);
+}
+
+async function downloadSpFile(
+  accessToken: string,
+  driveId: string,
+  itemId: string
+): Promise<ArrayBuffer> {
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      cache: "no-store",
+      redirect: "follow",
+    }
+  );
+  if (!res.ok) throw new Error(`Download failed (${res.status}): ${await res.text()}`);
+  return res.arrayBuffer();
+}
+
+function findUnindexedSpItems(
+  inventory: SpInventory,
+  indexDocs: IndexDoc[]
+): SpFileItem[] {
+  const indexedBySpItemId = new Set<string>();
+  const indexedByRelPath = new Set<string>();
+
+  for (const doc of indexDocs) {
+    if (doc.spItemId) indexedBySpItemId.add(doc.spItemId);
+    if (doc.relativePath) indexedByRelPath.add(doc.relativePath.toLowerCase());
+  }
+
+  console.log(
+    `[SL sync] findUnindexedSpItems: indexDocs=${indexDocs.length} bySpItemId=${indexedBySpItemId.size} byRelPath=${indexedByRelPath.size}`
+  );
+
+  return inventory.allItems.filter((item) => {
+    if (item.id && indexedBySpItemId.has(item.id)) return false;
+    if (item.relativePath && indexedByRelPath.has(item.relativePath.toLowerCase())) return false;
+    console.log(`[SL sync] UNINDEXED: name=${item.name} spItemId=${item.id} relPath=${item.relativePath}`);
+    return true;
+  });
+}
+
+function resolvePersonalOwnerHash(
+  spItem: SpFileItem,
+  baseFolder: string
+): string | null {
+  const domain = (process.env.SL_PERSONAL_EMAIL_DOMAIN ?? "").trim();
+  if (!domain) {
+    console.warn(
+      "[SL sync] SL_PERSONAL_EMAIL_DOMAIN is not set — personal slOwner cannot be determined"
+    );
+    return null;
+  }
+
+  const normalizedBase = normalizeFolderPath(baseFolder).toLowerCase();
+  const normalizedPath = normalizeFolderPath(spItem.relativePath).toLowerCase();
+
+  let rest: string;
+  if (normalizedBase) {
+    if (!normalizedPath.startsWith(normalizedBase + "/")) return null;
+    rest = normalizedPath.slice(normalizedBase.length + 1);
+  } else {
+    rest = normalizedPath;
+  }
+
+  const firstSegment = rest.split("/")[0];
+  if (!firstSegment) return null;
+
+  const commonSubfolder = (process.env.SL_COMMON_SUBFOLDER ?? "common").toLowerCase();
+  if (firstSegment.toLowerCase() === commonSubfolder) return null;
+
+  // フォルダ名が既知ユーザーのメールローカルパートでない場合は null を返す。
+  // 例: SL/新フォルダ/ のような任意フォルダ → dept_common として扱わせる。
+  const targetEmail = `${firstSegment}@${domain}`;
+  const isKnownUser = getAllowedDepts().some((dept) => {
+    const key = `SL_DEPT_BY_EMAIL_${dept.toUpperCase()}`;
+    return (process.env[key] ?? "")
+      .split(",")
+      .some((s) => s.trim().toLowerCase() === targetEmail);
+  });
+  if (!isKnownUser) return null;
+
+  return hashValue(`${firstSegment}@${domain}`);
+}
+
+async function indexNewSpFiles(params: {
+  accessToken: string;
+  dept: string;
+  siteUrl: string;
+  driveName: string;
+  baseFolder: string;
+  unindexedItems: SpFileItem[];
+  batchSize: number;
+  globalCommon?: GlobalCommonConfig | null;
+}): Promise<{ indexed: number; skipped: number }> {
+  const {
+    accessToken,
+    dept,
+    siteUrl,
+    driveName,
+    baseFolder,
+    unindexedItems,
+    batchSize,
+    globalCommon,
+  } = params;
+
+  const batch = unindexedItems.slice(0, batchSize);
+  if (batch.length === 0) return { indexed: 0, skipped: 0 };
+
+  const siteId = await resolveSiteId(accessToken, siteUrl);
+  const driveId = await resolveDriveId(accessToken, siteId, driveName);
+  const openai = OpenAIEmbeddingInstance();
+
+  let indexed = 0;
+  let skipped = 0;
+
+  for (const item of batch) {
+    try {
+      console.log(`[SL sync] Indexing new SP file: ${item.name} (id=${item.id})`);
+
+      const buffer = await downloadSpFile(accessToken, driveId, item.id);
+
+      const textChunks = await extractTextFromBuffer(buffer, item.name);
+      if (textChunks.length === 0) {
+        console.warn(`[SL sync] No text extracted from ${item.name}, skipping`);
+        skipped++;
+        continue;
+      }
+
+      const allChunks: string[] = [];
+      for (const text of textChunks) {
+        allChunks.push(...chunkWithOverlap(text));
+      }
+
+      const scope = resolveScopeFromLocation({
+        webUrl: item.webUrl,
+        sourceSiteUrl: item.sourceSiteUrl,
+        deptSiteUrl: siteUrl,
+        deptBaseFolder: baseFolder,
+        itemRelativePath: item.relativePath,
+        globalCommonSiteUrl: globalCommon?.siteUrl ?? null,
+        globalCommonFolder: globalCommon?.folder ?? null,
+      });
+
+      const slOwner =
+        scope === "personal" ? resolvePersonalOwnerHash(item, baseFolder) : null;
+
+      // フォルダ名が既知ユーザーに対応しない場合は dept_common に格下げしてインデックス
+      const effectiveScope: ScopeKind = scope === "personal" && slOwner === null
+        ? "dept_common"
+        : scope;
+
+      if (effectiveScope !== scope) {
+        console.log(`[SL sync] ${item.name}: unknown personal folder → treating as dept_common`);
+      }
+
+      const embeddingRes = await openai.embeddings.create({
+        input: allChunks,
+        model: "",
+      });
+
+      const docsToIndex: NewIndexDoc[] = allChunks.map((chunk, i) => ({
+        id: randomUUID(),
+        pageContent: chunk,
+        embedding: embeddingRes.data[i]?.embedding ?? [],
+        metadata: item.name,
+        fileUrl: item.webUrl,
+        effectiveFileUrl: item.webUrl,
+        chatThreadId: "sl-auto",
+        user: "",
+        dept: dept.toLowerCase(),
+        isSlDoc: true,
+        slScope: effectiveScope,
+        slOwner: slOwner ?? null,
+        spItemId: item.id,
+      }));
+
+      await addNewIndexDocs(docsToIndex);
+      indexed++;
+      console.log(
+        `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length}`
+      );
+    } catch (e) {
+      console.error(`[SL sync] Failed to index ${item.name}:`, e);
+      skipped++;
+    }
+  }
+
+  return { indexed, skipped };
+}
+
 async function updateIndexDocs(
   updates: Array<{
     id: string;
@@ -699,6 +963,8 @@ async function updateIndexDocs(
 export async function runSlSync({
   accessToken,
   apply = false,
+  indexNew = false,
+  batchSize = 5,
 }: RunSlSyncParams): Promise<SlSyncResult> {
   const results: Record<string, SlSyncDeptResult> = {};
 
@@ -753,7 +1019,7 @@ export async function runSlSync({
       const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon);
       console.log(`[SL sync] dept=${dept} indexed docs=${indexDocs.length}`);
 
-      const matchedDocs = indexDocs.map((doc) => ({
+      const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = indexDocs.map((doc) => ({
         doc,
         spItem: findMatchingSpItem(doc, inventory),
       }));
@@ -763,15 +1029,18 @@ export async function runSlSync({
         (entry) => !entry.spItem && entry.doc.spItemId && entry.doc.slScope !== "global_common"
       );
       if (scanMissed.length > 0) {
-        console.log(`[SL sync] dept=${dept} looking up ${scanMissed.length} scan-missed items by spItemId`);
+        const uniqueSpItemIds = Array.from(new Set(scanMissed.map((e) => e.doc.spItemId!)));
+        console.log(`[SL sync] dept=${dept} looking up ${uniqueSpItemIds.length} unique spItemIds (${scanMissed.length} docs)`);
+        const lookupCache = new Map<string, SpFileItem | null | "error">();
+        for (const spItemId of uniqueSpItemIds) {
+          lookupCache.set(spItemId, await lookupSpItemByIdInDrive(accessToken, siteUrl, driveName, spItemId));
+        }
         for (const entry of scanMissed) {
-          const found = await lookupSpItemByIdInDrive(
-            accessToken,
-            siteUrl,
-            driveName,
-            entry.doc.spItemId!
-          );
-          if (found) {
+          const found = lookupCache.get(entry.doc.spItemId!);
+          if (found === "error") {
+            entry.lookupFailed = true;
+            console.warn(`[SL sync] dept=${dept} lookup error for ${entry.doc.fileName}, skipping orphan`);
+          } else if (found) {
             entry.spItem = found;
             console.log(`[SL sync] dept=${dept} found outside scan scope: ${entry.doc.fileName} → ${found.webUrl}`);
           }
@@ -780,8 +1049,7 @@ export async function runSlSync({
 
       const orphanIds = matchedDocs
         .filter(({ doc }) => doc.slScope !== "global_common")
-        .filter(({ doc }) => !doc.spItemId)
-        .filter(({ spItem }) => !spItem)
+        .filter(({ spItem, lookupFailed }) => !spItem && !lookupFailed)
         .map(({ doc }) => doc.id);
 
       const gcExcluded = matchedDocs.filter(({ doc, spItem }) => doc.slScope === "global_common" && !spItem).length;
@@ -801,6 +1069,7 @@ export async function runSlSync({
             sourceSiteUrl: spItem.sourceSiteUrl,
             deptSiteUrl: siteUrl,
             deptBaseFolder: baseFolder,
+            itemRelativePath: spItem.relativePath,
             globalCommonSiteUrl: globalCommon?.siteUrl ?? null,
             globalCommonFolder: globalCommon?.folder ?? null,
           });
@@ -813,15 +1082,25 @@ export async function runSlSync({
             sourceSiteUrl: spItem.sourceSiteUrl,
             deptSiteUrl: siteUrl,
             deptBaseFolder: baseFolder,
+            itemRelativePath: spItem.relativePath,
             globalCommonSiteUrl: globalCommon?.siteUrl ?? null,
             globalCommonFolder: globalCommon?.folder ?? null,
           });
 
+          const slOwner = desiredScope === "personal"
+            ? resolvePersonalOwnerHash(spItem, baseFolder)
+            : null;
+
+          // フォルダ名が既知ユーザーに対応しない場合は dept_common に格下げ
+          const effectiveScope: ScopeKind = desiredScope === "personal" && slOwner === null
+            ? "dept_common"
+            : desiredScope;
+
           return {
             id: doc.id,
             effectiveFileUrl: spItem.webUrl,
-            slScope: desiredScope,
-            ...(desiredScope === "personal" ? {} : { slOwner: null }),
+            slScope: effectiveScope,
+            slOwner,
           };
         });
 
@@ -830,13 +1109,38 @@ export async function runSlSync({
         await updateIndexDocs(docUpdates);
       }
 
-      results[dept] = {
+      const deptResult: SlSyncDeptResult = {
         spFileNames: inventory.allItems.length,
         indexDocs: indexDocs.length,
         deleted: apply ? orphanIds.length : 0,
         urlUpdated: docUpdates.length,
         orphanIds,
       };
+
+      if (indexNew) {
+        const unindexed = findUnindexedSpItems(inventory, indexDocs);
+        console.log(
+          `[SL sync] dept=${dept} unindexedSPFiles=${unindexed.length} apply=${apply}`
+        );
+        if (apply && unindexed.length > 0) {
+          const { indexed, skipped } = await indexNewSpFiles({
+            accessToken,
+            dept,
+            siteUrl,
+            driveName,
+            baseFolder,
+            unindexedItems: unindexed,
+            batchSize,
+            globalCommon,
+          });
+          deptResult.newIndexed = indexed;
+          deptResult.newSkipped = skipped;
+        } else {
+          deptResult.unindexedCount = unindexed.length;
+        }
+      }
+
+      results[dept] = deptResult;
     } catch (deptErr: any) {
       console.error(`[SL sync] dept=${dept} error:`, deptErr);
       results[dept] = {
@@ -861,7 +1165,7 @@ export async function runSlSync({
       if (!globalScan.fetchFailed) {
         const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon);
         console.log(`[SL sync] global_common SP files=${globalScan.inventory.allItems.length} indexed docs=${globalIndexDocs.length}`);
-        const matchedDocs = globalIndexDocs.map((doc) => ({
+        const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = globalIndexDocs.map((doc) => ({
           doc,
           spItem: findMatchingSpItem(doc, globalScan.inventory),
         }));
@@ -871,15 +1175,18 @@ export async function runSlSync({
           (entry) => !entry.spItem && entry.doc.spItemId
         );
         if (globalScanMissed.length > 0) {
-          console.log(`[SL sync] global_common looking up ${globalScanMissed.length} scan-missed items by spItemId`);
+          const uniqueGlobalSpItemIds = Array.from(new Set(globalScanMissed.map((e) => e.doc.spItemId!)));
+          console.log(`[SL sync] global_common looking up ${uniqueGlobalSpItemIds.length} unique spItemIds (${globalScanMissed.length} docs)`);
+          const globalLookupCache = new Map<string, SpFileItem | null | "error">();
+          for (const spItemId of uniqueGlobalSpItemIds) {
+            globalLookupCache.set(spItemId, await lookupSpItemByIdInDrive(accessToken, globalCommon.siteUrl, globalCommon.driveName, spItemId));
+          }
           for (const entry of globalScanMissed) {
-            const found = await lookupSpItemByIdInDrive(
-              accessToken,
-              globalCommon.siteUrl,
-              globalCommon.driveName,
-              entry.doc.spItemId!
-            );
-            if (found) {
+            const found = globalLookupCache.get(entry.doc.spItemId!);
+            if (found === "error") {
+              entry.lookupFailed = true;
+              console.warn(`[SL sync] global_common lookup error for ${entry.doc.fileName}, skipping orphan`);
+            } else if (found) {
               entry.spItem = found;
               console.log(`[SL sync] global_common found outside scan scope: ${entry.doc.fileName} → ${found.webUrl}`);
             }
@@ -887,7 +1194,7 @@ export async function runSlSync({
         }
 
         const globalOrphanIds = matchedDocs
-          .filter(({ spItem }) => !spItem)
+          .filter(({ spItem, lookupFailed }) => !spItem && !lookupFailed)
           .map(({ doc }) => doc.id);
 
         const docUpdates = matchedDocs
@@ -903,21 +1210,47 @@ export async function runSlSync({
 
         if (globalOrphanIds.length > 0) {
           console.log(
-            `[SL sync] global_common orphans=${globalOrphanIds.length}; keeping index docs because files may have been moved outside Common temporarily.`
+            `[SL sync] global_common orphans=${globalOrphanIds.length} apply=${apply}`
           );
         }
 
         if (apply) {
+          if (globalOrphanIds.length > 0) await deleteIndexDocs(globalOrphanIds);
           if (docUpdates.length > 0) await updateIndexDocs(docUpdates);
         }
 
-        results["global_common"] = {
+        const gcResult: SlSyncDeptResult = {
           spFileNames: globalScan.inventory.allItems.length,
           indexDocs: globalIndexDocs.length,
-          deleted: 0,
+          deleted: apply ? globalOrphanIds.length : 0,
           urlUpdated: docUpdates.length,
           orphanIds: globalOrphanIds,
         };
+
+        if (indexNew) {
+          const gcUnindexed = findUnindexedSpItems(globalScan.inventory, globalIndexDocs);
+          console.log(
+            `[SL sync] global_common unindexedSPFiles=${gcUnindexed.length} apply=${apply}`
+          );
+          if (apply && gcUnindexed.length > 0) {
+            const { indexed, skipped } = await indexNewSpFiles({
+              accessToken,
+              dept: "common",
+              siteUrl: globalCommon.siteUrl,
+              driveName: globalCommon.driveName,
+              baseFolder: globalCommon.folder,
+              unindexedItems: gcUnindexed,
+              batchSize,
+              globalCommon,
+            });
+            gcResult.newIndexed = indexed;
+            gcResult.newSkipped = skipped;
+          } else {
+            gcResult.unindexedCount = gcUnindexed.length;
+          }
+        }
+
+        results["global_common"] = gcResult;
       } else {
         results["global_common"] = {
           spFileNames: 0,

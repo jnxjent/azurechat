@@ -14,6 +14,7 @@
 // - SL_SYNC_CHECK_KEY
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
@@ -80,6 +81,11 @@ async function getAppOnlyAccessToken(): Promise<string> {
 }
 
 // -------------------------------------------------------
+// Concurrency guard — prevent parallel sync runs
+// -------------------------------------------------------
+let syncRunning = false;
+
+// -------------------------------------------------------
 // Route handlers
 // -------------------------------------------------------
 export async function OPTIONS() {
@@ -87,6 +93,12 @@ export async function OPTIONS() {
 }
 
 export async function POST(req: NextRequest) {
+  if (syncRunning) {
+    console.warn("[SL sync-check] Sync already running, rejecting concurrent request");
+    return NextResponse.json({ ok: false, error: "同期が既に実行中です。完了をお待ちください。" }, { status: 429 });
+  }
+
+  syncRunning = true;
   try {
     await requireSyncKey(req);
 
@@ -94,10 +106,17 @@ export async function POST(req: NextRequest) {
 
     const url = new URL(req.url);
     const apply = url.searchParams.get("apply") === "true";
+    const indexNew = url.searchParams.get("indexNew") === "true";
+    const batchSize = Math.max(
+      1,
+      Math.min(20, parseInt(url.searchParams.get("batchSize") ?? "5", 10) || 5)
+    );
 
     const result = await runSlSync({
       accessToken,
       apply,
+      indexNew,
+      batchSize,
     });
 
     return NextResponse.json(result);
@@ -106,5 +125,7 @@ export async function POST(req: NextRequest) {
     const msg = String(e?.message ?? e);
     const status = msg.startsWith("Forbidden:") ? 403 : 500;
     return NextResponse.json({ ok: false, error: msg }, { status });
+  } finally {
+    syncRunning = false;
   }
 }

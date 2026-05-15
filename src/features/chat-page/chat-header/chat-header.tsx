@@ -38,7 +38,7 @@ export const ChatHeader: FC<Props> = (props) => {
     setSyncResult(null);
 
     try {
-      const res = await fetch("/api/sl/sync-check?apply=true", {
+      const res = await fetch("/api/sl/sync-check?apply=true&indexNew=true&batchSize=5", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
