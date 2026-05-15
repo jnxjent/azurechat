@@ -160,13 +160,13 @@ Rules:
 - preserveTextColors should usually be true unless the user explicitly asks to recolor text.
 - Only emit text replacements when the user explicitly wants wording changed.
 - slideIndex is zero-based.
-- If the user asks to add any visual element to a slide — including icons, illustrations, images, photos, vehicles, animals, objects, characters, or marks — populate imageInserts[]. Also treat descriptive phrases like "○○の絵" / "○○のイラスト" / "○○（説明）" as image requests even if the word "画像" or "image" is not used.
-  - imagePrompt: concise English DALL-E prompt (e.g. "white industrial garbage truck packer, side view, clean flat illustration, white background").
-  - nearText: if the user says "next to X" / "横に" / "〜の横" / "〜の隣" etc., set nearText to the shortest unique text string from the slide. The image will be placed adjacent to that shape.
-  - anchorSide: "right" for "横に/右に", "left" for "左に", "above" for "上に", "below" for "下に". Default "right".
-  - position: fallback when nearText shape is not found. Use "center" for main illustrations, "top-right" for decorative corner icons. Never use "top-left".
-  - widthPct: 6-8 for small inline icons, 12-15 for corner decorations, 30-50 for main illustrations. Default 35 for large illustrations, 13 for decorative icons.
-- Do NOT add descriptive text to the slide via replaceText when the user is clearly describing a visual/image to insert.
+- If the user asks to add an icon, illustration, image, or mark to a slide, populate imageInserts[].
+  - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background").
+  - nearText: if the user says "next to X", "beside X", "横に", "〇〇の横" etc., set nearText to the shortest unique text string found in the slide (e.g. "ボット" not the full sentence). The image will be placed adjacent to the shape containing that text.
+  - anchorSide: which side of the nearText shape to place the image. Use "right" for "横に/右に", "left" for "左に", "above" for "上に", "below" for "下に". Default "right".
+  - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons. Never use "top-left" as it may overlap slide content.
+  - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons next to text labels, 12-15 for decorative corner icons, 30-50 for large illustrations. Default 8 when nearText is set, 13 otherwise.
+- Only emit imageInserts when the user explicitly requests an image or visual element.
 - Keep the JSON minimal. Use null or [] when not needed.`;
 
   const userPrompt = `Instruction:
@@ -193,9 +193,9 @@ Return JSON only.`;
   parsed.slideEdits ??= [];
 
   const directAccent = parseDirectAccentColor(instruction);
-  // imageInserts がある場合、画像プロンプト内（「青系アイコン」等）の色を
-  // テキスト全体の色変更と誤認しないよう、parseDirectAccentColor を適用しない。
-  // LLM が明示的に accentColor を返した場合のみテキスト色を変更する。
+  // imageInserts がある場合は画像プロンプト内の色指定（「青系アイコン」等）を
+  // デッキ全体の色変更と誤認しないよう parseDirectAccentColor を適用しない。
+  // LLM が明示的に accentColor を返した場合のみデッキ色を変更する。
   const hasImageInserts = (parsed.imageInserts?.length ?? 0) > 0;
   if (!normalizeHexColor(parsed.deckEdits.accentColor) && directAccent && !hasImageInserts) {
     parsed.deckEdits.accentColor = directAccent;
@@ -288,8 +288,8 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
           }
         }
       } else {
-        // pptx コンテンツは {threadId}_edited_{uniqueId}.pptx などフラット構造
-        // threadId プレフィックスで前方一致検索、スラッシュなし！
+        // pptx コンテナは {threadId}_edited_{uniqueId}.pptx などフラット構造
+        // threadId プレフィックスで前方一致検索（スラッシュなし）
         const effectiveThreadId = threadId?.trim();
         if (effectiveThreadId) {
           for await (const blob of cc.listBlobsFlat({ prefix: effectiveThreadId })) {
@@ -369,6 +369,7 @@ type SheetSummary = {
     headerBold?: boolean;
   }>;
   sampleRows: Array<Record<string, string>>;
+  allRowsText: string; // 全行を "R行番号: 値1 | 値2 | ..." 形式で結合したテキスト
 };
 
 type ExcelEditPlan = {
@@ -409,7 +410,6 @@ async function extractXlsxHeaderStyles(
   try {
     const zip = await JSZip.loadAsync(buffer);
 
-    // --- テーマカラー解決 (theme index → RRGGBB) ---
     const themeColors: string[] = [];
     const themeFile = zip.files["xl/theme/theme1.xml"];
     if (themeFile) {
@@ -424,7 +424,6 @@ async function extractXlsxHeaderStyles(
       }
     }
 
-    // --- styles.xml 解极E---
     const stylesFile = zip.files["xl/styles.xml"];
     if (!stylesFile) return result;
     const stylesXml = await stylesFile.async("string");
@@ -463,7 +462,6 @@ async function extractXlsxHeaderStyles(
       });
     }
 
-    // --- 各シートのヘッダー行スタイルを抽出 ---
     for (let i = 0; i < sheetCount; i++) {
       const sheetFile = zip.files[`xl/worksheets/sheet${i + 1}.xml`];
       if (!sheetFile) continue;
@@ -526,6 +524,17 @@ async function extractSheetSummaries(buffer: Buffer): Promise<SheetSummary[]> {
       });
       return obj;
     });
+
+    // 全行を "R行番号: 値1 | 値2 | ..." 形式でテキスト化（最大200行）
+    const allRowsText = rows.slice(0, 200).map((row, rowIdx) => {
+      const cells = (row as unknown[]).map((cell) => {
+        if (cell === null || cell === undefined) return "";
+        if (cell instanceof Date) return cell.toLocaleDateString("ja-JP");
+        return String(cell).trim();
+      });
+      return `R${rowIdx + 1}: ${cells.join(" | ")}`;
+    }).join("\n");
+
     const ref = ws["!ref"];
     const range = ref ? XLSX.utils.decode_range(ref) : null;
 
@@ -535,6 +544,7 @@ async function extractSheetSummaries(buffer: Buffer): Promise<SheetSummary[]> {
       colCount: range ? range.e.c + 1 : columns.length,
       columns,
       sampleRows,
+      allRowsText,
     };
   });
 }
@@ -585,7 +595,7 @@ Return JSON only in this shape:
 Rules:
 - sheetName must match one of the provided sheet names exactly.
 - The "columns" array in each sheet lists column letters AND header names. Each column may also have headerFillColor, headerFontColor, headerBold indicating its current header cell style.
-- Always use the column LETTER (e.g. "D") in setCells addresses, copyRowColorEdits, and formatEdits ranges  Enever use the header name as a substitute for a column letter.
+- Always use the column LETTER (e.g. "D") in setCells addresses, copyRowColorEdits, and formatEdits ranges — never use the header name as a substitute for a column letter.
 - Use setCells when the user wants to add or update cell values. The value field can be a literal (number or string) OR an Excel formula string starting with "=".
   - When the user asks to calculate a value, use an Excel formula. Examples:
     - 合計 =SUM(B2:B10)
@@ -595,24 +605,38 @@ Rules:
       Replace B with the score column letter and 4 with the last data row number (rowCount - 1 if row 1 is header).
       Output one setCells entry per data row (from row 2 to last data row), adjusting only the lone "B2" row number each time (keep $B$2:$B$4 fixed).
       IMPORTANT: Never use STDEV.P, STDEVP, or any function containing a dot. Never prefix "@" before a function name.
-  - NEVER add a header name via setCells  Eset the header through the setCells value directly in row 1.
+  - NEVER add a header name via setCells — set the header through the setCells value directly in row 1.
 - Use replaceText ONLY when the user explicitly asks to find and replace text content. NEVER use replaceText for formatting operations.
 - Use formatEdits for bold/color changes. fontColor and fillColor are 6-digit hex (no #).
 - AUTO HEADER STYLING: Whenever you add a new column (i.e. setCells includes a row-1 cell for a column that does not yet exist), you MUST ALWAYS emit a formatEdits entry for that new header cell that copies the style of the existing styled headers:
-  1. Find any existing column that has headerFillColor set  Euse its headerFillColor, headerFontColor, and headerBold.
+  1. Find any existing column that has headerFillColor set — use its headerFillColor, headerFontColor, and headerBold.
   2. Apply all three (fillColor, fontColor, bold) to the new header cell range (e.g. "C1").
-  3. This rule is unconditional  Eapply it even if the user did not mention design or style.
+  3. This rule is unconditional — apply it even if the user did not mention design or style.
 - DESIGN MATCHING (explicit): When the user additionally says "デザインを合わせて" / "同じデザイン" etc., also emit copyRowColorEdits to copy row-by-row background colors from an adjacent styled column to the new column.
 - Use copyRowColorEdits when the user wants a column's background colors to match those of another column row-by-row. targetColumn and referenceColumn MUST be column letters from the "columns" list.
-- Use borderEdits when the user asks to add borders (枠・罫線/border), frame cells, or make the sheet look cleaner. Infer the data range from the sheet summary. Use edges="all" for full grid, "outer" for outer frame only.
+- Use borderEdits when the user asks to add borders (枠・罫線・border), frame cells, or make the sheet look cleaner. Infer the data range from the sheet summary. Use edges="all" for full grid, "outer" for outer frame only.
 - NEVER set a cell value to an empty string unless the user explicitly asks to clear that cell.
 - NEVER modify header row values (row 1) unless the user explicitly asks to change column names.
 - Only emit the operations the user actually requested. Keep the JSON minimal.`;
 
+  const sheetsSummary = sheets.map((s) => {
+    const colDesc = s.columns.map((c) => {
+      const style = [
+        c.headerFillColor ? `fill:${c.headerFillColor}` : "",
+        c.headerFontColor ? `font:${c.headerFontColor}` : "",
+        c.headerBold ? "bold" : "",
+      ].filter(Boolean).join(",");
+      return style ? `${c.letter}(${c.header})[${style}]` : `${c.letter}(${c.header})`;
+    }).join(", ");
+    return `=== Sheet: ${s.sheetName} | rows:${s.rowCount} cols:${s.colCount} ===
+Columns: ${colDesc}
+All rows:
+${s.allRowsText}`;
+  }).join("\n\n");
+
   const userPrompt = `Instruction: ${instruction}
 
-Sheets:
-${JSON.stringify(sheets, null, 2)}
+${sheetsSummary}
 
 Return JSON only.`;
 
@@ -623,7 +647,7 @@ Return JSON only.`;
       { role: "user", content: userPrompt },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 1500,
+    max_completion_tokens: 4096,
   });
 
   const content = res.choices[0]?.message?.content ?? "{}";
@@ -635,9 +659,6 @@ Return JSON only.`;
   return parsed;
 }
 
-/** 新列に対して既存ヘッダーの完全なスタイル（fill+font+bold）と枠線を強制注入する。
- *  LLMがfillだけ生成してfontを欠いても、この関数で上書き補完する。
- */
 function injectMissingHeaderStyles(
   plan: ExcelEditPlan,
   sheets: SheetSummary[]
@@ -648,13 +669,11 @@ function injectMissingHeaderStyles(
     const sheet = sheetMap.get(sheetEdit.sheetName);
     if (!sheet) continue;
 
-    // スタイルを持つ既存行をテンプレートとして使う
     const templateCol = sheet.columns.find((c) => c.headerFillColor);
     if (!templateCol) continue;
 
     const existingLetters = new Set(sheet.columns.map((c) => c.letter));
 
-    // setCells でrow1に追加される新列を収集
     const newHeaderLetters = new Set<string>();
     for (const cell of sheetEdit.setCells ?? []) {
       const m = /^([A-Z]+)1$/.exec(cell.address);
@@ -664,7 +683,6 @@ function injectMissingHeaderStyles(
     for (const colLetter of Array.from(newHeaderLetters)) {
       const headerRange = `${colLetter}1`;
 
-      // LLMが生成したこの列のformatEditsを削除して完全版で上書き！fillだけの不完全なものを排除する
       plan.formatEdits = (plan.formatEdits ?? []).filter(
         (fe) => !(fe.sheetName === sheetEdit.sheetName && fe.range === headerRange)
       );
@@ -676,8 +694,6 @@ function injectMissingHeaderStyles(
         fillColor: templateCol.headerFillColor!,
       });
 
-      // 新列の全セル（ヘッダー+データ行）に枠線を注入
-      // setCells の最大行数から列データ末尾を算出
       let maxRow = sheet.rowCount;
       for (const cell of sheetEdit.setCells ?? []) {
         const cm = /^([A-Z]+)(\d+)$/.exec(cell.address);
@@ -894,29 +910,31 @@ async function resolveConvertPdfScriptPath(): Promise<string> {
   throw new Error(`pdf_to_excel.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function correctExcelAccountNames(excelBuffer: Buffer): Promise<Buffer> {
+/** LLMで勘定科目名の断片化・文字化けを補正するプランを生成する（読み取り専用・XLSX.js書き込みなし）。
+ *  書き込みは呼び出し元がopenpyxl(edit_excel.py)で行うことで元のxlsx構造を保持する。
+ */
+async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<ExcelEditPlan> {
   const openai = OpenAIInstance();
   const wb = XLSX.read(excelBuffer, { type: "buffer" });
-
   const isAccountName = (val: string) =>
     val.trim().length > 0 && !/^[\d,，△▲\-()（）\s]+$/.test(val.trim());
 
+  const sheetEdits: NonNullable<ExcelEditPlan["sheetEdits"]> = [];
+
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
-    if (!ws) continue;
     const data = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" }) as string[][];
-    if (data.length === 0) continue;
-
-    // 科目名が入る列を自動検出（各列の isAccountName 候補が 3件以上ある列をすべて処理）
-    const maxCols = Math.max(...data.map(row => row.length));
+    if (!data.length) continue;
+    const maxCols = Math.max(...data.map((row) => row.length));
     const colIndices: number[] = [];
     for (let c = 0; c < maxCols; c++) {
-      const count = data.filter(row => isAccountName(String(row[c] ?? ""))).length;
+      const count = data.filter((row) => isAccountName(String(row[c] ?? ""))).length;
       if (count >= 3) colIndices.push(c);
     }
 
+    const setCells: Array<{ address: string; value: string }> = [];
+
     for (const colIdx of colIndices) {
-      // 科目名候補のみに絞る（数値・金額・空セルは対象外）
       const candidates: { rowIdx: number; name: string }[] = [];
       for (let i = 0; i < data.length; i++) {
         const val = String(data[i]?.[colIdx] ?? "").trim();
@@ -924,62 +942,54 @@ async function correctExcelAccountNames(excelBuffer: Buffer): Promise<Buffer> {
       }
       if (candidates.length === 0) continue;
 
-      console.log(`[pdf-to-excel] correctExcelAccountNames: sheet="${sheetName}" col=${colIdx} candidates=${candidates.length}`);
-      console.log(`[pdf-to-excel] sample input:`, candidates.slice(0, 10).map(r => r.name));
-
-      // バッチサイズ 80 件ずつ処理
       const BATCH = 80;
       for (let batchStart = 0; batchStart < candidates.length; batchStart += BATCH) {
         const batch = candidates.slice(batchStart, batchStart + BATCH);
-
         try {
           const res = await openai.chat.completions.create({
             model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
-            messages: [{
-              role: "user",
-              content:
-                "以下は日本の財務諸表（貸借対照表・損益計算書・販売費及び一般管理費・製造原価報告書）の列データです。\n" +
-                "TKC会計ソフトのPDFは文字を1文字ずつ配置するため、OCR後に文字化けや断片化が発生します。\n" +
-                "例: 「Ⅱ 上 原壳価」→「Ⅱ 売上原価」、「壳」→「売」、「資 本金」→「資本金」\n\n" +
-                "ルール:\n" +
-                "1. 入力と同じ順序・同じ件数で返してください\n" +
-                "2. 科目名の文字化けを正しい勘定科目名に補正してください\n" +
-                "3. 補正不要な行はそのまま返してください\n" +
-                "4. ローマ数字（Ⅰ Ⅱ Ⅲ）や括弧も含めてそのまま返してください\n\n" +
-                `以下の入力リスト(${batch.length}件)を補正し、JSON形式 {"corrected": [...]} で返してください:\n` +
-                JSON.stringify(batch.map(r => r.name)),
-            }],
+            messages: [
+              {
+                role: "user",
+                content:
+                  "以下は日本の財務諸表（貸借対照表・損益計算書・販売費及び一般管理費・製造原価報告書）の列データです。\n" +
+                  "TKC会計ソフトのPDFは文字を1文字ずつ配置するため、OCR後に文字化けや断片化が発生します。\n" +
+                  "例: 「Ⅱ 上 原壳価」→「Ⅱ 売上原価」、「壳」→「売」、「資 本金」→「資本金」\n" +
+                  "例: 「短\\n期貸付\\n金」→「短期貸付金」（改行で分割された文字を結合する）\n\n" +
+                  "ルール:\n1. 入力と同じ順序・同じ件数で返してください\n" +
+                  "2. 科目名の文字化けや改行による断片化を正しい勘定科目名に補正してください\n" +
+                  "3. 補正不要な行はそのまま返してください\n" +
+                  "4. ローマ数字（Ⅰ Ⅱ Ⅲ）や括弧も含めてそのまま返してください\n\n" +
+                  `以下の入力リスト(${batch.length}件)を補正し、JSON形式 {"corrected": [...]} で返してください:\n` +
+                  JSON.stringify(batch.map((r) => r.name)),
+              },
+            ],
             response_format: { type: "json_object" },
             max_completion_tokens: 4000,
           });
-
           const content = res.choices[0]?.message?.content ?? "{}";
-          console.log(`[pdf-to-excel] LLM response (batch ${batchStart}):`, content.slice(0, 300));
-
           const parsed = JSON.parse(content);
           const corrected: unknown[] = parsed.corrected ?? Object.values(parsed)[0];
-          if (!Array.isArray(corrected) || corrected.length !== batch.length) {
-            console.warn(`[pdf-to-excel] length mismatch: expected=${batch.length} got=${Array.isArray(corrected) ? corrected.length : "non-array"}`);
-            continue;
-          }
-
+          if (!Array.isArray(corrected) || corrected.length !== batch.length) continue;
           for (let i = 0; i < batch.length; i++) {
             const newVal = String(corrected[i] ?? "").trim();
             const oldVal = batch[i].name;
-            // 空文字返却・変更なし・明らかな誤補正はスキップ（原文維持）
             if (!newVal || newVal === oldVal) continue;
             const addr = XLSX.utils.encode_cell({ r: batch[i].rowIdx, c: colIdx });
-            ws[addr] = { t: "s", v: newVal };
-            console.log(`[pdf-to-excel] corrected: "${oldVal}" → "${newVal}"`);
+            setCells.push({ address: addr, value: newVal });
           }
         } catch (e) {
-          console.warn(`[pdf-to-excel] LLM correction failed sheet=${sheetName} col=${colIdx} batch=${batchStart}:`, String((e as any)?.message ?? e));
+          console.warn(`[pdf-to-excel] LLM correction failed:`, String((e as any)?.message ?? e));
         }
       }
     }
+
+    if (setCells.length > 0) {
+      sheetEdits.push({ sheetName, setCells });
+    }
   }
 
-  return Buffer.from(XLSX.write(wb, { type: "buffer", bookType: "xlsx" }));
+  return { sheetEdits };
 }
 
 async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUrl?: string) {
@@ -989,7 +999,7 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
   const outputPath = path.join(tempDir, "output.xlsx");
   const scriptPath = await resolveConvertPdfScriptPath();
 
-  // PYTHONPATH・LD_LIBRARY_PATH を明示的に設定！startup.sh が動いていない環境でも動作させるため
+  // PYTHONPATH・LD_LIBRARY_PATH を明示的に設定（startup.sh が動いていない環境でも動作させるため）
   const pyEnv = process.platform !== "win32"
     ? {
         ...process.env,
@@ -1014,13 +1024,33 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
     }
 
     const rawBuffer = await fs.readFile(outputPath);
-    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
-    let outputBuffer: Buffer = Buffer.from(rawBuffer);
+
+    // 勘定科目名の断片化・文字化けをLLMで補正し、openpyxlで書き込む（元のxlsx構造を保持）
+    let outputBuffer = rawBuffer;
     try {
-      outputBuffer = await correctExcelAccountNames(rawBuffer);
+      const correctionPlan = await buildAccountNameCorrectionPlan(rawBuffer);
+      if (correctionPlan.sheetEdits?.length) {
+        const correctionDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-correct-"));
+        try {
+          const corrInPath = path.join(correctionDir, "input.xlsx");
+          const corrOutPath = path.join(correctionDir, "output.xlsx");
+          const corrPlanPath = path.join(correctionDir, "plan.json");
+          const editScriptPath = await resolveEditExcelScriptPath();
+          await fs.writeFile(corrInPath, rawBuffer);
+          await fs.writeFile(corrPlanPath, JSON.stringify(correctionPlan), "utf8");
+          await execFileAsync(pythonBin, [editScriptPath, "--input", corrInPath, "--output", corrOutPath, "--plan", corrPlanPath], { env: pyEnv });
+          outputBuffer = await fs.readFile(corrOutPath);
+          console.log(`[pdf-to-excel] applied ${correctionPlan.sheetEdits.reduce((n, s) => n + (s.setCells?.length ?? 0), 0)} account name corrections`);
+        } finally {
+          await fs.rm(correctionDir, { recursive: true, force: true });
+        }
+      }
     } catch (e) {
-      console.warn("[pdf-to-excel] LLM account name correction skipped (fallback to raw):", String((e as any)?.message ?? e));
+      console.warn("[pdf-to-excel] account name correction failed, using uncorrected file:", String((e as any)?.message ?? e));
+      outputBuffer = rawBuffer;
     }
+
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.xlsx`;
     const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
 
@@ -1071,7 +1101,6 @@ type WordEditPlan = {
     italic?: boolean;
     fontSize?: number;
     fontColor?: string;
-    fontFace?: string;
   }>;
 };
 
@@ -1123,8 +1152,7 @@ Return JSON only in this shape:
       "text": "paragraph text to append",
       "style": "Normal",
       "bold": false,
-      "fontSize": 12,
-      "fontFace": "Meiryo"
+      "fontSize": 12
     }
   ]
 }
@@ -1138,7 +1166,6 @@ Rules:
   - fontFace: font name string. "ゴシック" → "Yu Gothic", "明朝" → "Yu Mincho", "メイリオ" → "Meiryo". Use the exact font name as a string.
 - addParagraphs: use when the user wants to INSERT or APPEND new text to the document.
   - style: "Normal" | "Heading1" | "Heading2" | "List Bullet" (default "Normal").
-  - fontFace: font name string. Apply the same mapping as formatRuns. "ゴシック" → "Yu Gothic", "明朝" → "Yu Mincho", "メイリオ" → "Meiryo".
   - Paragraphs are appended at the end of the document.
 - Only emit operations the user actually requested. Keep JSON minimal.`;
 
@@ -1385,7 +1412,7 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
       } catch {
         throw new Error(
           "python-pptx または lxml がサーバーにインストールされていません。" +
-          "startup.sh の設定を確認してください。"
+          "サーバー管理者に startup.sh の設定を確認してください。"
         );
       }
     }
@@ -1412,7 +1439,7 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     const insertedImages = Number(pythonResult.insertedImages ?? 0);
     const imageWarning =
       requestedImages > 0 && insertedImages < requestedImages
-        ? `画像挿入: ${requestedImages}件要汁E/ ${insertedImages}件成功`
+        ? `画像挿入: ${requestedImages}件要求 / ${insertedImages}件成功`
         : undefined;
 
     return {
@@ -1494,7 +1521,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, ...result });
     }
 
-    // PPTX フロー（既存！）
+    // PPTX フロー（既存）
     const pptxBuffer = await downloadBlob(fileUrl, threadId);
     const slides = await extractSlideSummaries(pptxBuffer);
     const plan = await buildEditPlan(slides, instruction);
