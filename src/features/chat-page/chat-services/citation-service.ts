@@ -96,39 +96,20 @@ export const FindCitationByID = async (
   }
 };
 
-function isBlobUrl(value?: string | null): boolean {
-  if (!value) return false;
-  try {
-    return new URL(value).hostname.endsWith(".blob.core.windows.net");
-  } catch {
-    return value.includes(".blob.core.windows.net");
-  }
-}
-
-function resolveCitationUrl(d: DocumentSearchResponse): string {
-  const fileUrl = d.document.fileUrl ?? "";
-  const effectiveFileUrl = d.document.effectiveFileUrl ?? "";
-
-  if (d.document.isSlDoc && isBlobUrl(effectiveFileUrl) && fileUrl) {
-    return fileUrl;
-  }
-
-  return effectiveFileUrl || fileUrl;
-}
-
 export const FormatCitations = (citation: DocumentSearchResponse[]) => {
   const withoutEmbedding: DocumentSearchResponse[] = [];
 
   citation.forEach((d) => {
-    const citationUrl = resolveCitationUrl(d);
+    const fileUrl = d.document.fileUrl ?? "";
+    const effectiveFileUrl = d.document.effectiveFileUrl ?? fileUrl;
 
     console.log(
       "[CITATION] effectiveFileUrl=",
       d.document.effectiveFileUrl,
       "fileUrl=",
       d.document.fileUrl,
-      "citationUrl=",
-      citationUrl
+      "downloadUrl=",
+      effectiveFileUrl || fileUrl
     );
 
     withoutEmbedding.push({
@@ -138,14 +119,16 @@ export const FormatCitations = (citation: DocumentSearchResponse[]) => {
         pageContent: d.document.pageContent,
         chatThreadId: d.document.chatThreadId,
 
-        // ★★★ ここが修正ポイント ★★★
-        fileUrl: citationUrl,
+        fileUrl,
 
-        effectiveFileUrl: citationUrl || null,
+        effectiveFileUrl: effectiveFileUrl || null,
         id: "",
         user: "",
         dept: d.document.dept ?? "",
         isSlDoc: d.document.isSlDoc ?? null,
+        slScope: d.document.slScope ?? null,
+        slOwner: d.document.slOwner ?? null,
+        spItemId: d.document.spItemId ?? null,
       },
     });
   });

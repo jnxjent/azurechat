@@ -181,18 +181,15 @@ export function buildUploadFolder(params: {
   userEmail: string;
 }): string {
   const baseFolder = params.baseFolder.trim().replace(/^\/+|\/+$/g, "");
-  if (!baseFolder) {
-    throw new Error("baseFolder is empty.");
-  }
 
   if (params.uploadScope === "common") {
     const commonSubfolder =
       (process.env.SL_COMMON_SUBFOLDER ?? "common").trim() || "common";
-    return `${baseFolder}/${commonSubfolder}`;
+    return baseFolder ? `${baseFolder}/${commonSubfolder}` : commonSubfolder;
   }
 
   const personalFolder = getPersonalFolderNameFromEmail(params.userEmail);
-  return `${baseFolder}/${personalFolder}`;
+  return baseFolder ? `${baseFolder}/${personalFolder}` : personalFolder;
 }
 
 export function getUserEmailFromJwtToken(token: any): string | null {
