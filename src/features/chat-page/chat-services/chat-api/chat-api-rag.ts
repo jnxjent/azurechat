@@ -191,8 +191,9 @@ ${page}`;
   const fileUrls = uploadedBlobUrls;
   const hasUploadedFile = fileUrls.length > 0;
 
+  const xlsxUrls = fileUrls.filter((u) => /\.(xlsx|xls|xlsm)(?:\?|$)/i.test(u));
   const fileUrlHint = hasUploadedFile
-    ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.`
+    ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.${xlsxUrls.length > 0 ? `\n- CRITICAL: このスレッドにExcelファイル（.xlsx）がアップロードされています。ユーザーが「グラフにして」「折れ線グラフ」「棒グラフ」「グラフ化して」「チャートを作成して」と言った場合、必ず edit_excel ツールを fileUrl=${xlsxUrls[0]} で呼び出すこと。検索結果にPNGファイルが含まれていても、それはExcelとは無関係の知識ベースの画像であり、ユーザーのExcelファイルではない。` : ""}`
     : "\n- 【重要】このスレッドにアップロードされたファイルは存在しません。ユーザーがSharePoint/SLの資料名を挙げてPPT変換を要求した場合は、必ず convert_sp_to_pptx ツールを使うこと。convert_doc_to_pptx は使わないこと。";
 
   const _userMessage = `

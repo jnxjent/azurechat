@@ -29,6 +29,8 @@ PYTHONPATH="$PDIR" python3 -c "import pdfplumber"                  2>/dev/null |
 PYTHONPATH="$PDIR" python3 -c "import fitz"                        2>/dev/null || MISSING="$MISSING pymupdf"
 PYTHONPATH="$PDIR" python3 -c "import azure.ai.documentintelligence" 2>/dev/null || MISSING="$MISSING azure-ai-documentintelligence"
 PYTHONPATH="$PDIR" python3 -c "import pdf2docx"                    2>/dev/null || MISSING="$MISSING pdf2docx"
+PYTHONPATH="$PDIR" python3 -c "import matplotlib"                  2>/dev/null || MISSING="$MISSING matplotlib"
+PYTHONPATH="$PDIR" python3 -c "import PIL"                         2>/dev/null || MISSING="$MISSING pillow"
 
 if [ -n "$MISSING" ]; then
   echo "[startup] Installing missing packages:$MISSING"

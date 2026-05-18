@@ -602,7 +602,7 @@ export type AnalyzeDocVisionResponse = {
   error?: string;
 };
 
-async function analyzeDocVision(
+export async function analyzeDocVision(
   fileUrl: string,
   maxPages: number = MAX_PAGES,
   mode?: "faithful" | "redesign"

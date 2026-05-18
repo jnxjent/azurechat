@@ -2,14 +2,16 @@
 "use server";
 import "server-only";
 
-import { GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
+import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
 import { OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
+import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
+import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
 import { SimpleSearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -20,43 +22,6 @@ import {
 } from "@/features/chat-page/chat-services/chat-api/reasoning-utils";
 
 type ThinkingModeAPI = "normal" | "thinking" | "fast";
-
-async function analyzeDocVision(
-  fileUrl: string,
-  maxPages: number = 30,
-  mode?: "faithful" | "redesign"
-) {
-  const baseUrl = (
-    process.env.NEXTAUTH_URL ||
-    (process.env.WEBSITE_HOSTNAME
-      ? `https://${process.env.WEBSITE_HOSTNAME}`
-      : "http://localhost:3000")
-  ).replace(/\/+$/, "");
-
-  const res = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify({ fileUrl, maxPages, mode }),
-  });
-
-  const text = await res.text();
-  let parsed: any = null;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = null;
-  }
-
-  if (!res.ok) {
-    return {
-      ok: false,
-      error: parsed?.error ?? parsed?.message ?? text.slice(0, 500) ?? `HTTP ${res.status}`,
-    };
-  }
-
-  return parsed;
-}
 
 /** standard を normal へ、その他はそのまま（保険） */
 function normalizeThinkingMode(
@@ -621,27 +586,98 @@ function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
 }
 
 function extractLatestXlsxUrlFromMessages(messages: string[]): string | null {
-  const urlPattern = /https?:\/\/[^\s)\]]+\.xlsx(?:\?[^\s)\]]*)?/gi;
+  // messages は createdAt DESC（新しい順）で渡される前提
+  // 最初にヒットした URL を即 return することで「最新」を確保する
+  const urlPattern = /https?:\/\/[^\s)\]"']+\.(?:xlsx|xls|xlsm)(?:\?[^\s)\]"']*)?/gi;
   for (const message of messages) {
     const matches = message.match(urlPattern);
     if (matches?.length) {
-      return matches[matches.length - 1];
+      // Blob URL（blob.core.windows.net）を優先、なければ最後の一致
+      const blobUrl = matches.find((u) => u.includes("blob.core.windows.net"));
+      return blobUrl ?? matches[matches.length - 1];
     }
   }
   return null;
 }
 
-async function resolveLatestXlsxUrlFromThread(chatThreadId: string): Promise<string | null> {
+// ---------- スレッド単位の最新 Excel URL ポインタ (Blob Storage) ----------
+
+type ExcelPointer = { url: string; fileName: string; savedAt: number; sourceFileQuery?: string; chartEdits?: object[] };
+const EXCEL_PTR_BLOB = (threadId: string) => `thread-${threadId}-excel-latest.json`;
+
+async function saveLatestExcelUrl(
+  threadId: string,
+  url: string,
+  fileName: string,
+  sourceFileQuery?: string,
+  chartEdits?: object[]
+): Promise<void> {
   try {
-    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
-    if (historyResponse.status !== "OK") return null;
-    const messages = historyResponse.response
-      .map((message) => String(message.content ?? "").trim())
-      .filter(Boolean);
-    return extractLatestXlsxUrlFromMessages(messages);
+    const data: ExcelPointer = { url, fileName, savedAt: Date.now(), sourceFileQuery, chartEdits };
+    await UploadBlob("dl-link", EXCEL_PTR_BLOB(threadId), Buffer.from(JSON.stringify(data)));
+    console.log(`[excel-ptr] saved pointer for thread ${threadId}: ${fileName} (query: ${sourceFileQuery ?? "-"}, charts: ${chartEdits?.length ?? 0})`);
+  } catch (e) {
+    console.warn("[excel-ptr] save failed:", e);
+  }
+}
+
+async function readLatestExcelPtr(threadId: string): Promise<ExcelPointer | null> {
+  try {
+    const res = await DownloadBlobAsText("dl-link", EXCEL_PTR_BLOB(threadId));
+    if (res.status !== "OK") return null;
+    return JSON.parse(res.response) as ExcelPointer;
   } catch {
     return null;
   }
+}
+
+// -----------------------------------------------------------------------
+
+async function resolveLatestXlsxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    // 0th: Blob ポインタ vs 新規アップロードを比較して新しい方を使う
+    const [ptr, docsResponse] = await Promise.all([
+      readLatestExcelPtr(chatThreadId),
+      FindAllChatDocuments(chatThreadId),
+    ]);
+
+    const latestUploadDoc = docsResponse.status === "OK"
+      ? docsResponse.response
+          .filter((doc) => /\.(xlsx|xls|xlsm)$/i.test(doc.name))
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
+      : null;
+    const latestUploadTime = latestUploadDoc ? new Date(latestUploadDoc.createdAt).getTime() : 0;
+
+    if (ptr?.url) {
+      if (latestUploadTime > ptr.savedAt) {
+        // 新規アップロードがポインタより新しい → アップロードを優先
+        console.log(`[resolveLatestXlsx] newer upload (${latestUploadDoc!.name}) > pointer, using upload`);
+        const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc!.name}`);
+        if (sasRes.status === "OK") return sasRes.response;
+      }
+      console.log(`[resolveLatestXlsx] using blob pointer: ${ptr.fileName}`);
+      return ptr.url;
+    }
+
+    // 1st: scan message history for xlsx URLs
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status === "OK") {
+      const messages = historyResponse.response
+        .map((message) => String(message.content ?? "").trim())
+        .filter(Boolean);
+      const fromHistory = extractLatestXlsxUrlFromMessages(messages);
+      if (fromHistory) return fromHistory;
+    }
+
+    // 2nd: fall back to ChatDocuments (already fetched above)
+    if (latestUploadDoc) {
+      const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc.name}`);
+      if (sasRes.status === "OK") return sasRes.response;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 function extractLatestDocxUrlFromMessages(messages: string[]): string | null {
@@ -1287,6 +1323,41 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
+  // ★ SharePoint SL の Excel ファイルを編集するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeEditSpExcel(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileQuery: {
+            type: "string",
+            description: "編集したいSharePointのExcelファイルの名前またはキーワード。例: '売上データ.xlsx'",
+          },
+          instruction: {
+            type: "string",
+            description: "編集指示。例: '折れ線グラフを作成して'、'棒グラフにして'、'縦軸を千円単位にして'",
+          },
+          previousChartEdits: {
+            type: "array",
+            description:
+              "【グラフ修正時は必須】直前の edit_sp_excel / edit_excel のtool結果に含まれる appliedChartEdits の値をそのまま渡すこと。前回のグラフ設定が引き継がれ、指定した項目だけ変更される。",
+            items: { type: "object" },
+          },
+        },
+        required: ["fileQuery", "instruction"],
+      },
+      description:
+        "SharePointのSLライブラリにあるExcelファイル（.xlsx/.xls/.xlsm）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ユーザーがSP/SL上のExcelのグラフ作成・セル編集・書式変更などを求める場合。\n" +
+        "例: 「SPにある売上データ.xlsxをグラフ化して」「SLの〇〇.xlsxに折れ線グラフを追加して」\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_sp_excel",
+    },
+  });
+
   // ★ テキスト・表データから Excel ファイルを新規作成するツール
   defaultExtensions.push({
     type: "function",
@@ -1350,14 +1421,23 @@ export const GetDefaultExtensions = async (props: {
           instruction: {
             type: "string",
             description:
-              "ユーザーの編集指示。例: 'A1セルを「売上合計」に変えて', '1行目を太字・背景色を青に', '「旧社名」を「新社名」に置換して'",
+              "ユーザーの編集指示。例: 'A1セルを「売上合計」に変えて', '1行目を太字・背景色を青に', '「旧社名」を「新社名」に置換して', '折れ線グラフを作成してシート内に追加して', '棒グラフにして', '棒を赤に'。",
+          },
+          previousChartEdits: {
+            type: "array",
+            description:
+              "【グラフ修正時は必須】直前の edit_excel / edit_sp_excel のtool結果に含まれる appliedChartEdits の値をそのまま渡すこと。" +
+              "これにより前回のグラフ設定（chartType・title・yDivisor・seriesColors等）が自動的に引き継がれ、指定した項目だけ変更される。" +
+              "グラフを新規作成する場合は省略してよい。",
+            items: { type: "object" },
           },
         },
         required: ["instruction"],
       },
       description:
         "このスレッドのExcelファイル（アップロードまたはcreate_excelで作成）を自然言語の指示に従って編集するツール。\n" +
-        "使用タイミング：ExcelファイルへのセルA値変更・テキスト置換・書式変更（太字・色・罫線・枠・border）・整形・見やすくする等を求める場合。\n" +
+        "使用タイミング：ExcelファイルへのセルA値変更・テキスト置換・書式変更（太字・色・罫線・枠・border）・整形・見やすくする・グラフ作成/修正（折れ線グラフ・棒グラフ・散布図・円グラフ・チャート・タイトル変更・縦軸/横軸ラベル変更・単位変更・目盛調整）等を求める場合。\n" +
+        "重要：グラフ・縦軸・横軸・単位に関する指示は必ずこのツールで処理すること。「画像なので数値が読めない」は誤り — このツールがExcelの元データを直接読み取る。\n" +
         "fileUrl が省略された場合はスレッド内の最新Excelを自動的に使用する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_excel",
@@ -1865,10 +1945,10 @@ async function executeEditPptx(
 
 // ---------------- Excel 編集 ----------------
 async function executeEditExcel(
-  args: { fileUrl?: string; instruction: string },
+  args: { fileUrl?: string; instruction: string; previousChartEdits?: object[]; sourceFileQuery?: string },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, instruction } = args ?? {};
+  const { fileUrl, instruction, previousChartEdits: llmPreviousChartEdits, sourceFileQuery } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
@@ -1881,6 +1961,15 @@ async function executeEditExcel(
     };
   }
 
+  // LLMが previousChartEdits を渡さなかった場合はポインタから自動補完（LLM依存を排除）
+  const existingPtr = await readLatestExcelPtr(chatThread.id);
+  const previousChartEdits = llmPreviousChartEdits?.length
+    ? llmPreviousChartEdits
+    : existingPtr?.chartEdits;
+  if (previousChartEdits?.length) {
+    console.log(`[edit_excel] previousChartEdits: ${previousChartEdits.length} entries (source: ${llmPreviousChartEdits?.length ? "LLM" : "pointer"})`);
+  }
+
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
     (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
@@ -1890,7 +1979,7 @@ async function executeEditExcel(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id, previousChartEdits }),
     });
 
     if (!res.ok) {
@@ -1904,12 +1993,22 @@ async function executeEditExcel(
       return { error: "ダウンロードURLが取得できませんでした。" };
     }
 
+    // ポインタ更新（sourceFileQuery は引数優先 → 既存ポインタ引き継ぎ、chartEdits も保持）
+    await saveLatestExcelUrl(
+      chatThread.id,
+      result.downloadUrl,
+      result.fileName ?? "edited.xlsx",
+      sourceFileQuery ?? existingPtr?.sourceFileQuery,
+      result.appliedChartEdits ?? existingPtr?.chartEdits
+    );
+
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
       changedSheets: result.changedSheets,
       totalSheets: result.totalSheets,
       message: `${result.changedSheets}シートを編集しました（全${result.totalSheets}シート）。`,
+      ...(result.appliedChartEdits ? { appliedChartEdits: result.appliedChartEdits } : {}),
     };
   } catch (e: any) {
     console.error("[edit_excel] error:", e);
@@ -2405,15 +2504,24 @@ async function executeEditSpPptx(
 
   const candidates = Array.from(seen.values());
 
+  const uniqueFileNamesPptx = new Set(
+    candidates.map((c) => c.fileName.toLowerCase().replace(/\.pptx$/i, ""))
+  );
+
+  let chosenPptx = candidates[0];
   if (candidates.length > 1) {
-    const list = candidates.map((c, i) => `${i + 1}. ${c.fileName}`).join("\n");
-    return {
-      multipleFiles: true,
-      message: `「${fileQuery}」で複数のファイルが見つかりました。どれを編集しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
-    };
+    if (uniqueFileNamesPptx.size === 1) {
+      console.log(`[edit_sp_pptx] ${candidates.length} duplicates of "${candidates[0].fileName}" found — auto-selecting first (highest relevance)`);
+    } else {
+      const list = Array.from(uniqueFileNamesPptx).map((n, i) => `${i + 1}. ${n}`).join("\n");
+      return {
+        multipleFiles: true,
+        message: `「${fileQuery}」で複数の異なるファイルが見つかりました。どれを編集しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+      };
+    }
   }
 
-  const { fileName, sourceUrl, effectiveFileUrl } = candidates[0];
+  const { fileName, sourceUrl, effectiveFileUrl } = chosenPptx;
   console.log(`[edit_sp_pptx] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
 
   // 4. SAS URL を解決する
@@ -2448,6 +2556,132 @@ async function executeEditSpPptx(
 
   // 5. edit-pptx API に委託
   return executeEditPptx({ fileUrl: resolvedUrl, instruction }, chatThread);
+}
+
+// ---------------- SharePoint SL の Excel を編集 ----------------
+async function executeEditSpExcel(
+  args: { fileQuery: string; instruction: string; previousChartEdits?: object[] },
+  chatThread: ChatThreadModel
+) {
+  const { fileQuery, instruction, previousChartEdits } = args ?? {};
+
+  if (!fileQuery?.trim()) return { error: "fileQuery（ファイル名またはキーワード）を指定してください。" };
+  if (!instruction?.trim()) return { error: "instruction（編集内容）を指定してください。" };
+
+  // 0. このスレッドで前回編集した Blob ポインタがあり、fileQuery と同名なら SP 再取得をスキップ
+  //    照合は sourceFileQuery（元のSPファイル名）を優先する（編集済みファイル名は "_edited_" が入るため）
+  const ptr = await readLatestExcelPtr(chatThread.id);
+  if (ptr?.url) {
+    const ptrMatch = (ptr.sourceFileQuery ?? ptr.fileName).toLowerCase().replace(/\.(xlsx|xls|xlsm)$/i, "");
+    const queryBase = fileQuery.trim().toLowerCase().replace(/\.(xlsx|xls|xlsm)$/i, "");
+    if (ptrMatch.includes(queryBase) || queryBase.includes(ptrMatch)) {
+      console.log(`[edit_sp_excel] Using saved blob URL for "${ptr.fileName}" (source: "${ptr.sourceFileQuery ?? "-"}", skipping SP fetch)`);
+      return executeEditExcel({ fileUrl: ptr.url, instruction, previousChartEdits, sourceFileQuery: fileQuery }, chatThread);
+    }
+  }
+
+  // 1. fileQuery でテキスト検索 + SL文書フィルタ（200件制限を回避するためクエリで絞る）
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+
+  const searchResult = await SimpleSearch(fileQuery, "isSlDoc eq true", deptLower, 50);
+  if (searchResult.status !== "OK" || !searchResult.response.length) {
+    return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
+  }
+
+  // 2. Excel ファイルをファイル名でフィルタ
+  //    metadata が空/別形式の場合に備えて fileUrl / effectiveFileUrl からもファイル名を取得する
+  const queryLower = fileQuery.trim().toLowerCase();
+  const matched = searchResult.response.filter(({ document: doc }) => {
+    const metaName = (doc.metadata ?? "").trim().toLowerCase();
+    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
+    // resolvedName と同じロジック: metaName がExcel拡張子付きなら採用、そうでなければ urlName
+    const name = /\.(xlsx|xls|xlsm)$/i.test(metaName) ? metaName : (urlName || metaName);
+    return (
+      /\.(xlsx|xls|xlsm)$/i.test(name) &&
+      (name.includes(queryLower) || queryLower.includes(name.replace(/\.(xlsx|xls|xlsm)$/i, "")))
+    );
+  });
+
+  console.log(`[edit_sp_excel] xlsx-matched count=${matched.length} (query="${fileQuery}")`);
+
+  if (!matched.length) {
+    return { error: `「${fileQuery}」に一致するExcelファイルが見つかりませんでした。` };
+  }
+
+  // 3. URL でユニーク化
+  const seen = new Map<string, { fileName: string; sourceUrl: string; effectiveFileUrl: string | null }>();
+  for (const { document: doc } of matched) {
+    const key = doc.effectiveFileUrl || doc.fileUrl;
+    if (key && !seen.has(key)) {
+      // metadata がExcel拡張子付きファイル名の場合に採用、それ以外は URL から取得する
+      const metaName = (doc.metadata ?? "").trim();
+      const urlName = extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "";
+      const resolvedName = /\.(xlsx|xls|xlsm)$/i.test(metaName) ? metaName : (urlName || metaName);
+      seen.set(key, {
+        fileName: resolvedName,
+        sourceUrl: doc.fileUrl,
+        effectiveFileUrl: doc.effectiveFileUrl ?? null,
+      });
+    }
+  }
+
+  const candidates = Array.from(seen.values());
+
+  // ファイル名（拡張子除く）でグループ化し、同一名が複数あれば最初の1件を自動選択
+  // 異なるファイル名が複数ある場合のみユーザーに選択を促す
+  const uniqueFileNames = new Set(
+    candidates.map((c) => c.fileName.toLowerCase().replace(/\.(xlsx|xls|xlsm)$/i, ""))
+  );
+
+  let chosen = candidates[0];
+  if (candidates.length > 1) {
+    if (uniqueFileNames.size === 1) {
+      // 同じファイルの重複アップロード → 検索スコア最高（先頭）を使用
+      console.log(`[edit_sp_excel] ${candidates.length} duplicates of "${candidates[0].fileName}" found — auto-selecting first (highest relevance)`);
+    } else {
+      // 本当に異なるファイルが複数ある → ユーザーに確認
+      const list = Array.from(uniqueFileNames).map((n, i) => `${i + 1}. ${n}`).join("\n");
+      return {
+        multipleFiles: true,
+        message: `「${fileQuery}」で複数の異なるファイルが見つかりました。どれを編集しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+      };
+    }
+  }
+
+  const { fileName, sourceUrl, effectiveFileUrl } = chosen;
+  console.log(`[edit_sp_excel] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
+
+  // 4. SAS URL を解決する
+  //    優先順位: ① effectiveFileUrl が Blob raw URL → GenerateSasUrl
+  //             ② SP 直パス URL → downloadSharePointFileToBlob (Graph API)
+  let resolvedUrl: string | null = null;
+
+  const blobParsed = parseBlobRawUrl(effectiveFileUrl);
+  if (blobParsed) {
+    const sasRes = await GenerateSasUrl(blobParsed.container, blobParsed.path);
+    if (sasRes.status === "OK" && sasRes.response) {
+      resolvedUrl = sasRes.response;
+      console.log(`[edit_sp_excel] Resolved via GenerateSasUrl: ${blobParsed.path}`);
+    }
+  }
+
+  if (!resolvedUrl) {
+    const urlForDownload = effectiveFileUrl || sourceUrl;
+    const spSas = await downloadSharePointFileToBlob(urlForDownload, chatThread.id, fileName);
+    if (spSas) {
+      resolvedUrl = spSas;
+      console.log(`[edit_sp_excel] Resolved via Graph API download`);
+    }
+  }
+
+  if (!resolvedUrl) {
+    console.warn(`[edit_sp_excel] Could not resolve to blob URL:`, sourceUrl);
+    return { error: `「${fileName}」のダウンロードURLを取得できませんでした。` };
+  }
+
+  // 5. edit_excel に委託（sourceFileQuery を渡してポインタ保存を集約）
+  return executeEditExcel({ fileUrl: resolvedUrl, instruction, previousChartEdits, sourceFileQuery: fileQuery }, chatThread);
 }
 
 // ---------------- 画像生成（NEW image 用） ----------------
