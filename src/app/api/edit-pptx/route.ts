@@ -397,6 +397,22 @@ type ExcelEditPlan = {
     style?: string;          // "thin" | "medium" | "thick" | "hair" | "dashed"
     edges?: string;          // "all" | "outer" | "inner" | "top" | "bottom" | "left" | "right"
   }>;
+  chartEdits?: Array<{
+    sheetName: string;
+    chartType: string;       // "line" | "bar" | "scatter" | "pie"
+    title: string;           // LLM が内容から生成したグラフタイトル
+    xColumn: string;         // X軸の列記号
+    yColumns: string[];      // Y軸の列記号リスト
+    xLabel?: string;         // X軸ラベル
+    yLabel?: string;         // Y軸ラベル（単位があれば含める）
+    insertCell?: string;     // グラフ画像の左上セル (例: "F1")
+    yDivisor?: number;       // Y値をこの数で割って表示 (例: 1000 → 千円, 10000 → 万円)
+    yTickFormat?: string;    // Y軸目盛のフォーマット: "comma"=カンマ区切り整数, "plain"=そのまま整数, "auto"=自動(デフォルト)
+    yMin?: number;           // Y軸の表示最小値（表示単位変換後）
+    yMax?: number;           // Y軸の表示最大値（表示単位変換後）
+    yTickStep?: number;      // Y軸の目盛間隔（表示単位変換後）
+    seriesColors?: string[]; // 系列ごとの色 (matplotlib色名 or "#RRGGBB")
+  }>;
 };
 
 /** xlsx (zip) の styles.xml と theme.xml を解析し、各シートのヘッダー行セルスタイルを返す。
@@ -505,8 +521,12 @@ async function extractSheetSummaries(buffer: Buffer): Promise<SheetSummary[]> {
 
     const headerRow = (rows[0] ?? []).map(String);
     const sheetStyles = headerStylesMap.get(sheetIdx) ?? {};
+    // !ref の開始列を取得して実際のExcel列記号にオフセット補正する
+    // （データがA列以外から始まる場合にXLSX.jsの配列インデックスがズレるため）
+    const ref = ws["!ref"];
+    const startColIdx = ref ? XLSX.utils.decode_range(ref).s.c : 0;
     const columns = headerRow.map((header, i) => {
-      const letter = XLSX.utils.encode_col(i);
+      const letter = XLSX.utils.encode_col(i + startColIdx);
       const style = sheetStyles[letter];
       return {
         letter,
@@ -526,17 +546,19 @@ async function extractSheetSummaries(buffer: Buffer): Promise<SheetSummary[]> {
     });
 
     // 全行を "R行番号: 値1 | 値2 | ..." 形式でテキスト化（最大200行）
-    const allRowsText = rows.slice(0, 200).map((row, rowIdx) => {
-      const cells = (row as unknown[]).map((cell) => {
-        if (cell === null || cell === undefined) return "";
-        if (cell instanceof Date) return cell.toLocaleDateString("ja-JP");
-        return String(cell).trim();
-      });
-      return `R${rowIdx + 1}: ${cells.join(" | ")}`;
-    }).join("\n");
-
-    const ref = ws["!ref"];
     const range = ref ? XLSX.utils.decode_range(ref) : null;
+    const startRowIdx = range ? range.s.r : 0;
+
+    const allRowsText = rows.slice(0, 200).map((row, rowIdx) => {
+      const cells = (row as unknown[]).map((cell, colOffset) => {
+        if (cell === null || cell === undefined) return "";
+        const colLetter = XLSX.utils.encode_col(startColIdx + colOffset);
+        const prefix = `${colLetter}=`;
+        if (cell instanceof Date) return `${prefix}${cell.toLocaleDateString("ja-JP")}`;
+        return `${prefix}${String(cell).trim()}`;
+      }).filter(Boolean);
+      return `R${startRowIdx + rowIdx + 1}: ${cells.join(" | ")}`;
+    }).join("\n");
 
     return {
       sheetName,
@@ -551,7 +573,8 @@ async function extractSheetSummaries(buffer: Buffer): Promise<SheetSummary[]> {
 
 async function buildExcelEditPlan(
   sheets: SheetSummary[],
-  instruction: string
+  instruction: string,
+  previousChartEdits?: ExcelEditPlan["chartEdits"]
 ): Promise<ExcelEditPlan> {
   const openai = OpenAIInstance();
 
@@ -589,6 +612,24 @@ Return JSON only in this shape:
       "style": "thin",        // "thin" | "medium" | "thick" | "hair" | "dashed" (default "thin")
       "edges": "all"          // "all" | "outer" | "inner" | "top" | "bottom" | "left" | "right" (default "all")
     }
+  ],
+  "chartEdits": [
+    {
+      "sheetName": string,
+      "chartType": "line",   // "line" | "bar" | "scatter" | "pie"
+      "title": string,        // Read the actual data and write a concise descriptive Japanese title
+      "xColumn": "A",         // column letter for X axis (categories / time axis)
+      "yColumns": ["B"],      // column letter(s) for Y axis values
+      "xLabel": string,       // X axis label (use the column header, e.g. "月")
+      "yLabel": string,       // Y axis label with unit AFTER yDivisor (e.g. "売上（千円）")
+      "insertCell": "F1",     // top-left anchor cell for the chart image
+      "yDivisor": 1,          // divide all Y values by this for display (1=no change, 1000=千円, 10000=万円)
+      "yTickFormat": "auto",  // Y axis tick format: "comma"=comma-separated integers (e.g. 1,200), "plain"=plain integer, "auto"=default
+      "yMin": number,         // optional Y axis minimum AFTER yDivisor
+      "yMax": number,         // optional Y axis maximum AFTER yDivisor
+      "yTickStep": number,    // optional Y axis tick interval AFTER yDivisor
+      "seriesColors": ["#2196F3"] // optional per-series colors (matplotlib color names or hex "#RRGGBB"). One entry per yColumn.
+    }
   ]
 }
 
@@ -617,6 +658,17 @@ Rules:
 - Use borderEdits when the user asks to add borders (枠・罫線・border), frame cells, or make the sheet look cleaner. Infer the data range from the sheet summary. Use edges="all" for full grid, "outer" for outer frame only.
 - NEVER set a cell value to an empty string unless the user explicitly asks to clear that cell.
 - NEVER modify header row values (row 1) unless the user explicitly asks to change column names.
+- Use chartEdits when the user asks to CREATE or MODIFY a chart (グラフ・折れ線グラフ・棒グラフ・散布図・円グラフ・チャートを作成/修正/変更・タイトルを変えて・縦軸を変えて・単位を変えて):
+  - When MODIFYING an existing chart (タイトル変更・軸変更・単位変更など), re-emit the full chartEdits entry with ALL parameters including unchanged ones. The old chart will be automatically replaced.
+  - Infer chartType: 折れ線→"line", 棒→"bar", 散布図→"scatter", 円→"pie". Default "line".
+  - Read all data rows to understand the content, then write a short descriptive Japanese title (e.g. "月別売上推移").
+  - xColumn is usually the leftmost column (categories, dates, labels). yColumns are the numeric value columns.
+  - xLabel: use the header of xColumn. yLabel: use the yColumn header as the base, then ALWAYS append the unit in parentheses when yDivisor != 1. Examples: header="売上", yDivisor=1000 → yLabel="売上（千円）"; header="売上", yDivisor=10000 → yLabel="売上（万円）"; header="売上", yDivisor=1 → yLabel="売上".
+  - yDivisor: set when the user wants a different unit scale. 千円→1000, 万円→10000, 百万円→1000000, 億円→100000000. Default 1 (no scaling). Check the raw data values to determine appropriate divisor (e.g., values like 1200000 are in 円; ÷1000 gives 千円).
+  - yTickFormat: "comma" when user asks for comma-separated numbers (数字3桁・カンマ区切り・3桁区切り・1,200形式). Default "auto" (no comma). Use "comma" also when yDivisor is applied and round numbers are expected.
+  - yMin/yMax/yTickStep: set only when the user asks to adjust vertical axis numbers/range/tick interval (e.g. "縦軸を0から1500に", "目盛を250刻みに"). Values are AFTER yDivisor.
+  - seriesColors: set when the user asks to change bar/line/scatter colors. Use matplotlib color names ("red","blue","green","orange","purple","yellow","black","gray","pink","cyan") or hex "#RRGGBB". Convert Japanese color names: 赤→"red", 青→"blue", 緑→"green", 橙/オレンジ→"orange", 紫→"purple", 黄→"yellow", 黒→"black", 灰/グレー→"gray", ピンク→"pink". One entry per yColumn. For a single series: ["red"].
+  - insertCell: find the rightmost column that has data, then place the chart 2 columns further right at row 1. Example: data in C:D → use "F1". NEVER overlap with any data column.
 - Only emit the operations the user actually requested. Keep the JSON minimal.`;
 
   const sheetsSummary = sheets.map((s) => {
@@ -634,7 +686,11 @@ All rows:
 ${s.allRowsText}`;
   }).join("\n\n");
 
-  const userPrompt = `Instruction: ${instruction}
+  const prevChartCtx = previousChartEdits?.length
+    ? `\n\n[EXISTING CHART STATE — preserve all unlisted parameters]\n${JSON.stringify(previousChartEdits, null, 2)}\nWhen emitting chartEdits, start from these parameters and apply ONLY the changes the user requested. Copy all other fields as-is.`
+    : "";
+
+  const userPrompt = `Instruction: ${instruction}${prevChartCtx}
 
 ${sheetsSummary}
 
@@ -656,6 +712,7 @@ Return JSON only.`;
   parsed.formatEdits ??= [];
   parsed.copyRowColorEdits ??= [];
   parsed.borderEdits ??= [];
+  parsed.chartEdits ??= [];
   return parsed;
 }
 
@@ -707,6 +764,38 @@ function injectMissingHeaderStyles(
         edges: "all",
       });
     }
+  }
+
+  return plan;
+}
+
+function normalizeExcelChartColumns(
+  plan: ExcelEditPlan,
+  sheets: SheetSummary[]
+): ExcelEditPlan {
+  const sheetMap = new Map(sheets.map((s) => [s.sheetName, s]));
+
+  const normalizeColumn = (sheet: SheetSummary, colSpec: string | undefined): string | undefined => {
+    const spec = String(colSpec ?? "").trim().toUpperCase();
+    if (!spec) return spec;
+    if (sheet.columns.some((c) => c.letter === spec)) return spec;
+    if (!/^[A-Z]+$/.test(spec)) return spec;
+
+    const ordinal = XLSX.utils.decode_col(spec);
+    const actual = sheet.columns[ordinal]?.letter;
+    return actual ?? spec;
+  };
+
+  for (const chartEdit of plan.chartEdits ?? []) {
+    const sheet = sheetMap.get(chartEdit.sheetName);
+    if (!sheet) continue;
+
+    const xColumn = normalizeColumn(sheet, chartEdit.xColumn);
+    if (xColumn) chartEdit.xColumn = xColumn;
+
+    chartEdit.yColumns = (chartEdit.yColumns ?? []).map((col) => {
+      return normalizeColumn(sheet, col) ?? col;
+    });
   }
 
   return plan;
@@ -780,10 +869,16 @@ async function runPythonEditExcel(
     await fs.writeFile(planPath, JSON.stringify(plan), "utf8");
 
     const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const pyEnv = process.platform !== "win32"
+      ? {
+          ...process.env,
+          PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        }
+      : process.env;
 
     if (process.platform !== "win32") {
       try {
-        await execFileAsync(pythonBin, ["-c", "import openpyxl"]);
+        await execFileAsync(pythonBin, ["-c", "import openpyxl"], { env: pyEnv });
       } catch {
         throw new Error(
           "openpyxl がサーバーにインストールされていません。" +
@@ -797,7 +892,7 @@ async function runPythonEditExcel(
       "--input", inputPath,
       "--output", outputPath,
       "--plan", planPath,
-    ]);
+    ], { env: pyEnv });
 
     if (stderr?.trim()) {
       console.warn("[edit-excel] python stderr:", stderr.trim());
@@ -1459,12 +1554,13 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
       action?: string;
       mode?: string;
+      previousChartEdits?: ExcelEditPlan["chartEdits"];
     };
 
     if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word")) {
@@ -1500,13 +1596,17 @@ export async function POST(req: NextRequest) {
       const excelBuffer = await downloadBlob(fileUrl, threadId);
       const sheets = await extractSheetSummaries(excelBuffer);
       console.log("[edit-excel] sheets:", JSON.stringify(sheets.map(s => ({ name: s.sheetName, columns: s.columns }))));
-      const rawPlan = await buildExcelEditPlan(sheets, instruction);
-      const plan = injectMissingHeaderStyles(rawPlan, sheets);
+      const rawPlan = await buildExcelEditPlan(sheets, instruction, previousChartEdits);
+      const plan = injectMissingHeaderStyles(normalizeExcelChartColumns(rawPlan, sheets), sheets);
 
       console.log("[edit-excel] plan:", JSON.stringify(plan));
 
       const result = await runPythonEditExcel(excelBuffer, ext, plan, threadId);
-      return NextResponse.json({ ok: true, ...result });
+      return NextResponse.json({
+        ok: true,
+        ...result,
+        appliedChartEdits: plan.chartEdits?.length ? plan.chartEdits : undefined,
+      });
     }
 
     // Word ファイル (.docx) の場合は Word 専用フローへ

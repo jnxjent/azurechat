@@ -14,12 +14,13 @@ from typing import Any
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import column_index_from_string
+from openpyxl.utils.cell import coordinate_to_tuple
 
 
 def _replace_stdev_with_sqrt_sumproduct(formula: str) -> str:
-    """STDEVP(range) / STDEV.P(range) \u3092\u5168Excel\u30d0\u30fc\u30b8\u30e7\u30f3\u4e92\u63db\u306e
-    SQRT(SUMPRODUCT((range-AVERAGE(range))^2)/COUNT(range)) \u306b\u7f6e\u63db\u3059\u308b\u3002
-    range \u90e8\u5206\u306f\u62ec\u5f27\u306e\u6df1\u3055\u3092\u8ffd\u3063\u3066\u6b63\u78ba\u306b\u53d6\u308a\u51fa\u3059\u3002"""
+    """STDEVP(range) / STDEV.P(range) を全Excelバージョン互換の
+    SQRT(SUMPRODUCT((range-AVERAGE(range))^2)/COUNT(range)) に置換する。
+    range 部分は括弧の深さを追って正確に取り出す。"""
     pattern = re.compile(r"\bSTDEV(?:\.P|P)\s*\(", re.IGNORECASE)
     result = []
     i = 0
@@ -29,7 +30,6 @@ def _replace_stdev_with_sqrt_sumproduct(formula: str) -> str:
             result.append(formula[i:])
             break
         result.append(formula[i:m.start()])
-        # \u62ec\u5f27\u5185\u306e range \u3092\u53d6\u308a\u51fa\u3059
         depth = 1
         j = m.end()
         while j < len(formula) and depth > 0:
@@ -46,16 +46,23 @@ def _replace_stdev_with_sqrt_sumproduct(formula: str) -> str:
     return "".join(result)
 
 
-def normalize_excel_formula(value: str) -> str:
-    """Normalize LLM-generated Excel formulas before writing them with openpyxl."""
-    if not value.startswith("="):
+def sanitize_formula(value: Any) -> Any:
+    """LLM が生成した Excel 式を正規化する。
+    - 全角・半角 @ 演算子の除去（例: @STDEV.P → STDEV.P）
+    - STDEV.P / STDEVP → SQRT(SUMPRODUCT(...)) 変換（全Excelバージョン互換）
+    """
+    if not isinstance(value, str) or not value.startswith("="):
         return value
-
-    # \u5168\u89d2@\u3068\u534a\u89d2@\u306e\u6697\u9ed9\u4ea4\u5dee\u6f14\u7b97\u5b50\u3092\u9664\u53bb
-    normalized = value.replace("\uff20", "@")
+    # 全角 @ を半角に統一してから除去
+    normalized = value.replace("＠", "@")
     normalized = re.sub(r"@(?=[A-Za-z_])", "", normalized)
-    # STDEV.P / STDEVP \u2192 SQRT(SUMPRODUCT(...)) \u306b\u5909\u63db\uff08\u5168Excel\u30d0\u30fc\u30b8\u30e7\u30f3\u5bfe\u5fdc\uff09
+    # STDEV.P / STDEVP を SQRT(SUMPRODUCT) に変換（互換性確保）
     normalized = _replace_stdev_with_sqrt_sumproduct(normalized)
+    if normalized != value:
+        print(
+            f"[edit_excel] sanitize_formula: {value!r} -> {normalized!r}",
+            file=sys.stderr,
+        )
     return normalized
 
 
@@ -77,10 +84,7 @@ def apply_sheet_edits(ws, edits: dict) -> int:
         address = str(cell_edit.get("address") or "").strip()
         value = cell_edit.get("value")
         if address and value is not None:
-            # Excel数式中の @ (暗黙交差演算子) を除去。LLMが誤って付けることがある
-            if isinstance(value, str) and value.startswith("="):
-                value = normalize_excel_formula(value)
-            ws[address] = value
+            ws[address] = sanitize_formula(value)
             changed += 1
 
     replacements = edits.get("replaceText") or []
@@ -309,6 +313,256 @@ def apply_copy_row_color(ws, target_col_spec: str, reference_col_spec: str, star
     return changed
 
 
+def apply_chart_edits(ws, chart_edit: dict, output_path: "Path" = None) -> bool:
+    """matplotlib でグラフ画像を生成し openpyxl Image としてシートに挿入する。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.font_manager as fm
+        from openpyxl.drawing.image import Image as XLImage
+    except ImportError as e:
+        print(f"[edit_excel] chart: matplotlib/pillow not available ({e}). Run: pip install matplotlib pillow", file=sys.stderr)
+        return False
+
+    chart_type = str(chart_edit.get("chartType") or "line").lower()
+    title = str(chart_edit.get("title") or "")
+    x_col_spec = str(chart_edit.get("xColumn") or "")
+    raw_y = chart_edit.get("yColumns") or []
+    y_col_specs: list[str] = [raw_y] if isinstance(raw_y, str) else list(raw_y)
+    x_label = str(chart_edit.get("xLabel") or "")
+    y_label = str(chart_edit.get("yLabel") or "")
+    insert_cell = str(chart_edit.get("insertCell") or "E2")
+
+    def chart_float(name: str) -> float | None:
+        raw = chart_edit.get(name)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            print(f"[edit_excel] chart: invalid {name}={raw!r}; ignoring", file=sys.stderr)
+            return None
+
+    _JP_COLOR_MAP: dict[str, str] = {
+        "赤": "red", "青": "blue", "緑": "green", "黄": "yellow",
+        "橙": "orange", "オレンジ": "orange", "紫": "purple",
+        "黒": "black", "白": "white", "灰": "gray", "グレー": "gray",
+        "ピンク": "pink", "水色": "cyan", "シアン": "cyan",
+        "茶": "brown", "茶色": "brown",
+    }
+
+    def _resolve_color(c: str) -> str | None:
+        import matplotlib.colors as _mcolors
+        c = str(c).strip()
+        # 日本語色名マップ
+        if c in _JP_COLOR_MAP:
+            c = _JP_COLOR_MAP[c]
+        if _mcolors.is_color_like(c):
+            return c
+        print(f"[edit_excel] chart: invalid color '{c}' — ignored", file=sys.stderr)
+        return None
+
+    raw_colors = chart_edit.get("seriesColors") or []
+    raw_list: list[str] = [raw_colors] if isinstance(raw_colors, str) else [str(c) for c in raw_colors if c]
+    series_colors: list[str | None] = [_resolve_color(c) for c in raw_list]
+
+    x_idx = resolve_column_index(ws, x_col_spec) if x_col_spec else None
+    y_divisor = chart_float("yDivisor") or 1.0
+    if y_divisor == 0:
+        y_divisor = 1.0
+
+    y_min = chart_float("yMin")
+    y_max = chart_float("yMax")
+    y_tick_step = chart_float("yTickStep")
+    y_tick_format = str(chart_edit.get("yTickFormat") or "auto").lower()
+
+    y_indices: list[int] = []
+    y_headers: list[str] = []
+    for y_spec in y_col_specs:
+        idx = resolve_column_index(ws, y_spec)
+        if idx is not None:
+            y_indices.append(idx)
+            y_headers.append(str(ws.cell(row=1, column=idx).value or y_spec))
+
+    if not y_indices:
+        print(f"[edit_excel] chart: no valid yColumns found", file=sys.stderr)
+        return False
+
+    # yDivisor != 1 なのに yLabel に単位がなければ自動補完（y_headers確定後に実行）
+    _unit_map = {1000.0: "千円", 10000.0: "万円", 1000000.0: "百万円", 100000000.0: "億円"}
+    _auto_unit = _unit_map.get(y_divisor)
+    if _auto_unit:
+        _base_label = y_label if y_label else (y_headers[0] if y_headers else "値")
+        if f"（{_auto_unit}）" not in _base_label and f"({_auto_unit})" not in _base_label:
+            y_label = f"{_base_label}（{_auto_unit}）"
+            print(f"[edit_excel] chart: auto-set yLabel: '{y_label}'", file=sys.stderr)
+
+    # データ読み取り（2行目以降）Y値がある行だけ採用、X空なら連番ラベル
+    x_labels: list[str] = []
+    y_data_sets: list[list[float]] = [[] for _ in y_indices]
+    for row_num in range(2, ws.max_row + 1):
+        row_y: list[float] = []
+        has_y = False
+        for y_idx in y_indices:
+            raw = ws.cell(row=row_num, column=y_idx).value
+            try:
+                val = float(raw) if raw not in (None, "") else None
+            except (TypeError, ValueError):
+                val = None  # 文字列（ヘッダー等）はスキップ
+            if val is not None:
+                has_y = True
+                row_y.append(val / y_divisor)
+            else:
+                row_y.append(0.0)
+        if not has_y:
+            continue
+        x_raw = ws.cell(row=row_num, column=x_idx).value if x_idx is not None else None
+        x_labels.append(str(x_raw).strip() if x_raw not in (None, "") else str(len(x_labels) + 1))
+        for i, v in enumerate(row_y):
+            y_data_sets[i].append(v)
+
+    if not x_labels:
+        print(f"[edit_excel] chart: no data rows found (sheet has {ws.max_row} rows, yColumns={y_col_specs})", file=sys.stderr)
+        return False
+
+    print(f"[edit_excel] chart: {len(x_labels)} rows, x={x_labels[:5]}, y[0]={y_data_sets[0][:5]}", file=sys.stderr)
+
+    # 日本語フォント設定
+    # 1. リポジトリ同梱フォント (public/fonts/NotoSansJP-Regular.ttf) を優先ロード
+    _script_dir = Path(__file__).resolve().parent
+    _bundled_font = None
+    for _candidate in [
+        _script_dir / ".." / ".." / "public" / "fonts" / "NotoSansJP-Regular.ttf",
+        _script_dir / ".." / "public" / "fonts" / "NotoSansJP-Regular.ttf",
+        Path("/home/site/wwwroot/public/fonts/NotoSansJP-Regular.ttf"),
+    ]:
+        _resolved = _candidate.resolve()
+        if _resolved.exists():
+            fm.fontManager.addfont(str(_resolved))
+            _bundled_font = fm.FontProperties(fname=str(_resolved)).get_name()
+            print(f"[edit_excel] chart: loaded bundled font '{_bundled_font}': {_resolved}", file=sys.stderr)
+            break
+
+    # 2. システムフォントフォールバック
+    if _bundled_font is None:
+        _jp_candidates = [
+            "IPAexGothic", "IPAPGothic", "Noto Sans CJK JP", "Noto Sans JP",
+            "MS Gothic", "Yu Gothic", "Hiragino Sans", "TakaoPGothic",
+        ]
+        _available = {f.name for f in fm.fontManager.ttflist}
+        _bundled_font = next((f for f in _jp_candidates if f in _available), None)
+
+    # font.family="sans-serif" + font.sans-serif リスト先頭に追加（最も確実な指定方法）
+    if _bundled_font:
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["font.sans-serif"] = [_bundled_font] + list(plt.rcParams.get("font.sans-serif", []))
+    else:
+        plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x_pos = list(range(len(x_labels)))
+
+    if chart_type == "bar":
+        n = max(len(y_indices), 1)
+        width = 0.7 / n
+        for i, (y_vals, label) in enumerate(zip(y_data_sets, y_headers)):
+            offsets = [p + (i - (n - 1) / 2) * width for p in x_pos]
+            color = series_colors[i] if i < len(series_colors) else None
+            kwargs: dict = {"width": width, "label": label}
+            if color:
+                kwargs["color"] = color
+            ax.bar(offsets, y_vals, **kwargs)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.grid(True, alpha=0.3, axis="y")
+    elif chart_type == "scatter":
+        for i, (y_vals, label) in enumerate(zip(y_data_sets, y_headers)):
+            color = series_colors[i] if i < len(series_colors) else None
+            skwargs: dict = {"label": label}
+            if color:
+                skwargs["color"] = color
+            ax.scatter(x_pos, y_vals, **skwargs)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.grid(True, alpha=0.3)
+    elif chart_type == "pie":
+        y_vals = y_data_sets[0] if y_data_sets else []
+        pie_kwargs: dict = {"labels": x_labels, "autopct": "%1.1f%%", "startangle": 90}
+        valid_pie_colors = [c for c in series_colors if c]
+        if valid_pie_colors:
+            pie_kwargs["colors"] = valid_pie_colors
+        ax.pie(y_vals, **pie_kwargs)
+        ax.axis("equal")
+    else:  # line
+        for i, (y_vals, label) in enumerate(zip(y_data_sets, y_headers)):
+            color = series_colors[i] if i < len(series_colors) else None
+            lkwargs: dict = {"marker": "o", "label": label}
+            if color:
+                lkwargs["color"] = color
+            ax.plot(x_pos, y_vals, **lkwargs)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.grid(True, alpha=0.3)
+
+    if title:
+        ax.set_title(title, fontsize=13, pad=10)
+    if x_label and chart_type != "pie":
+        ax.set_xlabel(x_label)
+    if y_label and chart_type != "pie":
+        ax.set_ylabel(y_label)
+    if chart_type != "pie":
+        if y_min is not None or y_max is not None:
+            current_min, current_max = ax.get_ylim()
+            ax.set_ylim(y_min if y_min is not None else current_min, y_max if y_max is not None else current_max)
+        if y_tick_step is not None and y_tick_step > 0:
+            tick_min, tick_max = ax.get_ylim()
+            tick = tick_min
+            ticks = []
+            guard = 0
+            while tick <= tick_max + (y_tick_step * 0.001) and guard < 1000:
+                ticks.append(tick)
+                tick += y_tick_step
+                guard += 1
+            if ticks:
+                ax.set_yticks(ticks)
+        import matplotlib.ticker as _ticker
+        if y_tick_format == "comma":
+            ax.yaxis.set_major_formatter(_ticker.FuncFormatter(lambda x, _: f"{int(round(x)):,}"))
+        else:
+            ax.ticklabel_format(style="plain", axis="y", useOffset=False)
+    if len(y_indices) > 1:
+        ax.legend()
+
+    fig.tight_layout()
+
+    save_dir = output_path.parent if output_path is not None else Path(sys.argv[0]).parent
+    png_path = save_dir / f"chart_{ws.title}_{insert_cell}.png"
+    fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Replace images anchored at the requested chart position. Keep unrelated images.
+    try:
+        insert_row, insert_col = coordinate_to_tuple(insert_cell)
+        ws._images = [
+            image for image in ws._images
+            if not (
+                hasattr(getattr(image, "anchor", None), "_from")
+                and image.anchor._from.row + 1 == insert_row
+                and image.anchor._from.col + 1 == insert_col
+            )
+        ]
+    except Exception:
+        pass
+
+    img = XLImage(str(png_path))
+    img.anchor = insert_cell
+    ws.add_image(img)
+    print(f"[edit_excel] chart: inserted {chart_type} chart image at {insert_cell}", file=sys.stderr)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -322,6 +576,18 @@ def main() -> None:
 
     plan: dict[str, Any] = json.loads(plan_path.read_text(encoding="utf-8"))
     wb = load_workbook_any(input_path)
+    for _ws in wb.worksheets:
+        non_empty = []
+        for row in _ws.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    non_empty.append((cell.row, cell.column, cell.value))
+                    if len(non_empty) >= 6:
+                        break
+            if len(non_empty) >= 6:
+                break
+        _sample = non_empty
+        print(f"[edit_excel] loaded sheet '{_ws.title}': max_row={_ws.max_row} max_col={_ws.max_column} sample={_sample[:6]}", file=sys.stderr)
     if wb.calculation is not None:
         wb.calculation.calcMode = "auto"
         wb.calculation.fullCalcOnLoad = True
@@ -379,6 +645,17 @@ def main() -> None:
         start_row = int(crc.get("startRow") or 2)
         n = apply_copy_row_color(ws, target_col, reference_col, start_row)
         if n > 0:
+            changed_sheets.add(ws.title)
+
+    # chartEdits: openpyxl ネイティブチャートをシートに挿入
+    for ce in plan.get("chartEdits") or []:
+        sheet_name = str(ce.get("sheetName") or "").strip()
+        ws = resolve_sheet(wb, sheet_name)
+        if ws is None:
+            print(f"[edit_excel] chartEdits: sheet '{sheet_name}' not found", file=sys.stderr)
+            continue
+        ok = apply_chart_edits(ws, ce, output_path)
+        if ok:
             changed_sheets.add(ws.title)
 
     wb.save(str(output_path))

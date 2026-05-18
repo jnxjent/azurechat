@@ -73,6 +73,31 @@ export const GenerateSasUrl = async (
 }
   
 
+export const DownloadBlobAsText = async (
+  containerName: string,
+  blobPath: string
+): Promise<ServerActionResponse<string>> => {
+  try {
+    const blobServiceClient = InitBlobServiceClient();
+    const containerClient = blobServiceClient.getContainerClient(containerName);
+    const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+    const downloadResponse = await blockBlobClient.download(0);
+    if (!downloadResponse.readableStreamBody) {
+      return { status: "ERROR", errors: [{ message: "Empty response body" }] };
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of downloadResponse.readableStreamBody as any) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return { status: "OK", response: Buffer.concat(chunks).toString("utf-8") };
+  } catch (e: any) {
+    if (e?.statusCode === 404 || e?.code === "BlobNotFound") {
+      return { status: "NOT_FOUND", errors: [{ message: `Blob not found: ${blobPath}` }] };
+    }
+    return { status: "ERROR", errors: [{ message: String(e) }] };
+  }
+};
+
 export const GetBlob = async (
   containerName: string,
   blobPath: string
