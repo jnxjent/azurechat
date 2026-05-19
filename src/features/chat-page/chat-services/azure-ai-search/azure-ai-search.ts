@@ -270,7 +270,7 @@ export const ExtensionSimilaritySearch = async (props: {
     console.log("[SEARCH:Extension] finalFilter =", finalFilter);
 
     const searchResults = await searchClient.search(searchText, {
-      top: 3,
+      top: 8,
       filter: finalFilter,
       vectorSearchOptions: {
         queries: [

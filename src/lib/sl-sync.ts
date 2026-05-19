@@ -853,10 +853,7 @@ async function indexNewSpFiles(params: {
         continue;
       }
 
-      const allChunks: string[] = [];
-      for (const text of textChunks) {
-        allChunks.push(...chunkWithOverlap(text));
-      }
+      const allChunks: string[] = chunkWithOverlap(textChunks.join("\n"));
 
       const scope = resolveScopeFromLocation({
         webUrl: item.webUrl,
