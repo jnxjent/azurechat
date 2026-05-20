@@ -233,6 +233,7 @@ export const ExtensionSimilaritySearch = async (props: {
   filter?: string;
   deptLower?: string | null;
   userHash?: string;
+  top?: number;
 }): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const openai = OpenAIEmbeddingInstance();
@@ -246,6 +247,7 @@ export const ExtensionSimilaritySearch = async (props: {
       filter,
       deptLower,
       userHash,
+      top,
     } = props;
 
     const embeddings = await openai.embeddings.create({
@@ -270,9 +272,10 @@ export const ExtensionSimilaritySearch = async (props: {
     console.log("[SEARCH:Extension] deptLower =", deptLower);
     console.log("[SEARCH:Extension] userHash =", userHash ? "***" : "(none)");
     console.log("[SEARCH:Extension] finalFilter =", finalFilter);
+    console.log("[SEARCH:Extension] top =", top ?? 8);
 
     const searchResults = await searchClient.search(searchText, {
-      top: 8,
+      top: top ?? 8,
       filter: finalFilter,
       vectorSearchOptions: {
         queries: [
