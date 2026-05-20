@@ -35,7 +35,7 @@ type UserContext = {
  * - email → hashValue(email)
  * - fallback は SL_DEPT_DEFAULT
  */
-async function resolveUserContext(): Promise<UserContext> {
+export async function resolveUserContext(): Promise<UserContext> {
   try {
     const session = await userSession().catch(() => null);
     const cookieStore = await cookies();
@@ -200,6 +200,7 @@ ${page}`;
 - Review the following content from documents uploaded by the user and create a final answer.
 - If you don't know the answer, just say that you don't know. Don't try to make up an answer.
 - You must always include a citation at the end of your answer and don't include full stop after the citations.
+- IMPORTANT: If the user asks to compare multiple documents or find contradictions across files: (1) First call sl_doc_search with a broad query (e.g. "IR議事録") to discover available document names. (2) Then call sl_doc_search once per discovered document using "company name + document type + keyword" queries. (3) Only answer after collecting content from all documents. Never answer based solely on the initial context when multi-document comparison is requested.
 - If the user asks to create a PowerPoint or slides from the document content, use the convert_doc_to_pptx tool with the file_url from the document context below. This tool uses Vision API for high-quality conversion.${fileUrlHint}
 
 ----------------
@@ -218,6 +219,66 @@ ${userMessage}
     signal,
   });
   const tools = extensionsResponse.status === "OK" ? extensionsResponse.response : [];
+
+  // ★ sl_doc_search ツール：LLMが複数文書を横断検索するために複数回呼び出し可能
+  tools.push({
+    type: "function",
+    function: {
+      name: "sl_doc_search",
+      description:
+        "SharePointの個人・部署・全社共通ドキュメントを検索します。\n" +
+        "【2段階で使うこと】\n" +
+        "① 比較対象の文書名が不明な場合: まず「IR議事録」など広いクエリで1回呼び出し、返ってくる file name から文書名・会社名を把握する。\n" +
+        "② 文書名が判明したら: 「会社名 + 文書種別 + キーワード」の形式で文書ごとに個別呼び出しする（複数回）。\n" +
+        "例：最初に「IR議事録」→ 次に「野村アセット IR議事録 社長コメント」「セイタキャピタル IR議事録 社長コメント」と個別検索。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "検索クエリ。会社名・ファイル名・キーワードを組み合わせると精度が上がります。例：「セイタキャピタル IR議事録 社長コメント」",
+          },
+        },
+        required: ["query"],
+      },
+      function: async (args: { query: string }) => {
+        console.log("[sl_doc_search] query =", args.query);
+        const searchResult = await ExtensionSimilaritySearch({
+          searchText: args.query,
+          vectors: ["embedding"],
+          apiKey,
+          searchName,
+          indexName,
+          filter,
+          deptLower,
+          userHash: userHash ?? undefined,
+          top: 16,
+        });
+
+        if (searchResult.status !== "OK") {
+          console.error("[sl_doc_search] error:", searchResult.errors);
+          return "検索エラーが発生しました";
+        }
+
+        if (searchResult.response.length === 0) {
+          return "該当する文書が見つかりませんでした";
+        }
+
+        const withoutEmbedding = FormatCitations(searchResult.response);
+        const citationResponse = await CreateCitations(withoutEmbedding);
+
+        return searchResult.response
+          .map((r, i) => {
+            const cit = citationResponse[i];
+            const id = cit?.status === "OK" ? cit.response.id : r.document.id;
+            return `[${i}]. file name: ${r.document.metadata}\nfile id: ${id}\n${r.document.pageContent}`;
+          })
+          .join("\n---\n");
+      },
+      parse: (input: string) => JSON.parse(input),
+    },
+  });
 
   if (tools.length > 0) {
     return openAI.beta.chat.completions.runTools(
