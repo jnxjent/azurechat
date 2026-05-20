@@ -46,6 +46,7 @@ type IndexDoc = {
   effectiveFileUrl: string;
   slScope: string | null;
   relativePath: string | null;
+  storedRelativePath: string | null;
   spItemId: string | null;
 };
 
@@ -63,6 +64,7 @@ type NewIndexDoc = {
   slScope: "global_common" | "dept_common" | "personal";
   slOwner: string | null;
   spItemId: string | null;
+  relativePath?: string | null;
 };
 
 type ScopeKind = "global_common" | "dept_common" | "personal";
@@ -529,7 +531,8 @@ async function getIndexDocs(
   dept: string,
   deptSiteUrl: string,
   deptBaseFolder: string,
-  globalCommon?: GlobalCommonConfig | null
+  globalCommon?: GlobalCommonConfig | null,
+  hasRelativePath = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -539,6 +542,10 @@ async function getIndexDocs(
     throw new Error("Missing Azure Search env vars");
   }
 
+  const selectFields = hasRelativePath
+    ? "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId,relativePath"
+    : "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId";
+
   const docs: IndexDoc[] = [];
   let skip = 0;
   const top = 200;
@@ -546,7 +553,7 @@ async function getIndexDocs(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId` +
+        `&$select=${selectFields}` +
         `&$filter=(dept eq '${dept.replace(/'/g, "''")}' or slScope eq 'global_common') and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -572,6 +579,7 @@ async function getIndexDocs(
         "";
 
       if (item.id && fileName) {
+        const storedRelativePath = hasRelativePath && item.relativePath ? String(item.relativePath) : null;
         const doc: IndexDoc = {
           id: String(item.id),
           fileName,
@@ -579,9 +587,10 @@ async function getIndexDocs(
           effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
           relativePath: null,
+          storedRelativePath,
           spItemId: item.spItemId ? String(item.spItemId) : null,
         };
-        doc.relativePath = resolveIndexRelativePath(
+        doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
           doc,
           deptSiteUrl,
           deptBaseFolder,
@@ -599,7 +608,8 @@ async function getIndexDocs(
 }
 
 async function getIndexDocsGlobalCommon(
-  globalCommon: GlobalCommonConfig
+  globalCommon: GlobalCommonConfig,
+  hasRelativePath = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -609,6 +619,10 @@ async function getIndexDocsGlobalCommon(
     throw new Error("Missing Azure Search env vars");
   }
 
+  const selectFields = hasRelativePath
+    ? "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId,relativePath"
+    : "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId";
+
   const docs: IndexDoc[] = [];
   let skip = 0;
   const top = 200;
@@ -616,7 +630,7 @@ async function getIndexDocsGlobalCommon(
   while (true) {
     const res = await fetch(
       `${endpoint}/indexes/${indexName}/docs?api-version=2024-07-01` +
-        `&$select=id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId` +
+        `&$select=${selectFields}` +
         `&$filter=slScope eq 'global_common' and isSlDoc eq true` +
         `&$top=${top}&$skip=${skip}`,
       {
@@ -641,6 +655,7 @@ async function getIndexDocsGlobalCommon(
         "";
 
       if (item.id && fileName) {
+        const storedRelativePath = hasRelativePath && item.relativePath ? String(item.relativePath) : null;
         const doc: IndexDoc = {
           id: String(item.id),
           fileName,
@@ -648,9 +663,10 @@ async function getIndexDocsGlobalCommon(
           effectiveFileUrl,
           slScope: item.slScope == null ? null : String(item.slScope),
           relativePath: null,
+          storedRelativePath,
           spItemId: item.spItemId ? String(item.spItemId) : null,
         };
-        doc.relativePath = resolveIndexRelativePath(
+        doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
           doc,
           globalCommon.siteUrl,
           globalCommon.folder,
@@ -694,6 +710,65 @@ async function deleteIndexDocs(ids: string[]): Promise<void> {
 
   if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
   console.log(`[SL sync] Deleted ${ids.length} index docs`);
+}
+
+async function ensureRelativePathField(): Promise<boolean> {
+  const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
+  const apiKey = process.env.AZURE_SEARCH_API_KEY;
+  const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
+  if (!endpoint || !apiKey || !indexName) return false;
+
+  const getRes = await fetch(
+    `${endpoint}/indexes/${indexName}?api-version=2024-07-01`,
+    { headers: { "api-key": apiKey }, cache: "no-store" }
+  );
+  if (!getRes.ok) {
+    console.warn("[SL sync] ensureRelativePathField: failed to get index schema");
+    return false;
+  }
+
+  const index = await getRes.json();
+  const fields: any[] = index.fields ?? [];
+
+  if (fields.some((f: any) => f.name === "relativePath")) {
+    console.log("[SL sync] relativePath field already exists in index");
+    return true;
+  }
+
+  // Only attempt to add the field when explicitly opted in via env var
+  if (process.env.SL_AUTO_ENSURE_RELATIVE_PATH_FIELD !== "true") {
+    console.warn("[SL sync] relativePath field missing; set SL_AUTO_ENSURE_RELATIVE_PATH_FIELD=true to add it automatically");
+    return false;
+  }
+
+  fields.push({
+    name: "relativePath",
+    type: "Edm.String",
+    searchable: true,
+    filterable: true,
+    retrievable: true,
+    sortable: false,
+    facetable: false,
+  });
+  index.fields = fields;
+
+  const putRes = await fetch(
+    `${endpoint}/indexes/${indexName}?api-version=2024-07-01`,
+    {
+      method: "PUT",
+      headers: { "api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(index),
+      cache: "no-store",
+    }
+  );
+
+  if (!putRes.ok) {
+    console.error("[SL sync] ensureRelativePathField: failed to update schema:", await putRes.text());
+    return false;
+  }
+
+  console.log("[SL sync] ensureRelativePathField: relativePath field added to index");
+  return true;
 }
 
 async function addNewIndexDocs(docs: NewIndexDoc[]): Promise<void> {
@@ -818,6 +893,7 @@ async function indexNewSpFiles(params: {
   unindexedItems: SpFileItem[];
   batchSize: number;
   globalCommon?: GlobalCommonConfig | null;
+  hasRelativePath?: boolean;
 }): Promise<{ indexed: number; skipped: number }> {
   const {
     accessToken,
@@ -828,6 +904,7 @@ async function indexNewSpFiles(params: {
     unindexedItems,
     batchSize,
     globalCommon,
+    hasRelativePath = false,
   } = params;
 
   const batch = unindexedItems.slice(0, batchSize);
@@ -900,6 +977,7 @@ async function indexNewSpFiles(params: {
         slScope: effectiveScope,
         slOwner: slOwner ?? null,
         spItemId: item.id,
+        ...(hasRelativePath ? { relativePath: item.relativePath ?? null } : {}),
       }));
 
       const emptyEmbCount = docsToIndex.filter((d) => d.embedding.length === 0).length;
@@ -927,6 +1005,7 @@ async function updateIndexDocs(
     effectiveFileUrl: string;
     slScope?: ScopeKind;
     slOwner?: string | null;
+    relativePath?: string | null;
   }>
 ): Promise<void> {
   if (updates.length === 0) return;
@@ -940,7 +1019,7 @@ async function updateIndexDocs(
   }
 
   const body = {
-    value: updates.map(({ id, effectiveFileUrl, slScope, slOwner }) => {
+    value: updates.map(({ id, effectiveFileUrl, slScope, slOwner, relativePath }) => {
       const doc: any = {
         "@search.action": "merge",
         id,
@@ -948,6 +1027,7 @@ async function updateIndexDocs(
       };
       if (slScope !== undefined) doc.slScope = slScope;
       if (slOwner !== undefined) doc.slOwner = slOwner;
+      if (relativePath !== undefined) doc.relativePath = relativePath;
       return doc;
     }),
   };
@@ -972,6 +1052,8 @@ export async function runSlSync({
   indexNew = false,
   batchSize = 5,
 }: RunSlSyncParams): Promise<SlSyncResult> {
+  const hasRelativePath = await ensureRelativePathField();
+
   const results: Record<string, SlSyncDeptResult> = {};
 
   for (const dept of getAllowedDepts()) {
@@ -994,7 +1076,7 @@ export async function runSlSync({
         if (rootMissing) {
           // ベースフォルダ自体が存在しない → SP上にファイルは0件確定
           // インデックス上の孤立ドキュメントをすべて削除する
-          const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon);
+          const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon, hasRelativePath);
           const orphanIds = indexDocs
             .filter((doc) => doc.slScope !== "global_common")
             .map((doc) => doc.id);
@@ -1022,7 +1104,7 @@ export async function runSlSync({
         continue;
       }
 
-      const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon);
+      const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon, hasRelativePath);
       console.log(`[SL sync] dept=${dept} indexed docs=${indexDocs.length}`);
 
       const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = indexDocs.map((doc) => ({
@@ -1080,7 +1162,9 @@ export async function runSlSync({
             globalCommonFolder: globalCommon?.folder ?? null,
           });
 
-          return doc.effectiveFileUrl !== spItem.webUrl || doc.slScope !== desiredScope;
+          return doc.effectiveFileUrl !== spItem.webUrl
+            || doc.slScope !== desiredScope
+            || (hasRelativePath && doc.storedRelativePath !== spItem.relativePath);
         })
         .map(({ doc, spItem }) => {
           const desiredScope = resolveScopeFromLocation({
@@ -1107,6 +1191,7 @@ export async function runSlSync({
             effectiveFileUrl: spItem.webUrl,
             slScope: effectiveScope,
             slOwner,
+            ...(hasRelativePath ? { relativePath: spItem.relativePath } : {}),
           };
         });
 
@@ -1138,6 +1223,7 @@ export async function runSlSync({
             unindexedItems: unindexed,
             batchSize,
             globalCommon,
+            hasRelativePath,
           });
           deptResult.newIndexed = indexed;
           deptResult.newSkipped = skipped;
@@ -1169,7 +1255,7 @@ export async function runSlSync({
       );
 
       if (!globalScan.fetchFailed) {
-        const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon);
+        const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon, hasRelativePath);
         console.log(`[SL sync] global_common SP files=${globalScan.inventory.allItems.length} indexed docs=${globalIndexDocs.length}`);
         const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = globalIndexDocs.map((doc) => ({
           doc,
@@ -1208,10 +1294,14 @@ export async function runSlSync({
             (entry): entry is { doc: IndexDoc; spItem: SpFileItem } =>
               Boolean(entry.spItem)
           )
-          .filter(({ doc, spItem }) => doc.effectiveFileUrl !== spItem.webUrl)
+          .filter(({ doc, spItem }) =>
+            doc.effectiveFileUrl !== spItem.webUrl
+            || (hasRelativePath && doc.storedRelativePath !== spItem.relativePath)
+          )
           .map(({ doc, spItem }) => ({
             id: doc.id,
             effectiveFileUrl: spItem.webUrl,
+            ...(hasRelativePath ? { relativePath: spItem.relativePath } : {}),
           }));
 
         if (globalOrphanIds.length > 0) {
@@ -1248,6 +1338,7 @@ export async function runSlSync({
               unindexedItems: gcUnindexed,
               batchSize,
               globalCommon,
+              hasRelativePath,
             });
             gcResult.newIndexed = indexed;
             gcResult.newSkipped = skipped;

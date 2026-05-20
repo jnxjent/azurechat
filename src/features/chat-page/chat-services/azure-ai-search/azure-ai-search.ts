@@ -30,6 +30,8 @@ export interface AzureSearchDocumentIndex {
   slOwner?: string | null;
   /** SharePoint drive item ID。ファイル移動後もIDは不変のため、sync時の追跡に使用 */
   spItemId?: string | null;
+  /** SP内の相対パス。例: j.nomoto/議事録サンプル/IR議事録20260220.docx */
+  relativePath?: string | null;
 }
 
 export type DocumentSearchResponse = {
