@@ -95,9 +95,6 @@ export async function extractTextFromBuffer(
   if (lower.endsWith(".xlsx") || lower.endsWith(".xlsm")) {
     return extractExcelText(buffer);
   }
-  if (lower.endsWith(".docx")) {
-    return extractWordText(buffer);
-  }
   return extractWithDocumentIntelligence(buffer);
 }
 

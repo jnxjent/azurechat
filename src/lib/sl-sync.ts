@@ -882,6 +882,10 @@ async function indexNewSpFiles(params: {
         model: "",
       });
 
+      console.log(
+        `[SL sync] Embedding result: chunks=${allChunks.length} embData=${embeddingRes.data.length} firstEmbLen=${embeddingRes.data[0]?.embedding?.length ?? 0}`
+      );
+
       const docsToIndex: NewIndexDoc[] = allChunks.map((chunk, i) => ({
         id: randomUUID(),
         pageContent: chunk,
@@ -898,10 +902,15 @@ async function indexNewSpFiles(params: {
         spItemId: item.id,
       }));
 
+      const emptyEmbCount = docsToIndex.filter((d) => d.embedding.length === 0).length;
+      if (emptyEmbCount > 0) {
+        console.warn(`[SL sync] WARNING: ${emptyEmbCount}/${docsToIndex.length} docs have empty embedding for ${item.name}`);
+      }
+
       await addNewIndexDocs(docsToIndex);
       indexed++;
       console.log(
-        `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length}`
+        `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length} embeddingDim=${embeddingRes.data[0]?.embedding?.length ?? 0}`
       );
     } catch (e) {
       console.error(`[SL sync] Failed to index ${item.name}:`, e);
