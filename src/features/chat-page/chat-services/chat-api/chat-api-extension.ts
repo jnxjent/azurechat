@@ -345,9 +345,9 @@ export const ChatApiExtensions = async (props: {
         description:
           "SharePointの個人・部署・全社共通ドキュメントを検索します。\n" +
           "【2段階で使うこと】\n" +
-          "① 比較対象の文書名が不明な場合: まず「IR議事録」など広いクエリで1回呼び出し、返ってくる file name から文書名・会社名を把握する。\n" +
-          "② 文書名が判明したら: 「会社名 + 文書種別 + キーワード」の形式で文書ごとに個別呼び出しする（複数回）。\n" +
-          "例：最初に「IR議事録」→ 次に「野村アセット IR議事録 社長コメント」「セイタキャピタル IR議事録 社長コメント」と個別検索。",
+          "① 比較対象の文書名が不明な場合: mode=\"discover\" で広いクエリ（例:「IR議事録」）を1回呼び出し、返ってくる file name から文書名・会社名を把握する。\n" +
+          "② 文書名が判明したら: mode=\"content\" で「会社名 + 文書種別 + キーワード」の形式で文書ごとに個別呼び出しする（複数回）。\n" +
+          "例：最初に mode=discover で「IR議事録」→ 次に mode=content で「野村アセット IR議事録 社長コメント」「セイタキャピタル IR議事録 社長コメント」と個別検索。",
         parameters: {
           type: "object",
           properties: {
@@ -356,11 +356,18 @@ export const ChatApiExtensions = async (props: {
               description:
                 "検索クエリ。会社名・ファイル名・キーワードを組み合わせると精度が上がります。例：「セイタキャピタル IR議事録 社長コメント」",
             },
+            mode: {
+              type: "string",
+              enum: ["discover", "content"],
+              description:
+                "discover: 文書名の一覧取得（広いクエリ向け、上位32件）。content: 個社別の本文取得（絞ったクエリ向け、上位8件）。省略時はcontent扱い。",
+            },
           },
           required: ["query"],
         },
-        function: async (args: { query: string }) => {
-          console.log("[sl_doc_search:ext] query =", args.query);
+        function: async (args: { query: string; mode?: string }) => {
+          const effectiveTop = args.mode === "discover" ? 32 : 8;
+          console.log("[sl_doc_search:ext] query =", args.query, "mode =", args.mode ?? "content", "top =", effectiveTop);
           const searchResult = await ExtensionSimilaritySearch({
             searchText: args.query,
             vectors: ["embedding"],
@@ -370,7 +377,7 @@ export const ChatApiExtensions = async (props: {
             filter: slFilter,
             deptLower: slDeptLower,
             userHash: slUserHash ?? undefined,
-            top: 16,
+            top: effectiveTop,
           });
 
           if (searchResult.status !== "OK") {
