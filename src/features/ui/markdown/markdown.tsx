@@ -62,6 +62,26 @@ function normalizeNewlines(src: string): string {
 }
 
 /**
+ * LLMが出力する <br> タグを react-markdown が解釈できる形に変換。
+ * テーブル行内（| ... | ... |）では「 / 」区切りに置換。
+ * それ以外では markdown 改行（行末スペース2つ + 改行）に変換。
+ */
+function normalizeBrTags(src: string): string {
+  if (!src || !/<br\s*\/?>/i.test(src)) return src;
+
+  return src
+    .split("\n")
+    .map((line) => {
+      const isTableRow = /^\s*\|/.test(line);
+      if (isTableRow) {
+        return line.replace(/<br\s*\/?>/gi, " / ");
+      }
+      return line.replace(/<br\s*\/?>/gi, "  \n");
+    })
+    .join("\n");
+}
+
+/**
  * Citation表現を react-markdown 用に正規化
  */
 function preprocessCitations(src: string): string {
@@ -167,11 +187,13 @@ function embedNakedImageUrls(src: string): string {
 export const Markdown: FC<Props> = (props) => {
   // ★順序重要：
   // 0) 改行正規化（GPT-5.1 癖の吸収）
+  // 0b) <br>タグ正規化（テーブル内: " / "、それ以外: markdown改行）
   // 1) citation正規化
   // 2) フェンス内テーブル救出
   // 3) 画像URL正規化
   const step0 = normalizeNewlines(props.content);
-  const step1 = preprocessCitations(step0);
+  const step0b = normalizeBrTags(step0);
+  const step1 = preprocessCitations(step0b);
   const step2 = unwrapFencedTables(step1);
   const content = embedNakedImageUrls(step2);
 
