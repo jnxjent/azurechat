@@ -67,16 +67,21 @@ function normalizeNewlines(src: string): string {
  * それ以外では markdown 改行（行末スペース2つ + 改行）に変換。
  */
 function normalizeBrTags(src: string): string {
-  if (!src || !/<br\s*\/?>/i.test(src)) return src;
+  // <br>, <br/>, <br />, <br class="..."> など全バリアント対応
+  // エスケープ済みの &lt;BR&gt; や全角括弧の ＜BR＞ も吸収する
+  // \b で breakthrough 等の誤マッチを防ぐ
+  const BR_TEST_RE = /<\/?br\b[^>]*>|&lt;\/?br\b[^&]*?&gt;|＜\/?br\b[^＞]*＞/i;
+  const BR_RE = /<\/?br\b[^>]*>|&lt;\/?br\b[^&]*?&gt;|＜\/?br\b[^＞]*＞/gi;
+  if (!src || !BR_TEST_RE.test(src)) return src;
 
   return src
     .split("\n")
     .map((line) => {
       const isTableRow = /^\s*\|/.test(line);
       if (isTableRow) {
-        return line.replace(/<br\s*\/?>/gi, " / ");
+        return line.replace(BR_RE, " / ");
       }
-      return line.replace(/<br\s*\/?>/gi, "  \n");
+      return line.replace(BR_RE, "  \n");
     })
     .join("\n");
 }
