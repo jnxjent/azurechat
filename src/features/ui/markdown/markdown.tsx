@@ -62,6 +62,31 @@ function normalizeNewlines(src: string): string {
 }
 
 /**
+ * LLMが出力する <br> タグを react-markdown が解釈できる形に変換。
+ * テーブル行内（| ... | ... |）では「 / 」区切りに置換。
+ * それ以外では markdown 改行（行末スペース2つ + 改行）に変換。
+ */
+function normalizeBrTags(src: string): string {
+  // <br>, <br/>, <br />, <br class="..."> など全バリアント対応
+  // エスケープ済みの &lt;BR&gt; や全角括弧の ＜BR＞ も吸収する
+  // \b で breakthrough 等の誤マッチを防ぐ
+  const BR_TEST_RE = /<\/?br\b[^>]*>|&lt;\/?br\b[^&]*?&gt;|＜\/?br\b[^＞]*＞/i;
+  const BR_RE = /<\/?br\b[^>]*>|&lt;\/?br\b[^&]*?&gt;|＜\/?br\b[^＞]*＞/gi;
+  if (!src || !BR_TEST_RE.test(src)) return src;
+
+  return src
+    .split("\n")
+    .map((line) => {
+      const isTableRow = /^\s*\|/.test(line);
+      if (isTableRow) {
+        return line.replace(BR_RE, " / ");
+      }
+      return line.replace(BR_RE, "  \n");
+    })
+    .join("\n");
+}
+
+/**
  * Citation表現を react-markdown 用に正規化
  */
 function preprocessCitations(src: string): string {
@@ -167,11 +192,13 @@ function embedNakedImageUrls(src: string): string {
 export const Markdown: FC<Props> = (props) => {
   // ★順序重要：
   // 0) 改行正規化（GPT-5.1 癖の吸収）
+  // 0b) <br>タグ正規化（テーブル内: " / "、それ以外: markdown改行）
   // 1) citation正規化
   // 2) フェンス内テーブル救出
   // 3) 画像URL正規化
   const step0 = normalizeNewlines(props.content);
-  const step1 = preprocessCitations(step0);
+  const step0b = normalizeBrTags(step0);
+  const step1 = preprocessCitations(step0b);
   const step2 = unwrapFencedTables(step1);
   const content = embedNakedImageUrls(step2);
 

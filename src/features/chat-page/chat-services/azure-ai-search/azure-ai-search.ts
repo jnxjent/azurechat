@@ -203,7 +203,7 @@ export const SimilaritySearch = async (
             vector: embeddings.data[0].embedding,
             fields: ["embedding"],
             kind: "vector",
-            kNearestNeighborsCount: 10,
+            kNearestNeighborsCount: Math.max(k * 4, 50),
           },
         ],
       },
@@ -274,8 +274,9 @@ export const ExtensionSimilaritySearch = async (props: {
     console.log("[SEARCH:Extension] finalFilter =", finalFilter);
     console.log("[SEARCH:Extension] top =", top ?? 8);
 
+    const effectiveTop = top ?? 8;
     const searchResults = await searchClient.search(searchText, {
-      top: top ?? 8,
+      top: effectiveTop,
       filter: finalFilter,
       vectorSearchOptions: {
         queries: [
@@ -283,7 +284,7 @@ export const ExtensionSimilaritySearch = async (props: {
             vector: embeddings.data[0].embedding,
             fields: vectors,
             kind: "vector",
-            kNearestNeighborsCount: 10,
+            kNearestNeighborsCount: Math.max(effectiveTop * 4, 50),
           },
         ],
       },
