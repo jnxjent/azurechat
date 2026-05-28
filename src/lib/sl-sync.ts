@@ -954,31 +954,43 @@ async function indexNewSpFiles(params: {
         console.log(`[SL sync] ${item.name}: unknown personal folder → treating as dept_common`);
       }
 
-      const embeddingRes = await openai.embeddings.create({
-        input: allChunks,
-        model: "",
-      });
+      const EMBED_BATCH = 50;
+      const docsToIndex: NewIndexDoc[] = [];
+      let firstEmbeddingDim = 0;
 
-      console.log(
-        `[SL sync] Embedding result: chunks=${allChunks.length} embData=${embeddingRes.data.length} firstEmbLen=${embeddingRes.data[0]?.embedding?.length ?? 0}`
-      );
+      for (let b = 0; b < allChunks.length; b += EMBED_BATCH) {
+        const batchChunks = allChunks.slice(b, b + EMBED_BATCH);
+        const embeddingRes = await openai.embeddings.create({
+          input: batchChunks,
+          model: "",
+        });
 
-      const docsToIndex: NewIndexDoc[] = allChunks.map((chunk, i) => ({
-        id: randomUUID(),
-        pageContent: chunk,
-        embedding: embeddingRes.data[i]?.embedding ?? [],
-        metadata: item.name,
-        fileUrl: item.webUrl,
-        effectiveFileUrl: item.webUrl,
-        chatThreadId: "sl-auto",
-        user: "",
-        dept: dept.toLowerCase(),
-        isSlDoc: true,
-        slScope: effectiveScope,
-        slOwner: slOwner ?? null,
-        spItemId: item.id,
-        ...(hasRelativePath ? { relativePath: item.relativePath ?? null } : {}),
-      }));
+        const batchEmbeddingDim = embeddingRes.data[0]?.embedding?.length ?? 0;
+        if (firstEmbeddingDim === 0) firstEmbeddingDim = batchEmbeddingDim;
+
+        console.log(
+          `[SL sync] Embedding batch: offset=${b} chunks=${batchChunks.length} embData=${embeddingRes.data.length} firstEmbLen=${batchEmbeddingDim}`
+        );
+
+        for (let j = 0; j < batchChunks.length; j++) {
+          docsToIndex.push({
+            id: randomUUID(),
+            pageContent: batchChunks[j],
+            embedding: embeddingRes.data[j]?.embedding ?? [],
+            metadata: item.name,
+            fileUrl: item.webUrl,
+            effectiveFileUrl: item.webUrl,
+            chatThreadId: "sl-auto",
+            user: "",
+            dept: dept.toLowerCase(),
+            isSlDoc: true,
+            slScope: effectiveScope,
+            slOwner: slOwner ?? null,
+            spItemId: item.id,
+            ...(hasRelativePath ? { relativePath: item.relativePath ?? null } : {}),
+          });
+        }
+      }
 
       const emptyEmbCount = docsToIndex.filter((d) => d.embedding.length === 0).length;
       if (emptyEmbCount > 0) {
@@ -988,7 +1000,7 @@ async function indexNewSpFiles(params: {
       await addNewIndexDocs(docsToIndex);
       indexed++;
       console.log(
-        `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length} embeddingDim=${embeddingRes.data[0]?.embedding?.length ?? 0}`
+        `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length} embeddingDim=${firstEmbeddingDim}`
       );
     } catch (e) {
       console.error(`[SL sync] Failed to index ${item.name}:`, e);
