@@ -5,8 +5,6 @@ import PptxGenJS from "pptxgenjs";
 import {
   BlobSASPermissions,
   BlobServiceClient,
-  StorageSharedKeyCredential,
-  generateBlobSASQueryParameters,
 } from "@azure/storage-blob";
 import { uniqueId } from "@/features/common/util";
 import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
@@ -244,7 +242,7 @@ function createFallbackBrief(
               : slide.layoutType === "conversation"
                 ? "editorial"
                 : visualCycle[index % visualCycle.length],
-      emphasis: slide.bullets[0] ?? slide.title,
+      emphasis: (Array.isArray(slide.bullets) && slide.bullets[0]) || slide.title,
     })),
   };
 }
@@ -332,7 +330,7 @@ async function generateDesignBrief(
               : slide.layoutType === "diagram"
                 ? "process"
                 : safeVisual,
-        emphasis: String(matched?.emphasis ?? "").trim() || fallback.visualHints[index]?.emphasis || slide.bullets[0] || slide.title,
+        emphasis: String(matched?.emphasis ?? "").trim() || fallback.visualHints[index]?.emphasis || (Array.isArray(slide.bullets) && slide.bullets[0]) || slide.title,
       };
     });
 
@@ -381,7 +379,6 @@ async function uploadPptxToBlob(buffer: Buffer, fileName: string): Promise<strin
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "pptx";
-  const sharedKeyCredential = new StorageSharedKeyCredential(acc, key);
   const blobServiceClient = BlobServiceClient.fromConnectionString(
     `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
   );
@@ -394,11 +391,13 @@ async function uploadPptxToBlob(buffer: Buffer, fileName: string): Promise<strin
       blobContentDisposition: `attachment; filename="${fileName}"`,
     },
   });
-  const sasToken = generateBlobSASQueryParameters(
-    { containerName, blobName: fileName, expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000), permissions: BlobSASPermissions.parse("r") },
-    sharedKeyCredential
-  );
-  return `${blockBlobClient.url}?${sasToken}`;
+  // generateSasUrl は BlockBlobClient が StorageSharedKeyCredential を持つ場合のみ使用可能
+  // fromConnectionString（アカウントキー含む）で作成した場合は使用可能
+  const sasUrl = await blockBlobClient.generateSasUrl({
+    expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    permissions: BlobSASPermissions.parse("r"),
+  });
+  return sasUrl;
 }
 
 const W = 13.33;
@@ -1147,7 +1146,7 @@ function buildBulletsSlide(
   // faithfulMode では execMode による内容圧縮（キーメッセージ1件＋最大3件）をスキップ
   if (theme.execMode && !faithfulMode) {
     const allBullets = sections.flatMap((section) => section.items);
-    const keyMessage = allBullets[0] ?? slide.bullets[0] ?? "";
+    const keyMessage = allBullets[0] ?? (Array.isArray(slide.bullets) && slide.bullets[0]) ?? "";
     const rest = allBullets.slice(1, 4);
 
     if (keyMessage) {
@@ -1653,7 +1652,7 @@ export async function POST(req: NextRequest) {
               : slide.layoutType === "diagram"
                 ? "process"
                 : "editorial",
-        emphasis: slide.bullets[0] ?? slide.title,
+        emphasis: (Array.isArray(slide.bullets) && slide.bullets[0]) || slide.title,
       };
       const slideIllustration =
         !illustrationPlaced &&
