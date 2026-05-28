@@ -193,7 +193,7 @@ ${page}`;
 
   const xlsxUrls = fileUrls.filter((u) => /\.(xlsx|xls|xlsm)(?:\?|$)/i.test(u));
   const fileUrlHint = hasUploadedFile
-    ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- If the user asks to convert the document to PowerPoint, use the convert_doc_to_pptx tool with the file_url from above.${xlsxUrls.length > 0 ? `\n- CRITICAL: このスレッドにExcelファイル（.xlsx）がアップロードされています。ユーザーが「グラフにして」「折れ線グラフ」「棒グラフ」「グラフ化して」「チャートを作成して」と言った場合、必ず edit_excel ツールを fileUrl=${xlsxUrls[0]} で呼び出すこと。検索結果にPNGファイルが含まれていても、それはExcelとは無関係の知識ベースの画像であり、ユーザーのExcelファイルではない。` : ""}`
+    ? `\n- The uploaded document file URLs are:\n${fileUrls.map((u, i) => `  [${i}] ${u}`).join("\n")}\n- PDFをそのままPPTに変換する場合は convert_doc_to_pptx を上記 file_url で呼ぶこと。ただし、会話でスライド構成が既に議論済みでPDFは参考資料として使う場合は create_pptx を使うこと（convert_doc_to_pptx は使わないこと）。${xlsxUrls.length > 0 ? `\n- CRITICAL: このスレッドにExcelファイル（.xlsx）がアップロードされています。ユーザーが「グラフにして」「折れ線グラフ」「棒グラフ」「グラフ化して」「チャートを作成して」と言った場合、必ず edit_excel ツールを fileUrl=${xlsxUrls[0]} で呼び出すこと。検索結果にPNGファイルが含まれていても、それはExcelとは無関係の知識ベースの画像であり、ユーザーのExcelファイルではない。` : ""}`
     : "\n- 【重要】このスレッドにアップロードされたファイルは存在しません。ユーザーがSharePoint/SLの資料名を挙げてPPT変換を要求した場合は、必ず convert_sp_to_pptx ツールを使うこと。convert_doc_to_pptx は使わないこと。";
 
   const _userMessage = `
@@ -201,7 +201,9 @@ ${page}`;
 - If you don't know the answer, just say that you don't know. Don't try to make up an answer.
 - You must always include a citation at the end of your answer and don't include full stop after the citations.
 - IMPORTANT: If the user asks to compare multiple documents or find contradictions across files: (1) First call sl_doc_search with a broad query (e.g. "IR議事録") to discover available document names. (2) Then call sl_doc_search once per discovered document using "company name + document type + keyword" queries. (3) Only answer after collecting content from all documents. Never answer based solely on the initial context when multi-document comparison is requested.
-- If the user asks to create a PowerPoint or slides from the document content, use the convert_doc_to_pptx tool with the file_url from the document context below. This tool uses Vision API for high-quality conversion.${fileUrlHint}
+- PowerPoint生成のツール選択ルール（厳守）：
+  ① ユーザーがPDF/文書を「そのままPPTに変換して」「スライド化して」と言った場合 → convert_doc_to_pptx を使うこと。
+  ② 会話の中でスライド構成（タイトル・箇条書き）が既に議論・提示されており、「PDFを参考に内容を拡充して」「追記して」「厚くして」とPDFはあくまで参考資料として扱う場合 → create_pptx を使うこと。この場合、前の会話のスライド構成を slides パラメータのベースとし、文書コンテキストや sl_doc_search の結果で各スライドの bullets を肉付けした上で呼び出すこと。convert_doc_to_pptx は使わないこと。${fileUrlHint}
 
 ----------------
 content:

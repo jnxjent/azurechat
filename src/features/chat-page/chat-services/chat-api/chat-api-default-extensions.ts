@@ -3,7 +3,7 @@
 import "server-only";
 
 import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
-import { OpenAIDALLEInstance } from "@/features/common/services/openai";
+import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
@@ -12,7 +12,7 @@ import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
-import { SimpleSearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
+import { SimpleSearch, SimilaritySearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
 import {
@@ -1113,7 +1113,11 @@ export const GetDefaultExtensions = async (props: {
           },
           slides: {
             type: "array",
-            description: "スライドのリスト",
+            description:
+              "スライドのリスト。\n" +
+              "【標準モード】1スライド3〜4項目の箇条書き。キーワードではなく1〜2文の具体的な説明文で書くこと。\n" +
+              "【提案書モード（proposalMode=true）】スライド枚数を12〜16枚に増やし、各スライドは1テーマに絞って3〜4項目のみ。" +
+              "構成例: 表紙→課題・背景→現状の問題点→提案概要→提案詳細（2〜3スライド）→根拠・実績→他社比較→導入効果→コスト感→導入ロードマップ→まとめ・次のステップ。",
             items: {
               type: "object",
               properties: {
@@ -1124,11 +1128,43 @@ export const GetDefaultExtensions = async (props: {
                 bullets: {
                   type: "array",
                   items: { type: "string" },
-                  description: "箇条書きの内容リスト",
+                  description: "箇条書きの内容リスト。各項目は具体的な事実・数値・根拠を含む1〜2文で記述すること。単なるキーワードや項目名だけは禁止。標準:3〜4項目、提案書モード:3項目以内。",
+                },
+                layoutType: {
+                  type: "string",
+                  enum: ["bullets", "multi-column", "table", "diagram"],
+                  description: "レイアウト種別。bullets=箇条書き（デフォルト）。multi-column=2〜3列比較（columns フィールドも必須）。table=表（tableRows フィールドも必須）。diagram=図解フロー。提案書モードでは比較・効果・ロードマップなどに table や multi-column を使うこと。",
+                },
+                columns: {
+                  type: "array",
+                  description: "multi-column レイアウト時に必須。各列のデータ。layoutType='multi-column' を指定した場合は必ずこのフィールドも設定すること。",
+                  items: {
+                    type: "object",
+                    properties: {
+                      header: { type: "string", description: "列のヘッダー（例: '自社サービス', '競合A', '競合B'）" },
+                      bullets: { type: "array", items: { type: "string" }, description: "この列の内容（3〜5項目）" },
+                    },
+                    required: ["header", "bullets"],
+                  },
+                },
+                tableRows: {
+                  type: "array",
+                  description: "table レイアウト時に必須。1行目をヘッダー行とし、以降がデータ行。layoutType='table' を指定した場合は必ずこのフィールドも設定すること。",
+                  items: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "1行分のセル値の配列。例: ['項目', '内容', '備考']",
+                  },
                 },
               },
               required: ["title", "bullets"],
             },
+          },
+          proposalMode: {
+            type: "boolean",
+            description:
+              "提案書モード。true にすると「1スライド1テーマ×12〜16枚構成」で、課題→提案→根拠→比較→効果→ロードマップの流れで自動展開する。" +
+              "ユーザーが「提案書で」「しっかりした資料で」「営業資料として」「お客様向けに」と言った場合、または文字が少ない・内容が薄いと指摘された場合は true にすること。",
           },
           fontFace: {
             type: "string",
@@ -1136,7 +1172,7 @@ export const GetDefaultExtensions = async (props: {
           },
           designInstruction: {
             type: "string",
-            description: "デザイン・色調の指示。例: '赤いトーンで力強く', '青を基調にしたシンプルなデザイン', 'ポップで明るい印象'",
+            description: "デザイン・色調の指示。業種感を含めると効果的。例: '廃棄物処理業らしい信頼感・環境意識を前面に、濃紺ベースで誠実さを表現', '医療・製薬向けの清潔感ある白と青', 'IT・DX提案書らしいモダンなグラデーション'",
           },
         },
         required: ["title", "slides"],
@@ -1144,9 +1180,13 @@ export const GetDefaultExtensions = async (props: {
       description:
         "ユーザーがテーマや内容を指定してPowerPoint（PPTX）を新規作成するツール。\n" +
         "テキストベースでスライド構成を作る場合に使用する。\n" +
-        "ファイル（PDF・画像）をPPTに変換する場合は、代わりに convert_doc_to_pptx ツールを使うこと。\n" +
+        "【最重要・ツール選択ルール】\n" +
+        "・PDFをそのままPPTに変換する場合 → convert_doc_to_pptx を使うこと。\n" +
+        "・会話で既にスライド構成を議論済みで、PDFは参考資料として内容を拡充・追記する場合 → このツール（create_pptx）を使うこと。\n" +
+        "  この場合、まず sl_doc_search や会話コンテキストでPDF内容を把握し、前の会話のスライド構成をベースに各スライドの bullets を肉付けした上で slides パラメータに設定して呼ぶこと。\n" +
+        "【提案書モード】ユーザーが「提案書」「営業資料」「お客様向け」「しっかりした資料」と言った場合は proposalMode=true にして、12〜16枚構成で作ること。\n" +
         "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更は edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
-        "ユーザーが色やデザインを指定した場合は designInstruction に渡すこと（例：「赤いトーン」→ designInstruction='赤いトーンで力強く'）。\n" +
+        "ユーザーが業種・用途を言及した場合は designInstruction に業種感を含めること。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "create_pptx",
     },
@@ -1206,6 +1246,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーがアップロードしたPDF・画像ファイルをPowerPoint（PPTX）に変換するツール。\n" +
         "Vision APIを使って各ページを視覚的に解析するため、グラフ・表・図も含めて高精度に変換できる。\n" +
         "使用タイミング：ユーザーが「PPTに変換して」「スライドにして」「PPT化して」と言い、かつ会話コンテキストにfile_urlがある場合。\n" +
+        "【禁止】会話で既にスライド構成を議論済みで、PDFは参考資料として内容を拡充・追記するだけの場合は、このツールを使わないこと。その場合は create_pptx を使うこと。\n" +
         "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること（blob.core.windows.net のURLを優先）。\n" +
         "検索結果の引用（citation本文中）に含まれるSharePointのリンクは使わないこと。'file_url:' 行から得たBlobURLであれば使ってよい。\n" +
         "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
@@ -1598,27 +1639,178 @@ export const GetDefaultExtensions = async (props: {
   return { status: "OK", response: defaultExtensions };
 };
 
+// ---------------- SP文書検索（提案書コンテキスト） ----------------
+
+/**
+ * 提案書生成前に AI Search（SharePoint文書）を複数クエリで検索し、
+ * 参照可能な社内文書のテキストをまとめて返す。
+ * LLMの事前学習知識ではなく、実際のSP文書を提案内容に反映させるための関数。
+ */
+async function fetchSpContextForProposal(
+  topic: string,
+  inputSlides: Array<{ title: string; bullets: string[] }>,
+  deptLower: string
+): Promise<string> {
+  try {
+    // タイトル + 各スライドタイトルから検索クエリを生成（最大4クエリ）
+    const queries = [topic, ...inputSlides.map((s) => s.title)]
+      .filter(Boolean)
+      .slice(0, 4);
+
+    const seen = new Set<string>();
+    const excerpts: string[] = [];
+
+    for (const query of queries) {
+      const result = await SimilaritySearch(query, 6, "isSlDoc eq true", deptLower);
+      if (result.status !== "OK") continue;
+
+      for (const item of result.response) {
+        const content = item.document.pageContent?.trim();
+        const source = item.document.metadata || "";
+        if (!content || seen.has(content)) continue;
+        seen.add(content);
+        // 1件あたり最大600文字に切り詰めて過大なトークン消費を防ぐ
+        excerpts.push(`【出典: ${source}】\n${content.slice(0, 600)}`);
+      }
+    }
+
+    console.log(`[proposalMode] SP文書取得: ${excerpts.length}件 (queries=${queries.length})`);
+    return excerpts.slice(0, 15).join("\n\n---\n\n");
+  } catch (e) {
+    console.warn("[proposalMode] fetchSpContextForProposal failed:", e);
+    return "";
+  }
+}
+
+// ---------------- 提案書スライド展開 ----------------
+type ProposalSlide = {
+  title: string;
+  bullets: string[];
+  layoutType?: string;
+  columns?: Array<{ header: string; bullets: string[] }>;
+  tableRows?: string[][];
+};
+
+async function expandToProposalSlides(
+  title: string,
+  inputSlides: ProposalSlide[],
+  designHint?: string,
+  deptLower?: string
+): Promise<ProposalSlide[]> {
+  try {
+    const openai = OpenAIInstance();
+    const inputSummary = inputSlides.length
+      ? inputSlides.map((s) => `- ${s.title}: ${(s.bullets ?? []).slice(0, 2).join(" / ")}`).join("\n")
+      : "（初期スライドなし）";
+
+    // SharePoint文書を検索してコンテキストとして取得
+    const spContext = deptLower
+      ? await fetchSpContextForProposal(title, inputSlides, deptLower)
+      : "";
+
+    const spSection = spContext
+      ? `\n\n【社内SharePoint文書（必ず内容を反映させること。LLMの事前学習知識より優先すること）】\n${spContext}`
+      : "";
+
+    const systemPrompt = `あなたは営業提案書のスライド構成の専門家です。与えられたタイトル・初期スライド・社内文書を元に、12〜16枚の提案書スライドを生成してください。
+
+【最重要】社内SharePoint文書が提供されている場合は、その内容（数値・事例・実績・規程・方針）を必ずスライドの bullets に盛り込むこと。LLMの事前学習知識で補完するのは、文書に記載のない部分のみとすること。
+
+【構成の流れ（必須）】
+1. 表紙（タイトルスライド）
+2. 課題・背景（顧客が抱える問題）
+3. 現状の問題点（具体的な課題の深掘り）
+4. 提案概要（一言で伝える解決策）
+5〜7. 提案詳細（サービス内容・特徴・強みを2〜3スライドで）
+8. 根拠・実績（数値・事例・実績。SP文書の数値を使うこと）
+9. 他社比較（layoutType="multi-column"、3列比較を推奨）
+10. 導入効果（layoutType="table"、効果を数値で）
+11. コスト感・導入ロードマップ
+12. まとめ・次のステップ
+
+【各スライドのルール】
+- bullets は3〜4項目のみ（詰め込まない）
+- 各 bullet は具体的な1〜2文。キーワードのみ禁止
+- multi-column 時は columns フィールドも必ず設定
+- table 時は tableRows フィールドも必ず設定（1行目はヘッダー）
+
+必ず以下のJSON形式で返すこと（配列のみ、説明文なし）:
+[{"title":"...","bullets":["..."],"layoutType":"bullets","columns":null,"tableRows":null}]`;
+
+    const userPrompt = `タイトル: ${title}
+デザインヒント: ${designHint ?? "ビジネス向け"}
+初期スライド:
+${inputSummary}${spSection}`;
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.3,
+      max_tokens: 4000,
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "";
+    const jsonMatch = raw.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      console.warn("[proposalMode] Failed to extract JSON from response");
+      return inputSlides;
+    }
+
+    const parsed: ProposalSlide[] = JSON.parse(jsonMatch[0]);
+    return parsed
+      .filter((s) => s.title)
+      .map((s) => ({
+        ...s,
+        bullets: Array.isArray(s.bullets) ? s.bullets : [],
+        columns: Array.isArray(s.columns) ? s.columns : undefined,
+        tableRows: Array.isArray(s.tableRows) ? s.tableRows : undefined,
+      }));
+  } catch (e) {
+    console.error("[proposalMode] expandToProposalSlides error:", e);
+    return inputSlides;
+  }
+}
+
 // ---------------- PowerPoint 生成 ----------------
 async function executeCreatePptx(
   args: {
     title: string;
-    slides: Array<{ title: string; bullets: string[] }>;
+    slides: Array<{
+      title: string;
+      bullets: string[];
+      layoutType?: string;
+      columns?: Array<{ header: string; bullets: string[] }>;
+      tableRows?: string[][];
+    }>;
+    proposalMode?: boolean;
     fontFace?: string;
     designInstruction?: string;
   },
   chatThread: ChatThreadModel
 ) {
-  const { title, slides, fontFace, designInstruction } = args ?? {};
+  const { title, slides, proposalMode, fontFace, designInstruction } = args ?? {};
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
   }
 
+  // 提案書モード: サーバー側でスライドを12〜16枚に展開（SP文書をRAGとして活用）
+  let finalSlides = slides;
+  if (proposalMode) {
+    const session = await userSession();
+    const deptLower = (session?.slDept ?? "others").toLowerCase().trim();
+    finalSlides = await expandToProposalSlides(title, slides, designInstruction, deptLower);
+  }
+
   // Each PPT creation is independent — do not accumulate style from thread history.
-  const explicitInstruction = designInstruction?.trim() || undefined;
-  const deckPreferences: DeckPreferences = explicitInstruction
-    ? { designInstruction: explicitInstruction }
-    : {};
+  const explicitInstruction = designInstruction?.trim() ||
+    (proposalMode
+      ? "提案書スタイル：課題→解決策→根拠→効果の流れを視覚的に表現。濃紺ベース、見出しは白抜き太字、重要数値は大きく強調。スライドごとにレイアウトを変化させ、比較スライドは表形式、プロセスはフロー図で表現すること。"
+      : "プロフェッショナルで信頼感のあるビジネス向けデザイン。見出しは太字で視認性高く、数値・実績は強調表示。スライド間でレイアウトに変化をつけること。");
+  const deckPreferences: DeckPreferences = { designInstruction: explicitInstruction };
 
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
@@ -1631,7 +1823,13 @@ async function executeCreatePptx(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         title,
-        slides,
+        slides: (finalSlides ?? []).map((s) => ({
+          title: s.title,
+          bullets: s.bullets,
+          ...(s.layoutType ? { layoutType: s.layoutType } : {}),
+          ...(s.columns ? { columns: s.columns } : {}),
+          ...(s.tableRows ? { tableRows: s.tableRows } : {}),
+        })),
         threadId: chatThread.id,
         fontFace,
         designInstruction: explicitInstruction,
