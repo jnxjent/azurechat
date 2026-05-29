@@ -86,25 +86,66 @@ def _get_doc_intel_client():
 # ── テキスト正規化 ────────────────────────────────────────────────────────
 
 # コロン・セミコロン・アポストロフィもOCR誤読の千区切りとして許容する
-_AMOUNT_RE = re.compile(r"^[△▲(（]?[\d,，:;']+[)）]?$")
+# 先頭の - はDIが直接マイナス記号を返す場合に対応
+_AMOUNT_RE = re.compile(r"^[-△▲(（]?[\d,，:;']+[)）]?$")
 
 _NUMERIC_LINE_RE = re.compile(r"^[\d,，]+$")
 
+# (2026/03/31) のような日付パターン — OCR誤読補正の対象外
+_DATE_RE = re.compile(r"^\(?\d{4}[/／]\d{1,2}[/／]\d{1,2}\)?$")
+
+# 数字と数字の間のスペース
+_DIGIT_SPACE_RE = re.compile(r"(?<=\d) (?=\d)")
+
+
+def _preprocess_ocr(text: str) -> str:
+    """OCRが千区切りカンマを誤読した文字（/ ／ スペース）を補正する。
+    日付パターン (YYYY/MM/DD) は変換しない。
+    スペース後にカンマがある場合（241 69,530 のような別値混入）はスキップ。
+    """
+    t = text.strip()
+    if not t or _DATE_RE.match(t):
+        return t
+    # / ／ をカンマに置換（例: 1412/755 → 1412,755）
+    t = t.replace("/", ",").replace("／", ",")
+    # 数字間スペースを除去（例: 1573 760 → 1573760）
+    # スペース後にカンマがある場合はスキップ（別値混入の可能性）
+    if " " in t:
+        after_last_space = t[t.rfind(" ") + 1:]
+        if "," not in after_last_space and "，" not in after_last_space:
+            t = _DIGIT_SPACE_RE.sub("", t)
+    return t
+
 
 def _normalize_amount(text: str) -> str:
-    """△1,234 / (1,234) → -1234 に正規化する。数字でなければ原文を返す。"""
+    """△1,234 / (1,234) / -1,234 → -1234 に正規化する。数字でなければ原文を返す。"""
     t = text.strip()
     if not t:
         return t
-    negative = t.startswith(("△", "▲")) or (
+    negative = t.startswith(("△", "▲", "-")) or (
         (t.startswith("(") and t.endswith(")")) or
         (t.startswith("（") and t.endswith("）"))
     )
-    cleaned = re.sub(r"[△▲(（)）,，:;'\s]", "", t)
-    if not cleaned.lstrip("-").isdigit():
+    cleaned = re.sub(r"[△▲(（)）,，:;'\s-]", "", t)
+    if not cleaned.isdigit():
         return text
     val = int(cleaned)
     return str(-val if negative else val)
+
+
+def _to_cell_value(text: str) -> int | float | str:
+    """数値文字列を int / float に変換してExcelが数値セルとして認識できるようにする。"""
+    if not text:
+        return text
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return text
 
 
 def _join_vertical_text(text: str) -> str:
@@ -126,13 +167,14 @@ def _join_vertical_text(text: str) -> str:
 
 
 def _maybe_normalize(text: str) -> str:
-    """縦書き結合 → :unselected: 除去 → 金額正規化の順で処理する。"""
+    """縦書き結合 → :unselected: 除去 → OCR誤読補正 → 金額正規化の順で処理する。"""
     t = text.strip()
     # DIチェックボックスマーカーを除去（文中に混入する場合も含む）
     t = re.sub(r"\s*:(?:un)?selected:\s*", "", t).strip()
     if not t:
         return ""
     t = _join_vertical_text(t)
+    t = _preprocess_ocr(t)
     if _AMOUNT_RE.match(t):
         return _normalize_amount(t)
     return t
@@ -207,6 +249,76 @@ def _join_cell_text(left: str, right: str) -> str:
     if _is_amountish_fragment(left) and _is_amountish_fragment(right):
         return _normalize_amount(left + right)
     return left + right
+
+
+def _stripped_digit_len(text: str) -> int:
+    """区切り文字を除去した後の桁数を返す。"""
+    return len(re.sub(r"[\s,，:;'\.\-\+\(\)（）△▲]", "", text.strip()))
+
+
+def _repair_extra_cells(
+    grid: dict[tuple[int, int], tuple[str, str, int, int]],
+) -> dict[tuple[int, int], tuple[str, str, int, int]]:
+    """行のセル数が最頻値+1の行を修正する。
+    「3桁以下の数値断片」と隣接する数値を結合し、以降のセルを左シフトして列数を揃える。
+    ちょうど1セル多い行のみ対象（複数ズレは対象外）。
+    """
+    row_counts: dict[int, int] = {}
+    for (r, c), (v, k, rs, cs) in grid.items():
+        if v and cs == 1:
+            row_counts[r] = row_counts.get(r, 0) + 1
+
+    if not row_counts:
+        return grid
+
+    counts = list(row_counts.values())
+    expected = max(set(counts), key=counts.count)
+
+    result = dict(grid)
+    for r, count in row_counts.items():
+        if count != expected + 1:
+            continue
+
+        row_items = sorted(
+            [(c, result[(r, c)]) for (rr, c) in result if rr == r],
+            key=lambda x: x[0],
+        )
+
+        # 小数点を含む数値セルが1つでもある行は行ごとスキップ
+        # （対比欄の小数値がある行でペアを誤結合するのを防ぐ）
+        if any(
+            "." in v and _is_amountish_fragment(v)
+            for _, (v, _, _, _) in row_items
+        ):
+            continue
+
+        for i in range(len(row_items) - 1):
+            c1, (v1, k1, rs1, cs1) = row_items[i]
+            c2, (v2, k2, rs2, cs2) = row_items[i + 1]
+            if c2 != c1 + 1:
+                continue
+            if not (_is_amountish_fragment(v1) and _is_amountish_fragment(v2)):
+                continue
+            # 両方とも4桁以上の場合は独立した数値として扱い結合しない
+            if _stripped_digit_len(v1) > 3 and _stripped_digit_len(v2) > 3:
+                continue
+
+            merged = _join_cell_text(v1, v2)
+            del result[(r, c1)]
+            del result[(r, c2)]
+            result[(r, c1)] = (merged, k1, rs1, cs1)
+
+            to_shift = sorted(
+                [(c, data) for (rr, c), data in list(result.items())
+                 if rr == r and c > c2],
+                key=lambda x: x[0],
+            )
+            for c_old, data in to_shift:
+                del result[(r, c_old)]
+                result[(r, c_old - 1)] = data
+            break
+
+    return result
 
 
 def _build_logical_column_map(raw_cells: list[dict], column_count: int) -> dict[int, int]:
@@ -431,10 +543,16 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
                     else:
                         grid[key] = (content, kind, rs, cs)
 
+                grid = _repair_extra_cells(grid)
+
                 # ① データ書き込み & スタイル適用
                 for (r, c), (content, kind, rs, cs) in grid.items():
-                    xl_cell = ws.cell(row=r + 1 + row_offset, column=c + 1, value=content)
+                    xl_cell = ws.cell(row=r + 1 + row_offset, column=c + 1, value=_to_cell_value(content))
                     _apply_cell_style(xl_cell, kind)
+                    if isinstance(xl_cell.value, int):
+                        xl_cell.number_format = "#,##0"
+                    elif isinstance(xl_cell.value, float):
+                        xl_cell.number_format = "#,##0.##"
 
                 # ② セル結合
                 for (r, c), (content, kind, rs, cs) in grid.items():
