@@ -21,6 +21,8 @@ from collections import defaultdict
 
 import openpyxl
 import pdfplumber
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 # ── オプション依存ライブラリ ──────────────────────────────────────────────
 try:
@@ -43,6 +45,32 @@ except ImportError:
     HAS_PYTHON_DOCX = False
 
 
+# ── 表スタイル定数 ────────────────────────────────────────────────────────
+_THIN = Side(style="thin")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_COL_HDR_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+_COL_HDR_FONT = Font(bold=True, color="FFFFFF")
+_ROW_HDR_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+_ROW_HDR_FONT = Font(bold=True, color="000000")
+_STUB_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+_STUB_FONT = Font(bold=True, color="000000")
+
+
+def _apply_cell_style(xl_cell, kind: str | None) -> None:
+    """セル種別に応じてスタイル（枠線・塗り・フォント）を適用する。"""
+    xl_cell.border = _BORDER
+    xl_cell.alignment = Alignment(vertical="center")
+    if kind == "columnHeader":
+        xl_cell.fill = _COL_HDR_FILL
+        xl_cell.font = _COL_HDR_FONT
+    elif kind == "rowHeader":
+        xl_cell.fill = _ROW_HDR_FILL
+        xl_cell.font = _ROW_HDR_FONT
+    elif kind == "stub":
+        xl_cell.fill = _STUB_FILL
+        xl_cell.font = _STUB_FONT
+
+
 # ── Doc Intelligence クライアント ─────────────────────────────────────────
 
 def _get_doc_intel_client():
@@ -55,12 +83,16 @@ def _get_doc_intel_client():
     return DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 
-# ── 金額正規化 ────────────────────────────────────────────────────────────
+# ── テキスト正規化 ────────────────────────────────────────────────────────
 
-_AMOUNT_RE = re.compile(r"^[△▲(（]?[\d,，]+[)）]?$")
+# コロン・セミコロン・アポストロフィもOCR誤読の千区切りとして許容する
+_AMOUNT_RE = re.compile(r"^[△▲(（]?[\d,，:;']+[)）]?$")
+
+_NUMERIC_LINE_RE = re.compile(r"^[\d,，]+$")
+
 
 def _normalize_amount(text: str) -> str:
-    """△1,234 / (1,234) → -1234、通常数字はそのまま返す。数字でなければ原文を返す。"""
+    """△1,234 / (1,234) → -1234 に正規化する。数字でなければ原文を返す。"""
     t = text.strip()
     if not t:
         return t
@@ -68,19 +100,206 @@ def _normalize_amount(text: str) -> str:
         (t.startswith("(") and t.endswith(")")) or
         (t.startswith("（") and t.endswith("）"))
     )
-    cleaned = re.sub(r"[△▲(（)）,，\s]", "", t)
+    cleaned = re.sub(r"[△▲(（)）,，:;'\s]", "", t)
     if not cleaned.lstrip("-").isdigit():
         return text
     val = int(cleaned)
     return str(-val if negative else val)
 
 
+def _join_vertical_text(text: str) -> str:
+    """TKC縦書きPDF対策: 改行で1文字ずつ分断されたセル値を結合する。
+    例: '現\\n金\\n及\\nび\\n預\\n金' → '現金及び預金'
+    各行が3文字以下かつ数字のみでない場合に限り結合する（金額行は対象外）。
+    """
+    if "\n" not in text:
+        return text
+    lines = [l.strip() for l in text.split("\n")]
+    non_empty = [l for l in lines if l]
+    if not non_empty:
+        return text
+    if all(1 <= len(l) <= 3 and not _NUMERIC_LINE_RE.match(l) for l in non_empty):
+        joined = "".join(non_empty)
+        joined = joined.replace("、", "").replace("・", "").replace("·", "")
+        return joined
+    return text
+
+
 def _maybe_normalize(text: str) -> str:
-    """金額っぽいセルだけ正規化する。"""
+    """縦書き結合 → :unselected: 除去 → 金額正規化の順で処理する。"""
     t = text.strip()
+    # DIチェックボックスマーカーを除去（文中に混入する場合も含む）
+    t = re.sub(r"\s*:(?:un)?selected:\s*", "", t).strip()
+    if not t:
+        return ""
+    t = _join_vertical_text(t)
     if _AMOUNT_RE.match(t):
         return _normalize_amount(t)
     return t
+
+
+# ── DI セル座標ユーティリティ ─────────────────────────────────────────────
+
+def _point_xy(point):
+    if isinstance(point, dict):
+        return point.get("x"), point.get("y")
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        return point[0], point[1]
+    return getattr(point, "x", None), getattr(point, "y", None)
+
+
+def _cell_x_bounds(di_cell) -> tuple[float, float] | None:
+    """DI セルの左端・右端X座標を返す。"""
+    regions = getattr(di_cell, "bounding_regions", None) or []
+    xs: list[float] = []
+    for region in regions:
+        polygon = getattr(region, "polygon", None) or []
+        if polygon and all(isinstance(p, (int, float)) for p in polygon):
+            xs.extend(float(polygon[i]) for i in range(0, len(polygon), 2))
+            continue
+        for point in polygon:
+            x, _y = _point_xy(point)
+            if x is not None:
+                xs.append(float(x))
+    if not xs:
+        return None
+    return min(xs), max(xs)
+
+
+def _get_y_from_polygon(polygon) -> float | None:
+    """polygon の最小Y座標を返す（フラットリスト・ポイントリスト両対応）。"""
+    ys: list[float] = []
+    if polygon and all(isinstance(p, (int, float)) for p in polygon):
+        ys = [float(polygon[i]) for i in range(1, len(polygon), 2)]
+    else:
+        for point in polygon:
+            _x, y = _point_xy(point)
+            if y is not None:
+                ys.append(float(y))
+    return min(ys) if ys else None
+
+
+# ── 列マージ判定 ──────────────────────────────────────────────────────────
+
+def _is_amountish_fragment(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    stripped = re.sub(r"[\s,，:;'\.\-\+\(\)（）△▲]", "", t)
+    return bool(stripped) and stripped.isdigit()
+
+
+def _looks_like_fragment(text: str) -> bool:
+    """カンマ等の区切り文字で終わる場合のみ「途中で切れた数字」と見なす。
+    短い独立した数値（100, 200 など）は断片扱いしない。
+    """
+    t = text.strip()
+    if not t:
+        return False
+    return t.endswith((",", "，", ":", ";"))
+
+
+def _join_cell_text(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right:
+        return left
+    if _is_amountish_fragment(left) and _is_amountish_fragment(right):
+        return _normalize_amount(left + right)
+    return left + right
+
+
+def _build_logical_column_map(raw_cells: list[dict], column_count: int) -> dict[int, int]:
+    """DI の物理列番号 → 論理列番号のマッピングを返す。
+    隣接する列が「途中で切れた数字（断片）」を持つ場合のみ結合する。
+    財務表の独立した数値列は結合しない。
+    """
+    col_bounds: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    col_values: dict[int, list[str]] = defaultdict(list)
+    row_values: dict[tuple[int, int], str] = {}
+    all_xs: list[float] = []
+
+    for cell in raw_cells:
+        col = int(cell["col"])
+        text = str(cell.get("content") or "").strip()
+        if text:
+            col_values[col].append(text)
+            row_values[(int(cell["row"]), col)] = text
+        bounds = cell.get("bounds")
+        if bounds and cell.get("cs", 1) == 1:
+            x0, x1 = bounds
+            col_bounds[col].append((x0, x1))
+            all_xs.extend([x0, x1])
+
+    parents = list(range(max(column_count, 1)))
+
+    def find(x: int) -> int:
+        while parents[x] != x:
+            parents[x] = parents[parents[x]]
+            x = parents[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parents[rb] = ra
+
+    def col_span(col: int) -> tuple[float, float] | None:
+        spans = col_bounds.get(col) or []
+        if not spans:
+            return None
+        return min(x0 for x0, _ in spans), max(x1 for _, x1 in spans)
+
+    if not all_xs:
+        return {c: c for c in range(column_count)}
+
+    table_width = max(all_xs) - min(all_xs)
+    if table_width <= 0:
+        return {c: c for c in range(column_count)}
+
+    for col in range(column_count - 1):
+        left_span = col_span(col)
+        right_span = col_span(col + 1)
+        if not left_span or not right_span:
+            continue
+
+        left_x0, left_x1 = left_span
+        right_x0, right_x1 = right_span
+        gap = max(0.0, right_x0 - left_x1)
+        left_width = max(0.0, left_x1 - left_x0)
+        right_width = max(0.0, right_x1 - right_x0)
+
+        same_rows = set(r for r, c in row_values if c == col) & set(
+            r for r, c in row_values if c == col + 1
+        )
+        amount_split_rows = [
+            r for r in same_rows
+            if _is_amountish_fragment(row_values[(r, col)] + row_values[(r, col + 1)])
+        ]
+        amount_split_ratio = len(amount_split_rows) / max(len(same_rows), 1)
+
+        # 少なくとも一方が「途中で切れた数字」の見た目である場合のみ結合
+        has_fragment = (
+            any(_looks_like_fragment(row_values.get((r, col), "")) for r in same_rows) or
+            any(_looks_like_fragment(row_values.get((r, col + 1), "")) for r in same_rows)
+        )
+
+        very_close = gap <= table_width * 0.005
+        close = gap <= table_width * 0.015
+        narrow_side = min(left_width, right_width) <= table_width * 0.025
+        amount_split_with_fragment = bool(same_rows) and amount_split_ratio >= 0.5 and has_fragment
+
+        if (very_close and narrow_side and has_fragment) or (close and amount_split_with_fragment):
+            union(col, col + 1)
+
+    root_to_logical: dict[int, int] = {}
+    col_map: dict[int, int] = {}
+    for col in range(column_count):
+        root = find(col)
+        if root not in root_to_logical:
+            root_to_logical[root] = len(root_to_logical)
+        col_map[col] = root_to_logical[root]
+    return col_map
 
 
 # ── Doc Intelligence メイン処理 ───────────────────────────────────────────
@@ -114,8 +333,26 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
     total_pages = len(result.pages) if result.pages else 0
     total_tables = 0
 
+    # ページごとのパラグラフを収集（表上部のタイトル・日付行を転記するため）
+    paragraphs_by_page: dict[int, list[tuple[float, str]]] = defaultdict(list)
+    if result.paragraphs:
+        for para in result.paragraphs:
+            content = (para.content or "").strip()
+            if not content:
+                continue
+            regions = getattr(para, "bounding_regions", None) or []
+            page_num_p = regions[0].page_number if regions else 1
+            y = 999.0
+            if regions:
+                poly = getattr(regions[0], "polygon", None) or []
+                y_val = _get_y_from_polygon(poly)
+                if y_val is not None:
+                    y = y_val
+            paragraphs_by_page[page_num_p].append((y, content))
+    for pn in paragraphs_by_page:
+        paragraphs_by_page[pn].sort(key=lambda x: x[0])
+
     if result.tables:
-        # ページごとにテーブルをグループ化してシート名を決める
         tables_by_page: dict[int, list] = defaultdict(list)
         for table in result.tables:
             page_num = (
@@ -123,6 +360,9 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
                 if table.bounding_regions else 1
             )
             tables_by_page[page_num].append(table)
+
+        # 各ページで「前のテーブルの下端Y」を追跡してヘッダー行の重複を防ぐ
+        page_next_table_y: dict[int, float] = {}
 
         for page_num in sorted(tables_by_page):
             page_tables = tables_by_page[page_num]
@@ -135,19 +375,89 @@ def _process_with_doc_intel(pdf_path: str, wb: openpyxl.Workbook) -> dict | None
                 )
                 ws = wb.create_sheet(title=sheet_name[:31])
 
-                # グリッドを構築（結合セルは左上セルのみ書き込む）
-                grid: dict[tuple[int, int], str] = {}
-                for cell in table.cells:
-                    content = _maybe_normalize(cell.content or "")
-                    grid[(cell.row_index, cell.column_index)] = content
+                # テーブル上端Yを取得
+                table_top_y = 999.0
+                table_regions = getattr(table, "bounding_regions", None) or []
+                if table_regions:
+                    poly = getattr(table_regions[0], "polygon", None) or []
+                    y_val = _get_y_from_polygon(poly)
+                    if y_val is not None:
+                        table_top_y = y_val
 
-                for r in range(table.row_count):
-                    row_data = [grid.get((r, c), "") for c in range(table.column_count)]
-                    ws.append(row_data)
+                # テーブルより上にあるパラグラフ（タイトル・日付等）を先頭行に書く
+                prev_y = page_next_table_y.get(page_num, 0.0)
+                header_rows = 0
+                for y, text in paragraphs_by_page.get(page_num, []):
+                    if prev_y <= y < table_top_y:
+                        ws.cell(row=header_rows + 1, column=1, value=text)
+                        header_rows += 1
+                page_next_table_y[page_num] = table_top_y
+                row_offset = header_rows + (1 if header_rows > 0 else 0)
+
+                # グリッド構築: (row_index, col_index) → (content, kind, row_span, col_span)
+                raw_cells: list[dict] = []
+                for di_cell in table.cells:
+                    raw_cells.append({
+                        "row": di_cell.row_index,
+                        "col": di_cell.column_index,
+                        "content": _maybe_normalize(di_cell.content or ""),
+                        "kind": di_cell.kind or "body",
+                        "rs": max(1, di_cell.row_span or 1),
+                        "cs": max(1, di_cell.column_span or 1),
+                        "bounds": _cell_x_bounds(di_cell),
+                    })
+
+                col_map = _build_logical_column_map(raw_cells, table.column_count)
+
+                grid: dict[tuple[int, int], tuple[str, str, int, int]] = {}
+                for raw_cell in raw_cells:
+                    row = int(raw_cell["row"])
+                    source_col = int(raw_cell["col"])
+                    source_col_end = source_col + int(raw_cell["cs"]) - 1
+                    logical_col = col_map.get(source_col, source_col)
+                    logical_col_end = col_map.get(source_col_end, logical_col)
+                    content = str(raw_cell["content"])
+                    kind = str(raw_cell["kind"])
+                    rs = int(raw_cell["rs"])
+                    cs = max(1, logical_col_end - logical_col + 1)
+                    key = (row, logical_col)
+
+                    if key in grid:
+                        old_content, old_kind, old_rs, old_cs = grid[key]
+                        content = _join_cell_text(old_content, content)
+                        if old_kind != "body":
+                            kind = old_kind
+                        grid[key] = (content, kind, max(old_rs, rs), max(old_cs, cs))
+                    else:
+                        grid[key] = (content, kind, rs, cs)
+
+                # ① データ書き込み & スタイル適用
+                for (r, c), (content, kind, rs, cs) in grid.items():
+                    xl_cell = ws.cell(row=r + 1 + row_offset, column=c + 1, value=content)
+                    _apply_cell_style(xl_cell, kind)
+
+                # ② セル結合
+                for (r, c), (content, kind, rs, cs) in grid.items():
+                    if rs > 1 or cs > 1:
+                        ws.merge_cells(
+                            start_row=r + 1 + row_offset, start_column=c + 1,
+                            end_row=r + rs + row_offset, end_column=c + cs,
+                        )
+
+                # ③ 列幅自動調整（1列スパンのセルのみ参照）
+                col_max: dict[int, int] = {}
+                for (r, c), (content, kind, rs, cs) in grid.items():
+                    if content and cs == 1:
+                        w = sum(2 if ord(ch) > 127 else 1 for ch in content)
+                        col_max[c] = max(col_max.get(c, 0), w)
+                for c_idx, width in col_max.items():
+                    col_letter = get_column_letter(c_idx + 1)
+                    ws.column_dimensions[col_letter].width = min(max(width + 2, 6), 40)
 
                 print(
                     f"[pdf_to_excel] P{page_num}-T{t_idx+1}: "
-                    f"{table.row_count}rows × {table.column_count}cols",
+                    f"{table.row_count}rows x {table.column_count}cols "
+                    f"(logical_cols={len(set(col_map.values()))})",
                     file=sys.stderr,
                 )
 
@@ -212,7 +522,6 @@ def _process_with_python_docx(docx_path: str, wb: openpyxl.Workbook) -> dict:
     total_tables = 0
     text_rows: list[list[str]] = []
 
-    # テーブル抽出
     for t_idx, table in enumerate(doc.tables):
         total_tables += 1
         sheet_name = f"Table{t_idx + 1}"
@@ -221,7 +530,6 @@ def _process_with_python_docx(docx_path: str, wb: openpyxl.Workbook) -> dict:
             ws.append([cell.text.strip() for cell in row.cells])
         print(f"[pdf_to_excel] python-docx table {t_idx+1}: {len(table.rows)} rows", file=sys.stderr)
 
-    # 段落テキスト（テーブルがない場合のみ）
     if total_tables == 0:
         for para in doc.paragraphs:
             if para.text.strip():
@@ -307,7 +615,7 @@ def main() -> None:
             }))
             return
 
-        # python-docx で取れなかった → DI で再試行（テキスト型 DOCX への保険）
+        # python-docx で取れなかった → DI で再試行
         print("[pdf_to_excel] python-docx found nothing, trying Doc Intelligence.", file=sys.stderr)
         wb2 = openpyxl.Workbook()
         wb2.remove(wb2.active)
@@ -343,7 +651,6 @@ def main() -> None:
                 }))
                 return
 
-        # 全手段で失敗 = LibreOffice 未インストールか変換不可
         print("[pdf_to_excel] All extraction methods failed for DOCX.", file=sys.stderr)
         ws_msg = wb.create_sheet(title="注意")
         ws_msg.append(["このWordファイルは画像埋め込み型のため、表データを抽出できませんでした。"])
@@ -369,7 +676,6 @@ def main() -> None:
 
     # ── 2. フォールバック（PDF） ──────────────────────────────────────────
 
-    # PDF 以外（想定外拡張子）は空Excelで終了（.docx は上で処理済み）
     if input_ext not in (".pdf",):
         print(f"[pdf_to_excel] No fallback for {input_ext}.", file=sys.stderr)
         wb.create_sheet(title="Sheet1")
