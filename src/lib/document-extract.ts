@@ -77,14 +77,49 @@ export async function extractWordText(buffer: ArrayBuffer): Promise<string[]> {
   }
 }
 
+const _parsed = parseInt(process.env.DOC_INTELLIGENCE_PAGE_CHUNK ?? "60", 10);
+const DOC_INTELLIGENCE_PAGE_CHUNK =
+  Number.isFinite(_parsed) && _parsed > 0 ? _parsed : 60;
+
+async function getPdfPageCount(buffer: ArrayBuffer): Promise<number> {
+  try {
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.js");
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buffer) });
+    const pdf = await loadingTask.promise;
+    return pdf.numPages;
+  } catch {
+    return 0;
+  }
+}
+
 export async function extractWithDocumentIntelligence(
   buffer: ArrayBuffer
 ): Promise<string[]> {
+  const totalPages = await getPdfPageCount(buffer);
+  if (totalPages === 0) {
+    console.warn("[doc-extract] Could not determine page count, falling back to single call");
+    const client = DocumentIntelligenceInstance();
+    const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer);
+    const { paragraphs } = await poller.pollUntilDone();
+    return (paragraphs ?? []).map((p) => p.content).filter(Boolean);
+  }
+
+  console.log(`[doc-extract] totalPages=${totalPages} chunkSize=${DOC_INTELLIGENCE_PAGE_CHUNK}`);
   const client = DocumentIntelligenceInstance();
-  const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer);
-  const { paragraphs } = await poller.pollUntilDone();
-  if (!paragraphs) return [];
-  return paragraphs.map((p) => p.content).filter(Boolean);
+  const allParagraphs: string[] = [];
+
+  for (let pageStart = 1; pageStart <= totalPages; pageStart += DOC_INTELLIGENCE_PAGE_CHUNK) {
+    const pageEnd = Math.min(pageStart + DOC_INTELLIGENCE_PAGE_CHUNK - 1, totalPages);
+    const pages = `${pageStart}-${pageEnd}`;
+    console.log(`[doc-extract] beginAnalyzeDocument pages=${pages}`);
+
+    const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer, { pages });
+    const result = await poller.pollUntilDone();
+    allParagraphs.push(...(result.paragraphs ?? []).map((p) => p.content).filter(Boolean));
+  }
+
+  console.log(`[doc-extract] total paragraphs extracted: ${allParagraphs.length}`);
+  return allParagraphs;
 }
 
 export async function extractTextFromBuffer(
