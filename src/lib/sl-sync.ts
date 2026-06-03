@@ -1004,6 +1004,35 @@ async function indexNewSpFiles(params: {
       );
     } catch (e) {
       console.error(`[SL sync] Failed to index ${item.name}:`, e);
+      // sentinel エントリを登録して次回Syncで再キューされないようにする
+      try {
+        const sentinelText = `[INDEXING_FAILED] ${item.name}`;
+        const sentinelEmbRes = await openai.embeddings.create({
+          input: [sentinelText],
+          model: "",
+        });
+        const sentinelEmbedding = sentinelEmbRes.data[0]?.embedding ?? [];
+        const sentinelId = `sl_error_${hashValue(item.id || item.name)}`;
+        await addNewIndexDocs([{
+          id: sentinelId,
+          pageContent: sentinelText,
+          embedding: sentinelEmbedding,
+          metadata: JSON.stringify({ indexingError: true, fileName: item.name }),
+          fileUrl: item.webUrl,
+          effectiveFileUrl: item.webUrl,
+          chatThreadId: "system",
+          user: "system",
+          dept: dept,
+          isSlDoc: true,
+          slScope: "dept_common",
+          slOwner: null,
+          spItemId: item.id,
+          relativePath: item.relativePath ?? null,
+        }]);
+        console.warn(`[SL sync] Sentinel registered for ${item.name} to prevent re-queue`);
+      } catch (sentinelErr) {
+        console.error(`[SL sync] Sentinel registration also failed for ${item.name}:`, sentinelErr);
+      }
       skipped++;
     }
   }

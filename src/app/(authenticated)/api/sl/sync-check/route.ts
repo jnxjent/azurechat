@@ -106,7 +106,12 @@ export async function POST(req: NextRequest) {
 
     const url = new URL(req.url);
     const apply = url.searchParams.get("apply") === "true";
-    const indexNew = url.searchParams.get("indexNew") === "true";
+    // SL_SYNC_DISABLED=true で新規インデックス化を完全停止できるキルスイッチ
+    const syncDisabled = process.env.SL_SYNC_DISABLED === "true";
+    const indexNew = !syncDisabled && url.searchParams.get("indexNew") === "true";
+    if (syncDisabled) {
+      console.warn("[SL sync-check] SL_SYNC_DISABLED=true: indexNew forced to false");
+    }
     const batchSize = Math.max(
       1,
       Math.min(20, parseInt(url.searchParams.get("batchSize") ?? "5", 10) || 5)
