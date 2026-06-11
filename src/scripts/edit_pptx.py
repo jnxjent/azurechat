@@ -376,12 +376,16 @@ def main() -> None:
         if item.get("slideIndex") is not None
     }
 
-    # imageInserts: slideIndex → list of inserts
+    # imageInserts: slideIndex → list of inserts (-1 = 全スライドに適用)
     image_insert_map: dict[int, list[dict]] = {}
+    all_slides_inserts: list[dict] = []
     for item in (plan.get("imageInserts") or []):
         si = item.get("slideIndex")
         if si is not None:
-            image_insert_map.setdefault(int(si), []).append(item)
+            if int(si) == -1:
+                all_slides_inserts.append(item)
+            else:
+                image_insert_map.setdefault(int(si), []).append(item)
 
     changed_slides: set[int] = set()
     inserted_images: int = 0
@@ -408,8 +412,8 @@ def main() -> None:
             if replacements and replace_text(shape, replacements):
                 slide_changed = True
 
-        # 画像挿入
-        for img_item in image_insert_map.get(slide_index, []):
+        # 画像挿入（特定スライド指定 + slideIndex:-1 の全スライド共通）
+        for img_item in image_insert_map.get(slide_index, []) + all_slides_inserts:
             image_path = img_item.get("imagePath")
             if image_path and Path(image_path).exists():
                 try:
