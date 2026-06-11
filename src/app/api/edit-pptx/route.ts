@@ -1111,7 +1111,10 @@ async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<Exce
     val.trim().length > 0 && !/^[\d,，△▲\-()（）\s]+$/.test(val.trim());
 
   const sheetEdits: NonNullable<ExcelEditPlan["sheetEdits"]> = [];
+  const CORRECTION_TIMEOUT_MS = 90_000;
+  const startTime = Date.now();
 
+  outer:
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
     const data = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" }) as string[][];
@@ -1126,6 +1129,11 @@ async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<Exce
     const setCells: Array<{ address: string; value: string }> = [];
 
     for (const colIdx of colIndices) {
+      if (Date.now() - startTime > CORRECTION_TIMEOUT_MS) {
+        console.warn("[pdf-to-excel] correction time limit reached, skipping remaining columns");
+        break outer;
+      }
+
       const candidates: { rowIdx: number; name: string }[] = [];
       for (let i = 0; i < data.length; i++) {
         const val = String(data[i]?.[colIdx] ?? "").trim();
@@ -1133,8 +1141,13 @@ async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<Exce
       }
       if (candidates.length === 0) continue;
 
-      const BATCH = 80;
+      const BATCH = 40;
       for (let batchStart = 0; batchStart < candidates.length; batchStart += BATCH) {
+        if (Date.now() - startTime > CORRECTION_TIMEOUT_MS) {
+          console.warn("[pdf-to-excel] correction time limit reached, skipping remaining batches");
+          break outer;
+        }
+
         const batch = candidates.slice(batchStart, batchStart + BATCH);
         try {
           const res = await openai.chat.completions.create({
@@ -1156,18 +1169,24 @@ async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<Exce
               },
             ],
             response_format: { type: "json_object" },
-            max_completion_tokens: 4000,
+            max_completion_tokens: 8000,
           });
+          const finishReason = res.choices[0]?.finish_reason;
           const content = res.choices[0]?.message?.content ?? "{}";
-          const parsed = JSON.parse(content);
-          const corrected: unknown[] = parsed.corrected ?? Object.values(parsed)[0];
-          if (!Array.isArray(corrected) || corrected.length !== batch.length) continue;
-          for (let i = 0; i < batch.length; i++) {
-            const newVal = String(corrected[i] ?? "").trim();
-            const oldVal = batch[i].name;
-            if (!newVal || newVal === oldVal) continue;
-            const addr = XLSX.utils.encode_cell({ r: batch[i].rowIdx, c: colIdx });
-            setCells.push({ address: addr, value: newVal });
+          console.log(`[pdf-to-excel] correction batch finish_reason=${finishReason} items=${batch.length}`);
+          try {
+            const parsed = JSON.parse(content);
+            const corrected: unknown[] = parsed.corrected ?? Object.values(parsed)[0];
+            if (!Array.isArray(corrected) || corrected.length !== batch.length) continue;
+            for (let i = 0; i < batch.length; i++) {
+              const newVal = String(corrected[i] ?? "").trim();
+              const oldVal = batch[i].name;
+              if (!newVal || newVal === oldVal) continue;
+              const addr = XLSX.utils.encode_cell({ r: batch[i].rowIdx, c: colIdx });
+              setCells.push({ address: addr, value: newVal });
+            }
+          } catch {
+            console.warn(`[pdf-to-excel] LLM correction JSON parse failed: finish_reason=${finishReason} content_head=${content.slice(0, 200)}`);
           }
         } catch (e) {
           console.warn(`[pdf-to-excel] LLM correction failed:`, String((e as any)?.message ?? e));
