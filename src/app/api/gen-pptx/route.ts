@@ -1391,7 +1391,7 @@ async function generateDesignBrief(
           { role: "user", content: userContent },
         ],
         response_format: { type: "json_object" },
-        max_completion_tokens: 4000,
+        max_completion_tokens: 8000,
       });
       if (res.choices[0]?.finish_reason === "length") {
         console.warn("[designBrief] retry also truncated → using fallback");
