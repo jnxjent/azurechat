@@ -11,7 +11,6 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
-import { analyzeDocVision } from "@/app/api/analyze-doc-vision/handler";
 import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -22,6 +21,29 @@ import {
 } from "@/features/chat-page/chat-services/chat-api/reasoning-utils";
 
 type ThinkingModeAPI = "normal" | "thinking" | "fast";
+
+async function analyzeDocVision(
+  fileUrl: string,
+  maxPages: number,
+  mode?: "faithful" | "redesign"
+): Promise<{ ok: boolean; slides?: any[]; totalPages?: number; error?: string }> {
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${baseUrl}/api/analyze-doc-vision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileUrl, maxPages, mode }),
+    });
+    const json = await res.json();
+    if (!res.ok) return { ok: false, error: json?.error ?? `analyze-doc-vision HTTP ${res.status}` };
+    return json;
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) };
+  }
+}
 
 /** standard を normal へ、その他はそのまま（保険） */
 function normalizeThinkingMode(
@@ -3548,6 +3570,20 @@ async function executeConvertDocToPptx(
   }
 }
 
+// ---------------- editLabel suffix 除去ヘルパー ----------------
+function stripEditLabelSuffix(baseName: string): string {
+  const SUFFIXES = ["_ロゴ追加", "_画像追加", "_色変更", "_フォント変更", "_文言修正", "_レイアウト変更", "_編集済み"];
+  let name = baseName;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const s of SUFFIXES) {
+      if (name.endsWith(s)) { name = name.slice(0, -s.length); changed = true; }
+    }
+  }
+  return name;
+}
+
 // ---------------- editLabel 抽出ヘルパー ----------------
 function buildEditLabel(instruction: string): string {
   const cleaned = instruction.replace(/https?:\/\/\S+/g, "").replace(/（[^）]*）|\([^)]*\)/g, "");
@@ -3606,6 +3642,7 @@ async function executeEditPptx(
     { re: /レイアウト.{0,6}最適化|重なり.{0,4}解消|配置.{0,4}(修正|変更|調整)|再レイアウト|位置.{0,4}調整/, label: "レイアウト最適化・shape移動" },
     { re: /スピーカーノート|ノート.{0,4}(追加|冒頭|末尾|記録)|speaker\s*note/i, label: "スピーカーノート追加" },
     { re: /再構成|作り直し|内容.{0,6}(整理|再生成|分離)|全体.{0,6}(見直し|修正|再生成)|を分ける|を分離/, label: "内容の再構成・作り直し" },
+    { re: /文字.{0,6}(多く|増やす|増量)|文字量.{0,6}増や|文章.{0,6}増やす|本文.{0,6}増やす|内容.{0,6}増やす|情報量.{0,6}増やす|詳しく(して|する)|詳細化|説明.{0,6}(追加|増やす)|ボリューム.{0,6}増やす|もっと詳しく/, label: "本文・内容の追加/増量" },
   ];
   const unsupportedFound = UNSUPPORTED_EDIT_PATTERNS.filter(({ re }) => re.test(instruction));
   if (unsupportedFound.length > 0) {
@@ -3649,7 +3686,8 @@ async function executeEditPptx(
       } catch { return ""; }
     })();
 
-  const outputBaseName = inputBaseName ? `${inputBaseName}_${editLabel}` : editLabel;
+  const cleanBaseName = inputBaseName ? stripEditLabelSuffix(inputBaseName) : "";
+  const outputBaseName = cleanBaseName ? `${cleanBaseName}_${editLabel}` : editLabel;
 
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
