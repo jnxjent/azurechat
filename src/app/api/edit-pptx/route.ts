@@ -26,13 +26,14 @@ type SlideSummary = {
 };
 
 type ImageInsert = {
-  slideIndex: number;
-  imagePrompt: string;
+  slideIndex: number;  // -1 = 全スライドに適用
+  imagePrompt?: string; // DALL-E 生成用プロンプト（imageUrl がない場合）
+  imageUrl?: string;   // 既存画像URL（ロゴ等）— 指定時は DALL-E をスキップ
   position?: "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center";
   nearText?: string;   // このテキストを含む Shape の隣に配置（指定時は position より優先）
   anchorSide?: "left" | "right" | "above" | "below"; // nearText Shape のどちら側か（default: "right"）
   widthPct?: number;
-  imagePath?: string; // set after DALL-E generation, before Python call
+  imagePath?: string; // set after download/generation, before Python call
 };
 
 type EditPlan = {
@@ -125,8 +126,64 @@ function parseDirectAccentColor(instruction: string): string | undefined {
   return undefined;
 }
 
+// URL付きの画像挿入指示をLLM不要で直接EditPlanに変換する
+function tryBuildDirectPlan(instruction: string, _slides: SlideSummary[]): EditPlan | null {
+  const urlMatch = instruction.match(/https?:\/\/[^\s)>\]　「」）]+/);
+  if (!urlMatch) return null;
+  const matchedUrl = urlMatch[0];
+
+  // PPTX/PDF/DOCX/XLSX など非画像URLは画像挿入対象外
+  const isImageUrl = /\.(?:png|jpg|jpeg|webp|gif|bmp)(\?|$)/i.test(matchedUrl);
+  if (!isImageUrl) return null;
+  const imageUrl = matchedUrl;
+
+  // スライドインデックス決定（デフォルト: 表紙=0）
+  let slideIndex = 0;
+  const allSlidesRe = /全スライド|全ページ|all slides|すべてのスライド|全ての/;
+  const slideNumRe = /スライド[　 ]*(\d+)|(\d+)[　 ]*枚目|(\d+)[　 ]*ページ/;
+  if (allSlidesRe.test(instruction)) {
+    slideIndex = -1;
+  } else {
+    const numMatch = instruction.match(slideNumRe);
+    if (numMatch) {
+      slideIndex = parseInt(numMatch[1] ?? numMatch[2] ?? numMatch[3], 10) - 1;
+    }
+    // 「表紙」指定があっても index=0 のまま（デフォルトと同じ）
+  }
+
+  // 配置・サイズ
+  const isLogo = /ロゴ|logo/i.test(instruction);
+  const widthPct = isLogo ? 12 : 15;
+  let position: "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center" = "top-right";
+  if (/左上|top[\s-]?left/i.test(instruction)) position = "top-left";
+  else if (/左下|bottom[\s-]?left/i.test(instruction)) position = "bottom-left";
+  else if (/右下|bottom[\s-]?right/i.test(instruction)) position = "bottom-right";
+  else if (/右上|top[\s-]?right/i.test(instruction)) position = "top-right";
+  else if (/中央|center/i.test(instruction)) position = "center";
+
+  return {
+    deckEdits: { accentColor: null, fontFace: null, preserveTextColors: true },
+    slideEdits: [],
+    imageInserts: [{ slideIndex, imageUrl, position, widthPct }],
+  };
+}
+
 async function buildEditPlan(slides: SlideSummary[], instruction: string): Promise<EditPlan> {
+  // 決定的に解釈できる画像URL挿入はLLMをスキップして直接プランを生成
+  const direct = tryBuildDirectPlan(instruction, slides);
+  if (direct && (direct.imageInserts?.length ?? 0) > 0 &&
+      (direct.slideEdits?.length ?? 0) === 0 &&
+      !direct.deckEdits?.accentColor) {
+    // URL挿入のみで色・テキスト編集がない場合は直接返す
+    const hasOtherIntent = /色|カラー|color|フォント|font|テキスト|text|文字|変更|replace|recolor/i.test(instruction);
+    if (!hasOtherIntent) {
+      console.log("[buildEditPlan] using direct plan (URL image insert, no LLM needed)");
+      return direct;
+    }
+  }
+
   const openai = OpenAIInstance();
+  const pptModel = process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!;
 
   const systemPrompt = `You convert a natural-language PowerPoint editing request into a safe JSON edit plan.
 Return JSON only in this shape:
@@ -145,6 +202,7 @@ Return JSON only in this shape:
   "imageInserts": [
     {
       "slideIndex": number,
+      "imageUrl": string,
       "imagePrompt": string,
       "nearText": string,
       "anchorSide": "left" | "right" | "above" | "below",
@@ -161,11 +219,13 @@ Rules:
 - Only emit text replacements when the user explicitly wants wording changed.
 - slideIndex is zero-based.
 - If the user asks to add an icon, illustration, image, or mark to a slide, populate imageInserts[].
-  - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background").
+  - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background"). Use this when NO existing URL is provided.
+  - imageUrl: if the user provides an existing image URL (logo, photo, etc.), set imageUrl to that URL and omit imagePrompt. Do NOT generate a DALL-E prompt when a URL is given.
+  - slideIndex: use -1 to apply the image to ALL slides (useful for logos/watermarks). Use a specific index for a single slide.
   - nearText: if the user says "next to X", "beside X", "横に", "〇〇の横" etc., set nearText to the shortest unique text string found in the slide (e.g. "ボット" not the full sentence). The image will be placed adjacent to the shape containing that text.
   - anchorSide: which side of the nearText shape to place the image. Use "right" for "横に/右に", "left" for "左に", "above" for "上に", "below" for "下に". Default "right".
-  - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons. Never use "top-left" as it may overlap slide content.
-  - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons next to text labels, 12-15 for decorative corner icons, 30-50 for large illustrations. Default 8 when nearText is set, 13 otherwise.
+  - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons and logos. Never use "top-left" as it may overlap slide content.
+  - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons, 10-15 for logos, 30-50 for large illustrations. Default 12 for logos (imageUrl), 8 when nearText is set, 13 otherwise.
 - Only emit imageInserts when the user explicitly requests an image or visual element.
 - Keep the JSON minimal. Use null or [] when not needed.`;
 
@@ -178,17 +238,38 @@ ${JSON.stringify(slides, null, 2)}
 Return JSON only.`;
 
   const res = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model: pptModel,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 1500,
+    max_completion_tokens: 4000,
   });
 
-  const content = res.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(content) as EditPlan;
+  const finishReason = res.choices[0]?.finish_reason;
+  if (finishReason && finishReason !== "stop") {
+    console.warn(`[buildEditPlan] finish_reason=${finishReason}`);
+  }
+  const content = res.choices[0]?.message?.content || "{}";
+
+  let parsed: EditPlan;
+  try {
+    parsed = JSON.parse(content) as EditPlan;
+  } catch (e) {
+    console.warn(
+      `[buildEditPlan] JSON.parse failed (finish_reason=${finishReason}), content[:300]=${content.slice(0, 300)}`
+    );
+    // 直接プランで救済できるか試みる
+    const fallback = tryBuildDirectPlan(instruction, slides);
+    if (fallback) {
+      console.log("[buildEditPlan] using direct plan as JSON-parse fallback");
+      return fallback;
+    }
+    // 最終フォールバック: 空プラン（500にしない）
+    parsed = { deckEdits: {}, slideEdits: [], imageInserts: [] };
+  }
+
   parsed.deckEdits ??= {};
   parsed.slideEdits ??= [];
 
@@ -203,6 +284,20 @@ Return JSON only.`;
     parsed.deckEdits.accentColor = normalizeHexColor(parsed.deckEdits.accentColor) ?? null;
   }
   parsed.deckEdits.preserveTextColors = parsed.deckEdits.preserveTextColors !== false;
+
+  // instruction に画像URLが含まれている場合、LLMが誤って imagePrompt を返しても
+  // imageUrl に差し替えて DALL-E フォールバックを防ぐ
+  if (parsed.imageInserts?.length) {
+    const urlInInstruction = instruction.match(/https?:\/\/[^\s)>\]　「」）]+/)?.[0];
+    if (urlInInstruction) {
+      for (const ins of parsed.imageInserts) {
+        if (!ins.imageUrl && ins.imagePrompt) {
+          ins.imageUrl = urlInInstruction;
+          delete ins.imagePrompt;
+        }
+      }
+    }
+  }
 
   return parsed;
 }
@@ -305,7 +400,7 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
   throw new Error(`Failed to download file: HTTP ${res.status}`);
 }
 
-async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
+async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "pptx";
@@ -317,19 +412,20 @@ async function uploadToBlob(buffer: Buffer, fileName: string): Promise<string> {
   const cc = svc.getContainerClient(containerName);
   await cc.createIfNotExists({ access: "blob" });
 
-  const bbc = cc.getBlockBlobClient(fileName);
+  // Blob key は ASCII のみ（URL短縮）。DL時のファイル名は Content-Disposition で指定
+  const bbc = cc.getBlockBlobClient(blobKey);
   await bbc.uploadData(buffer, {
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      blobContentDisposition: `attachment; filename="${fileName}"`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName ?? blobKey)}`,
     },
   });
 
   const sas = generateBlobSASQueryParameters(
     {
       containerName,
-      blobName: fileName,
+      blobName: blobKey,
       expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
@@ -836,7 +932,7 @@ async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<stri
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      blobContentDisposition: `attachment; filename="${fileName}"`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     },
   });
 
@@ -1324,7 +1420,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      blobContentDisposition: `attachment; filename="${fileName}"`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     },
   });
 
@@ -1464,7 +1560,7 @@ async function resolveEditPptxScriptPath(): Promise<string> {
   throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string) {
+async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string, fileBaseName?: string) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
   const inputPath = path.join(tempDir, "input.pptx");
   const outputPath = path.join(tempDir, "output.pptx");
@@ -1474,22 +1570,60 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
   try {
     await fs.writeFile(inputPath, inputBuffer);
 
-    // imageInserts がある場合は DALL-E で画像生成し、一時ファイルパスをプランに追記
+    // imageInserts がある場合: slideIndex=-1 を全スライドに展開し、画像を準備
     const requestedImages = plan.imageInserts?.length ?? 0;
     let generatedImages = 0;
     if (requestedImages > 0) {
+      // slideIndex: -1 → 全スライドに複製展開（Python側に渡す前に解決）
+      const totalSlideCount = (() => {
+        try {
+          // 実際のスライド数は Python 実行後にしか分からないため、-1 はそのまま渡す
+          // Python 側で -1 を全スライドと解釈する
+          return -1;
+        } catch { return -1; }
+      })();
+      void totalSlideCount; // 現在は Python 側で処理
+
+      const urlCache = new Map<string, Buffer>();
       for (let i = 0; i < plan.imageInserts!.length; i++) {
         const insert = plan.imageInserts![i];
-        console.log(`[edit-pptx] generating image ${i}: "${insert.imagePrompt}"`);
-        const imageBuffer = await generateDalleImage(insert.imagePrompt);
-        if (imageBuffer) {
-          const imagePath = path.join(tempDir, `image_${i}.png`);
-          await fs.writeFile(imagePath, imageBuffer);
-          insert.imagePath = imagePath;
-          generatedImages++;
-          console.log(`[edit-pptx] image ${i} generated`);
-        } else {
-          console.warn(`[edit-pptx] image ${i} skipped: DALL-E failed`);
+        if (insert.imageUrl) {
+          // 既存画像URL（ロゴ等）をダウンロード — 同じURLは1回のみ
+          const cached = urlCache.get(insert.imageUrl);
+          if (cached) {
+            const imagePath = path.join(tempDir, `image_${i}.png`);
+            await fs.writeFile(imagePath, cached);
+            insert.imagePath = imagePath;
+            generatedImages++;
+            console.log(`[edit-pptx] image ${i} reused from cache`);
+          } else {
+            try {
+              console.log(`[edit-pptx] downloading image ${i}: ${insert.imageUrl.slice(0, 80)}`);
+              const resp = await fetch(insert.imageUrl);
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+              const buf = Buffer.from(await resp.arrayBuffer());
+              urlCache.set(insert.imageUrl, buf);
+              const imagePath = path.join(tempDir, `image_${i}.png`);
+              await fs.writeFile(imagePath, buf);
+              insert.imagePath = imagePath;
+              generatedImages++;
+              console.log(`[edit-pptx] image ${i} downloaded (${buf.length} bytes)`);
+            } catch (e) {
+              console.warn(`[edit-pptx] image ${i} download failed:`, e);
+            }
+          }
+        } else if (insert.imagePrompt) {
+          console.log(`[edit-pptx] generating image ${i}: "${insert.imagePrompt}"`);
+          const imageBuffer = await generateDalleImage(insert.imagePrompt);
+          if (imageBuffer) {
+            const imagePath = path.join(tempDir, `image_${i}.png`);
+            await fs.writeFile(imagePath, imageBuffer);
+            insert.imagePath = imagePath;
+            generatedImages++;
+            console.log(`[edit-pptx] image ${i} generated`);
+          } else {
+            console.warn(`[edit-pptx] image ${i} skipped: DALL-E failed`);
+          }
         }
       }
     }
@@ -1528,8 +1662,14 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 
     const outputBuffer = await fs.readFile(outputPath);
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
-    const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.pptx`;
-    const downloadUrl = await uploadToBlob(outputBuffer, fileName);
+    const safeDisplay = (fileBaseName || "")
+      .replace(/[\\/:*?"<>|]/g, "")
+      .trim()
+      .slice(0, 60);
+    const displayFileName = safeDisplay ? `${safeDisplay}.pptx` : undefined;
+    const blobKey = `pptx_${uniqueId().slice(0, 8)}.pptx`;  // ASCII のみ（URL短縮）
+    const fileName = displayFileName ?? blobKey;
+    const downloadUrl = await uploadToBlob(outputBuffer, blobKey, displayFileName);
 
     const insertedImages = Number(pythonResult.insertedImages ?? 0);
     const imageWarning =
@@ -1554,13 +1694,14 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
       action?: string;
       mode?: string;
       previousChartEdits?: ExcelEditPlan["chartEdits"];
+      outputBaseName?: string;
     };
 
     if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word")) {
@@ -1628,7 +1769,7 @@ export async function POST(req: NextRequest) {
 
     console.log("[edit-pptx] plan:", JSON.stringify(plan));
 
-    const result = await runPythonEdit(pptxBuffer, plan, threadId);
+    const result = await runPythonEdit(pptxBuffer, plan, threadId, outputBaseName);
 
     return NextResponse.json({
       ok: true,

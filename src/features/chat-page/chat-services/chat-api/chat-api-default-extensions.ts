@@ -1,4 +1,4 @@
-// src/features/chat-page/chat-services/chat-api/chat-api-default-extensions.ts
+﻿// src/features/chat-page/chat-services/chat-api/chat-api-default-extensions.ts
 "use server";
 import "server-only";
 
@@ -11,8 +11,8 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
-import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
-import { SimpleSearch, SimilaritySearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
+import { analyzeDocVision } from "@/app/api/analyze-doc-vision/handler";
+import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
 import {
@@ -81,7 +81,7 @@ async function resolveDocumentUrlForVision(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation" | "stat_callouts" | "card_grid" | "icon_rows" | "metric-cards" | "process-cards" | "timeline" | "company-overview" | "closing";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
         conversationStyle?: "chat-ui" | "interview" | "dialog-list";
@@ -170,7 +170,7 @@ async function resolveDocumentUrlForVision(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation" | "stat_callouts" | "card_grid" | "icon_rows" | "metric-cards" | "process-cards" | "timeline" | "company-overview" | "closing";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
         conversationStyle?: "chat-ui" | "interview" | "dialog-list";
@@ -585,6 +585,29 @@ function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
   return null;
 }
 
+/** Markdownリンク [DisplayName.pptx](URL) からURL+表示名を両方取得する */
+function extractLatestPptxInfoFromMessages(messages: string[]): { url: string; displayName: string | null } | null {
+  const mdPattern = /\[([^\]]+?\.pptx)\]\((https?:\/\/[^\s)]+\.pptx(?:\?[^\s)]*)?)\)/gi;
+  const urlPattern = /https?:\/\/[^\s)\]]+\.pptx(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    mdPattern.lastIndex = 0;
+    let mdMatch: RegExpExecArray | null;
+    let lastMdMatch: RegExpExecArray | null = null;
+    while ((mdMatch = mdPattern.exec(message)) !== null) {
+      lastMdMatch = mdMatch;
+    }
+    if (lastMdMatch) {
+      return { url: lastMdMatch[2], displayName: lastMdMatch[1].replace(/\.pptx$/i, "").trim() };
+    }
+    urlPattern.lastIndex = 0;
+    const urlMatches = message.match(urlPattern);
+    if (urlMatches?.length) {
+      return { url: urlMatches[urlMatches.length - 1], displayName: null };
+    }
+  }
+  return null;
+}
+
 function extractLatestXlsxUrlFromMessages(messages: string[]): string | null {
   // messages は createdAt DESC（新しい順）で渡される前提
   // 最初にヒットした URL を即 return することで「最新」を確保する
@@ -736,6 +759,50 @@ async function resolveLatestPptxUrlFromThread(chatThreadId: string): Promise<str
       .map((message) => String(message.content ?? "").trim())
       .filter(Boolean);
     return extractLatestPptxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
+/** スレッドの最新アップロード画像URL（png/jpg/jpeg/webp等）を抽出する */
+function extractLatestImageUrlFromMessages(messages: string[]): string | null {
+  // file_url: ライン優先（アップロードされたファイルを示す）
+  const fileUrlLineRe = /(?:^|[\n\r])(?:file_url|fileUrl)\s*:\s*(https?:\/\/[^\s\n\r]+\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s\n\r]*)?)/gi;
+  const imageUrlRe = /https?:\/\/[^\s)\]]+\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    fileUrlLineRe.lastIndex = 0;
+    let lastFileUrl: string | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = fileUrlLineRe.exec(message)) !== null) { lastFileUrl = m[1]; }
+    if (lastFileUrl) return lastFileUrl;
+    const fallback = message.match(imageUrlRe);
+    if (fallback?.length) return fallback[fallback.length - 1];
+  }
+  return null;
+}
+
+async function resolveLatestImageUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((m) => String(m.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestImageUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
+/** Markdownリンクの表示名（displayName）も含めて返す版 */
+async function resolveLatestPptxInfoFromThread(chatThreadId: string): Promise<{ url: string; displayName: string | null } | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((m) => String(m.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestPptxInfoFromMessages(messages);
   } catch {
     return null;
   }
@@ -1102,7 +1169,7 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) =>
-        await executeCreatePptx(args, props.chatThread),
+        await executeCreatePptx(args, props.chatThread, props.userMessage),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1115,46 +1182,121 @@ export const GetDefaultExtensions = async (props: {
             type: "array",
             description:
               "スライドのリスト。\n" +
-              "【標準モード】1スライド3〜4項目の箇条書き。キーワードではなく1〜2文の具体的な説明文で書くこと。\n" +
-              "【提案書モード（proposalMode=true）】スライド枚数を12〜16枚に増やし、各スライドは1テーマに絞って3〜4項目のみ。" +
-              "構成例: 表紙→課題・背景→現状の問題点→提案概要→提案詳細（2〜3スライド）→根拠・実績→他社比較→導入効果→コスト感→導入ロードマップ→まとめ・次のステップ。",
+              "【重要】会社紹介・会社概要の場合は layoutType を積極的に使い分けること:\n" +
+              "  - 最初の「表紙」スライドは不要（自動生成される）\n" +
+              "  - 会社概要スライド → layoutType='company-overview' + metrics + leadText + callout\n" +
+              "  - 強み・工程・フロー（3ステップ程度） → layoutType='process-cards' + steps + benefits\n" +
+              "  - 比較・競合 → layoutType='multi-column'\n" +
+              "  - お問い合わせ・次のステップ → layoutType='closing'\n" +
+              "  - その他 → layoutType='bullets'（3〜4項目）\n" +
+              "【提案書モード】枚数を12〜16枚に増やし課題→提案→根拠→比較→効果→ロードマップの流れで構成。",
             items: {
               type: "object",
               properties: {
-                title: {
-                  type: "string",
-                  description: "スライドのタイトル",
-                },
+                title: { type: "string", description: "スライドのタイトル" },
                 bullets: {
                   type: "array",
                   items: { type: "string" },
-                  description: "箇条書きの内容リスト。各項目は具体的な事実・数値・根拠を含む1〜2文で記述すること。単なるキーワードや項目名だけは禁止。標準:3〜4項目、提案書モード:3項目以内。",
+                  description: "bullets/closing レイアウト時の内容リスト。1〜2文の具体的な記述。3〜4項目。",
                 },
                 layoutType: {
                   type: "string",
-                  enum: ["bullets", "multi-column", "table", "diagram"],
-                  description: "レイアウト種別。bullets=箇条書き（デフォルト）。multi-column=2〜3列比較（columns フィールドも必須）。table=表（tableRows フィールドも必須）。diagram=図解フロー。提案書モードでは比較・効果・ロードマップなどに table や multi-column を使うこと。",
+                  enum: ["bullets", "multi-column", "table", "diagram", "company-overview", "process-cards", "closing", "metric-cards", "timeline"],
+                  description:
+                    "レイアウト種別。\n" +
+                    "bullets=箇条書きカード（デフォルト）\n" +
+                    "company-overview=会社概要（leadText+metrics+callout 必須）\n" +
+                    "metric-cards=数値KPIカード4枚（metrics 必須）\n" +
+                    "process-cards=工程・プロセスフロー（steps+benefits 必須）\n" +
+                    "timeline=タイムライン（steps 必須）\n" +
+                    "multi-column=2〜3列比較（columns 必須）\n" +
+                    "table=表形式（tableRows 必須）\n" +
+                    "closing=締め・お問い合わせ（bullets使用）",
                 },
-                columns: {
+                // company-overview 専用フィールド
+                leadText: {
+                  type: "string",
+                  description: "company-overview: 左パネルに表示するリード文（会社の説明文2〜4文）",
+                },
+                metrics: {
                   type: "array",
-                  description: "multi-column レイアウト時に必須。各列のデータ。layoutType='multi-column' を指定した場合は必ずこのフィールドも設定すること。",
+                  description: "company-overview / metric-cards: 数値カード（最大4件）",
                   items: {
                     type: "object",
                     properties: {
-                      header: { type: "string", description: "列のヘッダー（例: '自社サービス', '競合A', '競合B'）" },
-                      bullets: { type: "array", items: { type: "string" }, description: "この列の内容（3〜5項目）" },
+                      label: { type: "string", description: "カードのラベル（例: '創業', '本社', '上場'）" },
+                      value: { type: "string", description: "カードのメイン数値・テキスト（例: '1952年', '東証プライム'）" },
+                      note: { type: "string", description: "カードの補足（例: '70年以上の実績'）" },
+                      iconKey: { type: "string", description: "アイコン: calendar/location/stock/network/people/chart/building/gear/verified/star" },
+                      colorRole: {
+                        type: "string",
+                        enum: ["primary", "accent", "neutral"],
+                        description:
+                          "カードの色役割。意味に基づいて設定すること（インデックス順サイクルは禁止）。\n" +
+                          "primary=深緑（基本情報・所在地・設立など）\n" +
+                          "accent=銅色（数値実績・上場・差別化ポイントなど強調したい項目）\n" +
+                          "neutral=ダークグリーン（補足・背景情報）\n" +
+                          "例: 創業→primary, 東証プライム→accent, 本社→neutral, 取引先数→accent",
+                      },
+                    },
+                    required: ["label", "value"],
+                  },
+                },
+                callout: {
+                  type: "object",
+                  description: "company-overview: 左パネル下部のコールアウトボックス（社名の由来・補足情報など）",
+                  properties: {
+                    title: { type: "string", description: "コールアウトのタイトル（例: '社名の由来'）" },
+                    body: { type: "string", description: "コールアウトの本文" },
+                  },
+                  required: ["title", "body"],
+                },
+                // process-cards 専用フィールド
+                subtitle: {
+                  type: "string",
+                  description: "process-cards: カード群の上に表示する説明文（1文）",
+                },
+                steps: {
+                  type: "array",
+                  description: "process-cards / timeline: 各ステップの内容（2〜4件）",
+                  items: {
+                    type: "object",
+                    properties: {
+                      title: { type: "string", description: "ステップのタイトル（例: '収集運搬'）" },
+                      body: { type: "string", description: "ステップの説明文（1〜2文）" },
+                      iconKey: {
+                        type: "string",
+                        description:
+                          "アイコン識別子。必ず指定すること。\n" +
+                          "廃棄物系: truck / gear / archive / shield / coins / leaf / eye\n" +
+                          "汎用: building / people / chart / star / verified / lightbulb / rocket / network",
+                      },
+                    },
+                    required: ["title", "body"],
+                  },
+                },
+                benefits: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "process-cards: スライド下部に表示するメリット行（2〜4項目、例: '不適正処理リスクの排除'）",
+                },
+                // multi-column 専用フィールド
+                columns: {
+                  type: "array",
+                  description: "multi-column: 各列のデータ",
+                  items: {
+                    type: "object",
+                    properties: {
+                      header: { type: "string" },
+                      bullets: { type: "array", items: { type: "string" } },
                     },
                     required: ["header", "bullets"],
                   },
                 },
                 tableRows: {
                   type: "array",
-                  description: "table レイアウト時に必須。1行目をヘッダー行とし、以降がデータ行。layoutType='table' を指定した場合は必ずこのフィールドも設定すること。",
-                  items: {
-                    type: "array",
-                    items: { type: "string" },
-                    description: "1行分のセル値の配列。例: ['項目', '内容', '備考']",
-                  },
+                  description: "table: 1行目ヘッダー、以降データ行",
+                  items: { type: "array", items: { type: "string" } },
                 },
               },
               required: ["title", "bullets"],
@@ -1164,7 +1306,8 @@ export const GetDefaultExtensions = async (props: {
             type: "boolean",
             description:
               "提案書モード。true にすると「1スライド1テーマ×12〜16枚構成」で、課題→提案→根拠→比較→効果→ロードマップの流れで自動展開する。" +
-              "ユーザーが「提案書で」「しっかりした資料で」「営業資料として」「お客様向けに」と言った場合、または文字が少ない・内容が薄いと指摘された場合は true にすること。",
+              "ユーザーが「提案書で」「しっかりした資料で」「営業資料として」「お客様向けに」と言った場合、または文字が少ない・内容が薄いと指摘された場合は true にすること。" +
+              "【禁止】ユーザーが「7枚」「8枚」「10枚以下」など具体的な少ない枚数を指定した場合は false にすること（指定枚数を優先）。",
           },
           fontFace: {
             type: "string",
@@ -1172,7 +1315,28 @@ export const GetDefaultExtensions = async (props: {
           },
           designInstruction: {
             type: "string",
-            description: "デザイン・色調の指示。業種感を含めると効果的。例: '廃棄物処理業らしい信頼感・環境意識を前面に、濃紺ベースで誠実さを表現', '医療・製薬向けの清潔感ある白と青', 'IT・DX提案書らしいモダンなグラデーション'",
+            description:
+              "デザイン・色調の指示。業種感を必ず含めること。\n" +
+              "【廃棄物処理・環境・インフラ・サステナ系】→ '廃棄物処理・環境配慮・信頼感をテーマに、深緑ベースの落ち着いたデザイン。会社紹介資料' のようにキーワード(廃棄物/環境/産廃)を含めること。\n" +
+              "例: '医療・製薬向けの清潔感ある白と青', 'IT・DX提案書らしいモダンなグラデーション', '廃棄物処理業の信頼感・環境意識を表現した深緑テーマ'",
+          },
+          palette: {
+            type: "string",
+            enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra"],
+            description:
+              "【カラーパレット選択】コンテンツの業種・用途・ターゲット感から必ず判断して設定すること。\n" +
+              "  navy_orange   = 紺×オレンジ → IT・AI・DX・経営・役員・システム・テクノロジー企業（落ち着いたプロ感）\n" +
+              "  forest_amber  = 深緑×琥珀  → 採用・人材募集・インターン・新卒リクルート・人の成長・農業・食品・エコ\n" +
+              "    ↑「人が育つ・生命感・成長」イメージ → 採用/研修/インターン系はこれ\n" +
+              "  burgundy_gold = 深赤×金    → 伝統・高級・老舗・製造業・工業・ものづくり・品質重視\n" +
+              "  teal_coral    = 青緑×珊瑚  → 産廃・廃棄物処理・リサイクル・医療・ヘルス・動的な産業系企業\n" +
+              "    ↑廃棄物処理業・環境サービス会社の会社紹介はこれ（会社の動的でモダンな印象）\n" +
+              "  charcoal_terra= 炭×煉瓦   → 建設・土木・インフラ・重工業・プラント・施設管理\n" +
+              "【判断例】\n" +
+              "  産廃会社の会社紹介 → teal_coral\n" +
+              "  DX人材採用・インターン募集 → forest_amber\n" +
+              "  AzureChat/AI/DX経営報告 → navy_orange\n" +
+              "  廃棄物処理施設・プラント建設 → charcoal_terra",
           },
         },
         required: ["title", "slides"],
@@ -1185,9 +1349,29 @@ export const GetDefaultExtensions = async (props: {
         "・会話で既にスライド構成を議論済みで、PDFは参考資料として内容を拡充・追記する場合 → このツール（create_pptx）を使うこと。\n" +
         "  この場合、まず sl_doc_search や会話コンテキストでPDF内容を把握し、前の会話のスライド構成をベースに各スライドの bullets を肉付けした上で slides パラメータに設定して呼ぶこと。\n" +
         "【提案書モード】ユーザーが「提案書」「営業資料」「お客様向け」「しっかりした資料」と言った場合は proposalMode=true にして、12〜16枚構成で作ること。\n" +
-        "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更は edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
+        "【経営向け再構築モード】複数の定期レポートや四半期報告書（例: Q1〜Q4 議事録・活動報告PDF）から経営層・役員向けPPTを作る場合：\n" +
+        "  ① slides パラメータを時系列（Q1→Q4）で組まないこと。以下の9カテゴリで構成すること:\n" +
+        "    1. 目的・位置づけ（なぜこのツール/施策が必要か）\n" +
+        "    2. 現在使える主な機能（ビジネス機能として整理。技術仕様でなく「何ができるか」「何の業務に使えるか」）\n" +
+        "    3. 利用状況・KPI・運用実績（アクティブ率・件数・満足度などの数値。四半期をまたぐ場合はトレンドを統合）\n" +
+        "    4. 拡張・連携状況（SharePoint検索、RAG、Salesforce、議事郎連携など。議事郎は独立スライド不可、ここに統合）\n" +
+        "    5. セキュリティ・ガバナンス・運用基盤\n" +
+        "    6. コスト・投資対効果（費用・ROI・削減効果）\n" +
+        "    7. 課題・リスク・改善要望\n" +
+        "    8. 今後のロードマップ\n" +
+        "    9. 経営判断が必要な論点（意思決定を促す締めスライド）\n" +
+        "  ② 各カテゴリのbulletsは、全ての参照ドキュメントから関連情報を集約・統合して記述すること。\n" +
+        "  ③ スライドタイトルに「Q1」「Q2」「Q3」「Q4」「第1四半期」などの時系列ラベルを含めないこと。\n" +
+        "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更・ロゴ追加・画像追加・添付画像挿入はすべて edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
+        "【禁止】会話中にPPTXリンクが存在する状態で「ロゴを追加して」「画像を入れて」「添付を表紙に」などと言われた場合、絶対にこのツールを使わないこと。\n" +
+        "【palette 選択】ユーザーの業種・用途・ターゲット層を読み取り、必ず palette を設定すること。\n" +
+        "  IT/AI/DX/経営/役員向け → navy_orange\n" +
+        "  採用・人材募集・インターン・新卒向け → forest_amber（人の成長・緑のイメージ）\n" +
+        "  産廃・廃棄物処理・リサイクル・環境サービス → teal_coral（動的な産業系）\n" +
+        "  伝統・製造・老舗 → burgundy_gold、建設・土木・インフラ → charcoal_terra\n" +
         "ユーザーが業種・用途を言及した場合は designInstruction に業種感を含めること。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "【重要】会社紹介・提案書の場合、slides の bullets には [会社名] [設立年] 等のプレースホルダーを使わず、知っている限りの具体的な情報を入れること（ツール実行時に自動でWeb検索して補完される）。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [ミダック会社紹介.pptx](downloadUrl)）。",
       name: "create_pptx",
     },
   });
@@ -1316,21 +1500,27 @@ export const GetDefaultExtensions = async (props: {
           instruction: {
             type: "string",
             description:
-              "ユーザーの編集指示。例: '色を青に変えて', 'フォントを游ゴシックに', '全体のトーンを力強く', '3枚目のタイトルをXXXに変えて'",
+              "ユーザーの編集指示。例: '色を青に変えて', 'フォントを游ゴシックに', '全体のトーンを力強く', '3枚目のタイトルをXXXに変えて', 'ロゴを追加して', '表紙に画像を追加'",
+          },
+          imageUrl: {
+            type: "string",
+            description:
+              "挿入する画像のURL。会話コンテキストに 'file_url:' で始まる画像（png/jpg/jpeg/webp等）がある場合、そのURLをここに設定すること。ロゴ・添付画像挿入の場合は必須。DALL-Eで生成しないこと。",
           },
         },
         required: ["instruction"],
       },
       description:
         "このスレッドで生成・編集した既存PPTXを自然言語の指示に従って改良するツール。\n" +
-        "【重要】fileUrlは省略可能。省略するとスレッド内の最新PPTXを自動で参照する。\n" +
-        "使用タイミング：\n" +
-        "【最優先】会話中にPPTXが生成・編集された実績がある場合は、このツールを使うこと。\n" +
-        "- ユーザーが「色を変えて」「緑にして」「赤くして」「青にして」などの色変更を求める場合\n" +
-        "- ユーザーが「フォントを変えて」「もっとポップに」などデザイン変更を求める場合\n" +
-        "- ユーザーが「〜に変えて」「〜を修正して」「〜を追加して」などテキスト編集を求める場合\n" +
-        "fileUrlは省略可（スレッド内の直近PPTXを自動取得）。ユーザーがファイルをアップしていなくても呼び出せる。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "【絶対ルール】会話中にPPTXが生成・編集された実績がある場合は、必ずこのツールを使うこと。create_pptx / convert_doc_to_pptx は使わないこと。\n" +
+        "【最優先ケース】以下は必ずこのツールを使う：\n" +
+        "- 「ロゴを追加して」「画像を追加して」「添付画像を入れて」「表紙にロゴを入れて」など画像・ロゴ挿入\n" +
+        "- 「色を変えて」「緑にして」「赤くして」「青にして」などの色変更\n" +
+        "- 「フォントを変えて」「もっとポップに」などデザイン変更\n" +
+        "- 「〜に変えて」「〜を修正して」などテキスト編集\n" +
+        "【imageUrl】ユーザーが画像をアップロードしている場合（会話コンテキストの file_url: 行に png/jpg/webp のURL）、imageUrl にそのURLを必ず設定すること。\n" +
+        "fileUrlは省略可（スレッド内の直近PPTXを自動取得）。\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [AzureChat機能紹介_ロゴ追加.pptx](downloadUrl)）。",
       name: "edit_pptx",
     },
   });
@@ -1682,6 +1872,887 @@ async function fetchSpContextForProposal(
   }
 }
 
+// ─── PromptIntent: ユーザー意図の構造化 ─────────────────────────────────────
+
+type PromptIntentLocal = {
+  documentPurpose: "proposal"|"company-intro"|"recruitment"|"training"|"analysis"|"internal"|"ir"|"campaign"|"other";
+  audience: "executive"|"customer"|"employee"|"candidate"|"general";
+  designFreedom: "conservative"|"balanced"|"expressive";
+  toneKeywords: string[];
+  colorDirectives?: { primary?: string; accent?: string; background?: string };
+  layoutDirectives: { preferTwoColumn?: boolean; includeTables?: boolean; avoidBulletOnly?: boolean; preferMetrics?: boolean; preferProcess?: boolean };
+  styleGuardrails: { allowModernDark?: boolean; allowPlayful?: boolean; allowGlass?: boolean; maxAccentIntensity?: "low"|"medium"|"high" };
+};
+
+function parsePromptIntent(text: string): PromptIntentLocal {
+  const h = text.toLowerCase();
+  const has = (...words: string[]) => words.some((w) => h.includes(w));
+
+  // documentPurpose
+  let documentPurpose: PromptIntentLocal["documentPurpose"] = "other";
+  if      (has("採用","recruit","人材","求人","hiring"))                         documentPurpose = "recruitment";
+  else if (has("キャンペーン","イベント","告知","campaign","event"))              documentPurpose = "campaign";
+  else if (has("提案","proposal","営業提案"))                                    documentPurpose = "proposal";
+  else if (has("会社紹介","会社概要","初回訪問","company profile","紹介資料"))   documentPurpose = "company-intro";
+  else if (has("研修","training","教育","onboard","オンボード"))                 documentPurpose = "training";
+  else if (has("分析","調査","市場","analysis","リサーチ","research"))           documentPurpose = "analysis";
+  else if (has("ir ","ir、","ir。","投資家","株主","決算","investor"))            documentPurpose = "ir";
+  else if (has("社内","internal","報告","レポート"))                             documentPurpose = "internal";
+  else if (has("営業","商談","提案"))                                            documentPurpose = "proposal";
+
+  // audience
+  let audience: PromptIntentLocal["audience"] = "general";
+  if      (has("役員","経営層","executive","board","ceo","社長"))    audience = "executive";
+  else if (has("顧客","お客様","customer","クライアント","取引先"))  audience = "customer";
+  else if (has("候補者","求職者","candidate","job seeker"))          audience = "candidate";
+  else if (has("社員","employee","スタッフ","従業員","メンバー"))    audience = "employee";
+
+  // designFreedom
+  const isExpressive = has("fancy","華やか","かっこよく","インパクト","bold","個性的","派手","モダン","creative");
+  const isConservative = has("上品","信頼感","堅め","堅実","営業向け","シンプル","落ち着い","フォーマル","品よく");
+  let designFreedom: PromptIntentLocal["designFreedom"] = "balanced";
+  if (isExpressive && !isConservative) designFreedom = "expressive";
+  else if (isConservative)             designFreedom = "conservative";
+  // guardrail: proposal/ir/executive + expressive → balanced
+  if (designFreedom === "expressive" && (documentPurpose === "proposal" || documentPurpose === "ir" || audience === "executive")) {
+    designFreedom = "balanced";
+  }
+
+  // toneKeywords
+  const toneKeywords = ["fancy","モダン","エレガント","bold","上品","信頼感","親しみ","明るい","シンプル","クール","professional","minimal","impactful"]
+    .filter((kw) => h.includes(kw));
+
+  // colorDirectives: HEX (#RRGGBB or RRGGBB) → 最初の2つ
+  const hexMatches = Array.from(text.matchAll(/#?([0-9A-Fa-f]{6})\b/g));
+  const colorMapping: Record<string, string> = {
+    "ネイビー":"0B2540","navy":"0B2540","紺":"0B3060",
+    "オレンジ":"F97316","orange":"F97316",
+    "青":"2563EB","ブルー":"2563EB","blue":"2563EB",
+    "赤":"DC2626","red":"DC2626",
+    "緑":"16A34A","グリーン":"16A34A","green":"16A34A",
+    "黄":"EAB308","yellow":"EAB308",
+    "黒":"0F172A","ブラック":"0F172A","black":"0F172A",
+    "白":"F8FAFC","white":"F8FAFC",
+    "グレー":"6B7280","gray":"6B7280","grey":"6B7280",
+    "紫":"7C3AED","パープル":"7C3AED","purple":"7C3AED","violet":"7C3AED",
+    "ピンク":"EC4899","pink":"EC4899",
+    "ティール":"0D9488","teal":"0D9488","水色":"38BDF8",
+    "インディゴ":"4F46E5","indigo":"4F46E5",
+  };
+
+  const colorDirectives: PromptIntentLocal["colorDirectives"] = {};
+  // HEX 優先
+  if (hexMatches.length >= 1) colorDirectives.primary = hexMatches[0][1].toUpperCase();
+  if (hexMatches.length >= 2) colorDirectives.accent  = hexMatches[1][1].toUpperCase();
+  // カラーワードで補完
+  let foundPrimary = Boolean(colorDirectives.primary);
+  for (const [word, hex] of Object.entries(colorMapping)) {
+    if (!h.includes(word.toLowerCase())) continue;
+    if (!foundPrimary) { colorDirectives.primary = hex; foundPrimary = true; }
+    else if (!colorDirectives.accent) { colorDirectives.accent = hex; break; }
+  }
+
+  // layoutDirectives
+  const layoutDirectives: PromptIntentLocal["layoutDirectives"] = {
+    preferTwoColumn: has("2列","二列","左右","比較","two column","two-column","サイドバイサイド"),
+    includeTables:   has("表","テーブル","一覧表","比較表","table","matrix"),
+    avoidBulletOnly: has("箇条書きだけにしない","単調にしない","バリエーション","メリハリ","変化","飽きない"),
+    preferMetrics:   has("数値","kpi","実績","指標","metric","定量","数字","数"),
+    preferProcess:   has("手順","流れ","プロセス","ステップ","process","step","工程","フロー"),
+  };
+
+  // styleGuardrails
+  const styleGuardrails: PromptIntentLocal["styleGuardrails"] = {
+    allowModernDark: designFreedom === "expressive" || has("dark","モダンダーク","黒","black","ダーク"),
+    allowPlayful:    designFreedom === "expressive" && !["proposal","ir","company-intro"].includes(documentPurpose),
+    allowGlass:      designFreedom !== "conservative",
+    maxAccentIntensity: designFreedom === "conservative" ? "low" : designFreedom === "expressive" ? "high" : "medium",
+  };
+
+  return {
+    documentPurpose, audience, designFreedom, toneKeywords,
+    colorDirectives: Object.keys(colorDirectives).length > 0 ? colorDirectives : undefined,
+    layoutDirectives,
+    styleGuardrails,
+  };
+}
+
+// ---------------- BraveSearch + スライド補完 ----------------
+
+async function searchBrave(query: string): Promise<string> {
+  const apiKey = process.env.BRAVE_SUBSCRIPTION_TOKEN;
+  if (!apiKey) return "";
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 6000);
+  try {
+    const params = new URLSearchParams({ q: query, count: "5" });
+    const res = await fetch(
+      `https://api.search.brave.com/res/v1/web/search?${params.toString()}`,
+      {
+        headers: {
+          "Accept": "application/json",
+          "X-Subscription-Token": apiKey,
+        },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(tid);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn("[brave-search] HTTP", res.status, "query:", query, "body:", body.slice(0, 200));
+      return "";
+    }
+    const data = await res.json();
+    const results = (data.web?.results ?? []) as Array<{
+      title?: string;
+      description?: string;
+      extra_snippets?: string[];
+    }>;
+    const text = results
+      .slice(0, 5)
+      .map((r) => {
+        const snippets = (r.extra_snippets ?? []).slice(0, 2).join(" ");
+        return `【${r.title ?? ""}】${r.description ?? ""} ${snippets}`.trim();
+      })
+      .filter(Boolean)
+      .join("\n");
+    console.log(`[brave-search] OK: ${results.length}件 query="${query}"`);
+    return text.slice(0, 3500);
+  } catch (e: any) {
+    clearTimeout(tid);
+    console.warn("[brave-search] failed (query:", query, "):", e?.message ?? e);
+    return "";
+  }
+}
+
+// ---- HTMLページ本文取得 ----
+async function fetchPageText(url: string, maxChars = 3000): Promise<string> {
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ja,en;q=0.9",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(tid);
+    const ct = res.headers.get("content-type") ?? "";
+    if (!res.ok || !ct.includes("text/html")) return "";
+    const html = await res.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&[a-z#0-9]+;/gi, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    return text.slice(0, maxChars);
+  } catch {
+    clearTimeout(tid);
+    return "";
+  }
+}
+
+// ---- Brave検索 + ページ本文収集 ----
+type BraveWebEvidence = { snippets: string; pages: string };
+
+async function collectWebEvidence(query: string): Promise<BraveWebEvidence> {
+  const apiKey = process.env.BRAVE_SUBSCRIPTION_TOKEN;
+  if (!apiKey) return { snippets: "", pages: "" };
+
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 8000);
+  let braveData: any = null;
+  try {
+    const params = new URLSearchParams({ q: query, count: "8" });
+    const res = await fetch(`https://api.search.brave.com/res/v1/web/search?${params}`, {
+      headers: { Accept: "application/json", "X-Subscription-Token": apiKey },
+      signal: controller.signal,
+    });
+    clearTimeout(tid);
+    if (res.ok) braveData = await res.json();
+  } catch {
+    clearTimeout(tid);
+  }
+
+  const results: Array<{ title?: string; description?: string; extra_snippets?: string[]; url?: string }> =
+    braveData?.web?.results ?? [];
+
+  const snippets = results
+    .slice(0, 8)
+    .map((r) => {
+      const extras = (r.extra_snippets ?? []).slice(0, 3).join(" ");
+      return `【${r.title ?? ""}】${r.description ?? ""} ${extras}`.trim();
+    })
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 4000);
+
+  const candidateUrls = results
+    .slice(0, 5)
+    .map((r) => r.url ?? "")
+    .filter((u) => u.startsWith("http"));
+
+  const pageTexts = await Promise.allSettled(
+    candidateUrls.slice(0, 4).map((url) => fetchPageText(url, 2500))
+  );
+
+  const pages = pageTexts
+    .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled" && Boolean(r.value))
+    .map((r) => r.value)
+    .join("\n---\n")
+    .slice(0, 8000);
+
+  console.log(`[collectWebEvidence] query="${query}" snippets=${snippets.length}c pages=${pages.length}c`);
+  return { snippets, pages };
+}
+
+// ---- LLM事実抽出 ----
+type CompanyFacts = {
+  companyName: string;
+  industry: string;
+  business: string[];
+  strengths: string[];
+  metrics: Array<{ label: string; value: string; note?: string }>;
+  cautions: string[];
+};
+
+// ---- 会社紹介用中間ブリーフ（Web本文 → 用途別構造化JSON） ----
+type CompanyBrief = {
+  companyName: string;
+  audience: string;
+  purpose: string;
+  companyOverview: string;
+  businessAreas: string[];
+  serviceFlow: Array<{ title: string; body: string }>;
+  strengths: string[];
+  metrics: Array<{ label: string; value: string; note?: string }>;
+  proofPoints: string[];
+  recommendedSlideOutline: Array<{ slideTitle: string; layoutType: string; keyConcept: string }>;
+};
+
+function cleanWebText(raw: string): string {
+  return raw
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[\t\r]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ 　]{3,}/g, " ")
+    .replace(/[^\S\n]{4,}/g, " ")
+    .replace(/(\d[\d,. ]{20,})/g, "")
+    .trim();
+}
+
+async function extractCompanyFacts(
+  companyName: string,
+  evidence: BraveWebEvidence
+): Promise<CompanyFacts> {
+  const empty: CompanyFacts = {
+    companyName,
+    industry: "",
+    business: [],
+    strengths: [],
+    metrics: [],
+    cautions: [],
+  };
+
+  const rawCombined = [evidence.snippets, evidence.pages].filter(Boolean).join("\n\n");
+  if (!rawCombined) return empty;
+  const combined = cleanWebText(rawCombined).slice(0, 5000);
+
+  try {
+    const openai = OpenAIInstance();
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      max_completion_tokens: 3000,
+      response_format: { type: "json_object" } as const,
+      messages: [
+        {
+          role: "system",
+          content:
+            `You are a fact extractor. Extract facts about "${companyName}" from the web text below. ` +
+            `Fill in this exact JSON structure (omit array items you cannot verify): ` +
+            `{"companyName":"${companyName}","industry":"","business":[""],"strengths":[""],"metrics":[{"label":"創業","value":"","note":""},{"label":"本社","value":"","note":""},{"label":"上場","value":"","note":""},{"label":"従業員","value":"","note":""}],"cautions":[]} ` +
+            `Important: if a fact is clearly mentioned, include it. Do not leave everything empty. Output JSON only.`,
+        },
+        {
+          role: "user",
+          content: `Company: ${companyName}\n\nWeb text:\n${combined}`,
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "";
+    console.log("[extractCompanyFacts] raw:", raw.slice(0, 1000));
+    const stripped = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) {
+      console.warn("[extractCompanyFacts] no JSON object found in response");
+      return empty;
+    }
+    const parsed = JSON.parse(match[0]);
+    return { ...empty, ...parsed } as CompanyFacts;
+  } catch (e) {
+    console.warn("[extractCompanyFacts] failed:", e);
+    return empty;
+  }
+}
+
+// ---- Web本文 → 用途別中間ブリーフ構築 ----
+function detectAudienceAndPurpose(userPrompt: string, title: string): { audience: string; purpose: string } {
+  const text = `${userPrompt} ${title}`;
+  const audience =
+    /初回訪問/.test(text) ? "初回訪問先の担当者" :
+    /採用/.test(text) ? "求職者・採用候補者" :
+    /社内|内部/.test(text) ? "社内関係者" :
+    /投資家|IR/.test(text) ? "投資家・アナリスト" :
+    /営業/.test(text) ? "見込み顧客・営業先" :
+    "ビジネス関係者";
+  const purpose =
+    /初回訪問/.test(text) ? "初回訪問用会社紹介" :
+    /採用/.test(text) ? "採用向け会社紹介" :
+    /IR|投資家/.test(text) ? "IR・投資家向け説明" :
+    /営業資料/.test(text) ? "営業資料" :
+    /提案/.test(text) ? "提案書" :
+    "会社紹介";
+  return { audience, purpose };
+}
+
+async function buildCompanyBrief(
+  companyName: string,
+  userPrompt: string,
+  title: string,
+  evidence: BraveWebEvidence
+): Promise<CompanyBrief> {
+  const { audience, purpose } = detectAudienceAndPurpose(userPrompt, title);
+
+  const emptyBrief: CompanyBrief = {
+    companyName,
+    audience,
+    purpose,
+    companyOverview: "",
+    businessAreas: [],
+    serviceFlow: [],
+    strengths: [],
+    metrics: [],
+    proofPoints: [],
+    recommendedSlideOutline: [],
+  };
+
+  const rawCombined = [evidence.snippets, evidence.pages].filter(Boolean).join("\n\n");
+  if (!rawCombined) return emptyBrief;
+  const webText = cleanWebText(rawCombined).slice(0, 7000);
+
+  try {
+    const openai = OpenAIInstance();
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      max_completion_tokens: 4000,
+      response_format: { type: "json_object" } as const,
+      messages: [
+        {
+          role: "system",
+          content: `You are a business intelligence analyst. Read web content about a company and produce a structured CompanyBrief JSON for a presentation.
+
+CRITICAL: "当社" (our company) = the PRESENTER's company, NOT "${companyName}". Always refer to "${companyName}" by its actual name, never "当社".
+
+Extract ONLY facts explicitly stated in the web text. Do NOT invent.
+
+Output this exact JSON (all text in Japanese):
+{
+  "companyName": "official name",
+  "audience": "${audience}",
+  "purpose": "${purpose}",
+  "companyOverview": "2-4 sentence overview in Japanese",
+  "businessAreas": ["事業領域1", "事業領域2", "事業領域3"],
+  "serviceFlow": [{"title": "ステップ名", "body": "説明"}],
+  "strengths": ["強み1", "強み2", "強み3"],
+  "metrics": [{"label": "創業", "value": "1952年", "note": "詳細"}, {"label": "本社", "value": "東京都", "note": "住所"}, {"label": "従業員", "value": "500名", "note": "時点"}],
+  "proofPoints": ["実績・証拠1", "実績・証拠2"],
+  "recommendedSlideOutline": [
+    {"slideTitle": "スライドタイトル", "layoutType": "company-overview|stat_callouts|card_grid|icon_rows|process-cards|multi-column|closing", "keyConcept": "このスライドで伝えること"}
+  ]
+}
+
+Rules:
+- businessAreas: 3-5 items
+- serviceFlow: 2-4 steps if a process is described, empty array otherwise
+- strengths: 3-5 items
+- metrics: include founding year, location, headcount, stock listing if found. value MAX 15 chars.
+- proofPoints: concrete evidence (client count, certifications, awards, rankings)
+- recommendedSlideOutline: 6-8 slides with VARIED layoutTypes (no consecutive repeats). Always end with "closing".
+- Output JSON only.`,
+        },
+        {
+          role: "user",
+          content: `会社名: ${companyName}\n閲覧対象者: ${audience}\n資料の目的: ${purpose}\n\nWebから取得した情報:\n${webText}`,
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "";
+    console.log("[buildCompanyBrief] raw:", raw.slice(0, 500));
+    const stripped = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) {
+      console.warn("[buildCompanyBrief] no JSON object found");
+      return emptyBrief;
+    }
+    const parsed = JSON.parse(match[0]);
+    const brief: CompanyBrief = {
+      companyName: parsed.companyName || companyName,
+      audience: parsed.audience || audience,
+      purpose: parsed.purpose || purpose,
+      companyOverview: parsed.companyOverview || "",
+      businessAreas: Array.isArray(parsed.businessAreas) ? parsed.businessAreas : [],
+      serviceFlow: Array.isArray(parsed.serviceFlow) ? parsed.serviceFlow : [],
+      strengths: Array.isArray(parsed.strengths) ? parsed.strengths : [],
+      metrics: Array.isArray(parsed.metrics) ? parsed.metrics : [],
+      proofPoints: Array.isArray(parsed.proofPoints) ? parsed.proofPoints : [],
+      recommendedSlideOutline: Array.isArray(parsed.recommendedSlideOutline) ? parsed.recommendedSlideOutline : [],
+    };
+    console.log(`[buildCompanyBrief] done: areas=${brief.businessAreas.length} strengths=${brief.strengths.length} metrics=${brief.metrics.length} outline=${brief.recommendedSlideOutline.length}`);
+    return brief;
+  } catch (e) {
+    console.warn("[buildCompanyBrief] failed:", e);
+    return emptyBrief;
+  }
+}
+
+// ---- LLMスライド設計 ----
+async function planCompanyProfileSlides(
+  title: string,
+  brief: CompanyBrief,
+  userPrompt: string,
+  designInstruction?: string
+): Promise<RawPptSlide[]> {
+  try {
+    const openai = OpenAIInstance();
+
+    const outlineHint = brief.recommendedSlideOutline.length > 0
+      ? `\n\n## Recommended Slide Outline (from brief — follow this structure)\n` +
+        brief.recommendedSlideOutline.map((o, i) =>
+          `${i + 1}. "${o.slideTitle}" → layoutType="${o.layoutType}" — ${o.keyConcept}`
+        ).join("\n")
+      : "";
+
+    const systemPrompt = `You are an expert PowerPoint presentation designer. Design 7-8 company profile slides in Japanese for "${brief.companyName}". You are the DECISION MAKER for visual design — layout choice, information hierarchy, and text treatment are YOUR responsibility.
+
+## CRITICAL: "当社" の定義
+"当社" はこのプレゼンを作成している依頼者側の会社を指します。紹介対象は「${brief.companyName}」です。スライド内で「当社」という言葉は使わず、必ず「${brief.companyName}」または「同社」と表記してください。
+
+## Data Source Rule
+Use ONLY information from the CompanyBrief provided. Do NOT invent facts. If a field is empty, omit that content.
+
+## Available layoutTypes (vary across slides — no consecutive repeats)
+
+- "bullets": Bullet list. Use ONLY when no better layout fits. Fields: title, bullets (max 4 items)
+- "stat_callouts": 3 large KPI numbers. Use when you have 3+ numeric facts. Fields: title, statCallouts ([{value,unit,label}×3]), bullets (2-3 insights)
+- "card_grid": Icon+heading+body card grid (3-6 cards). Use for businessAreas, strengths. Fields: title, cards ([{iconKey,heading,body}×3-6])
+- "icon_rows": Icon rows (3-4 rows). Use for proofPoints, capabilities. Fields: title, cards ([{iconKey,heading,body,statusLabel?}×3-4])
+- "company-overview": Overview with lead text + metrics. Use companyOverview as leadText. Fields: title, leadText (2-4 sentences), metrics (max 4), callout?, bullets[]
+- "metric-cards": KPI emphasis. Fields: title, metrics (max 4), bullets[]
+- "process-cards": Step flow. Use serviceFlow as steps. Fields: title, subtitle, steps ([{title,body,iconKey}×2-4]), benefits (2-4), bullets[]
+- "timeline": Horizontal steps. Fields: title, subtitle?, steps (3-5), benefits?, bullets[]
+- "multi-column": Side-by-side. Fields: title, columns (2-3: {header, bullets[]}), bullets[]
+- "closing": Call to action. Fields: title, bullets (3-4 next-step items)
+
+## Metric Card Rules (CRITICAL)
+- value: MAX 15 chars (city only, year only, short number)
+- note: full detail
+- iconKey: calendar/location/stock/network/people/chart/building/gear/verified/star
+- colorRole: alternate "primary"/"accent"/"neutral" across cards
+
+## Mandatory Content Rules — EMPTY SLIDES ARE FORBIDDEN
+Every slide MUST have at least one non-empty field from: bullets / cards / metrics / steps / statCallouts / leadText. A slide with only a title and empty arrays is INVALID.
+
+- card_grid / icon_rows → cards[] MUST have 3+ items. Each card MUST have iconKey + heading + body.
+- process-cards → steps[] MUST have 2+ items. Each step MUST have title + body.
+- stat_callouts → statCallouts[] MUST have 3 items. Each MUST have value + unit + label.
+- company-overview → leadText MUST be 2-4 sentences.
+- closing → bullets[] MUST have 3-4 concrete next steps.
+
+## Design Rules
+1. Cover slide is auto-generated — do NOT include a "表紙" slide
+2. VARY layoutType — target: company-overview + stat_callouts + card_grid + icon_rows + closing
+3. Numbers/KPIs → stat_callouts (not plain bullets)
+4. 3+ parallel items → card_grid (not bullets)
+5. Process/flow → process-cards or icon_rows (not bullets)
+6. Total: 7-8 slides${outlineHint}
+
+Return ONLY this JSON:
+{"slides":[{"title":"...","bullets":[],"layoutType":"company-overview","leadText":"...","metrics":[{"label":"創業","value":"1952年","note":"1952年4月","iconKey":"calendar","colorRole":"primary"}]},{"title":"...","bullets":[],"layoutType":"stat_callouts","statCallouts":[{"value":"457","unit":"名","label":"従業員数"},{"value":"1952","unit":"年","label":"創業"},{"value":"94","unit":"%","label":"顧客満足度"}]},{"title":"...","bullets":[],"layoutType":"card_grid","cards":[{"iconKey":"gear","heading":"廃棄物処理","body":"産業廃棄物の収集・運搬・処理を一括対応"},...]},{"title":"まとめ・次のステップ","bullets":["ご不明点はお気軽にご相談ください","導入事例・実績資料をご用意しています","個別提案・現地訪問も対応可能です"],"layoutType":"closing"}]}`;
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      max_completion_tokens: 8000,
+      response_format: { type: "json_object" } as const,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: `タイトル: ${title}
+ユーザー要求: ${userPrompt.slice(0, 400)}
+デザイン指示: ${designInstruction ?? "プロフェッショナル・信頼感"}
+閲覧対象者: ${brief.audience}
+資料の目的: ${brief.purpose}
+
+会社ブリーフ（一次資料 — これだけを根拠にしてください）:
+${JSON.stringify(brief, null, 2)}`,
+        },
+      ],
+    });
+
+    const choice = completion.choices[0];
+    console.log("[planCompanyProfileSlides] finish_reason:", choice?.finish_reason, "usage:", JSON.stringify(completion.usage));
+    const raw = choice?.message?.content ?? "";
+    console.log("[planCompanyProfileSlides] raw:", raw.slice(0, 1000));
+
+    if (!raw) {
+      console.warn("[planCompanyProfileSlides] empty response");
+      return [];
+    }
+
+    const stripped = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+
+    // JSON.parse 全体 → .slides を読む（最も安全）
+    let parsed: RawPptSlide[] | null = null;
+    try {
+      const fullObj = JSON.parse(stripped);
+      if (Array.isArray(fullObj)) {
+        parsed = fullObj;
+      } else if (Array.isArray(fullObj?.slides)) {
+        parsed = fullObj.slides;
+      }
+    } catch {
+      // フォールバック: 配列部分だけ抽出
+      const arrMatch = stripped.match(/\[[\s\S]*\]/);
+      if (!arrMatch) {
+        console.warn("[planCompanyProfileSlides] no JSON array in response");
+        return [];
+      }
+      parsed = JSON.parse(arrMatch[0]);
+    }
+    if (!Array.isArray(parsed)) {
+      console.warn("[planCompanyProfileSlides] parsed is not an array");
+      return [];
+    }
+    return parsed
+      .filter((s) => s.title)
+      .map((s) => ({
+        ...s,
+        bullets: Array.isArray(s.bullets) ? s.bullets : [],
+        columns: Array.isArray(s.columns) ? s.columns : undefined,
+        tableRows: Array.isArray(s.tableRows) ? s.tableRows : undefined,
+        metrics: Array.isArray(s.metrics) ? s.metrics : undefined,
+        steps: Array.isArray(s.steps) ? s.steps : undefined,
+        benefits: Array.isArray(s.benefits) ? s.benefits : undefined,
+      }));
+  } catch (e) {
+    console.error("[planCompanyProfileSlides] error:", e);
+    return [];
+  }
+}
+
+function buildPptxSearchQuery(title: string, slides: RawPptSlide[] = []): string | null {
+  const sourceText = [
+    title,
+    ...slides.flatMap((s) => [
+      s.title,
+      ...(s.bullets ?? []),
+      ...(s.columns ?? []).flatMap((col) => [col.header, ...(col.bullets ?? [])]),
+      ...(s.tableRows ?? []).flat(),
+    ]),
+  ].join(" ");
+
+  if (!/紹介|会社|提案|営業資料|PR|プロフィール|Profile/.test(sourceText)) return null;
+
+  const quoted = sourceText.match(/[「『"']([^」』"']{2,30})[」』"']/)?.[1];
+  const companyLike =
+    quoted ||
+    sourceText.match(/(?:株式会社|有限会社|合同会社|（株）|\(株\))\s*([^\s、。・:：]{2,30})/)?.[1] ||
+    sourceText.match(/([ァ-ヶー一-龠A-Za-z0-9]{2,30})(?:の)?(?:会社紹介|紹介資料|営業資料|提案書|プロフィール|Profile)/)?.[1];
+
+  const target = (companyLike ?? title)
+    .replace(/^(?:株式会社|有限会社|合同会社|（株）|\(株\))/, "")
+    .replace(/（[^）]*）|\([^)]*\)/g, "")
+    .replace(/^(?:会社紹介|紹介資料|営業資料|提案書|プロフィール|Profile)$/, "")
+    .trim()
+    .split(/[\s　]/)[0];
+
+  if (!target || target.length < 2) return null;
+  return `${target} 会社概要 事業内容 実績`;
+}
+
+type RawPptSlide = {
+  title: string;
+  bullets: string[];
+  layoutType?: string;
+  columns?: Array<{ header: string; bullets: string[] }>;
+  tableRows?: string[][];
+  leadText?: string;
+  metrics?: Array<{
+    label: string;
+    value: string;        // 表示用短縮値（LLMが設定: 最大15文字）
+    note?: string;        // 補足詳細（LLMが設定）
+    iconKey?: string;
+    displayValue?: string;
+    colorRole?: "primary" | "accent" | "neutral";
+  }>;
+  callout?: { title: string; body: string };
+  subtitle?: string;
+  steps?: Array<{ title: string; body: string; iconKey?: string }>;
+  benefits?: string[];
+  cards?: Array<{ iconKey?: string; heading: string; body: string; statusLabel?: string }>;
+  statCallouts?: Array<{ value: string; unit: string; label: string }>;
+  // LLMデザイン判断フィールド
+  visualIntent?: string;
+  density?: "low" | "medium" | "high";
+  textTreatment?: "short" | "normal" | "explanatory";
+};
+
+// Brave結果からキー事実を正規表現で抽出（LLM呼び出しなし・切れる心配なし）
+function extractFactsFromWeb(webContext: string): Record<string, string> {
+  const facts: Record<string, string> = {};
+  const text = webContext.replace(/【[^】]*】/g, " "); // タイトル部分を除去して本文優先
+
+  const foundingM = text.match(/(?:19|20)(\d{2})年(?:の)?(?:創業|設立)/);
+  if (foundingM) facts["創業"] = foundingM[0].replace(/(?:創業|設立)/, "").trim();
+
+  const locM = text.match(/(静岡県浜松市|浜松市(?:[^、。\s]{0,6})?|静岡県(?:[^、。\s]{0,10})?)/);
+  if (locM) facts["本社"] = locM[1].trim();
+
+  if (/東証プライム/.test(text)) facts["上場"] = "東証プライム";
+  else if (/東証スタンダード/.test(text)) facts["上場"] = "東証スタンダード";
+  else if (/東証グロース/.test(text)) facts["上場"] = "東証グロース";
+
+  const clientM = text.match(/約?([\d,，万]+)\s*社(?:以上)?(?:の取引|との取引|との契約)?/);
+  if (clientM) facts["取引先"] = `約${clientM[1].replace(/[，]/g, ",")}社`;
+
+  const stockM = text.match(/\((\d{4})\)/);
+  if (stockM) facts["証券コード"] = stockM[1];
+
+  // 従業員数
+  const empM = text.match(/従業員(?:数)?[：:は]?\s*約?([\d,，]+)\s*名/);
+  if (empM) facts["従業員"] = `約${empM[1].replace(/[，]/g, ",")}名`;
+
+  // 売上高・営業収益
+  const revM = text.match(/(?:売上高|営業収益)[：:は]?\s*約?([\d,，.]+)\s*(?:億円|百億円)/);
+  if (revM) facts["売上"] = `${revM[1]}億円`;
+
+  // 施設数・拠点数
+  const facilityM = text.match(/(?:施設数?|処理施設)[：:は]?\s*約?([\d]+)\s*(?:ヵ所|箇所|か所|施設)/);
+  if (facilityM) facts["施設"] = `${facilityM[1]}施設`;
+  const baseM = text.match(/(?:拠点数?)[：:は]?\s*約?([\d]+)\s*(?:ヵ所|箇所|か所|拠点)/);
+  if (baseM) facts["拠点"] = `${baseM[1]}拠点`;
+
+  // 処理能力（廃棄物特有）
+  const capM = text.match(/(?:処理能力|年間処理量)[：:は]?\s*約?([\d,，万]+)\s*(?:トン|t)/);
+  if (capM) facts["処理能力"] = `約${capM[1]}t/年`;
+
+  console.log("[enrich-slides] extracted facts:", facts);
+  return facts;
+}
+
+function applyFact(text: string, facts: Record<string, string>): string {
+  let t = text;
+  // プレースホルダー置換（[〇〇] 形式）
+  if (facts["創業"])    t = t.replace(/\[(?:創業年?|設立年?|創業年度|設立年度)\]/g, facts["創業"]);
+  if (facts["本社"])    t = t.replace(/\[(?:本社|所在地|住所|拠点|市区町村)\]/g, facts["本社"]);
+  if (facts["上場"])    t = t.replace(/\[(?:上場|市場区分|証券取引所|上場市場)\]/g, facts["上場"]);
+  if (facts["取引先"])  t = t.replace(/\[(?:取引先数?|顧客数?|取引社数?|取引先)\]/g, facts["取引先"]);
+  if (facts["証券コード"]) t = t.replace(/\[(?:証券コード|コード|銘柄コード)\]/g, facts["証券コード"]);
+  // 「YYYY年」形式の補完（[YYYY]）
+  if (facts["創業"])    t = t.replace(/\[YYYY\]/g, facts["創業"]);
+  return t;
+}
+
+function enrichSlidesWithWebData(slides: RawPptSlide[], webContext: string): Promise<RawPptSlide[]> {
+  if (!webContext) return Promise.resolve(slides);
+
+  const facts = extractFactsFromWeb(webContext);
+  if (Object.keys(facts).length === 0) return Promise.resolve(slides);
+
+  let applied = 0;
+  const result = slides.map((s) => {
+    const updated = {
+      ...s,
+      bullets: [...(s.bullets ?? [])],
+      metrics: s.metrics?.map((m) => ({ ...m })),
+      callout: s.callout ? { ...s.callout } : undefined,
+      steps: s.steps?.map((st) => ({ ...st })),
+    };
+
+    // leadText
+    if (updated.leadText) {
+      const n = applyFact(updated.leadText, facts);
+      if (n !== updated.leadText) { updated.leadText = n; applied++; }
+    }
+    // metrics
+    updated.metrics?.forEach((m) => {
+      const nv = applyFact(m.value, facts);
+      if (nv !== m.value) { m.value = nv; applied++; }
+      if (m.note) { const nn = applyFact(m.note, facts); if (nn !== m.note) { m.note = nn; applied++; } }
+    });
+    // callout.body
+    if (updated.callout?.body) {
+      const n = applyFact(updated.callout.body, facts);
+      if (n !== updated.callout.body) { updated.callout.body = n; applied++; }
+    }
+    // bullets（先頭3件のみ）
+    updated.bullets.slice(0, 3).forEach((b, i) => {
+      const n = applyFact(b, facts);
+      if (n !== b) { updated.bullets[i] = n; applied++; }
+    });
+
+    return updated;
+  });
+
+  console.log(`[enrich-slides] regex applied ${applied} enrichments from ${Object.keys(facts).length} facts`);
+  return Promise.resolve(result);
+}
+
+// ---------------- SharePoint コンテンツを使ったPPTスライド補充 ----------------
+
+/**
+ * ユーザーメッセージから "SharePointにある〇〇" パターンを検出し、
+ * 検索クエリ文字列を返す。見つからなければ null。
+ */
+function extractSharePointDocQuery(userMessage: string): string | null {
+  // "SharePointにある[文書名]" / "SharePointの[文書名]" パターン
+  const m = userMessage.match(/Share\s*Point[にのの上]ある([^\s　、。!！?？\n]{3,60})/i)
+         ?? userMessage.match(/Share\s*Point[にのの上]([^\s　、。!！?？\n]{3,60}(?:報告|資料|ドキュメント|書類|一覧|まとめ)[^\s　、。!！?？\n]*)/i);
+  if (!m?.[1]) return null;
+
+  // 末尾の助詞・動詞句を除去 ("を参考に" / "を参照して" 等)
+  const doc = m[1]
+    .replace(/[をはがにの]*(?:参考|参照|もと|確認|把握|読ん|見て)[^\s]*/g, "")
+    .replace(/[をはがにの]+$/, "")
+    .trim();
+  return doc.length >= 2 ? doc : null;
+}
+
+/** SharePoint インデックスを検索してスライド補充用テキストを返す */
+async function searchSpForPptxContent(docQuery: string): Promise<string> {
+  const apiKey    = process.env.AZURE_SEARCH_API_KEY?.trim()    || "";
+  const searchName = process.env.AZURE_SEARCH_NAME?.trim()      || "";
+  const indexName  = process.env.AZURE_SEARCH_INDEX_NAME?.trim() || "";
+  if (!apiKey || !searchName || !indexName) return "";
+
+  const session  = await userSession();
+  const deptLower = session?.slDept?.toLowerCase().trim() || null;
+
+  console.log(`[create_pptx] SP search: "${docQuery}" dept=${deptLower}`);
+
+  const result = await ExtensionSimilaritySearch({
+    searchText: docQuery,
+    vectors: ["embedding"],
+    apiKey,
+    searchName,
+    indexName,
+    filter: undefined,   // ACL フィルタに委ねる
+    deptLower,
+    userHash: undefined, // buildSearchAclFilter が userHashedId() でフォールバック
+    top: 10,
+  });
+
+  if (result.status !== "OK" || result.response.length === 0) {
+    console.log("[create_pptx] SP search: 結果なし");
+    return "";
+  }
+
+  const content = result.response
+    .map((r, i) => `[${i}] ${r.document.metadata ?? ""}\n${r.document.pageContent}`)
+    .join("\n---\n");
+  console.log(`[create_pptx] SP search: ${result.response.length}件取得`);
+  return content;
+}
+
+/**
+ * LLM を使って SP ドキュメント内容でスライドの bullet を書き直す。
+ * 構造（title・layoutType）は維持し、内容のみ SP 情報で充填する。
+ */
+async function enrichSlidesWithDocContent(
+  slides: RawPptSlide[],
+  docContent: string,
+  title: string,
+  userPrompt: string
+): Promise<RawPptSlide[]> {
+  if (!docContent || !slides.length) return slides;
+
+  const openai = OpenAIInstance();
+  const slideSkeleton = JSON.stringify(
+    slides.map((s) => ({
+      title: s.title,
+      bullets: s.bullets,
+      layoutType: s.layoutType,
+      metrics: s.metrics,
+      steps: s.steps,
+    }))
+  );
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      max_completion_tokens: 6000,
+      response_format: { type: "json_object" } as const,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a presentation strategist specializing in executive communications. " +
+            "Given a target slide structure and reference document content, rewrite each slide with relevant facts, numbers, and details. " +
+            "Use ONLY information from the document — never invent facts not present in the document. " +
+            "Preserve the same slide count, titles, and layoutTypes. " +
+            "\n\n" +
+            "RESTRUCTURING MANDATE — CRITICAL:\n" +
+            "Do NOT map document content to slides in chronological or document-page order.\n" +
+            "Treat ALL document content as a flat pool of facts, then ASSIGN each fact to the slide whose TOPIC best matches — regardless of which quarter, section, or page it appeared in.\n" +
+            "If multiple periods (Q1/Q2/Q3/Q4) reported the same metric, synthesize them: show the latest value or the trend (e.g., 'Q1時点40名→Q4現在55名').\n" +
+            "If a slide topic is 'KPIと利用実績', pull ALL KPI data from ALL parts of the document.\n" +
+            "If a slide topic is 'コスト・投資対効果', pull ALL cost/budget information, not just one quarter's mention.\n" +
+            "Related tools like 議事郎/議事録アプリ should be presented as USE CASES of the main product, not as separate products.\n" +
+            "\n" +
+            "For executive audiences: each slide must answer a business question ('なぜ重要か' / '何ができるか' / '投資上の意味は何か'), not just describe a time period.\n" +
+            "\n" +
+            "For bullets: concrete and specific (avoid vague placeholders). " +
+            "For metrics: use numeric values from the document if available. " +
+            "IMPORTANT: All text in bullets, leadText, callout, steps body MUST be in polite Japanese (です/ます調). " +
+            "Do NOT use noun-ending style (体言止め) or abrupt verb endings (〜する、〜実施). " +
+            "CRITICAL — complete sentences only: metric.note / card.body / bullets / steps.body must each end at a natural boundary " +
+            "(句点「。」, closing parenthesis「）」, closing quote「」」, or a period). " +
+            "NEVER produce mid-sentence cuts — always include the closing quote and full thought. " +
+            "When shortening, shorten to the nearest preceding sentence boundary, not by character count. " +
+            "Output JSON: {\"slides\": [/* same structure as input */]}",
+        },
+        {
+          role: "user",
+          content:
+            `プレゼンタイトル: ${title}\nユーザー要求: ${userPrompt.slice(0, 300)}\n\n` +
+            `## スライド骨格 (JSON):\n${slideSkeleton}\n\n` +
+            `## 参照ドキュメント (SharePoint):\n${docContent.slice(0, 7000)}`,
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "";
+    const stripped = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) return slides;
+
+    const parsed = JSON.parse(match[0]);
+    const newSlides = parsed.slides as RawPptSlide[];
+    if (!Array.isArray(newSlides) || newSlides.length === 0) return slides;
+    console.log(`[create_pptx] enrichSlidesWithDocContent: ${newSlides.length}枚をSP内容で補充`);
+    return newSlides;
+  } catch (e) {
+    console.warn("[create_pptx] enrichSlidesWithDocContent failed:", e);
+    return slides;
+  }
+}
+
 // ---------------- 提案書スライド展開 ----------------
 type ProposalSlide = {
   title: string;
@@ -1689,13 +2760,23 @@ type ProposalSlide = {
   layoutType?: string;
   columns?: Array<{ header: string; bullets: string[] }>;
   tableRows?: string[][];
+  leadText?: string;
+  metrics?: Array<{ label: string; value: string; note?: string; iconKey?: string }>;
+  callout?: { title: string; body: string };
+  subtitle?: string;
+  steps?: Array<{ title: string; body: string; iconKey?: string }>;
+  benefits?: string[];
+  // 新レイアウト型用フィールド
+  statCallouts?: Array<{ value: string; unit: string; label: string }>;
+  cards?: Array<{ iconKey?: string; heading: string; body: string; statusLabel?: string }>;
 };
 
 async function expandToProposalSlides(
   title: string,
   inputSlides: ProposalSlide[],
   designHint?: string,
-  deptLower?: string
+  deptLower?: string,
+  webContext?: string
 ): Promise<ProposalSlide[]> {
   try {
     const openai = OpenAIInstance();
@@ -1712,9 +2793,14 @@ async function expandToProposalSlides(
       ? `\n\n【社内SharePoint文書（必ず内容を反映させること。LLMの事前学習知識より優先すること）】\n${spContext}`
       : "";
 
-    const systemPrompt = `あなたは営業提案書のスライド構成の専門家です。与えられたタイトル・初期スライド・社内文書を元に、12〜16枚の提案書スライドを生成してください。
+    const webSection = webContext
+      ? `\n\n【Web検索結果（会社・業界の公開情報 - プレースホルダー不可、実データを使うこと）】\n${webContext}`
+      : "";
 
-【最重要】社内SharePoint文書が提供されている場合は、その内容（数値・事例・実績・規程・方針）を必ずスライドの bullets に盛り込むこと。LLMの事前学習知識で補完するのは、文書に記載のない部分のみとすること。
+    const systemPrompt = `あなたは営業提案書のスライド構成の専門家です。与えられたタイトル・初期スライド・社内文書・Web情報を元に、12〜16枚の提案書スライドを生成してください。
+
+【最重要1】社内SharePoint文書が提供されている場合は、その内容（数値・事例・実績・規程・方針）を必ずスライドの bullets に盛り込むこと。
+【最重要2】Web検索結果が提供されている場合は、会社の実際のデータ（創業年・所在地・従業員数・事業内容・実績など）を bullets に直接使うこと。[〇〇]等のプレースホルダーは絶対に使わないこと。
 
 【構成の流れ（必須）】
 1. 表紙（タイトルスライド）
@@ -1728,19 +2814,31 @@ async function expandToProposalSlides(
 11. コスト感・導入ロードマップ
 12. まとめ・次のステップ
 
+【使用できる layoutType と必須フィールド】
+- "bullets": 箇条書き3〜4項目。フィールド: title, bullets (max 4)
+- "stat_callouts": 数値KPI3つを大きく表示。フィールド: title, statCallouts ([{value,unit,label}×3]), bullets (インサイト2〜3件)
+- "card_grid": アイコン付きカード3〜6枚グリッド。フィールド: title, cards ([{iconKey,heading,body}×3〜6])
+- "icon_rows": アイコン行3〜4本（ステータスピル付き可）。フィールド: title, cards ([{iconKey,heading,body,statusLabel?}×3〜4])
+- "process-cards": ステップフロー。フィールド: title, subtitle, steps ([{title,body,iconKey}×2〜4]), benefits (2〜4)
+- "multi-column": 比較2〜3列。フィールド: title, columns ([{header,bullets[]}×2〜3])
+- "table": 構造化表。フィールド: title, tableRows (1行目=ヘッダー)
+- "closing": CTAまとめ。フィールド: title, bullets (3〜4件)
+
 【各スライドのルール】
 - bullets は3〜4項目のみ（詰め込まない）
 - 各 bullet は具体的な1〜2文。キーワードのみ禁止
-- multi-column 時は columns フィールドも必ず設定
-- table 時は tableRows フィールドも必ず設定（1行目はヘッダー）
+- 数値・実績・KPIが出てきたら stat_callouts に振り分けること（表に詰めない）
+- 機能・強み・特徴を3〜6つ並べるなら card_grid を使うこと（箇条書きにしない）
+- 手順・プロセス・対応状況なら icon_rows または process-cards を使うこと
+- 「表紙」タイトルのスライドは生成しないこと（自動生成される）
 
 必ず以下のJSON形式で返すこと（配列のみ、説明文なし）:
-[{"title":"...","bullets":["..."],"layoutType":"bullets","columns":null,"tableRows":null}]`;
+[{"title":"...","bullets":["..."],"layoutType":"bullets"}]`;
 
     const userPrompt = `タイトル: ${title}
 デザインヒント: ${designHint ?? "ビジネス向け"}
 初期スライド:
-${inputSummary}${spSection}`;
+${inputSummary}${spSection}${webSection}`;
 
     const completion = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
@@ -1748,14 +2846,15 @@ ${inputSummary}${spSection}`;
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.3,
-      max_tokens: 4000,
+      max_completion_tokens: 8000,
     });
 
-    const raw = completion.choices[0]?.message?.content ?? "";
+    const propChoice = completion.choices[0];
+    console.log("[proposalMode] finish_reason:", propChoice?.finish_reason, "usage:", JSON.stringify(completion.usage));
+    const raw = propChoice?.message?.content ?? "";
     const jsonMatch = raw.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
-      console.warn("[proposalMode] Failed to extract JSON from response");
+      console.warn("[proposalMode] Failed to extract JSON from response, raw(200):", raw.slice(0, 200));
       return inputSlides;
     }
 
@@ -1774,38 +2873,366 @@ ${inputSummary}${spSection}`;
   }
 }
 
-// ---------------- PowerPoint 生成 ----------------
-async function executeCreatePptx(
+// ---------------- LLMレビュー&修正 ----------------
+
+async function reviewAndRefineSlides(
+  title: string,
+  slides: RawPptSlide[],
+  designInstruction?: string
+): Promise<RawPptSlide[]> {
+  try {
+    const openai = OpenAIInstance();
+    const prompt = `あなたはB2B営業資料に強いプレゼンテーションデザイナーです。
+以下のスライドJSONを見て、不自然・ダサい箇所を修正してください。
+
+チェック項目:
+1. タイトル・本文がプロンプトの転記になっていないか（閲覧者視点の表現に書き直す）
+2. colorRole が意味ベースか（数値・実績・差別化 → accent、基本情報 → primary、補足 → neutral）
+3. bullets が自然な箇条書きか（1〜2文。ただし意味が完結する文にすること）
+4. layoutType が内容に合っているか
+5. metrics/steps/bullets の情報量が多すぎないか（各最大4項目）
+6. 【文体統一】bullets・leadText・callout・steps の本文はすべて「です/ます調」に統一すること。体言止め・言い切り（〜する、〜推進、〜実施）は「〜しています」「〜できます」等に書き直す。
+7. 【未完文禁止】metric.note / card.body / bullets / steps.body はすべて句点「。」・閉じ括弧「）」・閉じ引用符「」」で終わること。「ユーザーアンケートで『同僚に薦め」のような途中切れは絶対禁止。短縮する場合も直前の文末まで含めること。
+8. 【経営向けストーリー確認】タイトルやbulletsに「Q1」「Q2」「Q3」「Q4」「第1四半期」「第2四半期」など時系列ラベルが複数のスライドに散在していた場合、それは「定期レポートを時系列に並べた構成」になっています。経営層向け資料では、以下のアーク構造が正しい姿です：目的・位置づけ → 主な機能 → 利用状況・KPI → 拡張・連携状況 → セキュリティ・ガバナンス → コスト・投資対効果 → 課題・リスク → ロードマップ → 経営判断が必要な論点。時系列構造を検知した場合、各スライドのtitleをカテゴリ軸に書き直し、bulletsを該当カテゴリに適合した内容に整理してください。「議事郎」などの連携ツールは独立スライドを作らず、「連携・拡張状況」スライドのbulletsに統合すること。
+
+重要: metrics・steps・colorRole・iconKey・layoutType・leadText・callout フィールドは削除しないこと。
+変更不要なスライドはそのまま返すこと。
+
+元タイトル: ${title}
+デザイン指示: ${designInstruction ?? "なし"}
+スライドJSON:
+${JSON.stringify(slides)}
+
+{"slides":[...]} の形式でJSONのみ返してください。`;
+
+    const res = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [{ role: "user", content: prompt }],
+      max_completion_tokens: 8000,
+      response_format: { type: "json_object" },
+    });
+
+    const raw = res.choices[0]?.message?.content ?? "";
+    const parsed = JSON.parse(raw);
+    const refined: RawPptSlide[] = parsed?.slides;
+
+    // 構造検証: スライド数・title・layoutType・bullets が壊れていたら元に戻す
+    if (!Array.isArray(refined) || refined.length === 0) {
+      console.warn("[reviewSlides] empty result, using original");
+      return slides;
+    }
+    if (refined.length < slides.length * 0.7) {
+      console.warn(`[reviewSlides] too few slides (${refined.length} < ${slides.length}), using original`);
+      return slides;
+    }
+    const hasStructure = refined.every(
+      (s) => typeof s.title === "string" && Array.isArray(s.bullets)
+    );
+    if (!hasStructure) {
+      console.warn("[reviewSlides] structure broken, using original");
+      return slides;
+    }
+
+    console.log(`[reviewSlides] refined ${slides.length} → ${refined.length} slides`);
+    return refined.map((s, i) => ({
+      // 元スライドのフィールドをベースに、レビュー結果で上書き（重要フィールドの消失を防ぐ）
+      ...slides[i],
+      ...s,
+      // 空配列はレビュー結果を採用せず元スライドを維持
+      bullets:      (Array.isArray(s.bullets)      && s.bullets.length      > 0) ? s.bullets      : (slides[i]?.bullets      ?? []),
+      metrics:      (Array.isArray(s.metrics)      && s.metrics.length      > 0) ? s.metrics      : slides[i]?.metrics,
+      steps:        (Array.isArray(s.steps)        && s.steps.length        > 0) ? s.steps        : slides[i]?.steps,
+      cards:        (Array.isArray(s.cards)        && s.cards.length        > 0) ? s.cards        : slides[i]?.cards,
+      statCallouts: (Array.isArray(s.statCallouts) && s.statCallouts.length > 0) ? s.statCallouts : slides[i]?.statCallouts,
+      benefits:     (Array.isArray(s.benefits)     && s.benefits.length     > 0) ? s.benefits     : slides[i]?.benefits,
+    }));
+  } catch (e) {
+    console.warn("[reviewSlides] failed, using original slides:", e);
+    return slides;
+  }
+}
+
+/** 各PDFのスライドをタイトル＋bullets のテキストブロックに変換する（経営向け再構築用の事実プール） */
+function buildDocSummaryFromSlides(
+  fileName: string,
+  slides: Array<{ title: string; bullets?: string[] }>
+): string {
+  const lines = [`【${fileName}】`];
+  for (const slide of slides) {
+    lines.push(`■ ${slide.title}`);
+    for (const bullet of (slide.bullets ?? [])) {
+      lines.push(`  ・${bullet}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** 複数PDFのスライドを経営向け9カテゴリに再構築する（per-doc中間要約で情報源を確保） */
+async function restructureSlidesForExecutive(
+  title: string,
+  mergedSlides: RawPptSlide[],
+  perDocSummaries: string[],
+  designInstruction?: string
+): Promise<RawPptSlide[]> {
+  try {
+    const openai = OpenAIInstance();
+    const summaryBlock = perDocSummaries.length > 0
+      ? `\n\n=== 各ドキュメントの中間要約（事実プール）===\n${perDocSummaries.join("\n\n")}\n========================`
+      : "";
+
+    const prompt = `あなたはB2B経営層向けプレゼンテーションの構成エキスパートです。
+複数の四半期レポートや会議録をマージしたスライドJSONと、各PDFの中間要約を受け取り、経営層向けの9カテゴリ構成に再整理してください。${summaryBlock}
+
+再整理ルール:
+1. 以下の9カテゴリ軸でスライドを構成すること:
+   目的・位置づけ → 主な機能 → 利用状況・KPI → 拡張・連携状況 → セキュリティ・ガバナンス → コスト・投資対効果 → 課題・リスク → ロードマップ → 経営判断が必要な論点
+2. 各PDFの中間要約を「事実プール」として扱い、四半期ごとの時系列構造は崩す
+3. 固有名詞・数値・四半期由来の根拠（例: Q1実績◯件、Q3計画）は削除せずカテゴリのbulletsに組み込む
+4. bullets: 各bullet 45〜90文字、1カテゴリあたり3〜5項目（数値・固有名詞は短縮しない）
+5. 情報量を増やす方向で整理すること。圧縮・省略禁止
+6. metrics・steps・colorRole・iconKey・layoutType・leadText・callout フィールドは削除しないこと
+7. 「議事郎」などの連携ツールは独立スライドを作らず「拡張・連携状況」スライドのbulletsに統合すること
+8. すべての文末は「です/ます調」にすること
+
+元タイトル: ${title}
+デザイン指示: ${designInstruction ?? "なし"}
+マージ済みスライドJSON:
+${JSON.stringify(mergedSlides)}
+
+{"slides":[...]} の形式でJSONのみ返してください。`;
+
+    const res = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [{ role: "user", content: prompt }],
+      max_completion_tokens: 10000,
+      response_format: { type: "json_object" },
+    });
+
+    const raw = res.choices[0]?.message?.content ?? "";
+    const parsed = JSON.parse(raw);
+    const restructured: RawPptSlide[] = parsed?.slides;
+
+    if (!Array.isArray(restructured) || restructured.length === 0) {
+      console.warn("[restructureExec] empty result, using original");
+      return mergedSlides;
+    }
+    if (restructured.length < 5) {
+      console.warn(`[restructureExec] too few slides (${restructured.length}), using original`);
+      return mergedSlides;
+    }
+    const hasStructure = restructured.every(
+      (s) => typeof s.title === "string" && Array.isArray(s.bullets)
+    );
+    if (!hasStructure) {
+      console.warn("[restructureExec] structure broken, using original");
+      return mergedSlides;
+    }
+
+    console.log(`[restructureExec] restructured ${mergedSlides.length} → ${restructured.length} slides`);
+    return restructured;
+  } catch (e) {
+    console.warn("[restructureExec] failed, using original slides:", e);
+    return mergedSlides;
+  }
+}
+
+// ---------------- 会社紹介モード ----------------
+
+function detectCompanyProfileMode(
+  title: string,
+  slides: RawPptSlide[],
+  designInstruction?: string
+): boolean {
+  const text = `${title} ${(designInstruction ?? "")}`.toLowerCase();
+  // "機能紹介資料" は製品機能紹介であり会社紹介ではないため除外
+  const hasProfile = /会社紹介|(?<!機能)紹介資料|company profile|初回訪問|初回営業/.test(text);
+  const hasSmallDeck = slides.length <= 10;
+  return hasProfile && hasSmallDeck;
+}
+
+const TITLE_SUFFIXES =
+  /[\s　]*(会社紹介|紹介資料|営業資料|提案書|会社概要|初回訪問|COMPANY\s*PROFILE|Company\s*Profile|プロフィール|Profile)/gi;
+
+function extractCompanyNameFromTitle(title: string): string {
+  const cleaned = title
+    .replace(/（[^）]*）|\([^)]*\)/g, "")
+    .replace(TITLE_SUFFIXES, "")
+    .trim();
+
+  const quoted = cleaned.match(/[「『"']([^」』"']{2,20})[」』"']/)?.[1];
+  if (quoted) return quoted;
+
+  // 株式会社などのプレフィックスを除去してから先頭語を返す
+  const noPrefix = cleaned.replace(/^(株式会社|有限会社|合同会社|（株）|\(株\))\s*/, "");
+  return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
+}
+
+// ---------------- Python レンダラー経由 PowerPoint 生成 ----------------
+
+async function executeCreatePptxPython(
   args: {
     title: string;
-    slides: Array<{
-      title: string;
-      bullets: string[];
-      layoutType?: string;
-      columns?: Array<{ header: string; bullets: string[] }>;
-      tableRows?: string[][];
-    }>;
-    proposalMode?: boolean;
-    fontFace?: string;
+    slides: RawPptSlide[];
+    palette: string;
     designInstruction?: string;
   },
   chatThread: ChatThreadModel
 ) {
-  const { title, slides, proposalMode, fontFace, designInstruction } = args ?? {};
+  const { title, slides, palette, designInstruction } = args;
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/gen-pptx-profile`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title,
+        slides: (slides ?? []).map((s) => ({
+          title:      s.title,
+          bullets:    Array.isArray(s.bullets) ? s.bullets : [],
+          layoutType: s.layoutType,
+          leadText:   s.leadText,
+          callout:    s.callout,
+          metrics:    s.metrics,
+          steps:      s.steps,
+          benefits:   s.benefits,
+          subtitle:   s.subtitle,
+        })),
+        palette,
+        designInstruction,
+        threadId: chatThread.id,
+        fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[create_pptx_py] gen-pptx-profile failed:", res.status, t);
+      return { error: `PowerPoint生成に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    console.log(`[create_pptx_py] palette=${result.palette} → ${result.fileName}`);
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName:    result.fileName,
+      displayName: generatePptxDisplayName(title),
+      palette:     result.palette,
+      message:     "PowerPoint file created successfully.",
+    };
+  } catch (e: any) {
+    console.error("[create_pptx_py] error:", e);
+    return { error: "PowerPoint生成中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- PowerPoint 生成 ----------------
+
+function generatePptxDisplayName(title: string): string {
+  const clean = title
+    .replace(/（[^）]*）|\([^)]*\)/g, "")
+    .replace(/[\\/:*?"<>|【】「」『』〔〕]/g, "")
+    .replace(/\s+/g, "")
+    .trim()
+    .slice(0, 30);
+  return `${clean || "プレゼンテーション"}.pptx`;
+}
+
+async function executeCreatePptx(
+  args: {
+    title: string;
+    slides: RawPptSlide[];
+    proposalMode?: boolean;
+    fontFace?: string;
+    designInstruction?: string;
+    palette?: string;
+  },
+  chatThread: ChatThreadModel,
+  userMessage?: string
+) {
+  const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
   }
 
-  // 提案書モード: サーバー側でスライドを12〜16枚に展開（SP文書をRAGとして活用）
-  let finalSlides = slides;
-  if (proposalMode) {
+  // PromptIntent を finalSlides 生成前に解析し、以降のプロンプトへ伝搬する
+  const intentSource = [designInstruction ?? "", title, userMessage ?? ""].filter(Boolean).join(" ");
+  const promptIntent = parsePromptIntent(intentSource);
+  const ld = promptIntent.layoutDirectives;
+  console.log(
+    `[PromptIntent] purpose=${promptIntent.documentPurpose} audience=${promptIntent.audience} ` +
+    `freedom=${promptIntent.designFreedom} twoCol=${!!ld.preferTwoColumn} tables=${!!ld.includeTables} ` +
+    `metrics=${!!ld.preferMetrics} process=${!!ld.preferProcess}` +
+    (promptIntent.colorDirectives?.primary ? ` colors=${promptIntent.colorDirectives.primary}/${promptIntent.colorDirectives.accent ?? "?"}` : "")
+  );
+
+  // layoutDirectives をデザイン指示文に追加してスライド設計 LLM に伝搬
+  const layoutHints: string[] = [];
+  if (ld.preferTwoColumn) layoutHints.push("2列レイアウト(multi-column)を少なくとも1枚含めること");
+  if (ld.includeTables)   layoutHints.push("表形式(table)のスライドを少なくとも1枚含めること");
+  if (ld.preferMetrics)   layoutHints.push("数値・KPIを強調するmetric-cardsを使うこと");
+  if (ld.preferProcess)   layoutHints.push("手順・フローにはprocess-cardsまたはtimelineを使うこと");
+  if (ld.avoidBulletOnly) layoutHints.push("箇条書きのみのスライドが連続しないようレイアウトを変化させること");
+  const layoutHintText = layoutHints.length > 0 ? `【レイアウト要件】${layoutHints.join("。")}` : "";
+
+  const searchQuery = buildPptxSearchQuery(title, slides);
+  let finalSlides: RawPptSlide[] = slides;
+
+  // ★ SharePoint 参照検出: "SharePointにある〇〇を参考に" パターンがあればSP優先
+  const spDocQuery = userMessage ? extractSharePointDocQuery(userMessage) : null;
+  if (spDocQuery) {
+    const spContent = await searchSpForPptxContent(spDocQuery);
+    if (spContent) {
+      finalSlides = await enrichSlidesWithDocContent(slides, spContent, title, userMessage ?? "");
+    }
+  } else if (proposalMode) {
+    // 提案書モード: 12〜16枚展開（Brave snippetのみ継続使用）
+    let webContext = "";
+    if (searchQuery) {
+      webContext = await searchBrave(searchQuery);
+    }
     const session = await userSession();
     const deptLower = (session?.slDept ?? "others").toLowerCase().trim();
-    finalSlides = await expandToProposalSlides(title, slides, designInstruction, deptLower);
+    finalSlides = await expandToProposalSlides(title, slides, designInstruction, deptLower, webContext);
+  } else if (!proposalMode && detectCompanyProfileMode(title, slides, designInstruction)) {
+    // 会社紹介モード: Web事実収集 → CompanyBrief構築 → LLMスライド設計
+    const companyName = extractCompanyNameFromTitle(title);
+    const query = companyName
+      ? `${companyName} 会社概要 事業内容 実績`
+      : (searchQuery || `${title} 会社概要 事業内容`);
+    console.log("[create_pptx] company profile mode — collectWebEvidence:", query);
+    const evidence = await collectWebEvidence(query);
+    const brief = await buildCompanyBrief(companyName, userMessage ?? "", title, evidence);
+    console.log(`[create_pptx] brief built: areas=${brief.businessAreas.length} strengths=${brief.strengths.length} metrics=${brief.metrics.length} outline=${brief.recommendedSlideOutline.length}`);
+    const planned = await planCompanyProfileSlides(
+      title, brief, userMessage ?? "", designInstruction
+    );
+    if (planned.length > 0) {
+      finalSlides = planned;
+    } else {
+      // フォールバック: スニペットでregex補完
+      const snippetContext = evidence.snippets;
+      if (snippetContext) finalSlides = await enrichSlidesWithWebData(slides, snippetContext);
+    }
+  } else if (searchQuery) {
+    // 通常モード: Brave snippetでregex補完
+    const webContext = await searchBrave(searchQuery);
+    if (webContext) finalSlides = await enrichSlidesWithWebData(slides, webContext);
   }
 
-  // Each PPT creation is independent — do not accumulate style from thread history.
+  // LLMレビュー: スライド内容を見直して不自然な箇所を修正（layoutHintText でレイアウト要件を伝搬）
+  const reviewInstruction = [designInstruction, layoutHintText].filter(Boolean).join(" / ");
+  finalSlides = await reviewAndRefineSlides(title, finalSlides, reviewInstruction);
+
   const explicitInstruction = designInstruction?.trim() ||
     (proposalMode
       ? "提案書スタイル：課題→解決策→根拠→効果の流れを視覚的に表現。濃紺ベース、見出しは白抜き太字、重要数値は大きく強調。スライドごとにレイアウトを変化させ、比較スライドは表形式、プロセスはフロー図で表現すること。"
@@ -1825,15 +3252,29 @@ async function executeCreatePptx(
         title,
         slides: (finalSlides ?? []).map((s) => ({
           title: s.title,
-          bullets: s.bullets,
-          ...(s.layoutType ? { layoutType: s.layoutType } : {}),
-          ...(s.columns ? { columns: s.columns } : {}),
-          ...(s.tableRows ? { tableRows: s.tableRows } : {}),
+          bullets: Array.isArray(s.bullets) ? s.bullets : [],
+          ...(s.layoutType    ? { layoutType: s.layoutType }       : {}),
+          ...(s.columns       ? { columns: s.columns }             : {}),
+          ...(s.tableRows     ? { tableRows: s.tableRows }         : {}),
+          ...(s.leadText      ? { leadText: s.leadText }           : {}),
+          ...(s.metrics       ? { metrics: s.metrics }             : {}),
+          ...(s.callout       ? { callout: s.callout }             : {}),
+          ...(s.subtitle      ? { subtitle: s.subtitle }           : {}),
+          ...(s.steps         ? { steps: s.steps }                 : {}),
+          ...(s.benefits      ? { benefits: s.benefits }           : {}),
+          ...(s.cards         ? { cards: s.cards }                 : {}),
+          ...(s.statCallouts  ? { statCallouts: s.statCallouts }   : {}),
+          ...(s.visualIntent  ? { visualIntent: s.visualIntent }   : {}),
+          ...(s.density       ? { density: s.density }             : {}),
+          ...(s.textTreatment ? { textTreatment: s.textTreatment } : {}),
         })),
         threadId: chatThread.id,
         fontFace,
         designInstruction: explicitInstruction,
         deckPreferences,
+        fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
+        promptIntent,
+        ...(palette ? { palette } : {}),
       }),
     });
 
@@ -1851,6 +3292,7 @@ async function executeCreatePptx(
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
+      displayName: generatePptxDisplayName(title),
       message: "PowerPoint file created successfully.",
     };
   } catch (e: any) {
@@ -1908,7 +3350,7 @@ async function executeConvertDocToPptx(
       const mergedSlides: Array<{
         title: string;
         bullets: string[];
-        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
+        layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation" | "stat_callouts" | "card_grid" | "icon_rows" | "metric-cards" | "process-cards" | "timeline" | "company-overview" | "closing";
         tableRows?: string[][];
         columns?: Array<{ header: string; bullets: string[] }>;
         conversationStyle?: "chat-ui" | "interview" | "dialog-list";
@@ -1920,6 +3362,7 @@ async function executeConvertDocToPptx(
         }>;
       }> = [];
       let mergedTotalPages = 0;
+      const perDocSummaries: string[] = [];
 
       for (const currentFileUrl of sourceFileUrls) {
         const resolvedFileUrl = await resolveDocumentUrlForVision(
@@ -1939,6 +3382,10 @@ async function executeConvertDocToPptx(
 
         mergedSlides.push(...analyzeResult.slides);
         mergedTotalPages += analyzeResult.totalPages ?? analyzeResult.slides.length;
+        perDocSummaries.push(buildDocSummaryFromSlides(
+          extractFileNameFromDocumentUrl(currentFileUrl) ?? currentFileUrl,
+          analyzeResult.slides
+        ));
       }
 
       const mergedTitle =
@@ -1960,17 +3407,40 @@ async function executeConvertDocToPptx(
         slideCount: mergedSlides.length,
       });
 
+      // 複数ドキュメントのマージ後: 経営向け再構築（四半期時系列ではなくカテゴリ軸に整理）
+      const isExecutiveContext =
+        /経営|役員|幹部|経営層|executive|management/i.test(
+          [mergedTitle, designInstruction ?? ""].join(" ")
+        ) ||
+        (sourceFileUrls.length >= 2 &&
+          /Q[1-4]|[1-4]Q|第[1-4]四半期|四半期|report|議事録|会議録/i.test(
+            sourceFileUrls.join(" ")
+          ));
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let finalMergedSlides: any[] = mergedSlides;
+      if (mode !== "faithful" && isExecutiveContext && mergedSlides.length > 4) {
+        console.log("[convert_doc_to_pptx] Executive context detected — running restructure pass");
+        finalMergedSlides = await restructureSlidesForExecutive(
+          mergedTitle,
+          mergedSlides as unknown as RawPptSlide[],
+          perDocSummaries,
+          designInstruction
+        );
+      }
+
       const pptxRes = await fetch(`${baseUrl}/api/gen-pptx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           title: mergedTitle,
-          slides: mergedSlides,
+          slides: finalMergedSlides,
           threadId: chatThread.id,
           fontFace,
           designInstruction: deckPreferences.designInstruction,
           deckPreferences,
           mode,
+          fileBaseName: generatePptxDisplayName(mergedTitle).replace(/\.pptx$/i, ""),
         }),
       });
 
@@ -1988,6 +3458,7 @@ async function executeConvertDocToPptx(
       return {
         downloadUrl: pptxResult.downloadUrl,
         fileName: pptxResult.fileName,
+        displayName: generatePptxDisplayName(mergedTitle),
         totalPages: mergedTotalPages,
         message: `${sourceFileUrls.length}件の資料をまとめて${mergedTotalPages}ページ分を解析し、PowerPointを生成しました。`,
       };
@@ -2049,6 +3520,7 @@ async function executeConvertDocToPptx(
         designInstruction: deckPreferences.designInstruction,
         deckPreferences,
         mode,
+        fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
       }),
     });
 
@@ -2066,6 +3538,7 @@ async function executeConvertDocToPptx(
     return {
       downloadUrl: pptxResult.downloadUrl,
       fileName: pptxResult.fileName,
+      displayName: generatePptxDisplayName(title),
       totalPages,
       message: `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
     };
@@ -2075,19 +3548,78 @@ async function executeConvertDocToPptx(
   }
 }
 
+// ---------------- editLabel 抽出ヘルパー ----------------
+function buildEditLabel(instruction: string): string {
+  const cleaned = instruction.replace(/https?:\/\/\S+/g, "").replace(/（[^）]*）|\([^)]*\)/g, "");
+
+  // ロゴ（画像URLがある場合も含む）
+  if (/ロゴ|logo/i.test(instruction)) return "ロゴ追加";
+  // 画像
+  if (/画像|写真|イラスト|image|photo/i.test(cleaned)) return "画像追加";
+  // 色・カラー + 具体的な色名（「文字色」「タイトル文字を赤に」も色変更として扱うため先に判定）
+  if (/色|カラー|color|青|赤|緑|黄|白|黒|紫|オレンジ|ピンク|グレー|グリーン|ブルー|レッド/i.test(cleaned)) return "色変更";
+  // フォント・フォントサイズ
+  if (/フォント|font|文字サイズ|字体/i.test(cleaned)) return "フォント変更";
+  // 文言・テキスト・文字変更
+  if (/文言|テキスト|文字|コピー|見出し|タイトル|本文/i.test(cleaned)) return "文言修正";
+  // レイアウト・構成
+  if (/レイアウト|配置|構成|並び|整列|スライド追加|ページ追加/i.test(cleaned)) return "レイアウト変更";
+
+  // フォールバック: 応答文語句を除去して短縮
+  const stripped = cleaned
+    .slice(0, 40)
+    .replace(/以下|変更|行った|行いました|対応しました|確認ください|してください|して下さい|お願いします|てください|ください|します|しました|している|する|した/g, "")
+    .replace(/[をにがはでのへとからまで（）()、。！!？?\s　]/g, "")
+    .trim();
+  return stripped.slice(0, 8) || "編集済み";
+}
+
 // ---------------- 既存 PPTX 改良 ----------------
 async function executeEditPptx(
-  args: { fileUrl?: string; instruction: string },
+  args: { fileUrl?: string; instruction: string; imageUrl?: string },
   chatThread: ChatThreadModel
 ) {
-  let { fileUrl, instruction } = args ?? {};
+  let { fileUrl, instruction, imageUrl: argImageUrl } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
 
+  // 画像URL解決: LLMがimageUrlを省略した場合のフォールバック
+  // ロゴ/画像/添付の指示 かつ instruction にURLがない場合、スレッド最新アップロード画像URLを自動注入
+  const needsImageUrl = /ロゴ|logo|画像|写真|添付|イラスト|image|photo/i.test(instruction);
+  const resolvedImageUrl = argImageUrl?.trim() ||
+    (needsImageUrl && !/https?:\/\//.test(instruction)
+      ? (await resolveLatestImageUrlFromThread(chatThread.id)) ?? ""
+      : "");
+  if (resolvedImageUrl && !/https?:\/\//.test(instruction)) {
+    instruction = `${resolvedImageUrl} ${instruction.trim()}`;
+  }
+
+  // ── 未対応操作の早期検出 ──────────────────────────────────────────────────
+  // edit_pptx で実行できない操作が含まれる場合は即座に返却し、
+  // LLMが「対応済み」と虚偽表示するのを防ぐ。
+  const UNSUPPORTED_EDIT_PATTERNS: { re: RegExp; label: string }[] = [
+    { re: /(?:新規|新しい|空白)?スライド(?![にへ上右左下])[^。、\n]{0,6}(追加|挿入)|(?:新規|新しい|空白)?ページ(?![にへ上右左下])[^。、\n]{0,6}(追加|挿入)|(追加|挿入)[^。、\n]{0,6}(?:新規|新しい|空白)?スライド/, label: "スライド追加・挿入" },
+    { re: /空白.{0,8}スライド|空.{0,4}スライド|スライド.{0,4}空白|P\d+.{0,6}空|本文.{0,8}追加|箇条書き.{0,8}追加/, label: "空白スライドへの本文・箇条書き追加" },
+    { re: /フォントサイズ|\d+\s*pt|\d+\s*ポイント|タイトル.{0,6}サイズ|文字.{0,4}(大き|小さ|サイズ)/, label: "フォントサイズ変更" },
+    { re: /レイアウト.{0,6}最適化|重なり.{0,4}解消|配置.{0,4}(修正|変更|調整)|再レイアウト|位置.{0,4}調整/, label: "レイアウト最適化・shape移動" },
+    { re: /スピーカーノート|ノート.{0,4}(追加|冒頭|末尾|記録)|speaker\s*note/i, label: "スピーカーノート追加" },
+    { re: /再構成|作り直し|内容.{0,6}(整理|再生成|分離)|全体.{0,6}(見直し|修正|再生成)|を分ける|を分離/, label: "内容の再構成・作り直し" },
+  ];
+  const unsupportedFound = UNSUPPORTED_EDIT_PATTERNS.filter(({ re }) => re.test(instruction));
+  if (unsupportedFound.length > 0) {
+    const labels = unsupportedFound.map((u) => u.label).join("、");
+    return {
+      error: `この編集は既存PPTX編集では対応できません。PPTXを再生成する必要があります。\n\n未対応の要求: ${labels}\n\n対応可能な編集: ロゴ・画像挿入、アクセントカラー変更、既存文字列の置換`,
+    };
+  }
+
+  // Markdownリンクの表示名を優先取得（fileUrl + displayName を一括解決）
+  const originalFileUrl = fileUrl?.trim() ?? "";
+  const threadPptxInfo = await resolveLatestPptxInfoFromThread(chatThread.id);
   if (!fileUrl?.trim()) {
-    fileUrl = (await resolveLatestPptxUrlFromThread(chatThread.id)) ?? "";
+    fileUrl = threadPptxInfo?.url ?? "";
   }
 
   if (!fileUrl?.trim()) {
@@ -2096,6 +3628,28 @@ async function executeEditPptx(
         "編集対象のPPTXが見つかりませんでした。このスレッドでPPTXを生成するか、PPTのURLを指定してください。",
     };
   }
+
+  const editLabel = buildEditLabel(instruction);
+
+  // 元ファイル名: Markdownリンクの表示名は fileUrl が一致する場合のみ使用
+  // SASクエリは異なっても同一Blobなら一致とみなすため origin + pathname(decode) で比較する
+  const blobKey = (u: string) => { try { const p = new URL(u); return (p.origin + decodeURIComponent(p.pathname)).toLowerCase(); } catch { return u; } };
+  const isSameAsThreadPptx = !originalFileUrl || blobKey(originalFileUrl) === blobKey(threadPptxInfo?.url ?? "");
+  const inputBaseName = (isSameAsThreadPptx ? threadPptxInfo?.displayName : null) ??
+    (() => {
+      try {
+        const urlPath = new URL(fileUrl).pathname;
+        const decoded = decodeURIComponent(urlPath.split("/").pop() ?? "");
+        const base = decoded
+          .replace(/\.[^.]+$/, "")
+          .replace(/_edited_[A-Za-z0-9]{6,12}$/i, "")
+          .replace(/_[A-Za-z0-9]{6,12}$/, "")
+          .trim();
+        return /^pptx$/i.test(base) ? "" : base;
+      } catch { return ""; }
+    })();
+
+  const outputBaseName = inputBaseName ? `${inputBaseName}_${editLabel}` : editLabel;
 
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
@@ -2106,7 +3660,7 @@ async function executeEditPptx(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id, outputBaseName }),
     });
 
     if (!res.ok) {
@@ -2128,9 +3682,12 @@ async function executeEditPptx(
           : `⚠️ ${result.imageWarning}`
         : "";
 
+    const editDisplayName = `${outputBaseName}.pptx`;
+
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
+      displayName: editDisplayName,
       changedSlides: result.changedSlides,
       totalSlides: result.totalSlides,
       message: imageMessage ? `${baseMessage} ${imageMessage}` : baseMessage,
@@ -2626,6 +4183,7 @@ async function executeConvertSpToPptx(
         threadId: chatThread.id,
         deckPreferences: {},
         mode,
+        fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
       }),
     });
 
@@ -2643,6 +4201,7 @@ async function executeConvertSpToPptx(
     return {
       downloadUrl: pptxResult.downloadUrl,
       fileName: pptxResult.fileName,
+      displayName: generatePptxDisplayName(title),
       totalPages,
       message: `SharePointの「${fileName}」（${totalPages}ページ）をPowerPointに変換しました。`,
     };
