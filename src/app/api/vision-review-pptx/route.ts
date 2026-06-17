@@ -23,6 +23,15 @@ const ALLOWED_SLIDE_FIELDS = new Set([
   "regenerateStyle",
   "title",
   "callout",
+  // テキスト収まり系 (対応2)
+  "fitTextToShape",
+  "fontScaleDown",
+  "trimText",
+  // アイテムグループ整合系 (対応2)
+  "syncItemDecorations",
+  "copyItemDecoration",
+  "alignItemGroup",
+  "fallbackLayout",
 ]);
 
 export type VisionFix =
@@ -61,6 +70,20 @@ export type VisionFix =
       field: "metrics.colorRole";
       itemIndex: number;
       value: "primary" | "accent" | "neutral";
+      reason?: string;
+    }
+  | {
+      slideIndex: number;
+      /** テキスト overflow / poorFit 系の修正アクション */
+      field: "fitTextToShape" | "fontScaleDown" | "trimText" | "fallbackLayout";
+      value: string; // fontScaleDown="0.85", trimText="<短縮版テキスト>", fallbackLayout="bullets"
+      reason?: string;
+    }
+  | {
+      slideIndex: number;
+      /** アイテムグループ（カード+アイコン+テキスト）整合系 */
+      field: "syncItemDecorations" | "copyItemDecoration" | "alignItemGroup";
+      value: string; // "true" or 対象グループの説明
       reason?: string;
     };
 
@@ -159,21 +182,57 @@ async function reviewWithVision(
   }));
 
   const systemPrompt = [
-    "You are a QA reviewer for B2B Japanese corporate presentations.",
+    "You are a QA reviewer for B2B Japanese corporate presentations rendered with Meiryo font.",
     "Your ONLY job is to detect VISIBLE DEFECTS that users would complain about.",
     "Do NOT suggest micro-adjustments to slides that look acceptable.",
     "",
-    "DEFECT CHECKLIST — only flag these:",
-    "1. TEXT/SHAPE OVERLAP: Any text box or shape visibly colliding with another element.",
-    "2. OVERFLOW/CLIPPING: Text or shapes cut off at slide edges.",
-    "3. EMPTY BOTTOM HALF: Slide has significant whitespace in the bottom 40% with content only at top.",
-    "4. TEXT-ONLY SLIDE: No icons, shapes, charts, or visual elements — pure text bullets. CRITICAL defect.",
-    "5. CENTERED BODY TEXT: Body text is center-aligned (only titles should be centered).",
-    "6. FULL-WIDTH COLOR BAND: A horizontal color bar spanning the full slide width (header or footer).",
-    "7. NUMBERS IN TEXT: Numeric data (%, counts, dates) presented as plain text instead of a visual.",
-    "8. LAYOUT TYPE MISMATCH: 3+ items that would clearly work better as cards/icons/chart.",
+    "DEFECT CHECKLIST — check in priority order:",
+    "== TIER 1: OVERFLOW / OVERLAP (highest priority — always fix) ==",
+    "1. TEXT OVERFLOW: Text visibly extends beyond its containing box, card, or slide edge.",
+    "   Note: Meiryo is wide — full-width Japanese chars overflow boxes that look OK with other fonts.",
+    "2. TEXT/SHAPE OVERLAP: Text or shapes visibly collide with another element or icon.",
+    "3. POOR FIT (poorFit): Long text crammed into a small card/KPI box — text is illegible or truncated.",
+    "   Common pattern: summary/stat layout where right-side KPI cards have multi-line explanations.",
+    "4. IMBALANCED LAYOUT: One side of a two-column layout is empty/sparse while the other is over-packed.",
     "",
-    "When you detect a layout-type defect (items 4, 7, 8), output a layoutType fix:",
+    "== TIER 2: MISSING ITEM DECORATIONS (after bullet/item additions) ==",
+    "5. ITEM DECORATION MISMATCH: Text items were added without corresponding background cards or icons,",
+    "   while other items in the same slide have full card+icon+text groups.",
+    "   This looks like: 3 items with cards/icons, 1 item with text only — clearly inconsistent.",
+    "",
+    "== TIER 3: STRUCTURAL / LAYOUT DEFECTS ==",
+    "6. EMPTY BOTTOM HALF: Significant whitespace in the bottom 40% with content only at top.",
+    "7. TEXT-ONLY SLIDE: No icons, shapes, charts, or visual elements — pure text bullets. CRITICAL.",
+    "8. NUMBERS IN TEXT: Numeric data (%, counts, dates) as plain text instead of a visual.",
+    "9. LAYOUT TYPE MISMATCH: 3+ items clearly better as cards/icons/chart.",
+    "",
+    "FIX MAPPING:",
+    "- Tier 1 overflow/poorFit → PRIORITY ORDER (follow this order strictly):",
+    "  1st. fitTextToShape (value='true'): auto-shrinks text into its box — NO content loss, NO layout change.",
+    "  2nd. fontScaleDown (value='0.85'): reduces font size slightly — preserves ALL decorations/layout.",
+    "  3rd. trimText (value='<shortened text>'): only if content is genuinely too long to fit even at 0.75x.",
+    "  LAST RESORT: fallbackLayout — only if none of the above can fix the overflow.",
+    "    · If slide has icon/card layout (icon_rows, card_grid, etc.), use 'icon_rows' or 'card_grid' as fallback value.",
+    "    · 'fallbackLayout=bullets' is FORBIDDEN for slides that currently have icons, cards, or background shapes.",
+    "    · A slide becoming plain text with no icons/cards is a quality DEFECT, not an improvement.",
+    "- Tier 1 imbalanced → use 'trimText' for over-packed side",
+    "- Tier 2 decoration mismatch → use 'syncItemDecorations' (value='true') or 'copyItemDecoration'",
+    "- Tier 3 layout → use 'layoutType' fix (NEVER change to 'bullets' if slide has icons/cards)",
+    "- Tier 3 stat/bullets → use 'bullets' or 'steps' fix",
+    "- Whitespace only → use 'density' fix",
+    "",
+    "DECORATION PRESERVATION (critical — applies to ALL fix types):",
+    "- NEVER suggest any fix that would remove icon images, icon circles (ellipse), or background card shapes.",
+    "- If overflow exists on a slide with icon+card layout, use fitTextToShape or fontScaleDown first.",
+    "- A slide going from 'icon_rows'/'card_grid' to plain text bullets is a quality REGRESSION.",
+    "- 'layoutType=bullets' and 'fallbackLayout=bullets' are both FORBIDDEN for decorated slides.",
+    "",
+    "CRITICAL RULE — density prohibition:",
+    "If overflow / overlap / poorFit is present, DO NOT return 'density'.",
+    "'density' is for whitespace adjustment ONLY — it does NOT fix text overflow or poor fit.",
+    "Returning density for overflow is a false fix that will not resolve the visual problem.",
+    "",
+    "When you detect a layout-type defect (items 7, 8, 9), output a layoutType fix:",
     "- Bullet-only with numbers → layoutType='stat_callouts' (provide statCallouts data in bullets as 'value|unit|label' triplets)",
     "- 3-6 parallel items without visuals → layoutType='card_grid'",
     "- Process/capability list → layoutType='icon_rows'",
@@ -182,6 +241,13 @@ async function reviewWithVision(
     '{"deckScore": <0-100>, "fixes": [<fix>, ...]}',
     "",
     "Each <fix> must be EXACTLY one of these forms:",
+    '{"slideIndex":<n>, "field":"fitTextToShape", "value":"true", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"fontScaleDown", "value":"0.85", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"trimText", "value":"<shortened text>", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"fallbackLayout", "value":"bullets", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"syncItemDecorations", "value":"true", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"copyItemDecoration", "value":"true", "reason":"..."}',
+    '{"slideIndex":<n>, "field":"alignItemGroup", "value":"true", "reason":"..."}',
     '{"slideIndex":<n>, "field":"layoutType", "value":"stat_callouts"|"card_grid"|"icon_rows"|"bullets"|"process-cards"|"table"|"multi-column", "reason":"..."}',
     '{"slideIndex":<n>, "field":"bullets", "value":"bullet1|bullet2|bullet3", "reason":"..."}',
     '{"slideIndex":<n>, "field":"steps", "value":"タイトル1:説明1|タイトル2:説明2", "reason":"..."}',
@@ -243,8 +309,18 @@ async function reviewWithVision(
   }
 
   const rawFixes: any[] = Array.isArray(parsed.fixes) ? parsed.fixes : [];
+  // overflow系 field が存在するスライドでは density を除外（density 禁止ルールの後段実施）
+  const overflowFields = new Set(["fitTextToShape", "fontScaleDown", "trimText", "syncItemDecorations", "copyItemDecoration", "alignItemGroup", "fallbackLayout"]);
+  const slidesWithOverflowFix = new Set<number>(
+    rawFixes.filter((f) => overflowFields.has(f.field) && typeof f.slideIndex === "number").map((f) => f.slideIndex as number)
+  );
   const validFixes: VisionFix[] = rawFixes.filter((f) => {
     if (typeof f.slideIndex !== "number" || typeof f.field !== "string") return false;
+    // density 禁止: overflow fix があるスライドでは density を除外
+    if (f.field === "density" && slidesWithOverflowFix.has(f.slideIndex)) {
+      console.log(`[vision-review] density suppressed for slide ${f.slideIndex} (overflow fix present)`);
+      return false;
+    }
     if (f.field === "metrics.colorRole") {
       return typeof f.itemIndex === "number" && ["primary", "accent", "neutral"].includes(f.value);
     }
@@ -255,7 +331,6 @@ async function reviewWithVision(
       return f.slideIndex === -1 && typeof f.value === "string" && f.value.trim().length > 0;
     }
     if (f.field === "bullets" || f.field === "steps") {
-      // パイプ区切り文字列で中身があること
       return typeof f.value === "string" && f.value.trim().length > 0;
     }
     return ALLOWED_SLIDE_FIELDS.has(f.field) && typeof f.value === "string";

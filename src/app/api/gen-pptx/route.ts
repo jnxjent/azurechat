@@ -138,26 +138,12 @@ export type PptxConversationTurn = {
   turnIndex: number;
 };
 
-export type PptxStatCallout = {
-  value: string;   // 表示数値 (例: "94")
-  unit: string;    // 単位   (例: "%", "名", "億円")
-  label: string;   // 説明ラベル (例: "顧客満足度")
-};
-
-export type PptxCard = {
-  iconKey?: string;
-  heading: string;
-  body: string;
-  statusLabel?: string;  // ステータスピル用 (例: "導入済", "計画中")
-};
-
 export type PptxSlide = {
   title: string;
   bullets: string[];
   layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation"
              | "company-overview" | "process-cards" | "closing"
-             | "metric-cards" | "timeline"
-             | "stat_callouts" | "card_grid" | "icon_rows" | "roadmap";
+             | "metric-cards" | "timeline";
   tableRows?: string[][];
   columns?: PptxColumn[];
   visualBlocks?: PptxVisualBlock[];
@@ -172,10 +158,6 @@ export type PptxSlide = {
   subtitle?: string;
   steps?: PptxStep[];
   benefits?: string[];
-  // stat_callouts — 数字3つ大きく表示
-  statCallouts?: PptxStatCallout[];
-  // card_grid / icon_rows — アイコン+見出し+本文カード
-  cards?: PptxCard[];
   // LLMデザイン判断フィールド
   visualIntent?: string;
   density?: "low" | "medium" | "high";
@@ -321,7 +303,7 @@ const DEFAULT_PALETTES: Record<string, Palette> = {
   forest: { canvas: "F0F7F4", surface: "FFFFFF", titleBg: "1B4D3E", headerBg: "256B53", accentA: "2E8B68", accentB: "5DB89A", headerText: "FFFFFF", bodyText: "162E25", mutedText: "4A7265", sectionBg: "E8F5F0", tableHeaderBg: "2E8B68", tableHeaderText: "FFFFFF", tableAltBg: "F0FAF5", border: "C8E8DC" },
   forestBalanced: { canvas: "F7F8F6", surface: "FFFFFF", titleBg: "183F34", headerBg: "245447", accentA: "1F8A70", accentB: "2E86AB", headerText: "FFFFFF", bodyText: "172B25", mutedText: "61736D", sectionBg: "EEF3F0", tableHeaderBg: "1F8A70", tableHeaderText: "FFFFFF", tableAltBg: "F4F7F5", border: "D7E0DC" },
   // 役員向け提案書: navy × orange × gray（お手本ベース）
-  executiveProposal: { canvas: "FFFFFF", surface: "F4F5F8", titleBg: "13294B", headerBg: "13294B", accentA: "13294B", accentB: "F5821F", headerText: "FFFFFF", bodyText: "1D2435", mutedText: "6B7488", sectionBg: "EEF2F9", tableHeaderBg: "13294B", tableHeaderText: "FFFFFF", tableAltBg: "F7F8FB", border: "D9E0EC" },
+  executiveProposal: { canvas: "FFFFFF", surface: "F4F5F8", titleBg: "13294B", headerBg: "13294B", accentA: "13294B", accentB: "FF8C1A", headerText: "FFFFFF", bodyText: "1D2435", mutedText: "6B7488", sectionBg: "FFE6CC", tableHeaderBg: "13294B", tableHeaderText: "FFFFFF", tableAltBg: "F7F8FB", border: "D9E0EC" },
 };
 
 // ─── 固定パレット（決め打ち1パターン）────────────────────────────────────────
@@ -334,14 +316,14 @@ const PALETTE = {
   main:       "13294B",  // 濃紺の帯・章扉・濃色背景
   bg:         "FFFFFF",  // 本文スライドのベース背景（白）
   card:       "FFFFFF",  // カード/ボックスの塗り
-  accent:     "F5821F",  // 重要・強調・CTA（明るいオレンジ）← 1か所で調整
-  accent_bg:  "EEF2F9",  // 薄い強調ボックス（クリーム禁止）
+  accent:     "FF8C1A",  // 重要・強調・CTA（明るいオレンジ）← 1か所で調整（Python側と同期）
+  accent_bg:  "FFE6CC",  // 薄いオレンジの強調ボックス（Python側と同期）
   sub:        "6B7488",  // 補助・補足テキスト・枠線
   border:     "E4E8F0",  // 区切り線・細枠
 } as const;
 
-// ヘッダースタイル: 全幅バンド禁止 — 常に左アクセントバー+テキストのみ
-const STRICT_HEADER_STYLE = "minimal" as const;
+// タイトル帯スタイル: 常に塗りつぶし（紺背景＋白文字）
+const STRICT_HEADER_STYLE = "band" as const;
 
 // ── 5パレット定義（gen_pptx_profile.py の PALETTES と役割キーを同期） ───────
 // 役割キー: main / accent / accent_light / main_light / text_muted
@@ -349,7 +331,7 @@ const STRICT_HEADER_STYLE = "minimal" as const;
 const PPTX_PALETTES: Record<string, {
   main: string; accent: string; accent_light: string; main_light: string; text_muted: string;
 }> = {
-  navy_orange:    { main: "13294B", accent: "F5821F", accent_light: "EEF2F9", main_light: "E4E8F0", text_muted: "6B7488" },
+  navy_orange:    { main: "13294B", accent: "FF8C1A", accent_light: "FFE6CC", main_light: "E4E8F0", text_muted: "6B7488" },
   forest_amber:   { main: "1B4D3E", accent: "F4A300", accent_light: "FBEFD5", main_light: "E3EDE8", text_muted: "5E6E66" },
   burgundy_gold:  { main: "8C1D18", accent: "E0A33B", accent_light: "F7ECD6", main_light: "F3E5E4", text_muted: "6E5A58" },
   teal_coral:     { main: "0E4D5C", accent: "EE6C4D", accent_light: "FBE6DE", main_light: "DCE9EC", text_muted: "5A6B70" },
@@ -521,73 +503,6 @@ function isVividOrange(hex: string): boolean {
   return h >= 20 && h <= 45 && lum > 0.28; // 明るすぎるオレンジ
 }
 
-// ─── セマンティックカラートークン ─────────────────────────────────────────────
-// tint = 白と混合（ratio 0=原色 〜 1=白）/ shade = 黒と混合（ratio 0=原色 〜 1=黒）
-
-function tintHex(hex: string, ratio: number): string {
-  const ch = (off: number) => Math.round(parseInt(hex.slice(off, off + 2), 16) + (255 - parseInt(hex.slice(off, off + 2), 16)) * ratio);
-  return [ch(0), ch(2), ch(4)].map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
-}
-
-function shadeHex(hex: string, ratio: number): string {
-  const ch = (off: number) => Math.round(parseInt(hex.slice(off, off + 2), 16) * (1 - ratio));
-  return [ch(0), ch(2), ch(4)].map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
-}
-
-type SemanticTokens = {
-  primaryDark: string;    // primary shade25%
-  primary: string;        // 構造主色（= palette.accentA）
-  primaryMid: string;     // primary tint30%
-  primaryLight: string;   // primary tint70%
-  blueGray: string;       // primary tint55%（低彩度灰青）
-  surfaceBlue: string;    // primary tint92%（淡面）
-  accentDark: string;     // accent shade18%
-  accent: string;         // 差し色（= palette.accentB）
-  accentLight: string;    // accent tint45%
-  surfaceOrange: string;  // accent tint90%（淡面）
-  textPrimary: string;    // 本文主色
-  textMuted: string;      // 補助テキスト
-  surfaceGray: string;    // 汎用淡灰面
-  borderGray: string;     // 枠線
-  white: string;
-  info: string;           // シアン系補助色（#2A7DA3）
-  surfaceInfo: string;    // info tint90%
-  success: string;        // グリーン系補助色（#2E7D5B）
-  surfaceSuccess: string; // success tint90%
-};
-
-/**
- * Palette の主色・差し色から tint/shade でセマンティックトークンを導出する。
- * navy_orange 専用値を持つが、他パレットでも同比率で自動導出するため汎用。
- */
-function resolveSemanticTokens(palette: Palette): SemanticTokens {
-  const primary = palette.accentA;  // navy_orange → "13294B"
-  const accent  = palette.accentB;  // navy_orange → "F5821F"
-  const INFO    = "2A7DA3";         // 落ち着いたシアン（全パレット共通補助色）
-  const SUCCESS = "2E7D5B";         // 落ち着いたグリーン（全パレット共通補助色）
-  return {
-    primaryDark:    shadeHex(primary, 0.25),  // navy_orange → "0E1F38"
-    primary,
-    primaryMid:     tintHex(primary, 0.30),   // navy_orange → "5A6981"
-    primaryLight:   tintHex(primary, 0.70),   // navy_orange → "B8BFC9"
-    blueGray:       tintHex(primary, 0.55),   // navy_orange → "959FAE"
-    surfaceBlue:    tintHex(primary, 0.92),   // navy_orange → "E8EAF0"
-    accentDark:     shadeHex(accent, 0.18),   // navy_orange → "C96B19"
-    accent,
-    accentLight:    tintHex(accent, 0.45),    // navy_orange → "FABA84"
-    surfaceOrange:  tintHex(accent, 0.90),    // navy_orange → "FEF3E9"
-    textPrimary:    palette.bodyText,
-    textMuted:      palette.mutedText,
-    surfaceGray:    "F4F5F7",
-    borderGray:     palette.border,
-    white:          "FFFFFF",
-    info:           INFO,
-    surfaceInfo:    tintHex(INFO, 0.90),      // "EAF2F6"
-    success:        SUCCESS,
-    surfaceSuccess: tintHex(SUCCESS, 0.90),   // "EAF3EE"
-  };
-}
-
 /**
  * パレット多様性を検証・補正する。
  * - 青単色パレット (blue monochrome) を検出して accentB を暖色に修正
@@ -608,7 +523,7 @@ function normalizePaletteDiversity(
 
   let p = { ...palette };
   const NAVY      = "13294B";   // Claude版のDeep Navy
-  const ORANGE    = "F5821F";   // Accent Orange（明るいオレンジ）
+  const ORANGE    = "FF8C1A";   // Accent Orange（明るいオレンジ・Python側と同期）
   const BODY_TEXT = "1D2435";
   const MUTED     = "6B7488";
   const BORDER    = "D9E0EC";
@@ -814,30 +729,6 @@ function resolveLayoutType(slide: PptxSlide): NonNullable<PptxSlide["layoutType"
   if (lt === "diagram" && (!slide.visualBlocks || slide.visualBlocks.length === 0)) {
     console.log(`[gen-pptx] diagram→bullets fallback (no visualBlocks): "${slide.title}"`);
     return "bullets";
-  }
-  if (lt === "stat_callouts") {
-    const hasCallouts = (slide.statCallouts ?? []).some((c) => c.value?.trim());
-    const hasMetrics  = (slide.metrics ?? []).some((m) => m.value?.trim());
-    if (!hasCallouts && !hasMetrics) {
-      console.log(`[gen-pptx] stat_callouts→bullets fallback (no data): "${slide.title}"`);
-      return "bullets";
-    }
-  }
-  if (lt === "card_grid") {
-    const hasCards = (slide.cards ?? []).some((c) => c.heading?.trim());
-    const hasSteps = (slide.steps ?? []).some((st) => st.title?.trim() && st.body?.trim());
-    if (!hasCards && !hasSteps) {
-      console.log(`[gen-pptx] card_grid→bullets fallback (no cards/steps): "${slide.title}"`);
-      return "bullets";
-    }
-  }
-  if (lt === "icon_rows") {
-    const hasCards = (slide.cards ?? []).some((c) => c.heading?.trim());
-    const hasSteps = (slide.steps ?? []).some((st) => st.title?.trim());
-    if (!hasCards && !hasSteps) {
-      console.log(`[gen-pptx] icon_rows→bullets fallback (no rows): "${slide.title}"`);
-      return "bullets";
-    }
   }
   return lt;
 }
@@ -1143,13 +1034,7 @@ function correctOvergreenPalette(palette: Palette, deckPurpose?: string): Palett
 
 function truncateText(value: string, max: number): string {
   const text = String(value ?? "").trim();
-  if (text.length <= max) return text;
-  // 文末として扱える境界のみ（読点「、」とカンマ「,」は節の途中のため除外）
-  const boundaries = "。．.！!？?）」』）";
-  for (let i = max; i >= Math.floor(max * 0.5); i--) {
-    if (boundaries.includes(text[i])) return text.slice(0, i + 1).trim();
-  }
-  return `${text.slice(0, max).trim()}…`;
+  return text.length > max ? `${text.slice(0, max).trim()}...` : text;
 }
 
 function containsAny(value: string, tokens: string[]): boolean {
@@ -1246,7 +1131,7 @@ function inferFallbackStyleSpec(instructionText: string): DeckStyleSpec {
     deckPurpose,
     visualStyle,
     cardStyle: visualStyle === "modern-dark" ? "glass" : visualStyle === "minimal" ? "flat" : "default",
-    headerStyle: "minimal",  // 全幅バンド禁止 — 常にフラットヘッダー
+    headerStyle: visualStyle === "minimal" ? "accent-line" : visualStyle === "editorial" ? "minimal" : "band",
   };
 }
 
@@ -1284,10 +1169,9 @@ function createFallbackBrief(
       else if (lt === "multi-column") visualType = "comparison";
       else if (lt === "diagram" || lt === "process-cards") visualType = "process";
       else if (lt === "timeline") visualType = "timeline";
-      else if (lt === "company-overview" || lt === "metric-cards" || lt === "stat_callouts") visualType = "cards";
+      else if (lt === "company-overview" || lt === "metric-cards") visualType = "cards";
       else if (lt === "closing") visualType = "spotlight";
       else if (lt === "conversation") visualType = "editorial";
-      else if (lt === "card_grid" || lt === "icon_rows") visualType = "process";
       else visualType = visualCycle[index % visualCycle.length];
       return {
         title: slide.title,
@@ -1344,7 +1228,7 @@ async function generateDesignBrief(
       "  deckPurpose: 'recruitment'|'proposal'|'company-intro'|'training'|'ir'|'internal'|'other'",
       "  visualStyle: 'corporate-light'|'modern-dark'|'editorial'|'playful'|'minimal'|'bold'",
       "  cardStyle: 'default'|'filled'|'glass'|'flat'",
-      "  headerStyle: 'minimal'|'accent-line'  (NEVER 'band')",
+      "  headerStyle: 'band'|'minimal'|'accent-line'",
       "",
       "DESIGN RULES:",
       "- deckPurpose='recruitment' → vibrant, energetic colors. Consider indigo/violet, warm orange, or bold teal.",
@@ -1359,8 +1243,6 @@ async function generateDesignBrief(
       "- Executive proposal baseline: titleBg~13294B (dark navy), accentA~13294B, accentB~F5821F (orange), bodyText~1D2435, sectionBg~EEF2F9, canvas~FFFFFF.",
       "- Orange is used at ~5% — only on: metric values, step numbers, accent lines, CTAs. NOT full card fills.",
       "- Do NOT default to green unless the content is specifically environmental/ecological.",
-      "- STRICTLY FORBIDDEN: headerStyle='band'. Full-width header color fills make slides look like AI-generated templates.",
-      "- headerStyle='minimal' means left accent bar + title text only — no background fill.",
       "- Keep total JSON under 500 tokens.",
       ...intentConstraints,
       styleHint ? `\nStyle regeneration hint from reviewer: "${styleHint}" — honor this direction.` : "",
@@ -1372,7 +1254,7 @@ async function generateDesignBrief(
       intent ? `promptIntent: ${JSON.stringify({ documentPurpose: intent.documentPurpose, audience: intent.audience, designFreedom: intent.designFreedom, colorDirectives: intent.colorDirectives })}` : "",
     ].filter(Boolean).join("\n");
 
-    let res = await openai.chat.completions.create({
+    const res = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
       messages: [
         { role: "system", content: systemPrompt },
@@ -1383,20 +1265,8 @@ async function generateDesignBrief(
     });
 
     if (res.choices[0]?.finish_reason === "length") {
-      console.warn("[designBrief] truncated → retrying with higher token limit");
-      res = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-        response_format: { type: "json_object" },
-        max_completion_tokens: 8000,
-      });
-      if (res.choices[0]?.finish_reason === "length") {
-        console.warn("[designBrief] retry also truncated → using fallback");
-        return fallback;
-      }
+      console.warn("[designBrief] truncated → using fallback");
+      return fallback;
     }
 
     const parsed = JSON.parse(res.choices[0]?.message?.content ?? "{}");
@@ -1540,7 +1410,7 @@ async function patchEastAsianFont(buffer: Buffer): Promise<Buffer> {
     compressionOptions: { level: 6 } }) as Promise<Buffer>;
 }
 
-async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName?: string): Promise<string> {
+async function uploadPptxToBlob(buffer: Buffer, fileName: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "pptx";
@@ -1549,9 +1419,9 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
   );
   const containerClient = blobServiceClient.getContainerClient(containerName);
   await containerClient.createIfNotExists({ access: "blob" });
-  // Blob key は ASCII のみ（URLを短く保つ）。DL時のファイル名は Content-Disposition で指定
-  const blockBlobClient = containerClient.getBlockBlobClient(blobKey);
-  const encodedFileName = encodeURIComponent(displayFileName ?? blobKey);
+  const blockBlobClient = containerClient.getBlockBlobClient(fileName);
+  // Content-Disposition: HTTP headerはASCIIのみ有効。RFC 5987でUTF-8エンコード
+  const encodedFileName = encodeURIComponent(fileName);
   await blockBlobClient.uploadData(buffer, {
     blobHTTPHeaders: {
       blobContentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -1572,19 +1442,148 @@ const H = 7.5;
 const HEADER_H = 1.05;
 
 function addHeaderBand(s: PptxGenJS.Slide, title: string, theme: Theme) {
-  // 装飾バー完全撤廃 — テキストのみ
-  s.addText(title, {
-    x: 0.40, y: 0.08, w: W - 0.80, h: HEADER_H - 0.14,
-    fontSize: theme.titleFontSize,
-    fontFace: theme.fontFace,
-    bold: true,
-    color: theme.palette.bodyText,
-    valign: "middle",
+  if (theme.headerStyle === "minimal") {
+    // 細いアクセントラインのみ、背景は canvas 色
+    s.addShape("rect", {
+      x: 0, y: 0, w: W, h: HEADER_H,
+      fill: { color: theme.palette.canvas },
+      line: { color: theme.palette.canvas, width: 0 },
+    });
+    s.addShape("rect", {
+      x: 0.45, y: HEADER_H - 0.04, w: 1.4, h: 0.04,
+      fill: { color: theme.palette.accentA },
+      line: { color: theme.palette.accentA, width: 0 },
+    });
+    s.addText(title, {
+      x: 0.45, y: 0.08, w: W - 0.9, h: HEADER_H - 0.16,
+      fontSize: theme.titleFontSize,
+      fontFace: theme.fontFace,
+      bold: true,
+      color: theme.palette.bodyText,
+      valign: "middle",
+    });
+  } else if (theme.headerStyle === "accent-line") {
+    // 白/ダーク背景 + 上部に細いアクセントバー
+    s.addShape("rect", {
+      x: 0, y: 0, w: W, h: 0.07,
+      fill: { color: theme.palette.accentA },
+      line: { color: theme.palette.accentA, width: 0 },
+    });
+    s.addShape("rect", {
+      x: 0, y: 0.07, w: W, h: HEADER_H - 0.07,
+      fill: { color: theme.palette.surface },
+      line: { color: theme.palette.border, width: 0 },
+    });
+    s.addText(title, {
+      x: 0.45, y: 0.1, w: W - 0.9, h: HEADER_H - 0.18,
+      fontSize: theme.titleFontSize,
+      fontFace: theme.fontFace,
+      bold: true,
+      color: theme.palette.bodyText,
+      valign: "middle",
+    });
+  } else {
+    // "band" — 既存の塗り潰しバンド（デフォルト）
+    s.addShape("rect", {
+      x: 0, y: 0, w: W, h: HEADER_H,
+      fill: { color: theme.palette.headerBg },
+      line: { color: theme.palette.headerBg, width: 0 },
+    });
+    s.addShape("rect", {
+      x: 0, y: HEADER_H, w: W, h: 0.06,
+      fill: { color: theme.palette.accentA },
+      line: { color: theme.palette.accentA, width: 0 },
+    });
+    s.addText(title, {
+      x: 0.45, y: 0.1, w: W - 0.9, h: HEADER_H - 0.18,
+      fontSize: theme.titleFontSize,
+      fontFace: theme.fontFace,
+      bold: true,
+      color: theme.palette.headerText,
+      valign: "middle",
+    });
+  }
+}
+
+function addChrome(s: PptxGenJS.Slide, theme: Theme) {
+  // デザイン原則: フラット。右端ストリップは廃止。
+  // 下端に細い border ラインのみ（accent は使わない）
+  s.addShape("rect", {
+    x: 0, y: H - 0.04, w: W, h: 0.04,
+    fill: { color: theme.palette.border },
+    line: { color: theme.palette.border, width: 0 },
   });
 }
 
-function addChrome(_s: PptxGenJS.Slide, _theme: Theme) {
-  // フッターバンド撤廃 — クリーンなフラットデザイン
+/** Python gen_pptx_profile の _icon_badge に相当。
+ *  accent/headerBg 塗り円＋グリフ文字。パレット参照のみ（緑・赤系でも成立）。
+ *  kind: "check"=✓ポジティブ / "warn"=！リスク / "arrow"=→遷移 / "chart"=▲KPI */
+function addIconBadge(
+  s: PptxGenJS.Slide,
+  x: number, y: number,
+  kind: "check" | "warn" | "arrow" | "chart",
+  theme: Theme,
+  sizePt = 0.34
+): void {
+  const GLYPH: Record<string, string> = { check: "✓", warn: "!", arrow: "→", chart: "▲" };
+  const bgColor   = kind === "warn" ? theme.palette.headerBg : theme.palette.accentB;
+  const textColor = kind === "warn" ? theme.palette.accentB  : theme.palette.headerText;
+  s.addShape("ellipse", {
+    x, y, w: sizePt, h: sizePt,
+    fill: { color: bgColor },
+    line: { color: bgColor, width: 0 },
+  });
+  s.addText(GLYPH[kind] ?? "·", {
+    x: x + sizePt * 0.06, y: y + sizePt * 0.06,
+    w: sizePt * 0.88,     h: sizePt * 0.88,
+    fontSize: Math.round(sizePt * 20),
+    fontFace: theme.fontFace,
+    bold: true,
+    color: textColor,
+    align: "center", valign: "middle",
+  });
+}
+
+/** Python gen_pptx_profile の _highlight_block に相当。
+ *  3色結論バンド: headerBg背景・accentB見出し・白本文。各スライド最大1つ。*/
+function addHighlightBlock(
+  s: PptxGenJS.Slide,
+  x: number, y: number, w: number, h: number,
+  heading: string, body: string,
+  theme: Theme
+): void {
+  // 背景: headerBg（main 濃色）
+  s.addShape("roundRect", {
+    x, y, w, h,
+    rectRadius: 0.04,
+    fill: { color: theme.palette.headerBg },
+    line: { color: theme.palette.headerBg, width: 0 },
+  });
+  // 左端 accent 縦ライン
+  s.addShape("rect", {
+    x, y, w: 0.06, h,
+    fill: { color: theme.palette.accentB },
+    line: { color: theme.palette.accentB, width: 0 },
+  });
+  // accent 見出し
+  s.addText(heading, {
+    x: x + 0.14, y: y + 0.1,
+    w: w - 0.2,  h: 0.28,
+    fontSize: theme.smallFontSize,
+    fontFace: theme.fontFace,
+    bold: true,
+    color: theme.palette.accentB,
+  });
+  // 白本文
+  s.addText(body, {
+    x: x + 0.14, y: y + 0.4,
+    w: w - 0.2,  h: h - 0.48,
+    fontSize: theme.smallFontSize,
+    fontFace: theme.fontFace,
+    color: theme.palette.headerText,
+    valign: "middle",
+    fit: "shrink",
+  });
 }
 
 function clampPercent(value: number): number {
@@ -1791,7 +1790,7 @@ function buildDiagramSlide(
       w: 2.78,
       h: H - HEADER_H - 0.48,
       rectRadius: 0.05,
-      fill: { color: theme.palette.surface },
+      fill: { color: theme.palette.sectionBg },
       line: { color: theme.palette.border, width: 0.9 },
     });
 
@@ -2086,16 +2085,34 @@ function buildTitleSlide(
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.titleBg };
-  // 右上装飾サークル（バンドではなく幾何学的モチーフ）
+  // 装飾サークルクラスター（右上・ブランド感を表現）
   addTitleDecorativeCircles(s, theme);
-  // kicker ラベル（左上・小文字・アクセントカラー）— 区切り線なし
+  // 左縦ライン
+  s.addShape("rect", {
+    x: 0,
+    y: 0,
+    w: 0.28,
+    h: H,
+    fill: { color: theme.palette.accentA },
+    line: { color: theme.palette.accentA, width: 0 },
+  });
+  // 下部バー
+  s.addShape("rect", {
+    x: 0,
+    y: H - 0.12,
+    w: W,
+    h: 0.12,
+    fill: { color: theme.palette.accentB },
+    line: { color: theme.palette.accentB, width: 0 },
+  });
+  // kicker ラベル（左上・小文字）— 空なら非表示
   const kicker = brief.coverKicker?.trim();
   if (kicker) {
     s.addText(kicker, {
       x: 0.72,
       y: 0.85,
-      w: 6.0,
-      h: 0.28,
+      w: 5.5,
+      h: 0.24,
       fontSize: theme.smallFontSize,
       fontFace: theme.fontFace,
       bold: true,
@@ -2103,13 +2120,22 @@ function buildTitleSlide(
       charSpacing: 2,
     });
   }
+  // kicker 下の区切り線（accentB = orange で差し色として強調）
+  s.addShape("rect", {
+    x: 0.72,
+    y: kicker ? 1.18 : 1.0,
+    w: 0.72,
+    h: 0.06,
+    fill: { color: theme.palette.accentB },
+    line: { color: theme.palette.accentA, width: 0 },
+  });
   // メインタイトル（左揃え・大きく）
   const titleW = illustration?.dataUri ? W - 4.2 : W - 1.45;
   s.addText(title, {
     x: 0.72,
-    y: kicker ? 1.22 : 1.0,
+    y: 1.35,
     w: titleW,
-    h: 2.4,
+    h: 2.2,
     fontSize: theme.titleFontSize + 10,
     fontFace: theme.fontFace,
     bold: true,
@@ -2123,7 +2149,7 @@ function buildTitleSlide(
   if (subtitle) {
     s.addText(subtitle, {
       x: 0.72,
-      y: kicker ? 3.82 : 3.60,
+      y: 3.75,
       w: titleW,
       h: 0.55,
       fontSize: theme.bodyFontSize,
@@ -2217,33 +2243,14 @@ function buildSectionSlide(pptx: PptxGenJS, title: string, theme: Theme) {
   addChrome(s, theme);
 }
 
-// body が助詞で始まる場合は「は完了しており...」のような不自然な文になるためガード
-const LEADING_PARTICLE_RE = /^[はがをにでとへからまでよりも]/;
-
 function splitBulletTitle(text: string): { title: string; body: string } {
-  const full = text.trim();
-  const colonMatch = full.match(/^([^：:]{2,22})[：:]\s*([\s\S]*)$/);
-  if (colonMatch) {
-    const bd = colonMatch[2];
-    return { title: colonMatch[1], body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  const periodMatch = full.match(/^([^。！!]{5,20}[。！!])\s*([\s\S]*)$/);
-  if (periodMatch && periodMatch[1].length <= 22) {
-    const bd = periodMatch[2];
-    return { title: periodMatch[1], body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  const spaceIdx = full.search(/[\s　]/);
-  if (spaceIdx > 3 && spaceIdx < 16) {
-    const bd = full.slice(spaceIdx).trim();
-    return { title: full.slice(0, spaceIdx), body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  // は/が: title = 助詞前, body = 全文（助詞始まりの body を生成しない）
-  for (let i = 2; i <= Math.min(22, full.length - 2); i++) {
-    if (full[i] === "は" || full[i] === "が") {
-      return { title: full.slice(0, i).trim(), body: full };
-    }
-  }
-  return { title: full.slice(0, 14), body: full.slice(14).trim() };
+  const colonMatch = text.match(/^([^：:]{2,18})[：:]\s*([\s\S]*)$/);
+  if (colonMatch) return { title: colonMatch[1], body: colonMatch[2] };
+  const periodMatch = text.match(/^([^。！!]{5,20}[。！!])\s*([\s\S]*)$/);
+  if (periodMatch && periodMatch[1].length <= 22) return { title: periodMatch[1], body: periodMatch[2] };
+  const spaceIdx = text.search(/[\s　]/);
+  if (spaceIdx > 3 && spaceIdx < 16) return { title: text.slice(0, spaceIdx), body: text.slice(spaceIdx).trim() };
+  return { title: text.slice(0, 14), body: text.slice(14).trim() };
 }
 
 function renderHorizontalCards(
@@ -2251,12 +2258,13 @@ function renderHorizontalCards(
   bullets: string[],
   theme: Theme,
   startY: number,
-  totalW: number
+  totalW: number,
+  endY?: number
 ) {
   const count = bullets.length;
   const GAP = 0.14;
   const cardW = (totalW - GAP * (count - 1)) / count;
-  const cardH = H - startY - 0.26;
+  const cardH = (endY ?? H - 0.26) - startY;
   const x0 = 0.42;
   const ICON_D = 0.68;
   const ICON_TOP = 0.22;
@@ -2353,47 +2361,22 @@ function renderCardBullets(
   bullets: string[],
   theme: Theme,
   startY: number,
-  cardW: number
+  cardW: number,
+  endY?: number
 ) {
   if (bullets.length === 0) return;
-
-  // 6件以上: カード化せず dense bullets として全件表示（情報欠落防止）
-  if (bullets.length > 5) {
-    const denseFontSize = Math.max(9, theme.bodyFontSize - 1);
-    const denseItems = bullets.map((item) => ({
-      text: item,
-      options: {
-        bullet: { indent: 14 },
-        breakLine: true,
-        fontSize: denseFontSize,
-        fontFace: theme.fontFace,
-        color: theme.palette.bodyText,
-        paraSpaceAfter: 5,
-      },
-    }));
-    s.addText(denseItems, {
-      x: 0.42,
-      y: startY,
-      w: cardW,
-      h: H - startY - 0.26,
-      margin: 0.1,
-      valign: "top",
-    });
-    return;
-  }
-
-  const count = bullets.length;
+  const count = Math.min(bullets.length, 5);
 
   // 2〜3アイテム → 横並びカード（プロセスフロー）
   if (count <= 3) {
-    renderHorizontalCards(s, bullets.slice(0, count), theme, startY, cardW);
+    renderHorizontalCards(s, bullets.slice(0, count), theme, startY, cardW, endY);
     return;
   }
 
   // 4〜5アイテム → 縦並びカード
   const STRIP_W = 0.38;
   const GAP = 0.1;
-  const totalH = H - startY - 0.26;
+  const totalH = (endY ?? H - 0.26) - startY;
   const cardH = Math.max(0.88, (totalH - GAP * (count - 1)) / count);
 
   const CARD_STRIP_CYCLE = [
@@ -2466,6 +2449,11 @@ function buildBulletsSlide(
   const bMaxItems = densityMaxItems(slide.density, 5);
   const adjustedBullets = slide.bullets.slice(0, bMaxItems);
   const { hasSections, sections } = parseSections(adjustedBullets);
+  // Python build_bullets の callout（3色結論バンド）相当: faithfulMode のみ省略（execMode でも表示する）
+  const hasCallout = Boolean(slide.callout) && !faithfulMode;
+  const CALLOUT_H = 0.96;
+  const CALLOUT_MARGIN = 0.12;
+  const cardsEndY = hasCallout ? H - 0.26 - CALLOUT_MARGIN - CALLOUT_H : undefined;
   const useHorizontalCards = !faithfulMode && !theme.execMode && !hasSections &&
     adjustedBullets.length >= 2 && adjustedBullets.length <= 3;
   // 横並びカードのとき右側アクセントパネルは非表示（カードが全幅を使う）
@@ -2478,31 +2466,6 @@ function buildBulletsSlide(
   const textWidth = showIllustration ? 6.85 : 8.15;
   // faithfulMode では execMode による内容圧縮（キーメッセージ1件＋最大3件）をスキップ
   if (theme.execMode && !faithfulMode) {
-    // 6件以上は圧縮せず dense bullets fallback で全件表示
-    if (slide.bullets.length > 5) {
-      const denseFontSize = Math.max(9, theme.bodyFontSize - 1);
-      const denseItems = slide.bullets.map((item) => ({
-        text: item,
-        options: {
-          bullet: { indent: 14 },
-          breakLine: true,
-          fontSize: denseFontSize,
-          fontFace: theme.fontFace,
-          color: theme.palette.bodyText,
-          paraSpaceAfter: 5,
-        },
-      }));
-      s.addText(denseItems, {
-        x: 0.55,
-        y: HEADER_H + 0.24,
-        w: 8.15,
-        h: H - HEADER_H - 0.55,
-        margin: 0.1,
-        valign: "top",
-      });
-      addChrome(s, theme);
-      return;
-    }
     const allBullets = sections.flatMap((section) => section.items);
     const keyMessage = allBullets[0] ?? (Array.isArray(slide.bullets) && slide.bullets[0]) ?? "";
     const rest = allBullets.slice(1, 4);
@@ -2514,7 +2477,7 @@ function buildBulletsSlide(
         w: 8.15,
         h: 1.0,
         rectRadius: 0.04,
-        fill: { color: theme.palette.surface },
+        fill: { color: theme.palette.sectionBg },
         line: { color: theme.palette.accentA, width: 1.5 },
       });
       s.addText(keyMessage, {
@@ -2577,7 +2540,7 @@ function buildBulletsSlide(
 
   if (hasSections) {
     let currentY = HEADER_H + 0.24;
-    const maxY = H - 0.28;
+    const maxY = cardsEndY ?? H - 0.28;
     for (const section of sections) {
       if (section.header) {
         if (currentY + 0.42 > maxY) break;
@@ -2586,7 +2549,7 @@ function buildBulletsSlide(
           y: currentY,
           w: 8.35,
           h: 0.42,
-          fill: { color: theme.palette.surface },
+          fill: { color: theme.palette.sectionBg },
           line: { color: theme.palette.border, width: 0.8 },
         });
         s.addText(section.header, {
@@ -2641,8 +2604,15 @@ function buildBulletsSlide(
       });
     } else {
       const cardW = showIllustration ? 6.55 : 8.88;
-      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW);
+      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW, cardsEndY);
     }
+  }
+
+  // 3色結論バンド（Python build_bullets の _highlight_block と同等）
+  if (hasCallout && slide.callout) {
+    const calloutY = H - 0.26 - CALLOUT_H;
+    addHighlightBlock(s, 0.42, calloutY, W - 0.84, CALLOUT_H,
+                      slide.callout.title, slide.callout.body, theme);
   }
 
   addChrome(s, theme);
@@ -2925,7 +2895,7 @@ function buildMultiColumnSlide(
         y: colY,
         w: colInnerW,
         h: headerH,
-        fill: { color: theme.palette.surface },
+        fill: { color: theme.palette.sectionBg },
         line: { color: theme.palette.border, width: 0.8 },
       });
       s.addText(column.header, {
@@ -3073,7 +3043,7 @@ function buildCompanyOverviewSlide(pptx: PptxGenJS, slide: PptxSlide, theme: The
       x: 0.48, y: contentY,
       w: LEFT_W, h: contentH,
       rectRadius: 0.06,
-      fill: { color: theme.palette.surface },
+      fill: { color: theme.palette.sectionBg },
       line: { color: theme.palette.border, width: 0.8 },
     });
     s.addShape("roundRect", {
@@ -3099,37 +3069,12 @@ function buildCompanyOverviewSlide(pptx: PptxGenJS, slide: PptxSlide, theme: The
 
   if (hasCallout && slide.callout) {
     const calloutY = contentY + 2.75;
-    const calloutH = contentH - 2.75 - 0.1;
-    s.addShape("roundRect", {
-      x: 0.48, y: calloutY,
-      w: LEFT_W, h: Math.max(calloutH, 1.8),
-      rectRadius: 0.06,
-      fill: { color: theme.palette.surface },
-      line: { color: theme.palette.accentA, width: 1.2 },
-    });
-    s.addShape("rect", {
-      x: 0.48, y: calloutY,
-      w: 0.22, h: Math.max(calloutH, 1.8),
-      fill: { color: theme.palette.accentA },
-      line: { color: theme.palette.accentA, width: 0 },
-    });
-    s.addText(slide.callout.title, {
-      x: 0.82, y: calloutY + 0.14,
-      w: LEFT_W - 0.48, h: 0.32,
-      fontSize: theme.bodyFontSize - 1,
-      fontFace: theme.fontFace,
-      bold: true,
-      color: theme.palette.accentA,
-    });
-    s.addText(slide.callout.body, {
-      x: 0.82, y: calloutY + 0.5,
-      w: LEFT_W - 0.48, h: Math.max(calloutH, 1.8) - 0.68,
-      fontSize: theme.bodyFontSize - 2,
-      fontFace: theme.fontFace,
-      color: theme.palette.bodyText,
-      valign: "top",
-      fit: "shrink",
-    });
+    const calloutH = Math.max(contentH - 2.75 - 0.1, 1.8);
+    // 3色結論ブロック: headerBg背景・accentB見出し・白本文（Python _highlight_block と同等）
+    addHighlightBlock(s, 0.48, calloutY, LEFT_W, calloutH,
+                      slide.callout.title, slide.callout.body, theme);
+    // check バッジ（ポジティブな結論・効果を示す）
+    addIconBadge(s, 0.58, calloutY + calloutH / 2 - 0.17, "check", theme, 0.34);
   }
 
   // ── 縦区切り線 ──
@@ -3230,7 +3175,7 @@ function buildCompanyOverviewSlide(pptx: PptxGenJS, slide: PptxSlide, theme: The
     });
 
     if (metric.note) {
-      const noteText = metric.note;
+      const noteText = metric.note.length > 28 ? metric.note.slice(0, 28) + "…" : metric.note;
       s.addText(noteText, {
         x: cx + ICON_PAD, y: noteY,
         w: INNER_W, h: NOTE_H,
@@ -3405,6 +3350,17 @@ function buildClosingSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.titleBg };
   addTitleDecorativeCircles(s, theme);
+  // 左縦ライン
+  s.addShape("rect", {
+    x: 0, y: 0, w: 0.28, h: H,
+    fill: { color: theme.palette.accentA },
+    line: { color: theme.palette.accentA, width: 0 },
+  });
+  s.addShape("rect", {
+    x: 0, y: H - 0.12, w: W, h: 0.12,
+    fill: { color: theme.palette.accentB },
+    line: { color: theme.palette.accentB, width: 0 },
+  });
   s.addText(slide.title, {
     x: 0.72, y: 1.8, w: W - 4.0, h: 1.4,
     fontSize: theme.titleFontSize + 8,
@@ -3548,7 +3504,7 @@ function buildMetricCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) 
       const noteFontSize = textTreatment === "short"
         ? theme.smallFontSize - 2
         : theme.smallFontSize - 1;
-      const noteText = metric.note;
+      const noteText = metric.note.length > 28 ? metric.note.slice(0, 28) + "…" : metric.note;
       s.addText(noteText, {
         x: cx + ICON_PAD, y: noteY,
         w: INNER_W, h: NOTE_H,
@@ -3603,14 +3559,10 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     });
   }
 
-  // ロードマップ段階色: 短期=info(ティール) / 中期=accent(橙) / 長期=primary(紺)
-  const tok = resolveSemanticTokens(theme.palette);
-  const ROADMAP_DOT_COLORS = [tok.info, tok.accent, tok.primary];
-
-  // horizontal axis line（blueGray で控えめに）
+  // horizontal axis line
   s.addShape("line", {
     x: startX, y: lineY, w: lineW, h: 0,
-    line: { color: tok.blueGray, width: 2 },
+    line: { color: theme.palette.accentA, width: 2.5 },
   });
 
   const stepW = lineW / steps.length;
@@ -3618,7 +3570,8 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   steps.forEach((step, idx) => {
     const cx = startX + stepW * idx + stepW / 2;
     const dotR = 0.28;
-    const dotColor = ROADMAP_DOT_COLORS[idx % ROADMAP_DOT_COLORS.length];
+    const rawDotColor = idx % 2 === 0 ? theme.palette.accentA : theme.palette.accentB;
+    const dotColor = rawDotColor;
 
     // dot（glass/flat は枠を accentA で強調）
     s.addShape("ellipse", {
@@ -3677,403 +3630,20 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   });
 
   if (slide.benefits?.length) {
-    // フッターバンド禁止 — テキストのみ（背景なし）でスライド下部に表示
+    const stripY = H - 0.66;
+    s.addShape("rect", {
+      x: 0, y: stripY, w: W, h: 0.5,
+      fill: { color: theme.palette.sectionBg },
+      line: { color: theme.palette.border, width: 0 },
+    });
     s.addText(slide.benefits.slice(0, 4).map((b) => `✓ ${b}`).join("　　"), {
-      x: 0.42, y: H - 0.56, w: W - 0.84, h: 0.38,
+      x: 0.42, y: stripY + 0.08, w: W - 0.84, h: 0.34,
       fontSize: theme.smallFontSize - 1, fontFace: theme.fontFace,
-      color: theme.palette.mutedText, bold: false, align: "center",
+      color: theme.palette.accentA, bold: true, align: "center",
     });
   }
 
   addChrome(s, theme);
-}
-
-// ─── テキストのみスライド検出・アップグレード ────────────────────────────────────
-// bullets + 視覚データなし → icon_rows に自動変換してビジュアルを必ず確保する
-
-const UPGRADE_ICON_CYCLE = ["gear", "lightbulb", "rocket", "chart", "star", "verified", "shield", "network"] as const;
-
-/** bullet 1本を heading / body に分割する共通ロジック。
- *  body が助詞（は/が/を…）で始まる場合は全文を body に戻して不自然な分割を防ぐ。 */
-function splitBulletForCard(b: string): { heading: string; body: string } {
-  const full = b.trim();
-  const colonIdx = full.indexOf("：") >= 0 ? full.indexOf("：") : full.indexOf(":");
-  if (colonIdx > 0 && colonIdx <= 24) {
-    const bd = full.slice(colonIdx + 1).trim();
-    return { heading: full.slice(0, colonIdx).trim(), body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  const parenIdx = full.indexOf("（");
-  if (parenIdx > 0 && parenIdx <= 15) {
-    const bd = full.slice(parenIdx).trim();
-    return { heading: full.slice(0, parenIdx).trim(), body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  const totenIdx = full.indexOf("、");
-  if (totenIdx > 0 && totenIdx <= 15) {
-    const bd = full.slice(totenIdx + 1).trim();
-    return { heading: full.slice(0, totenIdx).trim(), body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  const spIdx = full.indexOf("　") >= 0 ? full.indexOf("　") : full.indexOf(" ");
-  if (spIdx > 0 && spIdx <= 10) {
-    const bd = full.slice(spIdx + 1).trim();
-    return { heading: full.slice(0, spIdx).trim(), body: LEADING_PARTICLE_RE.test(bd) ? full : bd };
-  }
-  // は/が: heading = 助詞前、body = 全文（「は完了しており...」という body を生成しない）
-  for (let j = 2; j <= Math.min(22, full.length - 2); j++) {
-    if (full[j] === "は" || full[j] === "が") {
-      return { heading: full.slice(0, j).trim(), body: full };
-    }
-  }
-  return { heading: "", body: full };
-}
-
-function autoCardsFromBullets(bullets: string[]): PptxCard[] {
-  return bullets.slice(0, 4).map((b, i) => {
-    const iconKey = UPGRADE_ICON_CYCLE[i % UPGRADE_ICON_CYCLE.length] as string;
-    const { heading, body } = splitBulletForCard(b);
-    return { iconKey, heading, body };
-  });
-}
-
-function upgradeTextOnlySlide(slide: PptxSlide): PptxSlide {
-  const lt = slide.layoutType;
-  if (lt && lt !== "bullets") return slide;
-  const bullets = (slide.bullets ?? []).filter((b: string) => b?.trim());
-  const hasCards   = (slide.cards   ?? []).some((c: PptxCard) => c.heading?.trim());
-  const hasSteps   = (slide.steps   ?? []).some((s: any) => s.title?.trim());
-  const hasMetrics = (slide.metrics ?? []).some((m: any) => m.label?.trim());
-  const hasTable   = (slide.tableRows ?? []).length >= 2;
-  // 5件以上は bullets レイアウトのまま維持（カード化すると5件目以降が落ちる）
-  if (bullets.length >= 2 && bullets.length <= 4 && !hasCards && !hasSteps && !hasMetrics && !hasTable) {
-    console.log(`[gen-pptx] upgradeTextOnly: "${slide.title}" bullets→icon_rows`);
-    return { ...slide, layoutType: "icon_rows" as const, cards: autoCardsFromBullets(bullets) };
-  }
-  return slide;
-}
-
-// ─── stat_callouts レイアウト ─────────────────────────────────────────────────
-// 大きな数字3つ（KPI/実績）+ バーチャート。数値を必ずビジュアル化する。
-
-function statValueFontSize(value: string): number {
-  const v = value.trim();
-  const hasComplex = /[ぁ-んァ-ヶ一-龥（）【】「」¥￥]/.test(v);
-  if (v.length >= 9 || (v.length >= 6 && hasComplex)) return 26;
-  if (v.length >= 5) return 32;
-  return 42;
-}
-
-function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
-  const s = pptx.addSlide();
-  s.background = { color: theme.palette.canvas };
-  addHeaderBand(s, slide.title, theme);
-
-  // statCallouts → なければ metrics を代用
-  const rawCallouts: { value: string; unit: string; label: string }[] = (slide.statCallouts ?? []).length > 0
-    ? slide.statCallouts!
-    : (slide.metrics ?? []).map((m) => ({ value: m.displayValue ?? m.value, unit: "", label: m.label }));
-  const callouts = rawCallouts.filter((c) => c.value?.trim()).slice(0, 3);
-
-  // KPIカード面: surfaceBlue/surfaceOrange 交互で意味の階層を作る（上端帯廃止）
-  const tokKpi = resolveSemanticTokens(theme.palette);
-  const CARD_FILLS = [tokKpi.surfaceBlue, tokKpi.surfaceOrange, tokKpi.surfaceBlue];
-  const CARD_H = 1.72;
-  const CARD_Y = HEADER_H + 0.28;
-  const count = Math.min(callouts.length, 3);
-
-  if (count > 0) {
-    const GAP = 0.18;
-    const CARD_W = (W - 0.84 - GAP * (count - 1)) / count;
-
-    callouts.forEach((item, idx) => {
-      const cx = 0.42 + idx * (CARD_W + GAP);
-      const cardFill = CARD_FILLS[idx % CARD_FILLS.length];
-
-      // カード背景（淡色面 — 上端ストリップ廃止・面の淡色+枠で差別化）
-      s.addShape("roundRect", {
-        x: cx, y: CARD_Y, w: CARD_W, h: CARD_H,
-        rectRadius: 0.08,
-        fill: { color: cardFill },
-        line: { color: tokKpi.borderGray, width: 0.8 },
-        shadow: { type: "outer", color: "000000", blur: 4, angle: 270, opacity: 0.06 },
-      });
-      // 数値（primaryDark で統一 — 淡色面上でコントラスト確保）— 長い値・日本語を含む場合は自動縮小
-      s.addText(item.value, {
-        x: cx + 0.18, y: CARD_Y + 0.2,
-        w: CARD_W * 0.7, h: 0.86,
-        fontSize: statValueFontSize(item.value),
-        fontFace: theme.fontFace, bold: true,
-        color: tokKpi.primaryDark,
-        valign: "middle", fit: "shrink",
-      });
-      // 単位（数値右横、小さめ）
-      if (item.unit) {
-        s.addText(item.unit, {
-          x: cx + CARD_W * 0.72, y: CARD_Y + 0.55,
-          w: CARD_W * 0.22, h: 0.38,
-          fontSize: theme.bodyFontSize,
-          fontFace: theme.fontFace,
-          color: theme.palette.mutedText,
-          valign: "bottom", fit: "shrink",
-        });
-      }
-      // ラベル（下部）
-      s.addText(item.label, {
-        x: cx + 0.18, y: CARD_Y + 1.14,
-        w: CARD_W - 0.36, h: 0.44,
-        fontSize: theme.smallFontSize,
-        fontFace: theme.fontFace,
-        color: theme.palette.mutedText,
-        valign: "top", fit: "shrink",
-      });
-    });
-  }
-
-  // バーチャート: 数値化可能なcalloutsがあれば bar chart で可視化
-  const CHART_Y = CARD_Y + CARD_H + 0.2;
-  const CHART_H = H - CHART_Y - 0.28;
-  const chartValues: number[] = [];
-  const chartLabels: string[] = [];
-  callouts.forEach((c) => {
-    const clean = c.value.replace(/[約,，\s]/g, "").replace(/[〜～].+$/, "").match(/[\d.]+/)?.[0];
-    const n = clean ? parseFloat(clean) : NaN;
-    if (!isNaN(n)) { chartValues.push(n); chartLabels.push(c.label.slice(0, 12)); }
-  });
-  if (chartValues.length >= 2) {
-    s.addChart("bar" as any, [{ name: "KPI", labels: chartLabels, values: chartValues }], {
-      x: 0.42, y: CHART_Y, w: W - 0.84, h: CHART_H,
-      barDir: "bar",
-      chartColors: [tokKpi.primaryDark, tokKpi.accent, tokKpi.info],
-      showValue: true,
-      showLegend: false,
-      valAxisLabelFontSize: 9,
-      catAxisLabelFontSize: 9,
-      dataLabelFontSize: 9,
-      dataLabelColor: "363636",
-    });
-  } else {
-    // チャート不可の場合のみ bullets フォールバック
-    const bullets = (slide.bullets ?? []).filter((b) => b?.trim()).slice(0, 4);
-    if (bullets.length > 0) {
-      const bulletItems = bullets.map((b) => ({
-        text: b,
-        options: { bullet: { indent: 14 }, breakLine: true, fontSize: theme.bodyFontSize, fontFace: theme.fontFace, color: theme.palette.bodyText, paraSpaceAfter: 8 },
-      }));
-      s.addText(bulletItems, { x: 0.52, y: CHART_Y, w: W - 1.04, h: CHART_H, margin: 0.1, valign: "top" });
-    }
-  }
-}
-
-// ─── card_grid レイアウト ─────────────────────────────────────────────────────
-// アイコン付きカードを2〜3列グリッドで並べる。features / benefits 向け。
-
-function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
-  const s = pptx.addSlide();
-  s.background = { color: theme.palette.canvas };
-  addHeaderBand(s, slide.title, theme);
-
-  // cards → なければ steps を代用
-  const rawCards: PptxCard[] = (slide.cards ?? []).length > 0
-    ? slide.cards!
-    : (slide.steps ?? []).map((st) => ({ iconKey: st.iconKey, heading: st.title, body: st.body }));
-  const cards = rawCards.filter((c) => c.heading?.trim()).slice(0, 6);
-
-  if (cards.length === 0) {
-    // フォールバック: bullets で描画
-    const bulletItems = (slide.bullets ?? []).slice(0, 5).map((b) => ({
-      text: b,
-      options: { bullet: { indent: 14 }, breakLine: true, fontSize: theme.bodyFontSize, fontFace: theme.fontFace, color: theme.palette.bodyText, paraSpaceAfter: 9 },
-    }));
-    if (bulletItems.length > 0) s.addText(bulletItems, { x: 0.52, y: HEADER_H + 0.24, w: W - 1.04, h: H - HEADER_H - 0.5, margin: 0.1, valign: "top" });
-    return;
-  }
-
-  const count = cards.length;
-  const cols = count <= 3 ? count : count <= 4 ? 2 : 3;
-  const rows = Math.ceil(count / cols);
-
-  const MARGIN_X = 0.42;
-  const START_Y = HEADER_H + 0.28;
-  const AVAIL_W = W - MARGIN_X * 2;
-  const AVAIL_H = H - START_Y - 0.22;
-  const GAP_X = 0.18;
-  const GAP_Y = 0.18;
-  const CARD_W = (AVAIL_W - GAP_X * (cols - 1)) / cols;
-  const CARD_H = (AVAIL_H - GAP_Y * (rows - 1)) / rows;
-  const ICON_D = Math.min(0.68, CARD_H * 0.28);
-
-  const ICON_COLORS = [theme.palette.accentA, theme.palette.headerBg, theme.palette.accentB,
-                       theme.palette.accentA, theme.palette.accentB, theme.palette.headerBg];
-
-  cards.forEach((card, idx) => {
-    const col = idx % cols;
-    const row = Math.floor(idx / cols);
-    const cx = MARGIN_X + col * (CARD_W + GAP_X);
-    const cy = START_Y + row * (CARD_H + GAP_Y);
-    const iconColor = ICON_COLORS[idx % ICON_COLORS.length];
-
-    // カード背景（白 + 薄い影）
-    s.addShape("roundRect", {
-      x: cx, y: cy, w: CARD_W, h: CARD_H,
-      rectRadius: 0.08,
-      fill: { color: "FFFFFF" },
-      line: { color: theme.palette.border, width: 0.8 },
-      shadow: { type: "outer", color: "000000", blur: 5, angle: 270, opacity: 0.07 },
-    });
-
-    // アイコン円（左上）
-    const ICON_PAD_X = 0.20;
-    const ICON_PAD_Y = CARD_H * 0.14;
-    const iconX = cx + ICON_PAD_X;
-    const iconY = cy + ICON_PAD_Y;
-    s.addShape("ellipse", {
-      x: iconX, y: iconY, w: ICON_D, h: ICON_D,
-      fill: { color: iconColor },
-      line: { color: iconColor, width: 0 },
-    });
-    const iconSvg = card.iconKey ? STEP_ICON_URIS[card.iconKey as keyof typeof STEP_ICON_URIS] : null;
-    if (iconSvg) {
-      const pad = ICON_D * 0.18;
-      s.addImage({ data: iconSvg, x: iconX + pad, y: iconY + pad, w: ICON_D - pad * 2, h: ICON_D - pad * 2 });
-    } else {
-      s.addText(String(idx + 1), {
-        x: iconX, y: iconY, w: ICON_D, h: ICON_D,
-        fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
-        color: "FFFFFF", align: "center", valign: "middle",
-      });
-    }
-
-    // 見出し（アイコン右横）
-    const textX = cx + ICON_PAD_X + ICON_D + 0.14;
-    const textW = CARD_W - ICON_PAD_X - ICON_D - 0.22;
-    s.addText(card.heading, {
-      x: textX, y: iconY, w: textW, h: ICON_D,
-      fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
-      color: theme.palette.bodyText, valign: "middle", fit: "shrink",
-    });
-
-    // 本文（アイコン下）
-    if (card.body) {
-      const bodyY = cy + ICON_PAD_Y + ICON_D + 0.1;
-      s.addText(card.body, {
-        x: cx + ICON_PAD_X, y: bodyY,
-        w: CARD_W - ICON_PAD_X * 2,
-        h: CARD_H - (bodyY - cy) - 0.14,
-        fontSize: Math.max(theme.bodyFontSize - 2, 10),
-        fontFace: theme.fontFace,
-        color: theme.palette.mutedText,
-        valign: "top", fit: "shrink",
-      });
-    }
-  });
-}
-
-// ─── icon_rows レイアウト ─────────────────────────────────────────────────────
-// アイコン + 見出し + 本文の行形式。ステータスピル付き対応。プロセス/機能一覧向け。
-
-function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
-  const s = pptx.addSlide();
-  s.background = { color: theme.palette.canvas };
-  addHeaderBand(s, slide.title, theme);
-
-  const rawRows: PptxCard[] = (slide.cards ?? []).length > 0
-    ? slide.cards!
-    : (slide.steps ?? []).map((st) => ({ iconKey: st.iconKey, heading: st.title, body: st.body }));
-  const rows = rawRows.filter((r) => r.heading?.trim()).slice(0, 4);
-
-  if (rows.length === 0) {
-    const bulletItems = (slide.bullets ?? []).slice(0, 5).map((b) => ({
-      text: b,
-      options: { bullet: { indent: 14 }, breakLine: true, fontSize: theme.bodyFontSize, fontFace: theme.fontFace, color: theme.palette.bodyText, paraSpaceAfter: 9 },
-    }));
-    if (bulletItems.length > 0) s.addText(bulletItems, { x: 0.52, y: HEADER_H + 0.24, w: W - 1.04, h: H - HEADER_H - 0.5, margin: 0.1, valign: "top" });
-    return;
-  }
-
-  const ICON_D = 0.58;
-  const START_Y = HEADER_H + 0.26;
-  const AVAIL_H = H - START_Y - 0.22;
-  const ROW_SLOT = AVAIL_H / rows.length;
-  const ROW_H = Math.min(ROW_SLOT - 0.08, 1.0);
-
-  // サマリ行: アイコン=info 統一・行ごとに surfaceGray/surfaceBlue を交互に
-  const tokRow = resolveSemanticTokens(theme.palette);
-  const ROW_SURFACES = [tokRow.surfaceGray, tokRow.surfaceBlue];
-
-  rows.forEach((row, idx) => {
-    const cy = START_Y + idx * ROW_SLOT + (ROW_SLOT - ROW_H) / 2;
-    const iconColor = tokRow.info;  // 機能アイコンは info で統一（視認性と意味の一貫性）
-    const rowSurface = ROW_SURFACES[idx % ROW_SURFACES.length];
-
-    // 全行に淡色面（交互）
-    s.addShape("roundRect", {
-      x: 0.38, y: cy - 0.04, w: W - 0.76, h: ROW_H + 0.08,
-      rectRadius: 0.06,
-      fill: { color: rowSurface },
-      line: { color: tokRow.borderGray, width: 0.5 },
-    });
-
-    // アイコン円
-    const iconX = 0.52;
-    const iconY = cy + ROW_H / 2 - ICON_D / 2;
-    s.addShape("ellipse", {
-      x: iconX, y: iconY, w: ICON_D, h: ICON_D,
-      fill: { color: iconColor },
-      line: { color: iconColor, width: 0 },
-    });
-    const iconSvg = row.iconKey ? STEP_ICON_URIS[row.iconKey as keyof typeof STEP_ICON_URIS] : null;
-    if (iconSvg) {
-      const pad = ICON_D * 0.18;
-      s.addImage({ data: iconSvg, x: iconX + pad, y: iconY + pad, w: ICON_D - pad * 2, h: ICON_D - pad * 2 });
-    } else {
-      s.addText(String(idx + 1), {
-        x: iconX, y: iconY, w: ICON_D, h: ICON_D,
-        fontSize: theme.bodyFontSize, fontFace: theme.fontFace, bold: true,
-        color: "FFFFFF", align: "center", valign: "middle",
-      });
-    }
-
-    // テキスト領域
-    const PILL_W = row.statusLabel ? 1.9 : 0;
-    const textX = iconX + ICON_D + 0.18;
-    const textW = W - textX - PILL_W - 0.5;
-
-    s.addText(row.heading, {
-      x: textX, y: cy,
-      w: textW, h: ROW_H * 0.44,
-      fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
-      color: theme.palette.bodyText, valign: "bottom", fit: "shrink",
-    });
-    if (row.body) {
-      s.addText(row.body, {
-        x: textX, y: cy + ROW_H * 0.44,
-        w: textW, h: ROW_H * 0.56,
-        fontSize: theme.bodyFontSize - 1, fontFace: theme.fontFace,
-        color: theme.palette.mutedText, valign: "top", fit: "shrink",
-      });
-    }
-
-    // ステータスピル（セマンティックカラー: 完了=success / 進行中=accent / その他=primaryMid）
-    if (row.statusLabel) {
-      const PILL_H = 0.30;
-      const pillX = W - PILL_W - 0.42;
-      const pillY = cy + ROW_H / 2 - PILL_H / 2;
-      const pillColor = /完了|done|finished|済/i.test(row.statusLabel)
-        ? tokRow.success
-        : /進行中|in.?progress|開発中|実装中|対応中/i.test(row.statusLabel)
-          ? tokRow.accent
-          : tokRow.primaryMid;
-      s.addShape("roundRect", {
-        x: pillX, y: pillY, w: PILL_W, h: PILL_H,
-        rectRadius: PILL_H / 2,
-        fill: { color: pillColor, transparency: 85 },
-        line: { color: pillColor, width: 0.8 },
-      });
-      s.addText(row.statusLabel, {
-        x: pillX, y: pillY, w: PILL_W, h: PILL_H,
-        fontSize: theme.smallFontSize - 1, fontFace: theme.fontFace, bold: true,
-        color: pillColor, align: "center", valign: "middle",
-      });
-    }
-  });
 }
 
 export async function POST(req: NextRequest) {
@@ -4165,94 +3735,7 @@ export async function POST(req: NextRequest) {
       : rawCleaned;
     const sanitizedSlides = validateAndRepairSlides(normalizeSlidesForPptx(intentApplied));
 
-    // ── guaranteed chart: stat_callouts がなければ最も数値が多いスライドを強制変換 ──
-    // 年 (2000〜2099) のみの値は有効なKPIとみなさない（既存 stat_callouts でも適用）
-    const isYearOnlyValue = (val: string, unit: string) => {
-      const u = String(unit ?? "").trim();
-      if (u && !/^年度?$/.test(u)) return false;
-      const n = parseFloat(String(val).replace(/[,，〜～].+$/, "").replace(/[,，]/g, ""));
-      return n >= 2000 && n <= 2099;
-    };
-    const hasParseableChart = sanitizedSlides.some((sl) => {
-      if (sl.layoutType !== "stat_callouts") return false;
-      const parseable = (sl.statCallouts ?? []).filter((c: any) => {
-        const clean = String(c.value ?? "").replace(/[約,，\s]/g, "").replace(/[〜～].+$/, "").match(/[\d.]+/)?.[0];
-        if (!clean || isNaN(parseFloat(clean))) return false;
-        return !isYearOnlyValue(clean, String(c.unit ?? ""));
-      });
-      return parseable.length >= 2;
-    });
-    if (!hasParseableChart && !faithfulMode) {
-      // 年・年度をKPI値として採用しないための抽出ヘルパー（金額・割合・件数を年より優先）
-      const extractKpiValue = (text: string): { value: string; unit: string } | null => {
-        // 年・年度・日付範囲 (2024/10〜2026/3 等) を除去してからKPI数値を探す
-        const t = text.replace(/\b20\d{2}(?:\/\d{1,2}(?:[〜～]20\d{2}\/\d{1,2})?|年度?[のはがを]?)?/g, "▪");
-        // 優先0: 通貨記号付き (¥1.1M, ¥763千, ¥110千)
-        const c0 = t.match(/[¥￥]\s*[\d,，.]+(?:\.\d+)?\s*(?:万|億|千|兆|[MBKk])/);
-        if (c0) {
-          const raw = c0[0].replace(/^[¥￥]\s*/, "");
-          const u = raw.match(/(?:万|億|千|兆|[MBKk])$/)?.[0] ?? "";
-          const num = raw.replace(/(?:万|億|千|兆|[MBKk])$/, "").replace(/[,，\s]/g, "");
-          return { value: "¥" + num, unit: u };
-        }
-        // 優先1: 範囲値 + 有意単位 (9〜12万円, 43〜46%)
-        const r = t.match(/(?:約\s*)?[\d,，.]+[〜～][\d,，.]+\s*(?:万|億|千)?[円%件人回倍社名台個本枚兆]/);
-        if (r) {
-          const raw = r[0].replace(/^約\s*/, "");
-          const u = raw.match(/(?:万|億|千)?[円%件人回倍社名台個本枚兆]$/)?.[0] ?? "";
-          return { value: raw.replace(/(?:万|億|千)?[円%件人回倍社名台個本枚兆]$/, "").replace(/[,，\s]/g, ""), unit: u };
-        }
-        // 優先2: 数値 + 有意単位 (240万円, 99.9%, 746件, 1,100千円)
-        const m = t.match(/(?:約\s*)?[\d,，.]+(?:\.\d+)?\s*(?:万|億|千)?[円%件人回倍社名台個本枚兆]/);
-        if (m) {
-          const raw = m[0].replace(/^約\s*/, "");
-          const u = raw.match(/(?:万|億|千)?[円%件人回倍社名台個本枚兆]$/)?.[0] ?? "";
-          return { value: raw.replace(/(?:万|億|千)?[円%件人回倍社名台個本枚兆]$/, "").replace(/[,，\s]/g, ""), unit: u };
-        }
-        return null; // 年のみ、またはKPI数値なし → statCallouts 候補にしない
-      };
-      const hasKpi = (s: string) => extractKpiValue(s) !== null;
-
-      let bestIdx = -1;
-      let bestCount = 0;
-      sanitizedSlides.forEach((sl, i) => {
-        const lt = sl.layoutType;
-        if (lt === "closing" || lt === "title" || lt === "stat_callouts") return;
-        // bullets と cards.body/heading の両方をカウント（年のみ bullet は除外）
-        const bulletCount = (sl.bullets ?? []).filter((b: string) => hasKpi(b)).length;
-        const cardCount = (sl.cards ?? []).filter((c: any) =>
-          hasKpi(c.body ?? "") || hasKpi(c.heading ?? "")
-        ).length;
-        const count = bulletCount + cardCount;
-        if (count > bestCount) { bestCount = count; bestIdx = i; }
-      });
-      if (bestIdx >= 0 && bestCount >= 2) {
-        const src = sanitizedSlides[bestIdx];
-        const numTexts: string[] = [
-          ...(src.bullets ?? []).filter((b: string) => hasKpi(b)),
-          ...(src.cards ?? [])
-            .filter((c: any) => hasKpi(c.body ?? "") || hasKpi(c.heading ?? ""))
-            .map((c: any) => (hasKpi(c.body ?? "") ? c.body : c.heading) as string),
-        ].slice(0, 4);
-        const statCallouts = numTexts.map((b: string) => {
-          const kpi = extractKpiValue(b)!;
-          // ラベル: 年・KPI値パターンをすべて除去して残った文脈テキスト（カンマ付き元文も除去）
-          const label = b
-            .replace(/\b20\d{2}(?:\/\d{1,2}(?:[〜～]20\d{2}\/\d{1,2})?|年度?[のはがをも]?)/g, "")
-            .replace(/[¥￥]\s*[\d,，.]+(?:\.\d+)?\s*(?:万|億|千|兆|[MBKk])/g, "")
-            .replace(/(?:約\s*)?[\d,，.]+(?:[〜～][\d,，.]+)?\s*(?:万|億|千)?[円%件人回倍社名台個本枚兆]/g, "")
-            .replace(/[：:。、・]\s*/g, " ")
-            .trim()
-            .slice(0, 18) || b.slice(0, 18);
-          return { value: kpi.value, unit: kpi.unit, label };
-        });
-        console.log(`[gen-pptx] guaranteedChart: slide[${bestIdx}] "${src.title}" (${src.layoutType}) → stat_callouts`);
-        (sanitizedSlides as any[])[bestIdx] = { ...src, layoutType: "stat_callouts", statCallouts };
-      }
-    }
-
-    sanitizedSlides.forEach((slideRaw, index) => {
-      const slide = upgradeTextOnlySlide(slideRaw);
+    sanitizedSlides.forEach((slide, index) => {
       const resolvedLt = resolveLayoutType(slide);
       const visual = designBrief.visualHints[index] ?? {
         title: slide.title,
@@ -4302,18 +3785,6 @@ export async function POST(req: NextRequest) {
         case "timeline":
           buildTimelineSlide(pptx, slide, theme);
           break;
-        case "stat_callouts":
-          buildStatCalloutsSlide(pptx, slide, theme);
-          break;
-        case "card_grid":
-          buildCardGridSlide(pptx, slide, theme);
-          break;
-        case "icon_rows":
-          buildIconRowsSlide(pptx, slide, theme);
-          break;
-        case "roadmap":
-          buildTimelineSlide(pptx, slide, theme);
-          break;
         default:
           buildBulletsSlide(pptx, slide, theme, visual, slideIllustration, faithfulMode);
           if (slideIllustration) illustrationPlaced = true;
@@ -4322,13 +3793,6 @@ export async function POST(req: NextRequest) {
     });
 
     let buffer = await patchEastAsianFont((await pptx.write({ outputType: "nodebuffer" })) as Buffer);
-    // PPTX バリデーション: ZIP magic bytes + スライドXML存在確認
-    {
-      const isZip = buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B;
-      const hasSlides = isZip && buffer.includes(Buffer.from("ppt/slides/slide"));
-      if (!isZip) throw new Error("[gen-pptx] Generated PPTX is not a valid ZIP file — aborting");
-      if (!hasSlides) throw new Error("[gen-pptx] Generated PPTX has no slide content — aborting");
-    }
 
     // ── Phase 2: Vision レビュー → パッチ適用 → 再生成 ──────────────────
     if (!faithfulMode && process.env.PPTX_VISION_REVIEW_ENABLED === "true") {
@@ -4409,6 +3873,35 @@ export async function POST(req: NextRequest) {
                       patch.steps = newSteps;
                       console.log(`[gen-pptx] patch slide[${idx}].steps (${newSteps.length}件)`);
                     }
+                  } else if (fix.field === "density" && typeof fix.value === "string") {
+                    // density=low は「過密・詰まりすぎ」専用。
+                    // reason が「内容が薄い」「情報が少ない」等の thin-content 系なら medium に補正する。
+                    const reason = String((fix as any).reason ?? "").toLowerCase();
+                    const isThinContent = /内容が薄|情報が少|要点.*追加|追加.*要点|もっと.*情報|content.*thin|too.*sparse|add.*more|lacks.*content|insufficient|empty|not enough/.test(reason);
+                    if (fix.value === "low" && isThinContent) {
+                      patch.density = "medium";
+                      console.log(`[gen-pptx] density=low→medium (thin content): slide[${idx}] reason="${(fix as any).reason}"`);
+                    } else {
+                      patch.density = fix.value;
+                      console.log(`[gen-pptx] patch slide[${idx}].density = ${fix.value}`);
+                    }
+                  } else if (fix.field === "title" && typeof fix.value === "string") {
+                    const newTitle = fix.value.trim();
+                    if (newTitle) {
+                      patch.title = newTitle;
+                      console.log(`[gen-pptx] patch slide[${idx}].title = "${newTitle}"`);
+                    }
+                  } else if (fix.field === "callout" && typeof fix.value === "string") {
+                    // "見出し|本文" パイプ区切りで callout を設定・上書き
+                    const pipeIdx = fix.value.indexOf("|");
+                    if (pipeIdx > 0) {
+                      const cTitle = fix.value.slice(0, pipeIdx).trim();
+                      const cBody  = fix.value.slice(pipeIdx + 1).trim();
+                      if (cTitle && cBody) {
+                        patch.callout = { title: cTitle, body: cBody };
+                        console.log(`[gen-pptx] patch slide[${idx}].callout = "${cTitle}" / "${cBody.slice(0, 30)}"`);
+                      }
+                    }
                   } else if (fix.field === "layoutType") {
                     patch.layoutType = fix.value;
                     console.log(`[gen-pptx] patch slide[${idx}].layoutType = ${fix.value}`);
@@ -4436,53 +3929,6 @@ export async function POST(req: NextRequest) {
                         console.log(`[gen-pptx] auto-generated tableRows from bullets for slide[${idx}]`);
                       }
                     }
-                    if ((fix.value === "icon_rows" || fix.value === "card_grid") &&
-                        !(slide.cards ?? []).some((c: { heading?: string }) => c.heading?.trim()) &&
-                        !(slide.steps ?? []).some((s: { title?: string }) => s.title?.trim())) {
-                      if (existingBullets.length > 4) {
-                        // 5件以上: layoutType をカードにしても bullets fallback が slice(0,5) になるため bullets に戻す
-                        patch.layoutType = "bullets";
-                        console.log(`[gen-pptx] bullets=${existingBullets.length} > 4, reverting layoutType to bullets for slide[${idx}]`);
-                      } else if (existingBullets.length >= 2) {
-                        const ICON_CYCLE = ["gear", "lightbulb", "rocket", "chart", "star", "verified"] as const;
-                        patch.cards = existingBullets.slice(0, 4).map((b: string, bi: number) => {
-                          const iconKey = ICON_CYCLE[bi % ICON_CYCLE.length];
-                          const { heading, body } = splitBulletForCard(b);
-                          return { iconKey, heading, body };
-                        });
-                        console.log(`[gen-pptx] auto-generated cards from bullets for slide[${idx}] (${fix.value})`);
-                      }
-                    }
-                    if (fix.value === "stat_callouts" &&
-                        !(slide.statCallouts ?? []).some((c: { value?: string }) => c.value?.trim()) &&
-                        !(slide.metrics ?? []).some((m: { label?: string }) => m.label?.trim())) {
-                      // Vision の reason から "value|unit|label" トリプレットを抽出
-                      const reasonStr = (fix as { reason?: string }).reason ?? "";
-                      const tripletRe = /([^\s|,，]+)\|([^|,]*)\|([^|,\n，]+)/g;
-                      const reasonCallouts: Array<{ value: string; unit: string; label: string }> = [];
-                      let rm;
-                      while ((rm = tripletRe.exec(reasonStr)) !== null && reasonCallouts.length < 3) {
-                        const val = rm[1].trim(), unit = rm[2].trim(), label = rm[3].trim().replace(/[|｜]$/, "");
-                        if (val && label) reasonCallouts.push({ value: val, unit, label });
-                      }
-                      if (reasonCallouts.length >= 1) {
-                        patch.statCallouts = reasonCallouts;
-                        console.log(`[gen-pptx] auto-generated statCallouts from Vision reason for slide[${idx}] (${reasonCallouts.length}件)`);
-                      } else if (existingBullets.length >= 1) {
-                        // fallback: bullets 内の数値パターンを抽出
-                        const numRe = /([\d,，.]+(?:[.．]\d+)?)\s*(万円|百万|千円|億円|%|％|人|件|回|個|点|倍|ms|GB|MB|KB)?/;
-                        const autoCallouts = existingBullets.slice(0, 3).flatMap((b: string) => {
-                          const nm = b.match(numRe);
-                          if (!nm) return [];
-                          const label = b.replace(nm[0], "").replace(/[：:=＝\-－]/g, "").trim().slice(0, 14);
-                          return label ? [{ value: nm[1], unit: nm[2] ?? "", label }] : [];
-                        });
-                        if (autoCallouts.length >= 1) {
-                          patch.statCallouts = autoCallouts;
-                          console.log(`[gen-pptx] auto-generated statCallouts from bullets for slide[${idx}] (${autoCallouts.length}件)`);
-                        }
-                      }
-                    }
                   } else if (SLIDE_FIELD_ALLOWLIST.has(fix.field)) {
                     patch[fix.field] = fix.value;
                     console.log(`[gen-pptx] patch slide[${idx}].${fix.field} = ${fix.value}`);
@@ -4491,6 +3937,23 @@ export async function POST(req: NextRequest) {
                 return { ...slide, ...patch, ...(updatedMetrics ? { metrics: updatedMetrics } : {}) };
               })
               .filter((s): s is PptxSlide => s !== null);
+
+            // density=low 連続5枚以上はログ警告＋medium に丸める
+            {
+              let lowRun = 0;
+              for (const s of patchedSlidesRaw) {
+                if (s.density === "low") {
+                  lowRun++;
+                  if (lowRun >= 5) {
+                    console.warn(`[gen-pptx] density=low run=${lowRun} slide "${s.title}" → corrected to medium`);
+                    s.density = "medium";
+                  }
+                } else {
+                  lowRun = 0;
+                }
+              }
+            }
+
             const patchedSlides = validateAndRepairSlides(normalizeSlidesForPptx(patchedSlidesRaw));
 
             // coverSubtitle パッチ
@@ -4530,8 +3993,7 @@ export async function POST(req: NextRequest) {
               buildTitleSlide(pptx2, title, designBrief, theme, patchedSlides.length + 1, coverIllustration);
             }
             let regeneratedIllustrationPlaced = false;
-            patchedSlides.forEach((slideRaw, index) => {
-              const slide = upgradeTextOnlySlide(slideRaw);
+            patchedSlides.forEach((slide, index) => {
               const resolvedLt = resolveLayoutType(slide);
               const visual = designBrief.visualHints[index] ?? {
                 title: slide.title,
@@ -4560,10 +4022,6 @@ export async function POST(req: NextRequest) {
                 case "closing":        buildClosingSlide(pptx2, slide, theme); break;
                 case "metric-cards":   buildMetricCardsSlide(pptx2, slide, theme); break;
                 case "timeline":       buildTimelineSlide(pptx2, slide, theme); break;
-                case "stat_callouts":  buildStatCalloutsSlide(pptx2, slide, theme); break;
-                case "card_grid":      buildCardGridSlide(pptx2, slide, theme); break;
-                case "icon_rows":      buildIconRowsSlide(pptx2, slide, theme); break;
-                case "roadmap":        buildTimelineSlide(pptx2, slide, theme); break;
                 default:
                   buildBulletsSlide(pptx2, slide, theme, visual, slideIllustration, faithfulMode);
                   if (slideIllustration) regeneratedIllustrationPlaced = true;
@@ -4571,17 +4029,7 @@ export async function POST(req: NextRequest) {
               }
             });
             buffer = await patchEastAsianFont((await pptx2.write({ outputType: "nodebuffer" })) as Buffer);
-            {
-              const isZip2 = buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B;
-              const hasSlides2 = isZip2 && buffer.includes(Buffer.from("ppt/slides/slide"));
-              if (!isZip2 || !hasSlides2) {
-                console.warn("[gen-pptx] Re-generated PPTX invalid — keeping original buffer");
-                buffer = await patchEastAsianFont((await pptx.write({ outputType: "nodebuffer" })) as Buffer);
-              }
-            }
-            if (buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B) {
-              console.log(`[gen-pptx] Re-generated after Vision review`);
-            }
+            console.log(`[gen-pptx] Re-generated after Vision review`);
           }
         }
       } catch (visionErr) {
@@ -4594,10 +4042,9 @@ export async function POST(req: NextRequest) {
     const safeBase = fileBaseName
       ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
       : (threadId ?? uniqueId());
-    const displayFileName = `${safeBase}.pptx`;          // 日本語名：リンク表示・DL名
-    const blobKey = `pptx_${shortId}.pptx`;              // ASCII のみ：Blob key（URL短縮）
-    const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
-    return NextResponse.json({ ok: true, downloadUrl, fileName: displayFileName });
+    const fileName = `${safeBase}_${shortId}.pptx`;
+    const downloadUrl = await uploadPptxToBlob(buffer, fileName);
+    return NextResponse.json({ ok: true, downloadUrl, fileName });
   } catch (e: any) {
     console.error("[gen-pptx] error:", e);
     return NextResponse.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });

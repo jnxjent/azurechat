@@ -17,6 +17,18 @@ install_pip_if_needed() {
 
 mkdir -p "$PDIR"
 
+# ── Step 0: LibreOffice（PPTX→PDF変換用） ────────────────────────────────
+if ! command -v libreoffice &>/dev/null && ! command -v soffice &>/dev/null; then
+  echo "[startup] Installing LibreOffice..."
+  apt-get update -qq && apt-get install -y --no-install-recommends \
+    libreoffice-impress libreoffice-writer fonts-noto-cjk \
+    2>/dev/null \
+    && echo "[startup] LibreOffice installed." \
+    || echo "[startup] WARNING: LibreOffice install failed (non-fatal)."
+else
+  echo "[startup] LibreOffice already available."
+fi
+
 # ── Step 1: コア Office 編集ライブラリ ──────────────────────────────────
 # python-pptx / openpyxl / docx / pdfplumber / Doc Intelligence SDK
 install_pip_if_needed
@@ -31,6 +43,7 @@ PYTHONPATH="$PDIR" python3 -c "import azure.ai.documentintelligence" 2>/dev/null
 PYTHONPATH="$PDIR" python3 -c "import pdf2docx"                    2>/dev/null || MISSING="$MISSING pdf2docx"
 PYTHONPATH="$PDIR" python3 -c "import matplotlib"                  2>/dev/null || MISSING="$MISSING matplotlib"
 PYTHONPATH="$PDIR" python3 -c "import PIL"                         2>/dev/null || MISSING="$MISSING pillow"
+PYTHONPATH="$PDIR" python3 -c "import cairosvg"                    2>/dev/null || MISSING="$MISSING cairosvg"
 
 if [ -n "$MISSING" ]; then
   echo "[startup] Installing missing packages:$MISSING"
