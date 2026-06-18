@@ -20,10 +20,6 @@ import { uniqueId } from "@/features/common/util";
 
 const execFileAsync = promisify(execFile);
 
-type SlideSummary = {
-  slideIndex: number;
-  texts: string[];
-};
 
 type ImageInsert = {
   slideIndex: number;  // -1 = 全スライドに適用
@@ -46,8 +42,27 @@ type EditPlan = {
     slideIndex: number;
     replaceText?: Array<{
       find: string;
-      replace: string;
+      replace?: string;
+      appendToRun?: string;
     }>;
+    addBullets?: Array<{
+      afterText: string;
+      texts: string[];
+    }>;
+    copyShapeBlock?: {
+      headingShapeName: string;
+      descShapeName: string;
+      headingText: string;
+      descText: string;
+      groupShapeNames?: string[];
+    };
+    convertToCards?: {
+      cards: Array<{
+        heading: string;
+        body: string;
+        iconKey?: string;
+      }>;
+    };
   }>;
   imageInserts?: ImageInsert[];
 };
@@ -64,6 +79,18 @@ function decodeXmlEntities(s: string): string {
 function normalizeHexColor(value: string | undefined | null): string | undefined {
   const normalized = String(value ?? "").replace("#", "").trim().toUpperCase();
   return /^[0-9A-F]{6}$/.test(normalized) ? normalized : undefined;
+}
+
+// 各 <a:t> テキストを個別に返す（Python run.text.replace の対象単位と一致）
+function extractShapeRunTexts(shapeXml: string): string[] {
+  const runs: string[] = [];
+  const runRe = /<a:t(?:\s[^>]*)?>([^<]*)<\/a:t>/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = runRe.exec(shapeXml)) !== null) {
+    const t = decodeXmlEntities(rm[1]).trim();
+    if (t.length >= 2) runs.push(t); // 1文字以下は記号・装飾の可能性が高いのでスキップ
+  }
+  return runs;
 }
 
 function extractShapeTextByParagraph(shapeXml: string): string[] {
@@ -91,7 +118,15 @@ function splitIntoShapes(slideXml: string): string[] {
   return shapes;
 }
 
-async function extractSlideSummaries(pptxBuffer: Buffer): Promise<SlideSummary[]> {
+
+// タイトルshapeを正確に検出して構造化スライドデータを返す（runs = Python置換単位のテキスト）
+function extractShapeName(shapeXml: string): string {
+  return shapeXml.match(/<p:cNvPr[^>]*\bname="([^"]+)"/)?.[1] ?? "";
+}
+
+async function extractSlidesStructured(
+  pptxBuffer: Buffer
+): Promise<Array<{ slideIndex: number; title: string; bullets: string[]; runs: string[]; shapes: Array<{ name: string; texts: string[] }> }>> {
   const zip = await JSZip.loadAsync(pptxBuffer);
   const slideEntries = Object.keys(zip.files)
     .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
@@ -101,17 +136,48 @@ async function extractSlideSummaries(pptxBuffer: Buffer): Promise<SlideSummary[]
       return numA - numB;
     });
 
-  const summaries: SlideSummary[] = [];
+  const result: Array<{ slideIndex: number; title: string; bullets: string[]; runs: string[]; shapes: Array<{ name: string; texts: string[] }> }> = [];
   for (let si = 0; si < slideEntries.length; si++) {
     const xml = await zip.files[slideEntries[si]].async("string");
-    const shapes = splitIntoShapes(xml);
-    const texts = shapes
-      .flatMap((shapeXml) => extractShapeTextByParagraph(shapeXml))
-      .map((text) => text.trim())
-      .filter(Boolean);
-    summaries.push({ slideIndex: si, texts: texts.slice(0, 20) });
+    const shapeXmls = splitIntoShapes(xml);
+
+    let title = "";
+    const bullets: string[] = [];
+    const runs: string[] = []; // 非タイトルshapeのrun単位テキスト（Python置換検証用）
+    const shapes: Array<{ name: string; texts: string[] }> = []; // shape単位の構造（heading+description検出用）
+
+    for (const shapeXml of shapeXmls) {
+      // <p:ph type="title"> or <p:ph type="ctrTitle"> marks the title placeholder
+      const isTitle = /<p:ph[^/]*type="(?:title|ctrTitle)"/.test(shapeXml);
+      const texts = extractShapeTextByParagraph(shapeXml)
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (isTitle && !title) {
+        title = texts.join(" ").slice(0, 80);
+      } else {
+        bullets.push(...texts.slice(0, 8));
+        runs.push(...extractShapeRunTexts(shapeXml));
+        const name = extractShapeName(shapeXml);
+        if (texts.length > 0) {
+          shapes.push({ name, texts: texts.slice(0, 6) });
+        }
+      }
+    }
+
+    // Fallback: no title placeholder found — promote first bullet
+    if (!title && bullets.length > 0) {
+      title = bullets.shift() ?? "";
+    }
+
+    result.push({
+      slideIndex: si,
+      title,
+      bullets: bullets.slice(0, 10),
+      runs: runs.slice(0, 80).map((r) => r.slice(0, 120)),
+      shapes: shapes.slice(0, 30),
+    });
   }
-  return summaries;
+  return result;
 }
 
 function parseDirectAccentColor(instruction: string): string | undefined {
@@ -127,7 +193,7 @@ function parseDirectAccentColor(instruction: string): string | undefined {
 }
 
 // URL付きの画像挿入指示をLLM不要で直接EditPlanに変換する
-function tryBuildDirectPlan(instruction: string, _slides: SlideSummary[]): EditPlan | null {
+function tryBuildDirectPlan(instruction: string, _slides: unknown[]): EditPlan | null {
   const urlMatch = instruction.match(/https?:\/\/[^\s)>\]　「」）]+/);
   if (!urlMatch) return null;
   const matchedUrl = urlMatch[0];
@@ -168,7 +234,10 @@ function tryBuildDirectPlan(instruction: string, _slides: SlideSummary[]): EditP
   };
 }
 
-async function buildEditPlan(slides: SlideSummary[], instruction: string): Promise<EditPlan> {
+async function buildEditPlan(
+  slides: Array<{ slideIndex: number; title: string; bullets: string[]; runs: string[] }>,
+  instruction: string
+): Promise<EditPlan> {
   // 決定的に解釈できる画像URL挿入はLLMをスキップして直接プランを生成
   const direct = tryBuildDirectPlan(instruction, slides);
   if (direct && (direct.imageInserts?.length ?? 0) > 0 &&
@@ -217,6 +286,7 @@ Rules:
 - Deck color change means accent shapes, fills, and lines. It does not mean changing body text color.
 - preserveTextColors should usually be true unless the user explicitly asks to recolor text.
 - Only emit text replacements when the user explicitly wants wording changed.
+- CRITICAL: "find" MUST be a short verbatim substring (≤ 80 chars) that appears in runs[] of the target slide. runs[] contains individual PowerPoint text-run units (shorter than full bullets). NEVER use a full bullet/paragraph sentence as "find" — it spans multiple runs and will not match. Pick a distinctive short phrase from runs[].
 - slideIndex is zero-based.
 - If the user asks to add an icon, illustration, image, or mark to a slide, populate imageInserts[].
   - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background"). Use this when NO existing URL is provided.
@@ -1101,15 +1171,11 @@ async function resolveConvertPdfScriptPath(): Promise<string> {
   throw new Error(`pdf_to_excel.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-/** LLMで勘定科目名の断片化・文字化けを補正するプランを生成する（読み取り専用・XLSX.js書き込みなし）。
- *  書き込みは呼び出し元がopenpyxl(edit_excel.py)で行うことで元のxlsx構造を保持する。
- */
 async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<ExcelEditPlan> {
   const openai = OpenAIInstance();
   const wb = XLSX.read(excelBuffer, { type: "buffer" });
   const isAccountName = (val: string) =>
     val.trim().length > 0 && !/^[\d,，△▲\-()（）\s]+$/.test(val.trim());
-
   const sheetEdits: NonNullable<ExcelEditPlan["sheetEdits"]> = [];
   const CORRECTION_TIMEOUT_MS = 90_000;
   const startTime = Date.now();
@@ -1234,8 +1300,6 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
     }
 
     const rawBuffer = await fs.readFile(outputPath);
-
-    // 勘定科目名の断片化・文字化けをLLMで補正し、openpyxlで書き込む（元のxlsx構造を保持）
     let outputBuffer = rawBuffer;
     try {
       const correctionPlan = await buildAccountNameCorrectionPlan(rawBuffer);
@@ -1699,21 +1763,78 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
     return {
       downloadUrl,
       fileName,
+      outputBuffer,
       changedSlides: Number(pythonResult.changedSlides ?? 0),
+      changedSlideIndices: Array.isArray(pythonResult.changedSlideIndices)
+        ? (pythonResult.changedSlideIndices as number[])
+        : [],
       totalSlides: Number(pythonResult.totalSlides ?? 0),
       requestedImages,
       insertedImages,
+      charsBefore: Number(pythonResult.charsBefore ?? 0),
+      charsAfter: Number(pythonResult.charsAfter ?? 0),
       ...(imageWarning ? { imageWarning } : {}),
+      ...(Array.isArray(pythonResult.outOfRangeSlides) && pythonResult.outOfRangeSlides.length > 0
+        ? { outOfRangeSlides: pythonResult.outOfRangeSlides as number[] }
+        : {}),
+      ...(Array.isArray(pythonResult.overflowCandidates) && pythonResult.overflowCandidates.length > 0
+        ? { overflowCandidates: pythonResult.overflowCandidates as string[] }
+        : {}),
+      ...(Array.isArray(pythonResult.layoutWarnings) && pythonResult.layoutWarnings.length > 0
+        ? { layoutWarnings: pythonResult.layoutWarnings as string[] }
+        : {}),
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 }
 
+/** edit-pptx 後に変更スライドのみ Vision レビューして目視警告を返す（対応3）*/
+async function runVisionReviewAfterEdit(
+  outputBuffer: Buffer,
+  changedSlideIndices: number[],
+  baseUrl: string
+): Promise<string[]> {
+  try {
+    const reviewForm = new FormData();
+    reviewForm.append(
+      "pptx",
+      new Blob([new Uint8Array(outputBuffer)], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" })
+    );
+    reviewForm.append("title", "edit-review");
+
+    const res = await fetch(`${baseUrl}/api/vision-review-pptx`, {
+      method: "POST",
+      body: reviewForm,
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!res.ok) return [];
+
+    const review = await res.json() as { fixes?: Array<{ slideIndex: number; field: string; value: string; reason?: string }> };
+    const warnings: string[] = [];
+    const overflowFields = new Set(["fitTextToShape", "fontScaleDown", "trimText", "syncItemDecorations", "copyItemDecoration", "alignItemGroup", "fallbackLayout"]);
+
+    for (const fix of (review.fixes ?? [])) {
+      if (!changedSlideIndices.includes(fix.slideIndex)) continue;
+      if (overflowFields.has(fix.field)) {
+        warnings.push(`Page${fix.slideIndex + 1}: ${fix.reason ?? fix.field}`);
+      }
+    }
+
+    if (warnings.length > 0) {
+      console.log(`[edit-pptx] vision post-review warnings: ${warnings.join(" / ")}`);
+    }
+    return warnings;
+  } catch (e) {
+    console.warn("[edit-pptx] vision post-review failed (non-fatal):", String((e as Error)?.message ?? e).slice(0, 120));
+    return [];
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -1721,9 +1842,10 @@ export async function POST(req: NextRequest) {
       mode?: string;
       previousChartEdits?: ExcelEditPlan["chartEdits"];
       outputBaseName?: string;
+      plan?: EditPlan;
     };
 
-    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word")) {
+    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
       return NextResponse.json(
         { ok: false, error: "fileUrl and instruction are required" },
         { status: 400 }
@@ -1732,7 +1854,8 @@ export async function POST(req: NextRequest) {
 
     const ext = getFileExtension(fileUrl);
     console.log(`[edit-pptx] fileUrl =`, fileUrl.substring(0, 80));
-    console.log(`[edit-pptx] ext =`, ext, "action =", action ?? "(none)", "instruction =", instruction.substring(0, 120));
+    const instructionText = instruction ?? "";
+    console.log(`[edit-pptx] ext =`, ext, "action =", action ?? "(none)", "instruction =", instructionText.substring(0, 120));
 
     // PDF → Excel 変換
     if (action === "pdf_to_excel") {
@@ -1749,6 +1872,108 @@ export async function POST(req: NextRequest) {
       const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode);
       console.log("[pdf-to-word] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
+    }
+
+    // PPTX スライド構造抽出（編集・アップロードなし）
+    if (action === "extract_pptx_summary") {
+      const pptxBuffer = await downloadBlob(fileUrl, threadId);
+      const slides = await extractSlidesStructured(pptxBuffer);
+      console.log(`[extract_pptx_summary] extracted ${slides.length} slides`);
+      return NextResponse.json({ ok: true, slides, totalSlides: slides.length });
+    }
+
+    // EditPlan を直接受け取って既存PPTXに適用（replaceText のみ・レイアウト再生成なし）
+    if (action === "apply_pptx_plan") {
+      if (!incomingPlan || !Array.isArray(incomingPlan.slideEdits)) {
+        return NextResponse.json({ ok: false, error: "plan.slideEdits is required" }, { status: 400 });
+      }
+      // deckEdits / imageInserts は内容増量では不要のため除去。item 単位バリデーション付き。
+      const safeplan: EditPlan = {
+        slideEdits: incomingPlan.slideEdits
+          .map((se) => {
+            const validReplace = (se.replaceText ?? []).filter((item) => {
+              const find = String((item as any).find ?? "").trim();
+              const replace = String((item as any).replace ?? "").trim();
+              const appendToRun = String((item as any).appendToRun ?? "").trim();
+              return find && (replace || appendToRun);
+            });
+            const validBullets = (se.addBullets ?? []).filter((item) => {
+              const texts = Array.isArray((item as any).texts)
+                ? (item as any).texts.filter((t: unknown) => String(t ?? "").trim())
+                : [];
+              return texts.length > 0;
+            });
+            const csb = (se as any).copyShapeBlock;
+            const rawCsbGroup: unknown = csb?.groupShapeNames;
+            const validGroupNames: string[] | undefined =
+              Array.isArray(rawCsbGroup) && rawCsbGroup.length >= 2
+                ? (rawCsbGroup as unknown[]).map((n) => String(n).trim()).filter(Boolean)
+                : undefined;
+            const validCopyBlock =
+              csb &&
+              typeof csb.headingShapeName === "string" && csb.headingShapeName.trim() &&
+              typeof csb.descShapeName === "string" && csb.descShapeName.trim()
+                ? { headingShapeName: csb.headingShapeName.trim(), descShapeName: csb.descShapeName.trim(),
+                    headingText: String(csb.headingText ?? "").trim(), descText: String(csb.descText ?? "").trim(),
+                    ...(validGroupNames ? { groupShapeNames: validGroupNames } : {}) }
+                : undefined;
+            const rawConvertToCards = (se as any).convertToCards;
+            const validCards = Array.isArray(rawConvertToCards?.cards)
+              ? rawConvertToCards.cards
+                  .map((card: any) => ({
+                    heading: String(card?.heading ?? "").trim().slice(0, 40),
+                    body: String(card?.body ?? "").trim().slice(0, 180),
+                    iconKey: String(card?.iconKey ?? "").trim().slice(0, 24),
+                  }))
+                  .filter((card: { heading: string; body: string }) => card.heading || card.body)
+                  .slice(0, 6)
+              : [];
+            const validConvertToCards = validCards.length > 0
+              ? { cards: validCards }
+              : undefined;
+            const hasValid = validReplace.length > 0 || validBullets.length > 0 || !!validCopyBlock || !!validConvertToCards;
+            if (!hasValid) return null;
+            return {
+              slideIndex: se.slideIndex,
+              ...(validReplace.length > 0 ? { replaceText: validReplace } : {}),
+              ...(validBullets.length > 0 ? { addBullets: validBullets } : {}),
+              ...(validCopyBlock ? { copyShapeBlock: validCopyBlock } : {}),
+              ...(validConvertToCards ? { convertToCards: validConvertToCards } : {}),
+            };
+          })
+          .filter((se): se is NonNullable<typeof se> => se !== null),
+      };
+      const pptxBuffer = await downloadBlob(fileUrl, threadId);
+      const safeBaseName = outputBaseName ?? "内容増量";
+      const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName);
+      console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
+
+      // 対応3: addBullets/copyShapeBlock 後に Vision レビューして目視警告を返す
+      let applyVisualWarnings: string[] | undefined;
+      const hasApplyBulletOrShapeEdit = (safeplan.slideEdits ?? []).some(
+        (se) =>
+          Array.isArray((se as any).addBullets) ||
+          (se as any).copyShapeBlock ||
+          (se as any).convertToCards ||
+          Array.isArray((se as any).replaceText)
+      );
+      if (
+        process.env.PPTX_EDIT_VISION_REVIEW_ENABLED === "true" &&
+        hasApplyBulletOrShapeEdit &&
+        result.changedSlides > 0 &&
+        result.changedSlideIndices.length > 0
+      ) {
+        const baseUrl = (
+          process.env.NEXTAUTH_URL ||
+          (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+        ).replace(/\/+$/, "");
+        const warnings = await runVisionReviewAfterEdit(result.outputBuffer, result.changedSlideIndices, baseUrl);
+        if (warnings.length > 0) applyVisualWarnings = warnings;
+      }
+
+      const { outputBuffer: _applyBuf, ...applyResult } = result;
+      void _applyBuf;
+      return NextResponse.json({ ok: true, ...applyResult, ...(applyVisualWarnings ? { visualWarnings: applyVisualWarnings } : {}) });
     }
 
     // Excel ファイル (.xlsx / .xls / .xlsm) の場合は Excel 専用フローへ
@@ -1783,16 +2008,66 @@ export async function POST(req: NextRequest) {
 
     // PPTX フロー（既存）
     const pptxBuffer = await downloadBlob(fileUrl, threadId);
-    const slides = await extractSlideSummaries(pptxBuffer);
-    const plan = await buildEditPlan(slides, instruction);
+    const slides = await extractSlidesStructured(pptxBuffer);
+    let plan = await buildEditPlan(slides, instruction);
+
+    // deckEdits はユーザーが明示的にスライド追加・削除を要求した場合のみ許可
+    // (それ以外の編集指示で accentColor/fontFace が混入すると別物化する)
+    const deckEditAllowed =
+      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更)|フォント.{0,8}(変え|変更)|アクセント/.test(instruction);
+    if (!deckEditAllowed && plan.deckEdits) {
+      console.log("[edit-pptx] stripping deckEdits (not explicitly requested)");
+      plan = { ...plan, deckEdits: undefined };
+    }
 
     console.log("[edit-pptx] plan:", JSON.stringify(plan));
 
+    const slideCountBefore = slides.length;
     const result = await runPythonEdit(pptxBuffer, plan, threadId, outputBaseName);
 
+    // 変更なし検証: 0件置換は無言成功ではなくエラーとして返す
+    if ((result.changedSlides ?? 0) <= 0 && (plan.imageInserts?.length ?? 0) === 0) {
+      return NextResponse.json({
+        ok: false,
+        error: "置換対象が見つからず、内容は変更されませんでした。文字列が複数のrunに分割されているか、指定した文字列が見つかりません。",
+      });
+    }
+    // スライド数変化検証: 編集依頼でページ数が増減するのは異常
+    if (result.totalSlides !== slideCountBefore) {
+      console.error(`[edit-pptx] slide count changed ${slideCountBefore} → ${result.totalSlides}`);
+      return NextResponse.json({
+        ok: false,
+        error: `スライド数が変化しました（${slideCountBefore}枚 → ${result.totalSlides}枚）。編集ではなく再生成が発生した可能性があります。`,
+      });
+    }
+
+    // 対応3: addBullets/copyShapeBlock 後に Vision レビューして目視警告を返す
+    // PPTX_EDIT_VISION_REVIEW_ENABLED=true の場合のみ実行（レイテンシ ~30秒）
+    let visualWarnings: string[] | undefined;
+    const hasBulletOrShapeEdit = (plan.slideEdits ?? []).some(
+      (se) => Array.isArray((se as any).addBullets) || (se as any).copyShapeBlock
+    );
+    if (
+      process.env.PPTX_EDIT_VISION_REVIEW_ENABLED === "true" &&
+      hasBulletOrShapeEdit &&
+      result.changedSlides > 0 &&
+      result.changedSlideIndices.length > 0
+    ) {
+      const baseUrl = (
+        process.env.NEXTAUTH_URL ||
+        (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+      ).replace(/\/+$/, "");
+      const warnings = await runVisionReviewAfterEdit(result.outputBuffer, result.changedSlideIndices, baseUrl);
+      if (warnings.length > 0) visualWarnings = warnings;
+    }
+
+    // outputBuffer は外部に公開しない（サイズが大きいため）
+    const { outputBuffer: _buf, ...safeResult } = result;
+    void _buf;
     return NextResponse.json({
       ok: true,
-      ...result,
+      ...safeResult,
+      ...(visualWarnings ? { visualWarnings } : {}),
     });
   } catch (e: any) {
     console.error("[edit-pptx] error:", e);
