@@ -180,6 +180,9 @@ export type PptxSlide = {
   visualIntent?: string;
   density?: "low" | "medium" | "high";
   textTreatment?: "short" | "normal" | "explanatory";
+  // Vision fix で設定されるフォント・テキスト調整フィールド
+  fontScale?: number;       // 0.70–1.0 実フォント縮小率（build 関数で反映、Vision fontScaleDown で設定）
+  fitTextToShape?: boolean; // true: テキストボックス内収縮を build 関数で強制
 };
 
 export type DeckPreferencesInput = {
@@ -2353,13 +2356,14 @@ function renderCardBullets(
   bullets: string[],
   theme: Theme,
   startY: number,
-  cardW: number
+  cardW: number,
+  fontScaleMult: number = 1.0
 ) {
   if (bullets.length === 0) return;
 
   // 6件以上: カード化せず dense bullets として全件表示（情報欠落防止）
   if (bullets.length > 5) {
-    const denseFontSize = Math.max(9, theme.bodyFontSize - 1);
+    const denseFontSize = Math.max(9, Math.round((theme.bodyFontSize - 1) * fontScaleMult));
     const denseItems = bullets.map((item) => ({
       text: item,
       options: {
@@ -2435,7 +2439,7 @@ function renderCardBullets(
     s.addText(numStr, {
       x: 0.44, y: y + cardH / 2 - 0.22,
       w: STRIP_W - 0.06, h: 0.44,
-      fontSize: theme.bodyFontSize - 1,
+      fontSize: Math.max(8, Math.round((theme.bodyFontSize - 1) * fontScaleMult)),
       fontFace: theme.fontFace, bold: true,
       color: "FFFFFF",
       align: "center", valign: "middle",
@@ -2443,7 +2447,7 @@ function renderCardBullets(
     s.addText(bullet, {
       x: 0.42 + STRIP_W + 0.16, y: y + 0.1,
       w: cardW - STRIP_W - 0.24, h: cardH - 0.2,
-      fontSize: theme.bodyFontSize,
+      fontSize: Math.max(9, Math.round(theme.bodyFontSize * fontScaleMult)),
       fontFace: theme.fontFace,
       color: theme.palette.bodyText,
       valign: "middle", fit: "shrink",
@@ -2463,6 +2467,7 @@ function buildBulletsSlide(
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
   const bFontAdj = densityFontAdj(slide.density);
+  const fontScaleMult = slide.fontScale ?? 1.0;
   const bMaxItems = densityMaxItems(slide.density, 5);
   const adjustedBullets = slide.bullets.slice(0, bMaxItems);
   const { hasSections, sections } = parseSections(adjustedBullets);
@@ -2620,12 +2625,13 @@ function buildBulletsSlide(
     }
   } else if (slide.bullets.length > 0) {
     if (faithfulMode) {
+      const faithfulFontSize = Math.max(9, Math.round(theme.bodyFontSize * fontScaleMult));
       const bulletItems = slide.bullets.map((item) => ({
         text: item,
         options: {
           bullet: { indent: 14 },
           breakLine: true,
-          fontSize: theme.bodyFontSize,
+          fontSize: faithfulFontSize,
           fontFace: theme.fontFace,
           color: theme.palette.bodyText,
           paraSpaceAfter: 9,
@@ -2638,10 +2644,11 @@ function buildBulletsSlide(
         h: H - HEADER_H - 0.55,
         margin: 0.1,
         valign: "top",
+        ...(slide.fitTextToShape ? { shrinkText: true } : {}),
       });
     } else {
       const cardW = showIllustration ? 6.55 : 8.88;
-      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW);
+      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW, fontScaleMult);
     }
   }
 
@@ -3439,9 +3446,10 @@ function buildMetricCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) 
   addHeaderBand(s, slide.title, theme);
 
   const { density, textTreatment, visualIntent } = slide;
-  const renderMode  = parseVisualIntent(visualIntent);
-  const mFontAdj    = densityFontAdj(density) + intentValueFontAdj(renderMode);
-  const mNoteExpand = intentNoteExpand(renderMode);
+  const renderMode    = parseVisualIntent(visualIntent);
+  const mFontAdj      = densityFontAdj(density) + intentValueFontAdj(renderMode);
+  const mNoteExpand   = intentNoteExpand(renderMode);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   const contentY = HEADER_H + 0.24;
   const contentH = H - contentY - 0.36;
@@ -3546,8 +3554,8 @@ function buildMetricCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) 
 
     if (metric.note) {
       const noteFontSize = textTreatment === "short"
-        ? theme.smallFontSize - 2
-        : theme.smallFontSize - 1;
+        ? Math.max(8, Math.round((theme.smallFontSize - 2) * fontScaleMult))
+        : Math.max(8, Math.round((theme.smallFontSize - 1) * fontScaleMult));
       const noteText = metric.note;
       s.addText(noteText, {
         x: cx + ICON_PAD, y: noteY,
@@ -3765,6 +3773,7 @@ function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   // statCallouts → なければ metrics を代用
   const rawCallouts: { value: string; unit: string; label: string }[] = (slide.statCallouts ?? []).length > 0
@@ -3809,7 +3818,7 @@ function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
         s.addText(item.unit, {
           x: cx + CARD_W * 0.72, y: CARD_Y + 0.55,
           w: CARD_W * 0.22, h: 0.38,
-          fontSize: theme.bodyFontSize,
+          fontSize: Math.max(8, Math.round(theme.bodyFontSize * fontScaleMult)),
           fontFace: theme.fontFace,
           color: theme.palette.mutedText,
           valign: "bottom", fit: "shrink",
@@ -3855,7 +3864,7 @@ function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
     if (bullets.length > 0) {
       const bulletItems = bullets.map((b) => ({
         text: b,
-        options: { bullet: { indent: 14 }, breakLine: true, fontSize: theme.bodyFontSize, fontFace: theme.fontFace, color: theme.palette.bodyText, paraSpaceAfter: 8 },
+        options: { bullet: { indent: 14 }, breakLine: true, fontSize: Math.max(9, Math.round(theme.bodyFontSize * fontScaleMult)), fontFace: theme.fontFace, color: theme.palette.bodyText, paraSpaceAfter: 8 },
       }));
       s.addText(bulletItems, { x: 0.52, y: CHART_Y, w: W - 1.04, h: CHART_H, margin: 0.1, valign: "top" });
     }
@@ -3869,6 +3878,7 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   // cards → なければ steps を代用
   const rawCards: PptxCard[] = (slide.cards ?? []).length > 0
@@ -3946,7 +3956,7 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     const textW = CARD_W - ICON_PAD_X - ICON_D - 0.22;
     s.addText(card.heading, {
       x: textX, y: iconY, w: textW, h: ICON_D,
-      fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
+      fontSize: Math.max(9, Math.round((theme.bodyFontSize + 1) * fontScaleMult)), fontFace: theme.fontFace, bold: true,
       color: theme.palette.bodyText, valign: "middle", fit: "shrink",
     });
 
@@ -3957,7 +3967,7 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
         x: cx + ICON_PAD_X, y: bodyY,
         w: CARD_W - ICON_PAD_X * 2,
         h: CARD_H - (bodyY - cy) - 0.14,
-        fontSize: Math.max(theme.bodyFontSize - 2, 10),
+        fontSize: Math.max(8, Math.round((theme.bodyFontSize - 2) * fontScaleMult)),
         fontFace: theme.fontFace,
         color: theme.palette.mutedText,
         valign: "top", fit: "shrink",
@@ -3973,6 +3983,7 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
   addHeaderBand(s, slide.title, theme);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   const rawRows: PptxCard[] = (slide.cards ?? []).length > 0
     ? slide.cards!
@@ -4039,14 +4050,14 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     s.addText(row.heading, {
       x: textX, y: cy,
       w: textW, h: ROW_H * 0.44,
-      fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
+      fontSize: Math.max(9, Math.round((theme.bodyFontSize + 1) * fontScaleMult)), fontFace: theme.fontFace, bold: true,
       color: theme.palette.bodyText, valign: "bottom", fit: "shrink",
     });
     if (row.body) {
       s.addText(row.body, {
         x: textX, y: cy + ROW_H * 0.44,
         w: textW, h: ROW_H * 0.56,
-        fontSize: theme.bodyFontSize - 1, fontFace: theme.fontFace,
+        fontSize: Math.max(8, Math.round((theme.bodyFontSize - 1) * fontScaleMult)), fontFace: theme.fontFace,
         color: theme.palette.mutedText, valign: "top", fit: "shrink",
       });
     }
@@ -4369,6 +4380,12 @@ export async function POST(req: NextRequest) {
               console.log(`[gen-pptx] Vision deleteSlide: indices=[${Array.from(deleteIndices).join(",")}]`);
             }
 
+            // 装飾ありレイアウト: bullets への直落ちは装飾保全ガードで禁止（対応 C+D）
+            const DECORATED_LAYOUTS = new Set([
+              "icon_rows", "card_grid", "stat_callouts", "metric-cards", "metric_cards",
+              "company-overview", "process-cards", "timeline", "roadmap",
+            ]);
+
             const patchedSlidesRaw = sanitizedSlides
               .map((slide, idx) => {
                 if (deleteIndices.has(idx)) {
@@ -4410,79 +4427,115 @@ export async function POST(req: NextRequest) {
                       console.log(`[gen-pptx] patch slide[${idx}].steps (${newSteps.length}件)`);
                     }
                   } else if (fix.field === "layoutType") {
-                    patch.layoutType = fix.value;
-                    console.log(`[gen-pptx] patch slide[${idx}].layoutType = ${fix.value}`);
-                    // layoutType 変更時: 必要なデータが欠如していれば bullets から自動生成
-                    const existingBullets = (slide.bullets ?? []).filter((b: string) => b?.trim());
-                    if (fix.value === "multi-column" && !hasUsableColumns(slide.columns)) {
-                      if (existingBullets.length >= 2) {
-                        const half = Math.ceil(existingBullets.length / 2);
-                        patch.columns = [
-                          { header: `${slide.title.slice(0, 8)}①`, bullets: existingBullets.slice(0, half) },
-                          { header: `${slide.title.slice(0, 8)}②`, bullets: existingBullets.slice(half) },
-                        ];
-                        console.log(`[gen-pptx] auto-generated columns from bullets for slide[${idx}]`);
+                    const newLt = fix.value as string;
+                    const currentLt = (slide.layoutType as string) ?? "bullets";
+                    // 装飾ありレイアウトから bullets への直落ちを阻止（装飾保全ガード D）
+                    if (DECORATED_LAYOUTS.has(currentLt) && newLt === "bullets") {
+                      console.log(`[gen-pptx] layoutType fix BLOCKED slide[${idx}]: ${currentLt} → bullets (decoration guard)`);
+                    } else {
+                      patch.layoutType = fix.value;
+                      console.log(`[gen-pptx] patch slide[${idx}].layoutType = ${fix.value}`);
+                      // layoutType 変更時: 必要なデータが欠如していれば bullets から自動生成
+                      const existingBullets = (slide.bullets ?? []).filter((b: string) => b?.trim());
+                      if (fix.value === "multi-column" && !hasUsableColumns(slide.columns)) {
+                        if (existingBullets.length >= 2) {
+                          const half = Math.ceil(existingBullets.length / 2);
+                          patch.columns = [
+                            { header: `${slide.title.slice(0, 8)}①`, bullets: existingBullets.slice(0, half) },
+                            { header: `${slide.title.slice(0, 8)}②`, bullets: existingBullets.slice(half) },
+                          ];
+                          console.log(`[gen-pptx] auto-generated columns from bullets for slide[${idx}]`);
+                        }
                       }
-                    }
-                    if (fix.value === "table" && !hasUsableTableRows(slide.tableRows)) {
-                      if (existingBullets.length >= 2) {
-                        const hasColon = existingBullets.some((b: string) => b.includes("：") || b.includes(":"));
-                        patch.tableRows = hasColon
-                          ? [["項目", "内容"], ...existingBullets.map((b: string) => {
-                              const ci = b.indexOf("：") >= 0 ? b.indexOf("：") : b.indexOf(":");
-                              return ci > 0 ? [b.slice(0, ci).trim(), b.slice(ci + 1).trim()] : [b, ""];
-                            })]
-                          : [["No.", slide.title], ...existingBullets.map((b: string, i: number) => [String(i + 1), b])];
-                        console.log(`[gen-pptx] auto-generated tableRows from bullets for slide[${idx}]`);
+                      if (fix.value === "table" && !hasUsableTableRows(slide.tableRows)) {
+                        if (existingBullets.length >= 2) {
+                          const hasColon = existingBullets.some((b: string) => b.includes("：") || b.includes(":"));
+                          patch.tableRows = hasColon
+                            ? [["項目", "内容"], ...existingBullets.map((b: string) => {
+                                const ci = b.indexOf("：") >= 0 ? b.indexOf("：") : b.indexOf(":");
+                                return ci > 0 ? [b.slice(0, ci).trim(), b.slice(ci + 1).trim()] : [b, ""];
+                              })]
+                            : [["No.", slide.title], ...existingBullets.map((b: string, i: number) => [String(i + 1), b])];
+                          console.log(`[gen-pptx] auto-generated tableRows from bullets for slide[${idx}]`);
+                        }
                       }
-                    }
-                    if ((fix.value === "icon_rows" || fix.value === "card_grid") &&
-                        !(slide.cards ?? []).some((c: { heading?: string }) => c.heading?.trim()) &&
-                        !(slide.steps ?? []).some((s: { title?: string }) => s.title?.trim())) {
-                      if (existingBullets.length > 4) {
-                        // 5件以上: layoutType をカードにしても bullets fallback が slice(0,5) になるため bullets に戻す
-                        patch.layoutType = "bullets";
-                        console.log(`[gen-pptx] bullets=${existingBullets.length} > 4, reverting layoutType to bullets for slide[${idx}]`);
-                      } else if (existingBullets.length >= 2) {
-                        const ICON_CYCLE = ["gear", "lightbulb", "rocket", "chart", "star", "verified"] as const;
-                        patch.cards = existingBullets.slice(0, 4).map((b: string, bi: number) => {
-                          const iconKey = ICON_CYCLE[bi % ICON_CYCLE.length];
-                          const { heading, body } = splitBulletForCard(b);
-                          return { iconKey, heading, body };
-                        });
-                        console.log(`[gen-pptx] auto-generated cards from bullets for slide[${idx}] (${fix.value})`);
+                      if ((fix.value === "icon_rows" || fix.value === "card_grid") &&
+                          !(slide.cards ?? []).some((c: { heading?: string }) => c.heading?.trim()) &&
+                          !(slide.steps ?? []).some((s: { title?: string }) => s.title?.trim())) {
+                        if (existingBullets.length >= 2) {
+                          const ICON_CYCLE = ["gear", "lightbulb", "rocket", "chart", "star", "verified"] as const;
+                          // 5件以上でも bullets に戻さず先頭4件でカード化（装飾保全: bullets revert 禁止）
+                          patch.cards = existingBullets.slice(0, 4).map((b: string, bi: number) => {
+                            const iconKey = ICON_CYCLE[bi % ICON_CYCLE.length];
+                            const { heading, body } = splitBulletForCard(b);
+                            return { iconKey, heading, body };
+                          });
+                          console.log(`[gen-pptx] auto-generated cards from bullets for slide[${idx}] (${fix.value}, capped at 4)`);
+                        }
                       }
-                    }
-                    if (fix.value === "stat_callouts" &&
-                        !(slide.statCallouts ?? []).some((c: { value?: string }) => c.value?.trim()) &&
-                        !(slide.metrics ?? []).some((m: { label?: string }) => m.label?.trim())) {
-                      // Vision の reason から "value|unit|label" トリプレットを抽出
-                      const reasonStr = (fix as { reason?: string }).reason ?? "";
-                      const tripletRe = /([^\s|,，]+)\|([^|,]*)\|([^|,\n，]+)/g;
-                      const reasonCallouts: Array<{ value: string; unit: string; label: string }> = [];
-                      let rm;
-                      while ((rm = tripletRe.exec(reasonStr)) !== null && reasonCallouts.length < 3) {
-                        const val = rm[1].trim(), unit = rm[2].trim(), label = rm[3].trim().replace(/[|｜]$/, "");
-                        if (val && label) reasonCallouts.push({ value: val, unit, label });
-                      }
-                      if (reasonCallouts.length >= 1) {
-                        patch.statCallouts = reasonCallouts;
-                        console.log(`[gen-pptx] auto-generated statCallouts from Vision reason for slide[${idx}] (${reasonCallouts.length}件)`);
-                      } else if (existingBullets.length >= 1) {
-                        // fallback: bullets 内の数値パターンを抽出
-                        const numRe = /([\d,，.]+(?:[.．]\d+)?)\s*(万円|百万|千円|億円|%|％|人|件|回|個|点|倍|ms|GB|MB|KB)?/;
-                        const autoCallouts = existingBullets.slice(0, 3).flatMap((b: string) => {
-                          const nm = b.match(numRe);
-                          if (!nm) return [];
-                          const label = b.replace(nm[0], "").replace(/[：:=＝\-－]/g, "").trim().slice(0, 14);
-                          return label ? [{ value: nm[1], unit: nm[2] ?? "", label }] : [];
-                        });
-                        if (autoCallouts.length >= 1) {
-                          patch.statCallouts = autoCallouts;
-                          console.log(`[gen-pptx] auto-generated statCallouts from bullets for slide[${idx}] (${autoCallouts.length}件)`);
+                      if (fix.value === "stat_callouts" &&
+                          !(slide.statCallouts ?? []).some((c: { value?: string }) => c.value?.trim()) &&
+                          !(slide.metrics ?? []).some((m: { label?: string }) => m.label?.trim())) {
+                        // Vision の reason から "value|unit|label" トリプレットを抽出
+                        const reasonStr = (fix as { reason?: string }).reason ?? "";
+                        const tripletRe = /([^\s|,，]+)\|([^|,]*)\|([^|,\n，]+)/g;
+                        const reasonCallouts: Array<{ value: string; unit: string; label: string }> = [];
+                        let rm;
+                        while ((rm = tripletRe.exec(reasonStr)) !== null && reasonCallouts.length < 3) {
+                          const val = rm[1].trim(), unit = rm[2].trim(), label = rm[3].trim().replace(/[|｜]$/, "");
+                          if (val && label) reasonCallouts.push({ value: val, unit, label });
+                        }
+                        if (reasonCallouts.length >= 1) {
+                          patch.statCallouts = reasonCallouts;
+                          console.log(`[gen-pptx] auto-generated statCallouts from Vision reason for slide[${idx}] (${reasonCallouts.length}件)`);
+                        } else if (existingBullets.length >= 1) {
+                          // fallback: bullets 内の数値パターンを抽出
+                          const numRe = /([\d,，.]+(?:[.．]\d+)?)\s*(万円|百万|千円|億円|%|％|人|件|回|個|点|倍|ms|GB|MB|KB)?/;
+                          const autoCallouts = existingBullets.slice(0, 3).flatMap((b: string) => {
+                            const nm = b.match(numRe);
+                            if (!nm) return [];
+                            const label = b.replace(nm[0], "").replace(/[：:=＝\-－]/g, "").trim().slice(0, 14);
+                            return label ? [{ value: nm[1], unit: nm[2] ?? "", label }] : [];
+                          });
+                          if (autoCallouts.length >= 1) {
+                            patch.statCallouts = autoCallouts;
+                            console.log(`[gen-pptx] auto-generated statCallouts from bullets for slide[${idx}] (${autoCallouts.length}件)`);
+                          }
                         }
                       }
                     }
+                  } else if (fix.field === "fontScaleDown") {
+                    // 実フォント縮小: bullets切り詰めではなく fontScale を設定（build 関数が反映）
+                    const ratio = parseFloat(fix.value);
+                    if (!isNaN(ratio) && ratio > 0 && ratio < 1) {
+                      patch.fontScale = Math.max(0.70, ratio);
+                      console.log(`[gen-pptx] fontScaleDown slide[${idx}] fontScale=${patch.fontScale}`);
+                    }
+                  } else if (fix.field === "trimText" && typeof fix.value === "string" && fix.value.trim().length > 0) {
+                    // 指定テキストに置き換え（bullets[0] を短縮版に差し替え）
+                    const newBullets = fix.value.split("|").map((b: string) => b.trim()).filter(Boolean);
+                    if (newBullets.length > 0) {
+                      patch.bullets = newBullets;
+                      console.log(`[gen-pptx] trimText slide[${idx}] bullets replaced (${newBullets.length}件)`);
+                    }
+                  } else if (fix.field === "fallbackLayout") {
+                    // 装飾ありレイアウトから bullets への直落ちを阻止（装飾保全ガード C）
+                    const requestedLt = (fix.value || "card_grid").trim();
+                    const currentLtFb = (slide.layoutType as string) ?? "bullets";
+                    if (DECORATED_LAYOUTS.has(currentLtFb) && requestedLt === "bullets") {
+                      patch.layoutType = "card_grid";
+                      console.log(`[gen-pptx] fallbackLayout GUARDED slide[${idx}]: ${currentLtFb} → card_grid (bullets blocked from decorated layout)`);
+                    } else {
+                      patch.layoutType = requestedLt;
+                      console.log(`[gen-pptx] fallbackLayout slide[${idx}] → ${requestedLt}`);
+                    }
+                  } else if (fix.field === "fitTextToShape") {
+                    // テキストボックス内 fit フラグ: build 関数でテキスト shrink を強制
+                    patch.fitTextToShape = true;
+                    console.log(`[gen-pptx] fitTextToShape slide[${idx}] → marked`);
+                  } else if (["syncItemDecorations", "copyItemDecoration", "alignItemGroup"].includes(fix.field)) {
+                    // itemGroup系は python-pptx 直接操作が必要なためログのみ
+                    console.log(`[gen-pptx] Vision fix ${fix.field} slide[${idx}] — logged (requires post-gen python apply)`);
                   } else if (SLIDE_FIELD_ALLOWLIST.has(fix.field)) {
                     patch[fix.field] = fix.value;
                     console.log(`[gen-pptx] patch slide[${idx}].${fix.field} = ${fix.value}`);
