@@ -337,6 +337,8 @@ export const ChatApiExtensions = async (props: {
   if (slApiKey && slSearchName && slIndexName) {
     const { deptLower: slDeptLower, userHash: slUserHash } = await resolveUserContext();
     const slFilter = `(chatThreadId eq '${(chatThread.id ?? "").replace(/'/g, "''")}' or isSlDoc eq true)`;
+    let slSearchCallCount = 0;
+    const SL_SEARCH_MAX_CALLS = 5;
 
     extensions.push({
       type: "function",
@@ -347,7 +349,8 @@ export const ChatApiExtensions = async (props: {
           "【2段階で使うこと】\n" +
           "① 比較対象の文書名が不明な場合: mode=\"discover\" で広いクエリ（例:「IR議事録」）を1回呼び出し、返ってくる file name から文書名・会社名を把握する。\n" +
           "② 文書名が判明したら: mode=\"content\" で「会社名 + 文書種別 + キーワード」の形式で文書ごとに個別呼び出しする（複数回）。\n" +
-          "例：最初に mode=discover で「IR議事録」→ 次に mode=content で「野村アセット IR議事録 社長コメント」「セイタキャピタル IR議事録 社長コメント」と個別検索。",
+          "例：最初に mode=discover で「IR議事録」→ 次に mode=content で「野村アセット IR議事録 社長コメント」「セイタキャピタル IR議事録 社長コメント」と個別検索。\n" +
+          "【検索打ち切りルール】「【検索終了】」で始まる結果が返ってきた場合は、それ以上検索せずユーザーに「指定された文書はライブラリに見つかりませんでした」と伝えること。",
         parameters: {
           type: "object",
           properties: {
@@ -366,8 +369,14 @@ export const ChatApiExtensions = async (props: {
           required: ["query"],
         },
         function: async (args: { query: string; mode?: string }) => {
+          slSearchCallCount++;
           const effectiveTop = args.mode === "discover" ? 32 : 8;
-          console.log("[sl_doc_search:ext] query =", args.query, "mode =", args.mode ?? "content", "top =", effectiveTop);
+          console.log("[sl_doc_search:ext] query =", args.query, "mode =", args.mode ?? "content", "top =", effectiveTop, "callCount =", slSearchCallCount);
+
+          if (slSearchCallCount > SL_SEARCH_MAX_CALLS) {
+            return "【検索終了】検索回数の上限に達しました。これ以上の検索は実行できません。指定された文書はライブラリに存在しないか、まだインデックス未登録の可能性があります。";
+          }
+
           const searchResult = await ExtensionSimilaritySearch({
             searchText: args.query,
             vectors: ["embedding"],
@@ -382,10 +391,13 @@ export const ChatApiExtensions = async (props: {
 
           if (searchResult.status !== "OK") {
             console.error("[sl_doc_search:ext] error:", searchResult.errors);
-            return "検索エラーが発生しました";
+            return "【検索終了】検索システムエラーが発生しました。Azure AI Searchへの接続に問題がある可能性があります。";
           }
           if (searchResult.response.length === 0) {
-            return "該当する文書が見つかりませんでした";
+            if (slSearchCallCount >= SL_SEARCH_MAX_CALLS) {
+              return "【検索終了】複数のクエリで検索しましたが、該当する文書がライブラリに見つかりませんでした。文書が存在しないか、インデックス未登録の可能性があります。これ以上検索しないでください。";
+            }
+            return "該当する文書が見つかりませんでした（別のクエリで再検索可）";
           }
 
           const withoutEmbedding = FormatCitations(searchResult.response);
