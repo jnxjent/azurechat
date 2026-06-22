@@ -170,7 +170,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
     {
       containerName,
       blobName: fileName,
-      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
     cred

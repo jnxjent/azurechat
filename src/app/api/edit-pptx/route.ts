@@ -496,7 +496,7 @@ async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: s
     {
       containerName,
       blobName: blobKey,
-      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
     cred
@@ -1010,7 +1010,7 @@ async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<stri
     {
       containerName,
       blobName: fileName,
-      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
     cred
@@ -1511,7 +1511,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
     {
       containerName,
       blobName: fileName,
-      expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
     cred

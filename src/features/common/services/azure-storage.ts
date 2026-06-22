@@ -62,7 +62,7 @@ export const GenerateSasUrl = async (
   const sasToken = generateBlobSASQueryParameters({
     containerName: containerName,
     blobName: blobPath,
-    expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     permissions: BlobSASPermissions.parse("r")
   }, sharedKeyCredential);
   const sasUrl = `${blockBlobClient.url}?${sasToken}`;

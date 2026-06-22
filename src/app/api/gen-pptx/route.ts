@@ -1564,7 +1564,7 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
   // generateSasUrl は BlockBlobClient が StorageSharedKeyCredential を持つ場合のみ使用可能
   // fromConnectionString（アカウントキー含む）で作成した場合は使用可能
   const sasUrl = await blockBlobClient.generateSasUrl({
-    expiresOn: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     permissions: BlobSASPermissions.parse("r"),
   });
   return sasUrl;
