@@ -647,7 +647,7 @@ function extractLatestXlsxUrlFromMessages(messages: string[]): string | null {
 
 // ---------- スレッド単位の最新 Excel URL ポインタ (Blob Storage) ----------
 
-type ExcelPointer = { url: string; fileName: string; savedAt: number; sourceFileQuery?: string; chartEdits?: object[] };
+type ExcelPointer = { url: string; fileName: string; savedAt: number; sourceFileQuery?: string; chartEdits?: object[]; sheetNames?: string[] };
 const EXCEL_PTR_BLOB = (threadId: string) => `thread-${threadId}-excel-latest.json`;
 
 async function saveLatestExcelUrl(
@@ -655,10 +655,11 @@ async function saveLatestExcelUrl(
   url: string,
   fileName: string,
   sourceFileQuery?: string,
-  chartEdits?: object[]
+  chartEdits?: object[],
+  sheetNames?: string[]
 ): Promise<void> {
   try {
-    const data: ExcelPointer = { url, fileName, savedAt: Date.now(), sourceFileQuery, chartEdits };
+    const data: ExcelPointer = { url, fileName, savedAt: Date.now(), sourceFileQuery, chartEdits, sheetNames };
     await UploadBlob("dl-link", EXCEL_PTR_BLOB(threadId), Buffer.from(JSON.stringify(data)));
     console.log(`[excel-ptr] saved pointer for thread ${threadId}: ${fileName} (query: ${sourceFileQuery ?? "-"}, charts: ${chartEdits?.length ?? 0})`);
   } catch (e) {
@@ -1844,8 +1845,52 @@ export const GetDefaultExtensions = async (props: {
         "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。\n" +
         "fileUrl は省略可能。省略するとスレッド内の最新PDF/Wordを自動的に使用する。\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
+        "【禁止】既にExcel変換済みのスレッドで「再変換して」「もう一度変換して」と言われた場合はこのツールを使わないこと。その場合は refine_excel_pages を使うこと。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_excel",
+    },
+  });
+
+  // ★ PDF→Excel変換後の指定シートをGPT-4Vで精度向上するツール
+  // ポインタからシート名一覧を取得してLLMが正確なシート名を指定できるようにする
+  const refineExcelPtr = await readLatestExcelPtr(props.chatThread.id).catch(() => null);
+  const sheetNamesContext = refineExcelPtr?.sheetNames?.length
+    ? `\n現在のExcelシート名（左から順）: ${refineExcelPtr.sheetNames.map((n, i) => `${i + 1}番目="${n}"`).join(", ")}`
+    : "";
+
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeRefineExcelPages(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          targetSheets: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "精度を上げるExcelシート名のリスト。シート名はExcelのタブ名と完全一致させること。" +
+              "例: ユーザーが「P2からP4」→ [\"P2\",\"P3\",\"P4\"]、「タブ2から4」→ 2番目〜4番目のシート名を指定する。",
+          },
+        },
+        required: [],
+      },
+      description:
+        "PDF→Excel変換後のExcelを、Vision AIで1シートずつ再抽出して精度を上げるツール。\n" +
+        "【必須】このスレッドで既に convert_pdf_to_excel を実行済みの場合に限り使用可能。\n" +
+        "使用タイミング:\n" +
+        "  - 「P2の精度を上げて」「タブ3を修正して」→ targetSheets に該当シート名を指定\n" +
+        "  - 「再変換して」「全部やり直して」「もう一度変換して」→ targetSheets を空配列にする（全シート対象）\n" +
+        "【禁止】「再変換して」はPDFからの再変換ではない。convert_pdf_to_excel を呼び直してはいけない。\n" +
+        "【重要】1回の呼び出しで1シートを処理する。シートを処理するたびに、処理したシート名とその時点の downloadUrl を\n" +
+        "Markdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示してから、次のシートの処理に進むこと。\n" +
+        "ツールの返り値に remainingSheets が含まれていてかつ空でない場合は、直ちに targetSheets=remainingSheets で再度このツールを呼び出すこと。\n" +
+        "targetSheets: 精度を上げるシート名の配列。空配列または省略で全シートを対象にする。\n" +
+        "ユーザーが「タブN」と言った場合は以下のシート名一覧のN番目を指定すること。" +
+        sheetNamesContext + "\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "refine_excel_pages",
     },
   });
 
@@ -4626,13 +4671,14 @@ async function executeEditExcel(
       return { error: "ダウンロードURLが取得できませんでした。" };
     }
 
-    // ポインタ更新（sourceFileQuery は引数優先 → 既存ポインタ引き継ぎ、chartEdits も保持）
+    // ポインタ更新（sourceFileQuery・chartEdits・sheetNames を引き継ぐ）
     await saveLatestExcelUrl(
       chatThread.id,
       result.downloadUrl,
       result.fileName ?? "edited.xlsx",
       sourceFileQuery ?? existingPtr?.sourceFileQuery,
-      result.appliedChartEdits ?? existingPtr?.chartEdits
+      result.appliedChartEdits ?? existingPtr?.chartEdits,
+      existingPtr?.sheetNames
     );
 
     return {
@@ -4859,6 +4905,16 @@ async function executeConvertPdfToExcel(
       return { error: "ダウンロードURLが取得できませんでした。" };
     }
 
+    // ExcelポインタにsheetNamesも保存（精度向上ツールでシート名をLLMに提示するため）
+    await saveLatestExcelUrl(
+      chatThread.id,
+      result.downloadUrl,
+      result.fileName ?? "converted.xlsx",
+      undefined,
+      undefined,
+      result.sheetNames
+    );
+
     const tableInfo = result.tables > 0
       ? `テーブル${result.tables}個を${result.sheets}シートに変換`
       : `テキストを「Text」シートに出力`;
@@ -4874,6 +4930,105 @@ async function executeConvertPdfToExcel(
   } catch (e: any) {
     console.error("[convert_pdf_to_excel] error:", e);
     return { error: "PDF→Excel変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- Excel 精度向上（GPT-4V リファイン） ----------------
+async function executeRefineExcelPages(
+  args: { targetSheets?: string[] },
+  chatThread: ChatThreadModel
+) {
+  const { targetSheets: rawTargetSheets } = args ?? {};
+
+  const ptr = await readLatestExcelPtr(chatThread.id);
+  if (!ptr?.url) {
+    return { error: "Excelファイルが見つかりません。先に convert_pdf_to_excel でExcelを作成してください。" };
+  }
+
+  // targetSheets 未指定 or 空配列 → ptr.sheetNames 全件を対象にする
+  let targetSheets: string[];
+  if (!Array.isArray(rawTargetSheets) || rawTargetSheets.length === 0) {
+    if (!ptr.sheetNames?.length) {
+      return { error: "シート名が不明です。再度 convert_pdf_to_excel から実行してください。" };
+    }
+    targetSheets = ptr.sheetNames;
+  } else {
+    targetSheets = rawTargetSheets;
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  // タイムアウト対策：1回の呼び出しで1シートのみ処理し、残りは remainingSheets で返す
+  const sheetToProcess = targetSheets[0];
+  const remainingSheets = targetSheets.slice(1);
+
+  // ptr.fileName からベース名を取り出して出力ファイル名を決定
+  // _revN があればインクリメント、なければ _rev1 を付与（_精度向上後 は旧命名なので除去）
+  const baseName = ptr.fileName?.replace(/\.xlsx$/i, "").replace(/(_精度向上後)+$/, "") ?? "output";
+  const revMatch = baseName.match(/^(.*?)_rev(\d+)$/);
+  const outputFileName = revMatch
+    ? `${revMatch[1]}_rev${parseInt(revMatch[2]) + 1}.xlsx`
+    : `${baseName}_rev1.xlsx`;
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        excelFileUrl: ptr.url,
+        targetSheets: [sheetToProcess],
+        outputFileName,
+        instruction: "",
+        threadId: chatThread.id,
+        action: "refine_excel_pages",
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error("[refine_excel_pages] route failed:", res.status, t);
+      return { error: `Excel精度向上に失敗しました: HTTP ${res.status}` };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "ダウンロードURLが取得できませんでした。" };
+    }
+
+    const didRefine = Number(result.refined ?? 0) > 0;
+
+    // ポインタ更新（refined > 0 のときのみ。失敗ファイルでポインタを上書きしない）
+    if (didRefine) {
+      await saveLatestExcelUrl(
+        chatThread.id,
+        result.downloadUrl,
+        result.fileName ?? "refined.xlsx",
+        ptr.sourceFileQuery,
+        ptr.chartEdits,
+        ptr.sheetNames
+      );
+    }
+
+    return {
+      downloadUrl: didRefine ? result.downloadUrl : ptr.url,
+      fileName: didRefine ? (result.fileName ?? "refined.xlsx") : ptr.fileName,
+      refined: result.refined,
+      skipped: result.skipped,
+      processedSheet: sheetToProcess,
+      remainingSheets,
+      message: didRefine
+        ? `「${sheetToProcess}」をGPT-4Vで再変換しました。` +
+          (remainingSheets.length > 0
+            ? ` 残り${remainingSheets.length}シート: ${remainingSheets.join(", ")}。続けて処理します。`
+            : " 全シートの処理が完了しました。")
+        : `「${sheetToProcess}」は再変換できませんでした。最新Excelは更新していません。`,
+    };
+  } catch (e: any) {
+    console.error("[refine_excel_pages] error:", e);
+    return { error: "Excel精度向上中にエラーが発生しました: " + String(e?.message ?? e) };
   }
 }
 

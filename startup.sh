@@ -6,8 +6,9 @@ PDIR=/home/site/python-packages
 PIP_CMD=/home/.local/bin/pip
 
 install_pip_if_needed() {
-  if [ ! -f "$PIP_CMD" ]; then
-    echo "[startup] pip not found, bootstrapping with get-pip.py..."
+  # ファイル存在だけでなく実際に動くかも確認（/home マウント由来の壊れたバイナリ対策）
+  if [ ! -f "$PIP_CMD" ] || ! "$PIP_CMD" --version &>/dev/null; then
+    echo "[startup] pip not found or broken, bootstrapping with get-pip.py..."
     curl -sS https://bootstrap.pypa.io/get-pip.py \
       | python3 - --user --break-system-packages 2>/dev/null \
       && echo "[startup] pip bootstrapped." \
@@ -21,12 +22,22 @@ mkdir -p "$PDIR"
 if ! command -v libreoffice &>/dev/null && ! command -v soffice &>/dev/null; then
   echo "[startup] Installing LibreOffice..."
   apt-get update -qq && apt-get install -y --no-install-recommends \
-    libreoffice-impress libreoffice-writer fonts-noto-cjk \
+    libreoffice-impress libreoffice-writer libreoffice-calc fonts-noto-cjk \
     2>/dev/null \
     && echo "[startup] LibreOffice installed." \
     || echo "[startup] WARNING: LibreOffice install failed (non-fatal)."
 else
   echo "[startup] LibreOffice already available."
+fi
+
+# xlsx→PDF変換には libreoffice-calc が必須（既存インストールに含まれていない場合に追加）
+if ! dpkg -s libreoffice-calc &>/dev/null 2>&1; then
+  echo "[startup] libreoffice-calc not found, installing..."
+  apt-get install -y --no-install-recommends libreoffice-calc 2>/dev/null \
+    && echo "[startup] libreoffice-calc installed." \
+    || echo "[startup] WARNING: libreoffice-calc install failed (non-fatal)."
+else
+  echo "[startup] libreoffice-calc already available."
 fi
 
 # ── Step 1: コア Office 編集ライブラリ ──────────────────────────────────
