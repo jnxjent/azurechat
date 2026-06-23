@@ -745,17 +745,26 @@ def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 20
         wb_src.close()
 
         # 2. LibreOffice で1シートxlsx → PDF
-        result = subprocess.run(
-            [lo_exe, "--headless", "--convert-to", "pdf", "--outdir", out_dir, single_xlsx],
-            capture_output=True, text=True, timeout=60,
-        )
+        import platform
+        lo_cmd = [lo_exe, "--headless"]
+        # Linuxコンテナではホームディレクトリが書き込めずサイレント失敗するため
+        # プロセス固有のtmpディレクトリをユーザープロファイルに指定する
+        if platform.system() != "Windows":
+            lo_profile = f"/tmp/lo_profile_{os.getpid()}"
+            lo_cmd += [f"-env:UserInstallation=file://{lo_profile}"]
+        lo_cmd += ["--convert-to", "pdf", "--outdir", out_dir, single_xlsx]
+
+        result = subprocess.run(lo_cmd, capture_output=True, text=True, timeout=60)
+        print(f"[pdf_to_excel] LibreOffice returncode={result.returncode} stderr={result.stderr[:200]!r}", file=sys.stderr)
         if result.returncode != 0:
-            print(f"[pdf_to_excel] LibreOffice failed: {result.stderr[:200]}", file=sys.stderr)
+            print(f"[pdf_to_excel] LibreOffice failed (rc={result.returncode})", file=sys.stderr)
             return []
 
         pdf_path = os.path.join(out_dir, "single_sheet.pdf")
+        out_dir_files = os.listdir(out_dir)
+        print(f"[pdf_to_excel] out_dir contents after LibreOffice: {out_dir_files}", file=sys.stderr)
         if not os.path.exists(pdf_path):
-            print(f"[pdf_to_excel] LibreOffice output PDF not found", file=sys.stderr)
+            print(f"[pdf_to_excel] LibreOffice output PDF not found (expected: {pdf_path})", file=sys.stderr)
             return []
 
         # 3. 各ページを個別PNGとして返す（縦結合しない）
