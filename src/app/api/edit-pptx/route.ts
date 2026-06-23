@@ -523,6 +523,25 @@ function isExcelFile(ext: string): boolean {
   return EXCEL_EXTENSIONS.has(ext);
 }
 
+/** Blob URL またはファイル名からベース名を取り出し、suffix を付けた出力ファイル名を生成する。 */
+function buildOutputFileName(sourceUrl: string | undefined, suffix: string): string {
+  let base = "";
+  if (sourceUrl) {
+    try {
+      const pathname = new URL(sourceUrl.split("?")[0]).pathname;
+      const decoded = decodeURIComponent(path.basename(pathname));
+      base = path.basename(decoded, path.extname(decoded));
+    } catch {
+      base = path.basename(sourceUrl.split("?")[0], path.extname(sourceUrl.split("?")[0]));
+    }
+  }
+  // 空・UUID のみ・先頭が threadId パターンの場合はフォールバック
+  if (!base || /^[0-9a-f-]{32,}$/i.test(base)) base = "output";
+  // Blob Storage で使えない文字を除去（最大100文字）
+  const safe = base.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
+  return `${safe}${suffix}`;
+}
+
 type SheetSummary = {
   sheetName: string;
   rowCount: number;
@@ -1325,16 +1344,80 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
     }
 
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
-    const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.xlsx`;
+    const fileName = buildOutputFileName(fileUrl, "_変換後.xlsx");
+    const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
+
+    // シート名一覧を取得（refine_excel_pages ツールがLLMに提示するため）
+    let sheetNames: string[] = [];
+    try {
+      const wb = XLSX.read(outputBuffer, { type: "buffer" });
+      sheetNames = wb.SheetNames;
+    } catch {
+      // 取得失敗は非致命的
+    }
+
+    return {
+      downloadUrl,
+      fileName,
+      sheetNames,
+      sheets: Number(pythonResult.sheets ?? 0),
+      tables: Number(pythonResult.tables ?? 0),
+      pages: Number(pythonResult.pages ?? 0),
+      engine: String(pythonResult.engine ?? ""),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// ─────────────────────────────────────────────
+// Excel 精度向上（GPT-4V リファイン）
+// ─────────────────────────────────────────────
+
+async function runPythonRefineExcelPages(
+  excelBuffer: Buffer,
+  targetSheets: string[],
+  threadId: string,
+  outputFileName?: string
+): Promise<{ downloadUrl: string; fileName: string; refined: number; skipped: number }> {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-refine-"));
+  const excelInPath = path.join(tempDir, "input.xlsx");
+  const excelOutPath = path.join(tempDir, "output.xlsx");
+  const scriptPath = await resolveConvertPdfScriptPath();
+
+  const pyEnv = process.platform !== "win32"
+    ? {
+        ...process.env,
+        PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        LD_LIBRARY_PATH: `/home/site/python-packages${process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""}`,
+      }
+    : process.env;
+
+  try {
+    await fs.writeFile(excelInPath, excelBuffer);
+
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(pythonBin, [
+      scriptPath,
+      "--input", excelInPath,
+      "--output", excelOutPath,
+      "--refine-sheets", targetSheets.join(","),
+    ], { env: pyEnv });
+
+    if (stderr?.trim()) {
+      console.warn("[refine-excel] python stderr:", stderr.trim());
+    }
+
+    const outputBuffer = await fs.readFile(excelOutPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const fileName = outputFileName ?? buildOutputFileName(undefined, "_精度向上後.xlsx");
     const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
 
     return {
       downloadUrl,
       fileName,
-      sheets: Number(pythonResult.sheets ?? 0),
-      tables: Number(pythonResult.tables ?? 0),
-      pages: Number(pythonResult.pages ?? 0),
-      engine: String(pythonResult.engine ?? ""),
+      refined: Number(pythonResult.refined ?? 0),
+      skipped: Number(pythonResult.skipped ?? 0),
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -1834,7 +1917,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -1843,7 +1926,22 @@ export async function POST(req: NextRequest) {
       previousChartEdits?: ExcelEditPlan["chartEdits"];
       outputBaseName?: string;
       plan?: EditPlan;
+      trackChanges?: boolean;
+      excelFileUrl?: string;
+      targetSheets?: string[];
+      outputFileName?: string;
     };
+
+    // Excel 指定シート精度向上（GPT-4V リファイン）— fileUrl 不要なので先に処理
+    if (action === "refine_excel_pages") {
+      if (!excelFileUrl?.trim() || !Array.isArray(targetSheets) || targetSheets.length === 0) {
+        return NextResponse.json({ ok: false, error: "excelFileUrl and targetSheets are required" }, { status: 400 });
+      }
+      const excelBuffer = await downloadBlob(excelFileUrl, threadId);
+      const result = await runPythonRefineExcelPages(excelBuffer, targetSheets, threadId, outputFileName);
+      console.log("[refine-excel] result:", JSON.stringify(result));
+      return NextResponse.json({ ok: true, ...result });
+    }
 
     if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
       return NextResponse.json(

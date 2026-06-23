@@ -697,13 +697,323 @@ def _pymupdf_text_lines(pdf_path: str, page_index: int) -> list[list[str]]:
     return lines
 
 
+# ── GPT-4V による精度向上（リファインモード） ────────────────────────────
+# 元PDFは使わない。変換後ExcelシートをLibreOffice→PDFで画像化してVisionに渡す。
+
+def _find_libreoffice() -> str | None:
+    """Linux / Windows どちらでも LibreOffice 実行ファイルを探す。"""
+    import shutil as _shutil
+    candidates = [
+        "libreoffice",                                           # Linux (PATH)
+        "soffice",                                               # Linux 別名
+        r"C:\Program Files\LibreOffice\program\soffice.exe",    # Windows 標準
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    for c in candidates:
+        if _shutil.which(c) or os.path.isfile(c):
+            return c
+    return None
+
+
+def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 200) -> list[bytes]:
+    """指定シートだけの一時xlsxを作成→LibreOffice→PDF→ページごとにPNG化して返す。
+    1シートが複数PDFページになる場合もページ単位のリストで返す（縦結合しない）。"""
+    import subprocess
+    import tempfile
+    import shutil
+
+    if not HAS_PYMUPDF:
+        print("[pdf_to_excel] PyMuPDF not available, cannot render Excel sheet", file=sys.stderr)
+        return []
+
+    lo_exe = _find_libreoffice()
+    if lo_exe is None:
+        print("[pdf_to_excel] LibreOffice not found, cannot render Excel sheet", file=sys.stderr)
+        return []
+
+    out_dir = tempfile.mkdtemp()
+    try:
+        # 1. 指定シートだけを含む一時xlsxを作成
+        wb_src = openpyxl.load_workbook(excel_path)
+        if sheet_name not in wb_src.sheetnames:
+            print(f"[pdf_to_excel] Sheet '{sheet_name}' not found in Excel", file=sys.stderr)
+            return []
+        for sn in [s for s in wb_src.sheetnames if s != sheet_name]:
+            del wb_src[sn]
+        single_xlsx = os.path.join(out_dir, "single_sheet.xlsx")
+        wb_src.save(single_xlsx)
+        wb_src.close()
+
+        # 2. LibreOffice で1シートxlsx → PDF
+        result = subprocess.run(
+            [lo_exe, "--headless", "--convert-to", "pdf", "--outdir", out_dir, single_xlsx],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            print(f"[pdf_to_excel] LibreOffice failed: {result.stderr[:200]}", file=sys.stderr)
+            return []
+
+        pdf_path = os.path.join(out_dir, "single_sheet.pdf")
+        if not os.path.exists(pdf_path):
+            print(f"[pdf_to_excel] LibreOffice output PDF not found", file=sys.stderr)
+            return []
+
+        # 3. 各ページを個別PNGとして返す（縦結合しない）
+        doc = fitz.open(pdf_path)
+        n_pages = len(doc)
+        if n_pages == 0:
+            doc.close()
+            return []
+
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pages_png = [doc[i].get_pixmap(matrix=mat).tobytes("png") for i in range(n_pages)]
+        doc.close()
+
+        total_bytes = sum(len(p) for p in pages_png)
+        print(f"[pdf_to_excel] Rendered sheet '{sheet_name}' ({n_pages} PDF page(s)) as {n_pages} PNG(s) ({total_bytes} bytes total)", file=sys.stderr)
+        return pages_png
+
+    except subprocess.TimeoutExpired:
+        print("[pdf_to_excel] LibreOffice timeout when rendering Excel sheet", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"[pdf_to_excel] Excel sheet render error: {e}", file=sys.stderr)
+        return []
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _call_vision_for_table(
+    page_pngs: list[bytes],
+    sheet_name: str,
+    existing_data: list[list[str]] | None = None,
+) -> list[list[str]]:
+    """GPT-4V でExcelシートの各ページ画像（複数可）からテーブルを再抽出する。
+    existing_data（全行×全列の現在値）を渡すと、構造を固定したまま文字化け・数値誤りのみ修正するモードになる。
+    複数ページは1リクエスト内で別々の image_url ブロックとして渡す。"""
+    import base64
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    key = os.environ.get("AZURE_OPENAI_VISION_API_KEY", "")
+    instance = os.environ.get("AZURE_OPENAI_VISION_API_INSTANCE_NAME", "")
+    deployment = os.environ.get("AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME", "")
+    api_version = os.environ.get("AZURE_OPENAI_VISION_API_VERSION", "2024-12-01-preview")
+
+    if not (key and instance and deployment):
+        print(f"[pdf_to_excel] Vision API env not configured, skipping sheet '{sheet_name}'", file=sys.stderr)
+        return []
+
+    if not page_pngs:
+        return []
+
+    url = (
+        f"https://{instance}.openai.azure.com/openai/deployments/{deployment}"
+        f"/chat/completions?api-version={api_version}"
+    )
+
+    n_pages = len(page_pngs)
+    if n_pages > 1:
+        page_note = f"このシートは{n_pages}ページにわたっています。全ページの表データを結合して1つのJSONにまとめてください。\n"
+    else:
+        page_note = ""
+
+    # 既存データが渡された場合：構造固定・値修正モード
+    if existing_data:
+        n_rows = len(existing_data)
+        n_cols = max(len(r) for r in existing_data) if existing_data else 0
+        existing_json = _json.dumps(existing_data, ensure_ascii=False)
+        structure_note = (
+            f"【修正モード】以下が現在のExcelシート「{sheet_name}」の内容です（{n_rows}行 × {n_cols}列）:\n"
+            f"{existing_json}\n\n"
+            "画像を見て、上記データの文字化け・数値の読み誤りのみ修正してください。\n"
+            "【絶対禁止】行数・列数の変更 / 列の並び替え / 構造の変更\n"
+            f"返すJSONのrowsは必ず{n_rows}行 × {n_cols}列を維持すること。\n"
+            "修正が不要なセルもすべて含めること。\n"
+        )
+        text_prompt = (
+            f"{page_note}"
+            f"{structure_note}"
+            "以下のJSON形式のみで返してください。説明文は不要。\n"
+            '{"rows": [["値1", "値2", ...], ...]}\n\n'
+            "数値の読み取り注意:\n"
+            "- △▲や括弧で囲まれた数値はマイナス（例: △1,234 → -1234）\n"
+            "- 千区切りカンマを含む数値はそのまま保持（例: 1,234,567）\n"
+            "- 空白セルは空文字列\n"
+            "- JSONのみ返すこと"
+        )
+    else:
+        # フォールバック：既存データなし → 従来通りゼロから抽出
+        text_prompt = (
+            f"{page_note}"
+            "画像はExcelシートの表です。表のデータを正確に読み取り、以下のJSON形式のみで返してください。\n"
+            '{"rows": [["ヘッダー1", "ヘッダー2"], ["値1", "値2"], ...]}\n\n'
+            "注意:\n"
+            "- △▲や括弧で囲まれた数値はマイナス（例: △1,234 → -1234）\n"
+            "- 千区切りカンマを含む数値はそのまま保持（例: 1,234,567）\n"
+            "- 空白セルは空文字列\n"
+            "- セル結合がある場合は各セルに同じ値を入れる\n"
+            "- 複数ページの場合はヘッダー行は先頭ページのみ使用し、データ行を連結する\n"
+            "- 説明文は不要。JSONのみ返すこと"
+        )
+
+    # existing_data モードは画像テキスト確認が目的なので auto でトークン節約
+    # ゼロ抽出モード（existing_data なし）は high で精度優先
+    img_detail = "auto" if existing_data else "high"
+
+    # 各ページを個別の image_url ブロックとして追加
+    content: list[dict] = []
+    for png_bytes in page_pngs:
+        img_b64 = base64.b64encode(png_bytes).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": img_detail},
+        })
+    content.append({"type": "text", "text": text_prompt})
+
+    payload = {
+        "messages": [{"role": "user", "content": content}],
+        "max_completion_tokens": 16000,
+    }
+
+    print(f"[pdf_to_excel] Vision request: {len(page_pngs)} image(s) detail={img_detail} sheet='{sheet_name}'", file=sys.stderr)
+
+    data = _json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"api-key": key, "Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = _json.loads(resp.read().decode())
+        choice = result["choices"][0]
+        finish_reason = choice.get("finish_reason", "unknown")
+        usage = result.get("usage", {})
+        print(
+            f"[pdf_to_excel] Vision response: finish_reason={finish_reason} "
+            f"prompt_tokens={usage.get('prompt_tokens', '?')} completion_tokens={usage.get('completion_tokens', '?')}",
+            file=sys.stderr,
+        )
+        message = choice.get("message", {})
+        msg_keys = list(message.keys())
+        raw_content = message.get("content")
+        print(f"[pdf_to_excel] Vision message keys={msg_keys} content_type={type(raw_content).__name__} content_len={len(raw_content) if isinstance(raw_content, str) else raw_content}", file=sys.stderr)
+        content_str = (raw_content or "").strip()
+        json_match = re.search(r"\{[\s\S]*\}", content_str)
+        if json_match:
+            parsed = _json.loads(json_match.group())
+            rows = parsed.get("rows", [])
+            return [[str(cell) for cell in row] for row in rows if row]
+        print(f"[pdf_to_excel] Vision: no JSON found for sheet '{sheet_name}' (raw: {content_str[:300]})", file=sys.stderr)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        print(f"[pdf_to_excel] Vision HTTPError {e.code} sheet '{sheet_name}': {body}", file=sys.stderr)
+    except Exception as e:
+        print(f"[pdf_to_excel] Vision error sheet '{sheet_name}': {e}", file=sys.stderr)
+
+    return []
+
+
+def _refine_pages_with_vision(
+    excel_path: str,
+    output_path: str,
+    target_sheets: list[str],
+) -> dict:
+    """指定Excelシートを画像化→GPT-4Vで再抽出して置き換える。元PDFは使用しない。"""
+    wb = openpyxl.load_workbook(excel_path)
+    refined = 0
+    skipped = 0
+
+    for sheet_name in target_sheets:
+        if sheet_name not in wb.sheetnames:
+            print(f"[pdf_to_excel] Sheet '{sheet_name}' not found in Excel, skipping", file=sys.stderr)
+            skipped += 1
+            continue
+
+        # 既存シートの全データ（全行×全列）を読み取り Vision の修正制約として渡す
+        ws_src = wb[sheet_name]
+        existing_data: list[list[str]] = []
+        for xl_row in ws_src.iter_rows(values_only=True):
+            existing_data.append([str(v) if v is not None else "" for v in xl_row])
+        n_rows = len(existing_data)
+        n_cols = max(len(r) for r in existing_data) if existing_data else 0
+        print(f"[pdf_to_excel] Sheet '{sheet_name}' existing data: {n_rows} rows × {n_cols} cols", file=sys.stderr)
+
+        page_pngs = _render_excel_sheet_as_pages(excel_path, sheet_name)
+        if not page_pngs:
+            print(f"[pdf_to_excel] Failed to render sheet '{sheet_name}', skipping", file=sys.stderr)
+            skipped += 1
+            continue
+
+        rows = _call_vision_for_table(page_pngs, sheet_name, existing_data=existing_data or None)
+        if not rows:
+            print(f"[pdf_to_excel] Vision returned no data for sheet '{sheet_name}', skipping", file=sys.stderr)
+            skipped += 1
+            continue
+
+        # 行数・列数チェック：構造が既存データと一致しない場合は適用しない
+        if existing_data and n_rows > 0 and n_cols > 0:
+            actual_cols = max(len(r) for r in rows) if rows else 0
+            if len(rows) != n_rows or actual_cols != n_cols:
+                print(
+                    f"[pdf_to_excel] Vision returned wrong dimensions for '{sheet_name}': "
+                    f"expected {n_rows}×{n_cols}, got {len(rows)}×{actual_cols}. Skipping to avoid structure corruption.",
+                    file=sys.stderr,
+                )
+                skipped += 1
+                continue
+
+        # シート順序を保ちながら置き換え
+        insert_idx = wb.sheetnames.index(sheet_name)
+        del wb[sheet_name]
+        ws = wb.create_sheet(title=sheet_name, index=insert_idx)
+
+        for row in rows:
+            ws.append(row)
+
+        for r_idx, xl_row in enumerate(ws.iter_rows()):
+            for xl_cell in xl_row:
+                if r_idx == 0:
+                    _apply_cell_style(xl_cell, "columnHeader")
+                else:
+                    xl_cell.border = _BORDER
+                    xl_cell.alignment = Alignment(vertical="center")
+
+        # 列幅を内容の最大長に合わせて自動調整（日本語は2単位、ASCII は1単位）
+        from openpyxl.utils import get_column_letter
+        for col_idx in range(1, ws.max_column + 1):
+            col_letter = get_column_letter(col_idx)
+            max_width = 10  # 最低幅
+            for cell in ws[col_letter]:
+                if cell.value is not None:
+                    char_width = sum(2 if ord(c) > 127 else 1 for c in str(cell.value))
+                    max_width = max(max_width, char_width)
+            ws.column_dimensions[col_letter].width = min(max_width + 2, 60)
+
+        refined += 1
+        col_count = max(len(r) for r in rows) if rows else 0
+        print(f"[pdf_to_excel] Refined '{sheet_name}': {len(rows)} rows x {col_count} cols", file=sys.stderr)
+
+    wb.save(output_path)
+    return {"refined": refined, "skipped": skipped, "engine": "vision"}
+
+
 # ── メイン ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--refine-sheets", default=None, help="再抽出シート名のカンマ区切り（例: P2,P3,P4）。指定時は --input がExcelパスになる。")
     args = parser.parse_args()
+
+    # ── リファインモード（--inputはExcelパス、元PDFは使わない） ──────────
+    if args.refine_sheets:
+        target_sheets = [s.strip() for s in args.refine_sheets.split(",") if s.strip()]
+        print(f"[pdf_to_excel] refine mode: excel={args.input}, sheets={target_sheets}", file=sys.stderr)
+        result = _refine_pages_with_vision(args.input, args.output, target_sheets)
+        print(json.dumps(result))
+        return
 
     print(
         f"[pdf_to_excel] HAS_PYMUPDF={HAS_PYMUPDF} HAS_DOC_INTEL={HAS_DOC_INTEL}",
