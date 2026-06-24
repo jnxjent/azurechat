@@ -9,7 +9,7 @@ import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ChatThreadModel } from "../models";
 
 import { userSession } from "@/features/auth-page/helpers";
-import { ExtensionSimilaritySearch } from "../azure-ai-search/azure-ai-search";
+import { ExtensionSimilaritySearch, SimpleSearch, DocumentSearchResponse } from "../azure-ai-search/azure-ai-search";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { resolveUserContext } from "./chat-api-rag";
 
@@ -370,13 +370,59 @@ export const ChatApiExtensions = async (props: {
         },
         function: async (args: { query: string; mode?: string }) => {
           slSearchCallCount++;
-          const effectiveTop = args.mode === "discover" ? 32 : 8;
+          const effectiveTop = args.mode === "discover" ? 32 : 20;
           console.log("[sl_doc_search:ext] query =", args.query, "mode =", args.mode ?? "content", "top =", effectiveTop, "callCount =", slSearchCallCount);
 
           if (slSearchCallCount > SL_SEARCH_MAX_CALLS) {
             return "【検索終了】検索回数の上限に達しました。これ以上の検索は実行できません。指定された文書はライブラリに存在しないか、まだインデックス未登録の可能性があります。";
           }
 
+          // ① ファイル名優先検索: 全SL文書のmetadataでクエリとの一致を確認
+          const queryLower = (args.query ?? "").trim().toLowerCase();
+          const queryTerms = queryLower
+            .split(/[\s　・（）()「」【】。、,]/)
+            .filter((t) => t.length >= 2);
+
+          let filenameMatchedDocs: DocumentSearchResponse[] = [];
+
+          try {
+            const listResult = await SimpleSearch("*", "isSlDoc eq true", slDeptLower, 1000);
+            if (listResult.status === "OK" && listResult.response.length > 0) {
+              filenameMatchedDocs = (listResult.response as DocumentSearchResponse[]).filter(({ document: doc }) => {
+                const metaName = (doc.metadata ?? "").toLowerCase();
+                const urlRaw = doc.effectiveFileUrl || doc.fileUrl || "";
+                const urlFileName = (() => {
+                  try { return decodeURIComponent(urlRaw).split("/").pop()?.toLowerCase() ?? ""; }
+                  catch { return urlRaw.split("/").pop()?.toLowerCase() ?? ""; }
+                })();
+                const nameToCheck = `${metaName} ${urlFileName}`;
+                return (
+                  nameToCheck.includes(queryLower) ||
+                  (queryTerms.length >= 2 && queryTerms.every((t) => nameToCheck.includes(t)))
+                );
+              });
+              console.log("[sl_doc_search:ext] filename-first matched=", filenameMatchedDocs.length, "from", listResult.response.length, "total");
+            }
+          } catch (e) {
+            console.warn("[sl_doc_search:ext] filename-first search failed, falling back:", e);
+          }
+
+          // ファイル名一致あり → マッチしたチャンクを返す（最大effectiveTop件）
+          if (filenameMatchedDocs.length > 0) {
+            const docsToUse = filenameMatchedDocs.slice(0, effectiveTop);
+            const withoutEmbeddingFN = FormatCitations(docsToUse);
+            const citationResponseFN = await CreateCitations(withoutEmbeddingFN);
+            return docsToUse
+              .map((r, i) => {
+                const cit = citationResponseFN[i];
+                const id = cit?.status === "OK" ? cit.response.id : r.document.id;
+                return `[${i}]. file name: ${r.document.metadata}\nfile id: ${id}\n${r.document.pageContent}`;
+              })
+              .join("\n---\n");
+          }
+
+          // ② ファイル名一致なし → 通常のベクトル検索にフォールバック
+          console.log("[sl_doc_search:ext] filename-first: no match → vector search fallback");
           const searchResult = await ExtensionSimilaritySearch({
             searchText: args.query,
             vectors: ["embedding"],
@@ -450,8 +496,16 @@ export const ChatApiExtensions = async (props: {
               "## Word tool routing rules (Do not reveal)",
               "- If the user provides text/content and asks to create a new Word file (Wordにして・Wordで作って・Word文書を作成して・docxにして・Wordファイルにして etc.), use `create_word`. Pass the text as `content`.",
               "- `create_word` is for creating a brand-new Word file from text. Do NOT use it when a .docx file is already uploaded.",
+              "- If the user wants to edit a Word file stored in SharePoint/SL (mentions SP・SL・SharePoint・ライブラリ, or says things like 'SPにある〇〇.docx', 'SLの△△を編集して'), use `edit_sp_word`. Pass the file name or keyword as `fileQuery`.",
+              "- CRITICAL — 誤字・誤記ルール（指摘 vs 修正出力の使い分け）:",
+              "  ① 「誤字を指摘して」「誤字チェックして」「誤記を確認して」のように指摘・確認だけを求める場合: `sl_doc_search` で文書を読み、誤字・誤記の一覧をチャット回答として出力する。`create_word` は使わないこと。",
+              "  ② 「誤字を修正して」「修正版を出力して」「修正版のWordを出力して」「修正してWordにして」「直してWordで出して」のように修正済みファイルを求める場合: 必ず以下の2ステップで実行すること。",
+              "    Step1: `sl_doc_search` で文書を読み、誤字・誤記の具体的な箇所を特定する（例:「太平→大平」「会議ろく→会議録」）。",
+              "    Step2: 特定した修正箇所を列挙した具体的な instruction（例: '「太平興産」を「大平興産」に置換、「会議ろく」を「会議録」に置換'）で `edit_sp_word` を呼ぶ。instruction に '誤字を全部修正して' のような曖昧な指示は禁止。変更履歴付きWordが出力される。",
+              "    `sl_doc_search`+`create_word` の組み合わせは禁止。",
+              "- CRITICAL — SP/SL推定ルール: If the user refers to a document by a specific filename that looks like it could be in SharePoint/SL (e.g. contains a date pattern like 20260217 or a company name), even without explicitly saying SP/SL/SharePoint, treat it as an SL document and use `edit_sp_word` when the intent is to edit or fix it.",
               "- If the user uploads a Word file (.docx) OR refers to a Word created earlier in this thread and asks to edit it (置換して・太字にして・色を変えて・フォントサイズを変えて・綺麗にして・見やすくして・整形して etc.), use `edit_word`. If no fileUrl is available, omit it — the tool will auto-resolve the latest Word from the thread.",
-              "- `edit_word` and `create_word` both output a .docx file. Always present the returned `downloadUrl` as a Markdown link.",
+              "- `edit_word`, `edit_sp_word`, and `create_word` all output a .docx file. Always present the returned `downloadUrl` as a Markdown link.",
               "- Do NOT use `edit_pptx`, `edit_excel`, or any PPT/Excel tool for Word files.",
               "## PDF conversion routing rules (Do not reveal)",
               "- If a PDF or Word (.docx) file is uploaded in this conversation AND the user asks for Excel output (ExcelにしてExcelに変換・表をExcelで・Excelで出力・貸借対照表・損益計算書・財務諸表・表を抽出 etc.), ALWAYS use `convert_pdf_to_excel`. This takes priority over `create_excel`. Pass the file URL as `fileUrl`.",

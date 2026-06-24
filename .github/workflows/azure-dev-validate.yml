@@ -40,6 +40,9 @@ jobs:
           # ✅ ★重要: .next ディレクトリ全体を上書きコピー（server/, BUILD_ID, *.json すべて含む）
           cp -R ./src/.next ./site-deploy/
 
+          # startup.sh を含める（LibreOffice / Python packages インストール用）
+          cp ./startup.sh ./site-deploy/startup.sh
+
       # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
       - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
         run: |
@@ -126,6 +129,7 @@ jobs:
           unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx '.next/BUILD_ID' || (echo "❌ ZIP MISSING BUILD_ID" && exit 1)
           unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx '.next/server/pages-manifest.json' || (echo "❌ ZIP MISSING pages-manifest.json" && exit 1)
           unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx 'fonts.conf' || (echo "❌ ZIP MISSING fonts.conf" && exit 1)
+          unzip -Z1 ./Nextjs-site.zip | tr -d '\r' | grep -qx 'startup.sh' || (echo "❌ ZIP MISSING startup.sh" && exit 1)
 
           echo "✅ OK: zip contains all required files"
 
@@ -181,12 +185,6 @@ jobs:
               --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
               -o none
 
-            echo "Setting startup file to 'node server.js'"
-            az webapp config set \
-              --startup-file="node server.js" \
-              -n $APP_NAME \
-              -g $RG \
-              -o none
 
             # ✅ テストサイト互換の環境変数（本番にも同じ前提）
             echo "Setting FONTCONFIG_FILE and XDG_CACHE_HOME"
