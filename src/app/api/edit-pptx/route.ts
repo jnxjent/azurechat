@@ -1459,6 +1459,7 @@ type WordEditPlan = {
     fontSize?: number;
     fontColor?: string;
   }>;
+  trackChanges?: boolean;
 };
 
 async function extractDocSummary(buffer: Buffer): Promise<WordDocSummary> {
@@ -1524,6 +1525,7 @@ Rules:
 - addParagraphs: use when the user wants to INSERT or APPEND new text to the document.
   - style: "Normal" | "Heading1" | "Heading2" | "List Bullet" (default "Normal").
   - Paragraphs are appended at the end of the document.
+  - NEVER use addParagraphs to append a summary of changes made (e.g. "修正箇所一覧", "変更点一覧"). Word comments are inserted automatically at each change location.
 - Only emit operations the user actually requested. Keep JSON minimal.`;
 
   const userPrompt = `Instruction: ${instruction}
@@ -1540,11 +1542,21 @@ Return JSON only.`;
       { role: "user", content: userPrompt },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 1000,
+    max_completion_tokens: 4000,
   });
 
-  const content = res.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(content) as WordEditPlan;
+  const raw = res.choices[0]?.message?.content ?? "{}";
+  const finishReason = res.choices[0]?.finish_reason;
+  if (finishReason === "length") {
+    console.warn("[buildWordEditPlan] LLM response truncated (finish_reason=length). Plan may be incomplete.");
+  }
+  let parsed: WordEditPlan;
+  try {
+    parsed = JSON.parse(raw) as WordEditPlan;
+  } catch {
+    console.error("[buildWordEditPlan] JSON.parse failed. raw=", raw.slice(0, 200));
+    throw new Error("編集プランの生成に失敗しました（JSONパースエラー）。指示を短くして再試行してください。");
+  }
   parsed.replaceText ??= [];
   parsed.formatRuns ??= [];
   parsed.addParagraphs ??= [];
@@ -1569,7 +1581,7 @@ async function resolveEditWordScriptPath(): Promise<string> {
   throw new Error(`edit_word.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<string> {
+async function uploadWordToBlob(buffer: Buffer, fileName: string, displayName?: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "docx";
@@ -1586,7 +1598,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayName ?? fileName)}`,
     },
   });
 
@@ -1605,7 +1617,8 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
 async function runPythonEditWord(
   inputBuffer: Buffer,
   plan: WordEditPlan,
-  threadId: string
+  threadId: string,
+  originalFileName?: string
 ) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-docx-"));
   const inputPath = path.join(tempDir, "input.docx");
@@ -1652,12 +1665,15 @@ async function runPythonEditWord(
 
     const outputBuffer = await fs.readFile(outputPath);
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
-    const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.docx`;
-    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
+    const blobKey = `${threadId || uniqueId()}_edited_${uniqueId()}.docx`;
+    const displayName = originalFileName
+      ? `${originalFileName.replace(/\.docx$/i, "")}_rev1.docx`
+      : blobKey;
+    const downloadUrl = await uploadWordToBlob(outputBuffer, blobKey, displayName);
 
     return {
       downloadUrl,
-      fileName,
+      fileName: displayName,
       changedParagraphs: Number(pythonResult.changedParagraphs ?? 0),
       totalParagraphs: Number(pythonResult.totalParagraphs ?? 0),
     };
@@ -2097,10 +2113,14 @@ export async function POST(req: NextRequest) {
       const wordBuffer = await downloadBlob(fileUrl, threadId);
       const summary = await extractDocSummary(wordBuffer);
       const plan = await buildWordEditPlan(summary, instruction);
+      plan.trackChanges = !!trackChanges;
 
       console.log("[edit-word] plan:", JSON.stringify(plan));
 
-      const result = await runPythonEditWord(wordBuffer, plan, threadId);
+      const rawName = fileUrl.split("?")[0].split("/").pop() ?? "";
+      const originalFileName = (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })();
+
+      const result = await runPythonEditWord(wordBuffer, plan, threadId, originalFileName || undefined);
       return NextResponse.json({ ok: true, ...result });
     }
 

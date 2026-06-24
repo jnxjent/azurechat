@@ -11,7 +11,7 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
-import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
+import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
 import {
@@ -1610,6 +1610,35 @@ export const GetDefaultExtensions = async (props: {
         "例: 「SPにある売上データ.xlsxをグラフ化して」「SLの〇〇.xlsxに折れ線グラフを追加して」\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_sp_excel",
+    },
+  });
+
+  // ★ SharePoint SL の Word ファイルを指示に従って編集するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) => await executeEditSpWord(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileQuery: {
+            type: "string",
+            description: "編集したいSharePointのWordファイルの名前またはキーワード。例: '議事録2024.docx'",
+          },
+          instruction: {
+            type: "string",
+            description: "編集指示。例: '「旧社名」を「新社名」に置換して'、'タイトルを太字にして'、'フォントを游明朝に変えて'",
+          },
+        },
+        required: ["fileQuery", "instruction"],
+      },
+      description:
+        "SharePointのSLライブラリにあるWordファイル（.docx）を自然言語の指示に従って編集するツール。\n" +
+        "使用タイミング：ユーザーがSP/SL上のWordファイルのテキスト置換・書式変更を求める場合。\n" +
+        "例: 「SPにある議事録のフォントを変えて」「SLの〇〇.docxの社名を置換して」\n" +
+        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+      name: "edit_sp_word",
     },
   });
 
@@ -4802,10 +4831,10 @@ async function executeCreateWord(
 
 // ---------------- Word 編集 ----------------
 async function executeEditWord(
-  args: { fileUrl?: string; instruction: string },
+  args: { fileUrl?: string; instruction: string; trackChanges?: boolean },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, instruction } = args ?? {};
+  const { fileUrl, instruction, trackChanges } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
@@ -4827,7 +4856,7 @@ async function executeEditWord(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id }),
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id, trackChanges: trackChanges ?? false }),
     });
 
     if (!res.ok) {
@@ -5472,6 +5501,138 @@ async function executeEditSpExcel(
 
   // 5. edit_excel に委託（sourceFileQuery を渡してポインタ保存を集約）
   return executeEditExcel({ fileUrl: resolvedUrl, instruction, previousChartEdits, sourceFileQuery: fileQuery }, chatThread);
+}
+
+// ---------------- SharePoint SL の Word を編集 ----------------
+async function executeEditSpWord(
+  args: { fileQuery: string; instruction: string },
+  chatThread: ChatThreadModel
+) {
+  const { fileQuery, instruction } = args ?? {};
+
+  if (!fileQuery?.trim()) return { error: "fileQuery（ファイル名またはキーワード）を指定してください。" };
+  if (!instruction?.trim()) return { error: "instruction（編集内容）を指定してください。" };
+
+  // 1. AI Search でアクセス可能な全 SL 文書を取得し、クライアント側でファイル名フィルタ
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+  const queryLower = fileQuery.trim().toLowerCase().replace(/\.docx$/i, "");
+
+  // 1a. 全件取得でファイル名一致を優先（ベクトルランキング負け回避）
+  const listResult = await SimpleSearch("*", "isSlDoc eq true", deptLower, 1000);
+  let matched: DocumentSearchResponse[] = [];
+
+  const getDocxName = (doc: DocumentSearchResponse["document"]) => {
+    const metaName = (doc.metadata ?? "").trim().toLowerCase();
+    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
+    return /\.docx$/i.test(metaName) ? metaName : (urlName || metaName);
+  };
+
+  const filterDocx = (docs: DocumentSearchResponse[]) => {
+    const all = docs.filter(({ document: doc }) => {
+      const name = getDocxName(doc);
+      return (
+        /\.docx$/i.test(name) &&
+        (name.includes(queryLower) || queryLower.includes(name.replace(/\.docx$/i, "")))
+      );
+    });
+    // 完全一致（拡張子除くファイル名 === クエリ）を優先して返す
+    const exact = all.filter(({ document: doc }) => getDocxName(doc).replace(/\.docx$/i, "") === queryLower);
+    return exact.length > 0 ? exact : all;
+  };
+
+  if (listResult.status === "OK" && listResult.response.length > 0) {
+    matched = filterDocx(listResult.response);
+    console.log(`[edit_sp_word] filename-first matched=${matched.length} (query="${fileQuery}")`);
+  }
+
+  // 1b. ファイル名一致なし → fileQuery のベクトル検索にフォールバック
+  if (!matched.length) {
+    console.log(`[edit_sp_word] filename-first: no match → fallback to query search`);
+    const searchResult = await SimpleSearch(fileQuery, "isSlDoc eq true", deptLower, 50);
+    if (searchResult.status === "OK" && searchResult.response.length > 0) {
+      matched = filterDocx(searchResult.response);
+      console.log(`[edit_sp_word] fallback matched=${matched.length}`);
+    }
+  }
+
+  if (!matched.length) {
+    return { error: `「${fileQuery}」に一致するWordファイルが見つかりませんでした。` };
+  }
+
+  // 3. URL でユニーク化
+  const seen = new Map<string, { fileName: string; sourceUrl: string; effectiveFileUrl: string | null }>();
+  for (const { document: doc } of matched) {
+    const key = doc.effectiveFileUrl || doc.fileUrl;
+    if (key && !seen.has(key)) {
+      const metaName = (doc.metadata ?? "").trim();
+      const urlName = extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "";
+      const resolvedName = /\.docx$/i.test(metaName) ? metaName : (urlName || metaName);
+      seen.set(key, {
+        fileName: resolvedName,
+        sourceUrl: doc.fileUrl,
+        effectiveFileUrl: doc.effectiveFileUrl ?? null,
+      });
+    }
+  }
+
+  const candidates = Array.from(seen.values());
+  const uniqueFileNames = new Set(
+    candidates.map((c) => c.fileName.toLowerCase().replace(/\.docx$/i, ""))
+  );
+
+  let chosen = candidates[0];
+  if (candidates.length > 1) {
+    if (uniqueFileNames.size === 1) {
+      console.log(`[edit_sp_word] ${candidates.length} duplicates of "${candidates[0].fileName}" found — auto-selecting first`);
+    } else {
+      const exactMatch = candidates.find(
+        (c) => c.fileName.toLowerCase().replace(/\.docx$/i, "") === queryLower
+      );
+      if (exactMatch) {
+        console.log(`[edit_sp_word] exact match auto-selected: "${exactMatch.fileName}"`);
+        chosen = exactMatch;
+      } else {
+        const list = Array.from(uniqueFileNames).map((n, i) => `${i + 1}. ${n}`).join("\n");
+        return {
+          multipleFiles: true,
+          message: `「${fileQuery}」で複数の異なるファイルが見つかりました。どれを編集しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+        };
+      }
+    }
+  }
+
+  const { fileName, sourceUrl, effectiveFileUrl } = chosen;
+  console.log(`[edit_sp_word] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
+
+  // 4. SAS URL を解決する
+  let resolvedUrl: string | null = null;
+
+  const blobParsed = parseBlobRawUrl(effectiveFileUrl);
+  if (blobParsed) {
+    const sasRes = await GenerateSasUrl(blobParsed.container, blobParsed.path);
+    if (sasRes.status === "OK" && sasRes.response) {
+      resolvedUrl = sasRes.response;
+      console.log(`[edit_sp_word] Resolved via GenerateSasUrl: ${blobParsed.path}`);
+    }
+  }
+
+  if (!resolvedUrl) {
+    const urlForDownload = effectiveFileUrl || sourceUrl;
+    const spSas = await downloadSharePointFileToBlob(urlForDownload, chatThread.id, fileName);
+    if (spSas) {
+      resolvedUrl = spSas;
+      console.log(`[edit_sp_word] Resolved via Graph API download`);
+    }
+  }
+
+  if (!resolvedUrl) {
+    console.warn(`[edit_sp_word] Could not resolve to blob URL:`, sourceUrl);
+    return { error: `「${fileName}」のダウンロードURLを取得できませんでした。` };
+  }
+
+  // 5. edit_word に委託（SP ファイルは常に変更履歴を残す）
+  return executeEditWord({ fileUrl: resolvedUrl, instruction, trackChanges: true }, chatThread);
 }
 
 // ---------------- 画像生成（NEW image 用） ----------------
