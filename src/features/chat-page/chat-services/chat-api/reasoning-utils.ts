@@ -18,7 +18,7 @@ export function canonicalizeMode(m?: ThinkingModeInput | null): ThinkingModeCano
 /** プリセット：fast=minimal / normal=medium / thinking=high */
 const PRESETS: Record<ThinkingModeCanonical, ReasoningOptions> = {
   fast:     { reasoning_effort: "minimal", temperature: 0.10 },  // ← "low" → "minimal"
-  normal:   { reasoning_effort: "medium",  temperature: 0.20 },
+  normal:   { reasoning_effort: "minimal", temperature: 0.20 },
   thinking: { reasoning_effort: "high",    temperature: 0.40 },
 };
 /** モードに応じて送信オプションを返す（auto は存在しない想定） */

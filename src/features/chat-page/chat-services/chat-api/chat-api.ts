@@ -154,6 +154,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
         history,
         extensions: extension,
         signal,
+        mode: resolvedMode,
       });
       break;
   }
