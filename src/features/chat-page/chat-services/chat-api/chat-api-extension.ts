@@ -12,6 +12,7 @@ import { userSession } from "@/features/auth-page/helpers";
 import { ExtensionSimilaritySearch, SimpleSearch, DocumentSearchResponse } from "../azure-ai-search/azure-ai-search";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { resolveUserContext } from "./chat-api-rag";
+import { buildSendOptionsFromMode } from "./reasoning-utils";
 
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
@@ -271,8 +272,9 @@ export const ChatApiExtensions = async (props: {
   history: ChatCompletionMessageParam[];
   extensions: RunnableToolFunction<any>[];
   signal: AbortSignal;
+  mode?: "normal" | "thinking" | "fast";
 }): Promise<ChatCompletionStreamingRunner> => {
-  const { userMessage, history, signal, chatThread, extensions } = props;
+  const { userMessage, history, signal, chatThread, extensions, mode } = props;
 
   const openAI = OpenAIInstance();
 
@@ -462,9 +464,13 @@ export const ChatApiExtensions = async (props: {
     });
   }
 
-  return openAI.beta.chat.completions.runTools(
+  const modeOpts = buildSendOptionsFromMode(mode ?? "normal");
+  const _openAI = openAI as any;
+  // @ts-ignore
+  return _openAI.beta.chat.completions.runTools(
     {
       model,
+      reasoning_effort: modeOpts.reasoning_effort,
       stream: true,
       messages: [
         {
@@ -756,12 +762,11 @@ async function runSfDirect(props: {
 }
 
 const extensionsSystemMessage = async (chatThread: ChatThreadModel) => {
-  let message = "";
-  for (const e of chatThread.extension) {
-    const extension = await FindExtensionByID(e);
-    if (extension.status === "OK") {
-      message += ` ${extension.response.executionSteps} \n`;
-    }
-  }
-  return message;
+  const results = await Promise.all(
+    chatThread.extension.map((e) => FindExtensionByID(e))
+  );
+  return results
+    .filter((r) => r.status === "OK")
+    .map((r) => ` ${r.response.executionSteps} \n`)
+    .join("");
 };
