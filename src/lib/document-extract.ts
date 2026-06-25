@@ -122,6 +122,41 @@ export async function extractWithDocumentIntelligence(
   return allParagraphs;
 }
 
+export async function extractMsgText(buffer: ArrayBuffer): Promise<string[]> {
+  try {
+    const MsgReaderModule = require("@kenjiuno/msgreader");
+    const MsgReader = MsgReaderModule.default ?? MsgReaderModule;
+    const reader = new MsgReader(Buffer.from(buffer));
+    const data = reader.getFileData();
+
+    const lines: string[] = [];
+    if (data.subject) lines.push(`件名: ${data.subject}`);
+    if (data.senderName || data.senderEmail) {
+      lines.push(`送信者: ${[data.senderName, data.senderEmail].filter(Boolean).join(" ")}`);
+    }
+    if (Array.isArray(data.recipients) && data.recipients.length > 0) {
+      const toList = data.recipients
+        .map((r: any) => [r.name, r.email].filter(Boolean).join(" "))
+        .join(", ");
+      lines.push(`宛先: ${toList}`);
+    }
+    if (data.messageDeliveryTime) lines.push(`日時: ${data.messageDeliveryTime}`);
+
+    let body: string = data.body ?? "";
+    if (!body && data.bodyHtml) {
+      body = data.bodyHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+    if (body) lines.push(body);
+
+    const fullText = lines.join("\n").trim();
+    console.log(`[doc-extract] .msg extracted: subject="${data.subject ?? ""}" bodyLen=${body.length}`);
+    return fullText ? [fullText] : [];
+  } catch (e) {
+    console.warn("[doc-extract] .msg parse failed:", e);
+    return [];
+  }
+}
+
 export async function extractTextFromBuffer(
   buffer: ArrayBuffer,
   fileName: string
@@ -129,6 +164,9 @@ export async function extractTextFromBuffer(
   const lower = fileName.toLowerCase();
   if (lower.endsWith(".xlsx") || lower.endsWith(".xlsm")) {
     return extractExcelText(buffer);
+  }
+  if (lower.endsWith(".msg")) {
+    return extractMsgText(buffer);
   }
   return extractWithDocumentIntelligence(buffer);
 }
