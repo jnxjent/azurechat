@@ -1488,9 +1488,10 @@ export const GetDefaultExtensions = async (props: {
       },
       description:
         "SharePointのSLライブラリにある文書（PDF）をPowerPoint（PPTX）に変換するツール。\n" +
-        "使用タイミング：会話コンテキストに file_url が存在しない状態で、ユーザーがSP/SLの資料名を挙げてPPT変換を求めた場合。\n" +
+        "使用タイミング：会話コンテキストに file_url が存在しない状態で、ユーザーがSP/SLの資料名を挙げてPPT・スライド変換を求めた場合。\n" +
         "例: 「SPの営業資料2024.pdfをPPTにして」「SLにある〇〇をスライドにして」\n" +
         "【重要】会話コンテキストに file_url が既にある場合は convert_doc_to_pptx を使うこと（このツールは不要）。\n" +
+        "【禁止】ExcelへのPDF変換は convert_pdf_to_excel を使うこと。WordへのPDF変換は convert_pdf_to_word を使うこと。このツールはPPT/スライド専用。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。\n" +
         "複数候補がある場合はリストを提示してユーザーに選ばせること。",
       name: "convert_sp_to_pptx",

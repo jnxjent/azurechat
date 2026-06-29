@@ -488,7 +488,7 @@ async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: s
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName ?? blobKey)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(displayFileName ?? blobKey)}`,
     },
   });
 
@@ -1711,7 +1711,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string, displayName?: 
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayName ?? fileName)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(displayName ?? fileName)}`,
     },
   });
 
