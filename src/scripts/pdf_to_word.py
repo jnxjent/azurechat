@@ -30,6 +30,7 @@ except ImportError:
 try:
     import docx as python_docx
     from docx.shared import Pt
+    from docx.oxml.ns import qn as _qn
     HAS_PYTHON_DOCX = True
 except ImportError:
     HAS_PYTHON_DOCX = False
@@ -53,6 +54,44 @@ def _get_doc_intel_client():
     return DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 
+# ── ヘッダー/フッター除去 ────────────────────────────────────────────────
+
+def _remove_empty_headers_footers(doc_path: str) -> None:
+    """テキストのない空ヘッダー/フッターのみ除去する。内容があるものは保持する。"""
+    if not HAS_PYTHON_DOCX:
+        return
+    try:
+        doc = python_docx.Document(doc_path)
+        changed = False
+        for section in doc.sections:
+            sect_pr = section._sectPr
+            for tag in (_qn('w:headerReference'), _qn('w:footerReference')):
+                for ref in list(sect_pr.findall(tag)):
+                    rel_id = ref.get(_qn('r:id'))
+                    if not rel_id:
+                        sect_pr.remove(ref)
+                        changed = True
+                        continue
+                    try:
+                        part = doc.part.related_parts.get(rel_id)
+                        if part is None:
+                            sect_pr.remove(ref)
+                            changed = True
+                            continue
+                        all_text = "".join(
+                            (t.text or "") for t in part._element.findall('.//' + _qn('w:t'))
+                        )
+                        if not all_text.strip():
+                            sect_pr.remove(ref)
+                            changed = True
+                    except Exception:
+                        pass
+        if changed:
+            doc.save(doc_path)
+    except Exception as e:
+        print(f"[pdf_to_word] header/footer removal warning: {e}", file=sys.stderr)
+
+
 # ── 1. pdf2docx ──────────────────────────────────────────────────────────
 
 def _convert_with_pdf2docx(pdf_path: str, output_path: str) -> dict | None:
@@ -70,6 +109,9 @@ def _convert_with_pdf2docx(pdf_path: str, output_path: str) -> dict | None:
         if not os.path.exists(output_path):
             print("[pdf_to_word] pdf2docx produced no output file.", file=sys.stderr)
             return None
+
+        # 空ヘッダー/フッターのみ除去して標準モードで開けるようにする
+        _remove_empty_headers_footers(output_path)
 
         # 簡易的にパラグラフ数・テーブル数を取得
         if HAS_PYTHON_DOCX:

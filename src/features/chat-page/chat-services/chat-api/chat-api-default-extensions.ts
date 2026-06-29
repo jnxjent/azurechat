@@ -11,7 +11,7 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { analyzeDocVision } from "@/app/api/analyze-doc-vision/route";
-import { SimpleSearch } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
+import { SimpleSearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
 import {
@@ -619,6 +619,17 @@ function extractLatestDocxUrlFromMessages(messages: string[]): string | null {
   return null;
 }
 
+function extractLatestPdfOrDocxUrlFromMessages(messages: string[]): string | null {
+  const urlPattern = /https?:\/\/[^\s)\]]+\.(?:pdf|docx)(?:\?[^\s)\]]*)?/gi;
+  for (const message of messages) {
+    const matches = message.match(urlPattern);
+    if (matches?.length) {
+      return matches[matches.length - 1];
+    }
+  }
+  return null;
+}
+
 async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
@@ -627,6 +638,19 @@ async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<str
       .map((message) => String(message.content ?? "").trim())
       .filter(Boolean);
     return extractLatestDocxUrlFromMessages(messages);
+  } catch {
+    return null;
+  }
+}
+
+async function resolveLatestPdfOrDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
+  try {
+    const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
+    if (historyResponse.status !== "OK") return null;
+    const messages = historyResponse.response
+      .map((message) => String(message.content ?? "").trim())
+      .filter(Boolean);
+    return extractLatestPdfOrDocxUrlFromMessages(messages);
   } catch {
     return null;
   }
@@ -1397,7 +1421,12 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURL。fileQuery と同時に指定しないこと。",
+          },
+          fileQuery: {
+            type: "string",
+            description:
+              "SharePointにあるPDFファイルのファイル名またはキーワード。SPのファイルを変換する場合に指定。例: '営業資料2024.pdf'。fileUrl と同時に指定しないこと。",
           },
           mode: {
             type: "string",
@@ -1406,12 +1435,14 @@ export const GetDefaultExtensions = async (props: {
               "layout: 見た目・レイアウト再現優先（pdf2docx使用）。editable: テキスト・表を編集可能な形で抽出優先（Doc Intelligence使用）。",
           },
         },
-        required: ["fileUrl"],
+        required: [],
       },
       description:
-        "このスレッドでアップロードされたPDFファイルをWord（.docx）に変換するツール。\n" +
+        "PDFファイルをWord（.docx）に変換するツール。スレッドにアップロードされたファイルでもSharePointのファイルでも対応。\n" +
         "使用タイミング：ユーザーがPDFをWordに変換したいと言った場合。\n" +
-        "mode=layout: 「WordにしてWordに変換して」など見た目重視の場合。\n" +
+        "- スレッドにアップロードされたPDF → fileUrl を指定\n" +
+        "- SharePointにあるPDF → fileQuery にファイル名を指定\n" +
+        "mode=layout: 「Wordに変換して」など見た目重視の場合。\n" +
         "mode=editable: 「編集可能なWordに」「表を編集できるWordに」「テキストとして抽出」など編集重視の場合。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_word",
@@ -1422,7 +1453,8 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
+      function: async (args: any) =>
+        await executeConvertPdfToExcel(args, props.chatThread),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1430,14 +1462,21 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+              "変換対象のPDF/WordファイルのURL。このスレッドでアップロードされた.pdf/.docxのURL。fileQuery と同時に指定しないこと。",
+          },
+          fileQuery: {
+            type: "string",
+            description:
+              "SharePointにあるPDF/WordファイルのファイルName又はキーワード。SPのファイルを変換する場合に指定。例: '財務諸表2024.pdf'。fileUrl と同時に指定しないこと。",
           },
         },
-        required: ["fileUrl"],
+        required: [],
       },
       description:
-        "このスレッドでアップロードされたPDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
-        "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。\n" +
+        "PDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
+        "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。スレッドにアップロードされたファイルでもSharePointのファイルでも対応。\n" +
+        "- スレッドにアップロードされたPDF/Word → fileUrl を指定（省略時はスレッド内の最新を自動解決）\n" +
+        "- SharePointにあるPDF/Word → fileQuery にファイル名を指定\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_excel",
@@ -2005,17 +2044,145 @@ async function executeEditWord(
   }
 }
 
+// ---------------- SP PDF → SAS URL 解決（Excel/Word変換共通ヘルパー） ----------------
+// 許容拡張子: .pdf および .docx（Word→Excel変換用）
+async function resolveSpPdfToSasUrl(
+  fileQuery: string,
+  allowedExts: RegExp,
+  chatThread: ChatThreadModel,
+  logTag: string
+): Promise<
+  | { resolvedUrl: string; fileName: string }
+  | { error: string }
+  | { multipleFiles: true; message: string }
+> {
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+  const queryLower = fileQuery.trim().toLowerCase().replace(allowedExts, "");
+
+  const getPdfName = (doc: DocumentSearchResponse["document"]) => {
+    const metaName = (doc.metadata ?? "").trim().toLowerCase();
+    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
+    return allowedExts.test(metaName) ? metaName : (urlName || metaName);
+  };
+
+  const filterDocs = (docs: DocumentSearchResponse[]) => {
+    const all = docs.filter(({ document: doc }) => {
+      const name = getPdfName(doc);
+      return allowedExts.test(name) && (name.includes(queryLower) || queryLower.includes(name.replace(allowedExts, "")));
+    });
+    const exact = all.filter(({ document: doc }) => getPdfName(doc).replace(allowedExts, "") === queryLower);
+    return exact.length > 0 ? exact : all;
+  };
+
+  // 1a. 全件ファイル名優先検索
+  let matched: DocumentSearchResponse[] = [];
+  const listResult = await SimpleSearch("*", "isSlDoc eq true", deptLower, 1000);
+  if (listResult.status === "OK" && listResult.response.length > 0) {
+    matched = filterDocs(listResult.response);
+    console.log(`[${logTag}] filename-first matched=${matched.length} (query="${fileQuery}")`);
+  }
+
+  // 1b. 見つからない場合は fileQuery でベクトル検索フォールバック
+  if (!matched.length) {
+    console.log(`[${logTag}] filename-first: no match → fallback to query search`);
+    const searchResult = await SimpleSearch(fileQuery, "isSlDoc eq true", deptLower, 50);
+    if (searchResult.status === "OK" && searchResult.response.length > 0) {
+      matched = filterDocs(searchResult.response);
+      console.log(`[${logTag}] fallback matched=${matched.length}`);
+    }
+  }
+
+  if (!matched.length) {
+    return { error: `「${fileQuery}」に一致するファイルが見つかりませんでした。ファイル名を確認してください。` };
+  }
+
+  // 2. URL でユニーク化
+  const seen = new Map<string, { fileName: string; sourceUrl: string; effectiveFileUrl: string | null }>();
+  for (const { document: doc } of matched) {
+    const key = doc.effectiveFileUrl || doc.fileUrl;
+    if (key && !seen.has(key)) {
+      const metaName = (doc.metadata ?? "").trim();
+      const urlName = extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "";
+      const resolvedName = allowedExts.test(metaName) ? metaName : (urlName || metaName);
+      seen.set(key, { fileName: resolvedName, sourceUrl: doc.fileUrl, effectiveFileUrl: doc.effectiveFileUrl ?? null });
+    }
+  }
+
+  const candidates = Array.from(seen.values());
+  const uniqueNames = new Set(candidates.map((c) => c.fileName.toLowerCase().replace(allowedExts, "")));
+
+  let chosen = candidates[0];
+  if (candidates.length > 1) {
+    if (uniqueNames.size === 1) {
+      console.log(`[${logTag}] ${candidates.length} duplicates of "${candidates[0].fileName}" — auto-selecting first`);
+    } else {
+      const exact = candidates.find((c) => c.fileName.toLowerCase().replace(allowedExts, "") === queryLower);
+      if (exact) {
+        chosen = exact;
+        console.log(`[${logTag}] exact match auto-selected: "${exact.fileName}"`);
+      } else {
+        const list = Array.from(uniqueNames).map((n, i) => `${i + 1}. ${n}`).join("\n");
+        return { multipleFiles: true, message: `「${fileQuery}」で複数ファイルが見つかりました。どれを変換しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。` };
+      }
+    }
+  }
+
+  const { fileName, sourceUrl, effectiveFileUrl } = chosen;
+  console.log(`[${logTag}] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
+
+  // 3. SAS URL を解決: 常に最新版を使うため SP sourceUrl 経由の Graph API を優先
+  //    Blob キャッシュは SP で更新された場合に旧版を掴む可能性があるため fallback 扱い
+  let resolvedUrl: string | null = null;
+
+  const spSas = await downloadSharePointFileToBlob(sourceUrl, chatThread.id, fileName);
+  if (spSas) {
+    resolvedUrl = spSas;
+    console.log(`[${logTag}] Resolved via Graph API download`);
+  }
+
+  if (!resolvedUrl) {
+    const blobParsed = parseBlobRawUrl(effectiveFileUrl);
+    if (blobParsed) {
+      const sasRes = await GenerateSasUrl(blobParsed.container, blobParsed.path);
+      if (sasRes.status === "OK" && sasRes.response) {
+        resolvedUrl = sasRes.response;
+        console.log(`[${logTag}] Resolved via GenerateSasUrl (fallback): ${blobParsed.path}`);
+      }
+    }
+  }
+
+  if (!resolvedUrl) {
+    console.warn(`[${logTag}] Could not resolve to blob URL:`, sourceUrl);
+    return { error: `「${fileName}」のダウンロードURLを取得できませんでした。` };
+  }
+
+  return { resolvedUrl, fileName };
+}
+
 // ---------------- PDF → Excel 変換 ----------------
 async function executeConvertPdfToExcel(
-  args: { fileUrl?: string },
+  args: { fileUrl?: string; fileQuery?: string },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl } = args ?? {};
+  let { fileUrl, fileQuery } = args ?? {};
+
+  // SharePoint ファイル名指定の場合は SP 検索で SAS URL を解決する
+  if (!fileUrl?.trim() && fileQuery?.trim()) {
+    const spResult = await resolveSpPdfToSasUrl(fileQuery, /\.(pdf|docx)$/i, chatThread, "convert_pdf_to_excel");
+    if ("error" in spResult) return spResult;
+    if ("multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+  }
+
+  if (!fileUrl?.trim()) {
+    fileUrl = (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
+  }
 
   if (!fileUrl?.trim()) {
     return {
       error:
-        "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+        "変換対象のPDF/Wordファイルが見つかりませんでした。ファイルをアップロードするか、SharePointのファイル名（fileQuery）を指定してください。",
     };
   }
 
@@ -2072,14 +2239,22 @@ async function executeConvertPdfToExcel(
 
 // ---------------- PDF → Word 変換 ----------------
 async function executeConvertPdfToWord(
-  args: { fileUrl?: string; mode?: "layout" | "editable" },
+  args: { fileUrl?: string; fileQuery?: string; mode?: "layout" | "editable" },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, mode = "layout" } = args ?? {};
+  let { fileUrl, fileQuery, mode = "layout" } = args ?? {};
+
+  // SharePoint ファイル名指定の場合は SP 検索で SAS URL を解決する
+  if (!fileUrl?.trim() && fileQuery?.trim()) {
+    const spResult = await resolveSpPdfToSasUrl(fileQuery, /\.pdf$/i, chatThread, "convert_pdf_to_word");
+    if ("error" in spResult) return spResult;
+    if ("multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+  }
 
   if (!fileUrl?.trim()) {
     return {
-      error: "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+      error: "変換対象のPDFファイルが見つかりませんでした。ファイルをアップロードするか、SharePointのファイル名（fileQuery）を指定してください。",
     };
   }
 

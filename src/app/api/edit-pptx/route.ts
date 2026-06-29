@@ -528,6 +528,24 @@ async function resolveEditExcelScriptPath(): Promise<string> {
   throw new Error(`edit_excel.py not found. Checked: ${candidates.join(", ")}`);
 }
 
+function buildOutputFileName(sourceUrl: string | undefined, suffix: string): string {
+  let base = "";
+  if (sourceUrl) {
+    try {
+      const pathname = new URL(sourceUrl.split("?")[0]).pathname;
+      const decoded = decodeURIComponent(path.basename(pathname));
+      base = path.basename(decoded, path.extname(decoded));
+    } catch {
+      const cleanSource = sourceUrl.split("?")[0];
+      base = path.basename(cleanSource, path.extname(cleanSource));
+    }
+  }
+
+  if (!base || /^[0-9a-f-]{32,}$/i.test(base)) base = "output";
+  const safe = base.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
+  return `${safe}${suffix}`;
+}
+
 async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
@@ -639,7 +657,7 @@ async function resolveConvertPdfToWordScriptPath(): Promise<string> {
   throw new Error(`pdf_to_word.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "layout" | "editable" = "layout") {
+async function runPythonPdfToWord(inputBuffer: Buffer, _threadId: string, mode: "layout" | "editable" = "layout", fileUrl?: string) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2docx-"));
   const inputPath = path.join(tempDir, "input.pdf");
   const outputPath = path.join(tempDir, "output.docx");
@@ -675,7 +693,7 @@ async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "
     }
 
     const outputBuffer = await fs.readFile(outputPath);
-    const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.docx`;
+    const fileName = buildOutputFileName(fileUrl, "_変換後.docx");
     const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
 
     return {
@@ -1177,7 +1195,7 @@ export async function POST(req: NextRequest) {
     if (action === "pdf_to_word") {
       const pdfBuffer = await downloadBlob(fileUrl, threadId);
       const wordMode = mode === "editable" ? "editable" : "layout";
-      const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode);
+      const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode, fileUrl);
       console.log("[pdf-to-word] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
     }
