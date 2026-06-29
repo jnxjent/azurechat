@@ -1385,7 +1385,7 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, _threadId: string, fileU
 async function runPythonRefineExcelPages(
   excelBuffer: Buffer,
   targetSheets: string[],
-  threadId: string,
+  _threadId: string,
   outputFileName?: string
 ): Promise<{ downloadUrl: string; fileName: string; refined: number; skipped: number }> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-refine-"));
@@ -1550,20 +1550,25 @@ Return JSON only.`;
       { role: "user", content: userPrompt },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 4000,
+    max_completion_tokens: 8000,
   });
 
   const raw = res.choices[0]?.message?.content ?? "{}";
   const finishReason = res.choices[0]?.finish_reason;
   if (finishReason === "length") {
-    console.warn("[buildWordEditPlan] LLM response truncated (finish_reason=length). Plan may be incomplete.");
+    console.warn("[buildWordEditPlan] LLM response truncated (finish_reason=length). Returning user-friendly error.");
+    throw new Error(
+      "編集プランが大きすぎて生成が途中で切れました。" +
+      "まず「誤字候補を一覧で指摘して」と入力して候補を抽出し、" +
+      "その後「○○を××に置換」のような具体的な置換リストで修正してください。"
+    );
   }
   let parsed: WordEditPlan;
   try {
     parsed = JSON.parse(raw) as WordEditPlan;
   } catch {
     console.error("[buildWordEditPlan] JSON.parse failed. raw=", raw.slice(0, 200));
-    throw new Error("編集プランの生成に失敗しました（JSONパースエラー）。指示を短くして再試行してください。");
+    throw new Error("編集プランの生成に失敗しました（JSONパースエラー）。指示を分割して再試行してください。");
   }
   parsed.replaceText ??= [];
   parsed.formatRuns ??= [];
@@ -1855,7 +1860,7 @@ async function resolveEditPptxScriptPath(): Promise<string> {
   throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string, fileBaseName?: string) {
+async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, _threadId: string, fileBaseName?: string) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
   const inputPath = path.join(tempDir, "input.pptx");
   const outputPath = path.join(tempDir, "output.pptx");

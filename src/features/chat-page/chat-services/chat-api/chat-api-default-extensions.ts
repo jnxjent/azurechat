@@ -1839,10 +1839,10 @@ export const GetDefaultExtensions = async (props: {
         required: [],
       },
       description:
-        "このスレッドでアップロードされたPDFファイルをWord（.docx）に変換するツール。\n" +
-        "使用タイミング：ユーザーがPDFをWordに変換したいと言った場合。\n" +
-        "mode=layout: 「WordにしてWordに変換して」など見た目重視の場合。\n" +
-        "mode=editable: 「編集可能なWordに」「表を編集できるWordに」「テキストとして抽出」など編集重視の場合。\n" +
+        "PDFファイルをWord（.docx）に変換するツール。\n" +
+        "- スレッド内アップロードPDFの場合: fileUrl にURLを指定（省略時はスレッド内の最新PDFを自動使用）。\n" +
+        "- SharePoint/SL上のPDFの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
+        "mode=layout: 見た目・レイアウト再現優先。mode=editable: テキスト・表の編集を優先。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "convert_pdf_to_word",
     },
@@ -1852,7 +1852,17 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
+      function: async (args: any) => {
+        const fq = String(args?.fileQuery ?? "").trim();
+        const fu = String(args?.fileUrl ?? "").trim();
+        return await executeConvertPdfToExcel(
+          {
+            ...args,
+            fileUrl: fu || (!fq ? (await resolveLatestPdfOrDocxUrlFromThread(props.chatThread.id)) || "" : ""),
+          },
+          props.chatThread
+        );
+      },
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1871,9 +1881,9 @@ export const GetDefaultExtensions = async (props: {
         required: [],
       },
       description:
-        "このスレッドでアップロードされたPDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
-        "使用タイミング：ユーザーがPDF/WordをExcelに変換したいと言った場合。\n" +
-        "fileUrl は省略可能。省略するとスレッド内の最新PDF/Wordを自動的に使用する。\n" +
+        "PDFまたはWord（.docx）ファイルをExcel（.xlsx）に変換するツール。\n" +
+        "- スレッド内アップロードファイルの場合: fileUrl にURLを指定（省略時はスレッド内の最新PDF/Wordを自動使用）。\n" +
+        "- SharePoint/SL上のPDF/Wordの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "【禁止】既にExcel変換済みのスレッドで「再変換して」「もう一度変換して」と言われた場合はこのツールを使わないこと。その場合は refine_excel_pages を使うこと。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
@@ -4938,8 +4948,7 @@ async function executeEditWord(
   }
 }
 
-// ---------------- PDF → Excel 変換 ----------------
-// ---------------- SP file → SAS URL resolver for Word/Excel conversion ----------------
+// ---------------- SP ファイル → SAS URL 解決（Word/Excel共用） ----------------
 async function resolveSpFileToSasUrl(
   fileQuery: string,
   allowedExts: RegExp,
@@ -4953,6 +4962,7 @@ async function resolveSpFileToSasUrl(
   const currentUser = await userSession();
   const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
 
+  // filename-first search (top=1000); query fallback
   let allDocs: Array<{ document: any }> = [];
   const sr1 = await SimpleSearch("*", "isSlDoc eq true", deptLower, 1000);
   if (sr1.status === "OK" && sr1.response.length) {
@@ -5014,11 +5024,12 @@ async function resolveSpFileToSasUrl(
 
   const { fileName, url } = candidates[0];
   const resolvedUrl = await resolveDocumentUrlForVision(url, chatThread.id);
-  console.log(`[${logTag}] SP resolved: ${fileName} -> ${resolvedUrl.substring(0, 80)}`);
+  console.log(`[${logTag}] SP resolved: ${fileName} → ${resolvedUrl.substring(0, 80)}`);
 
   return { resolvedUrl, fileName };
 }
 
+// ---------------- PDF → Excel 変換 ----------------
 async function executeConvertPdfToExcel(
   args: { fileUrl?: string; fileQuery?: string },
   chatThread: ChatThreadModel
@@ -5048,7 +5059,13 @@ async function executeConvertPdfToExcel(
   if (!fileUrl?.trim()) {
     return {
       error:
-        "変換対象のPDF/Wordファイルが見つかりませんでした。このスレッドでPDFまたはWordファイルをアップロードしてください。",
+        "変換対象のPDF/Wordファイルが見つかりませんでした。このスレッドでPDFまたはWordファイルをアップロードするか、fileQueryでSharePoint/SLのファイル名を指定してください。",
+    };
+  }
+
+  if (!/^https?:\/\//i.test(fileUrl)) {
+    return {
+      error: `fileUrlにはURLが必要です（「${fileUrl}」はURLではありません）。SharePoint/SLのファイル名の場合はfileQueryを使ってください。`,
     };
   }
 
@@ -5243,7 +5260,13 @@ async function executeConvertPdfToWord(
 
   if (!fileUrl?.trim()) {
     return {
-      error: "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードしてください。",
+      error: "変換対象のPDFファイルが見つかりませんでした。このスレッドでPDFファイルをアップロードするか、fileQueryでSharePoint/SLのファイル名を指定してください。",
+    };
+  }
+
+  if (!/^https?:\/\//i.test(fileUrl)) {
+    return {
+      error: `fileUrlにはURLが必要です（「${fileUrl}」はURLではありません）。SharePoint/SLのファイル名の場合はfileQueryを使ってください。`,
     };
   }
 
