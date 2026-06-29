@@ -4370,8 +4370,13 @@ async function executeEditPptx(
   }
 
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
-  const isLayoutConversionRequest =
-    /(Box|ボックス|カード|card|card_grid|型.{0,4}(変え|変更|替え|に変)|デザイン.{0,4}(変え|変更|替え|を変)|レイアウト.{0,4}(変え|変更|変換|をカード))/i.test(instruction);
+  // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
+  const hasLayoutIntent =
+    /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|デザイン.{0,4}(変え|変更|替え|を変)|レイアウト.{0,4}(変え|変更|変換|をカード)|項目数|箇条書き|bullet)/i.test(instruction);
+  const hasColorIntent =
+    /(色|色味|カラー|トーン|tone|緑|青|赤|黄|紫|オレンジ|ピンク|グレー|グリーン|ブルー|レッド|navy|orange|green|blue|red|yellow|purple|pink|gray)/i.test(instruction);
+  const isColorOnlyEdit = hasColorIntent && !hasLayoutIntent;
+  const isLayoutConversionRequest = !isColorOnlyEdit && hasLayoutIntent;
   if (isLayoutConversionRequest) {
     try {
       const t0 = Date.now();
@@ -5305,6 +5310,17 @@ async function executeEditSpPptx(
   console.log(`[edit_sp_pptx] pptx-matched count=${matched.length} (query="${fileQuery}")`);
 
   if (!matched.length) {
+    // SP未ヒット → ユーザーがSP/SL/SharePoint等を明示していない場合のみスレッド内PPTXへフォールバック
+    // （LLMが edit_sp_pptx に誤ルーティングした際の救済。明示SPファイルの検索ミスは従来どおりエラー）
+    const explicitlySharePoint =
+      /(?:\bSP\b|SharePoint|ＳＰ|共有フォルダ|ライブラリ|SL|ＳＬ)/i.test(`${fileQuery} ${instruction}`);
+    if (!explicitlySharePoint) {
+      const threadPptx = await resolveLatestPptxInfoFromThread(chatThread.id);
+      if (threadPptx?.url) {
+        console.log(`[edit_sp_pptx] SP not found, falling back to thread PPTX: ${threadPptx.url.substring(0, 80)}`);
+        return executeEditPptx({ fileUrl: threadPptx.url, instruction }, chatThread);
+      }
+    }
     return { error: `「${fileQuery}」に一致するPPTXファイルが見つかりませんでした。` };
   }
 
