@@ -1852,17 +1852,7 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => {
-        const fq = String(args?.fileQuery ?? "").trim();
-        const fu = String(args?.fileUrl ?? "").trim();
-        return await executeConvertPdfToExcel(
-          {
-            ...args,
-            fileUrl: fu || (!fq ? (await resolveLatestPdfOrDocxUrlFromThread(props.chatThread.id)) || "" : ""),
-          },
-          props.chatThread
-        );
-      },
+      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
