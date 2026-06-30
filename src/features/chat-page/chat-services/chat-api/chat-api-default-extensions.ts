@@ -1821,7 +1821,12 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURLを指定する。",
+              "変換対象のPDFファイルのURL。このスレッドでアップロードされた.pdfのURL。省略時はスレッド内の最新PDFを自動使用。SharePoint/SLのファイルはfileQueryを使うこと。ファイル名だけをここに入れてはいけない。",
+          },
+          fileQuery: {
+            type: "string",
+            description:
+              "SharePoint/SLにあるPDFのファイル名またはキーワード。SharePointのPDFをWordに変換する場合はこちらを使用する。fileUrl と排他。",
           },
           mode: {
             type: "string",
@@ -1830,7 +1835,7 @@ export const GetDefaultExtensions = async (props: {
               "layout: 見た目・レイアウト再現優先（pdf2docx使用）。editable: テキスト・表を編集可能な形で抽出優先（Doc Intelligence使用）。",
           },
         },
-        required: ["fileUrl"],
+        required: [],
       },
       description:
         "このスレッドでアップロードされたPDFファイルをWord（.docx）に変換するツール。\n" +
@@ -1846,17 +1851,7 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) =>
-        await executeConvertPdfToExcel(
-          {
-            ...args,
-            fileUrl:
-              String(args?.fileUrl ?? "").trim() ||
-              (await resolveLatestPdfOrDocxUrlFromThread(props.chatThread.id)) ||
-              "",
-          },
-          props.chatThread
-        ),
+      function: async (args: any) => await executeConvertPdfToExcel(args, props.chatThread),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1864,7 +1859,12 @@ export const GetDefaultExtensions = async (props: {
           fileUrl: {
             type: "string",
             description:
-              "変換対象のPDF/WordファイルのURL。このスレッドでアップロードされた.pdf/.docxのURL。省略時はスレッド内の最新PDF/Wordを自動解決する。",
+              "変換対象のPDF/WordファイルのURL。このスレッドでアップロードされた.pdf/.docxのURL。省略時はスレッド内の最新PDF/Wordを自動使用。SharePoint/SLのファイルはfileQueryを使うこと。ファイル名だけをここに入れてはいけない。",
+          },
+          fileQuery: {
+            type: "string",
+            description:
+              "SharePoint/SLにあるPDF/WordのファイルQuery（ファイル名またはキーワード）。SharePointのファイルを変換する場合はこちらを使用する。fileUrl と排他。",
           },
         },
         required: [],
@@ -4377,6 +4377,18 @@ async function executeEditPptx(
     /(色|色味|カラー|トーン|tone|緑|青|赤|黄|紫|オレンジ|ピンク|グレー|グリーン|ブルー|レッド|navy|orange|green|blue|red|yellow|purple|pink|gray)/i.test(instruction);
   const isColorOnlyEdit = hasColorIntent && !hasLayoutIntent;
   const isLayoutConversionRequest = !isColorOnlyEdit && hasLayoutIntent;
+  // layout_regen パス内で色指定を検出するためのルックアップ（route.ts の parseDirectAccentColor と同値）
+  const detectLayoutAccentColor = (s: string): string | null => {
+    const t = s.toLowerCase();
+    if (/(赤|red)/.test(t)) return "C00000";
+    if (/(青|blue)/.test(t)) return "2F5597";
+    if (/(緑|green)/.test(t)) return "548235";
+    if (/(紫|purple)/.test(t)) return "7030A0";
+    if (/(オレンジ|orange|橙)/.test(t)) return "C55A11";
+    if (/(黄|yellow)/.test(t)) return "BF9000";
+    if (/(ピンク|pink)/.test(t)) return "C0508A";
+    return null;
+  };
   if (isLayoutConversionRequest) {
     try {
       const t0 = Date.now();
@@ -4441,6 +4453,43 @@ async function executeEditPptx(
       if (!directEditJson?.downloadUrl) throw new Error("PowerPoint layout edit did not return a download URL");
       const directDisplayName = `${directOutputName}.pptx`;
       console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} total=${Date.now() - t0}ms`);
+      // 複合指示（カード型 + 色変更）の場合、レイアウト編集済みファイルに対してデッキ色を適用する
+      // hasColorIntent（単語存在チェック）ではなく、明示的な色変更要求のみに限定する
+      const hasExplicitDeckColorIntent =
+        /(色|色味).{0,8}(変え|変更|かえ|にして|替え)|(緑|青|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|green|blue|red|yellow|purple|orange|pink|navy|gray).{0,10}(にして|にかえ|に変え|に変更)/i.test(instruction);
+      if (hasExplicitDeckColorIntent) {
+        const accentColor = detectLayoutAccentColor(instruction);
+        if (accentColor) {
+          try {
+            const colorRes = await fetch(`${baseUrl}/api/edit-pptx`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                fileUrl: directEditJson.downloadUrl,
+                action: "apply_pptx_plan",
+                plan: { slideEdits: [], deckEdits: { accentColor, preserveTextColors: true } },
+                threadId: chatThread.id,
+                outputBaseName: directOutputName,
+              }),
+            });
+            if (colorRes.ok) {
+              const colorJson = await colorRes.json();
+              if (colorJson?.downloadUrl) {
+                console.log(`[layout_direct_edit] color_pass accentColor=#${accentColor}`);
+                return {
+                  downloadUrl: colorJson.downloadUrl,
+                  fileName: colorJson.fileName ?? directDisplayName,
+                  displayName: directDisplayName,
+                  message: "指定スライドをカード型に変更し、デッキ全体の色も変更しました。",
+                };
+              }
+            }
+            console.warn("[layout_direct_edit] color pass failed, returning layout-only result");
+          } catch (e) {
+            console.warn("[layout_direct_edit] color pass error:", e);
+          }
+        }
+      }
       return {
         downloadUrl: directEditJson.downloadUrl,
         fileName: directEditJson.fileName ?? directDisplayName,
@@ -4889,11 +4938,107 @@ async function executeEditWord(
 }
 
 // ---------------- PDF → Excel 変換 ----------------
+// ---------------- SP file → SAS URL resolver for Word/Excel conversion ----------------
+async function resolveSpFileToSasUrl(
+  fileQuery: string,
+  allowedExts: RegExp,
+  chatThread: ChatThreadModel,
+  logTag: string
+): Promise<
+  | { resolvedUrl: string; fileName: string }
+  | { error: string }
+  | { multipleFiles: true; message: string }
+> {
+  const currentUser = await userSession();
+  const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
+
+  let allDocs: Array<{ document: any }> = [];
+  const sr1 = await SimpleSearch("*", "isSlDoc eq true", deptLower, 1000);
+  if (sr1.status === "OK" && sr1.response.length) {
+    allDocs = sr1.response;
+  } else {
+    const sr2 = await SimpleSearch(fileQuery, "isSlDoc eq true", deptLower, 50);
+    if (sr2.status === "OK") allDocs = sr2.response;
+  }
+
+  if (!allDocs.length) {
+    return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
+  }
+
+  const queryLower = fileQuery.trim().toLowerCase();
+  const matched = allDocs.filter(({ document: doc }) => {
+    const metaName = (doc.metadata ?? "").trim().toLowerCase();
+    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
+    const name = allowedExts.test(metaName) ? metaName : (urlName || metaName);
+    if (!allowedExts.test(name)) return false;
+    return name.includes(queryLower) || queryLower.includes(name.replace(/\.[^.]+$/i, ""));
+  });
+
+  console.log(`[${logTag}] SP name-matched count=${matched.length} (query="${fileQuery}")`);
+
+  if (!matched.length) {
+    const extFiles = Array.from(
+      new Map(
+        allDocs
+          .filter(({ document: doc }) => allowedExts.test(doc.metadata ?? ""))
+          .map(({ document: doc }) => [doc.effectiveFileUrl || doc.fileUrl, doc.metadata || "不明"])
+      ).entries()
+    );
+    if (!extFiles.length) {
+      return { error: `「${fileQuery}」に一致するファイルが見つかりませんでした。` };
+    }
+    const list = extFiles.map(([, name], i) => `${i + 1}. ${name}`).join("\n");
+    return {
+      multipleFiles: true,
+      message: `「${fileQuery}」に一致するファイルが見つかりませんでした。\nアクセス可能なファイル一覧:\n\n${list}\n\nファイル名を指定してください。`,
+    };
+  }
+
+  const seen = new Map<string, { fileName: string; url: string }>();
+  for (const { document: doc } of matched) {
+    const url = doc.effectiveFileUrl || doc.fileUrl;
+    const name = doc.metadata || extractFileNameFromDocumentUrl(url) || url.split("/").pop() || "file";
+    if (url && !seen.has(url)) seen.set(url, { fileName: name, url });
+  }
+
+  const candidates = Array.from(seen.values());
+
+  if (candidates.length > 1) {
+    const list = candidates.map((c, i) => `${i + 1}. ${c.fileName}`).join("\n");
+    return {
+      multipleFiles: true,
+      message: `「${fileQuery}」で複数のファイルが見つかりました。どれを変換しますか？\n\n${list}\n\nファイル名を指定して再度お試しください。`,
+    };
+  }
+
+  const { fileName, url } = candidates[0];
+  const resolvedUrl = await resolveDocumentUrlForVision(url, chatThread.id);
+  console.log(`[${logTag}] SP resolved: ${fileName} -> ${resolvedUrl.substring(0, 80)}`);
+
+  return { resolvedUrl, fileName };
+}
+
 async function executeConvertPdfToExcel(
-  args: { fileUrl?: string },
+  args: { fileUrl?: string; fileQuery?: string },
   chatThread: ChatThreadModel
 ) {
-  let { fileUrl } = args ?? {};
+  let { fileUrl, fileQuery } = args ?? {};
+  let spFileName: string | undefined;
+
+  if (fileUrl && /\.pptx(\?|$)/i.test(fileUrl)) {
+    console.error(`[convert_pdf_to_excel] fileUrl is PPTX, not PDF/Word: ${fileUrl.substring(0, 80)}`);
+    return { error: "変換対象はPDFまたはWordファイルを指定してください。PPTXファイルはExcel変換に使用できません。" };
+  }
+
+  // SP fileQuery → SAS URL解決
+  if (fileQuery?.trim() && !fileUrl?.trim()) {
+    const spResult = await resolveSpFileToSasUrl(fileQuery, /\.(pdf|docx)$/i, chatThread, "convert_pdf_to_excel");
+    if ("error" in spResult) return spResult;
+    if ("multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+    spFileName = spResult.fileName;
+    console.log(`[convert_pdf_to_excel] Resolved SP file: ${spResult.fileName}`);
+  }
 
   if (!fileUrl?.trim()) {
     fileUrl = (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
@@ -4915,7 +5060,7 @@ async function executeConvertPdfToExcel(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_excel" }),
+      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_excel", outputBaseName: spFileName }),
     });
 
     if (!res.ok) {
@@ -5068,10 +5213,32 @@ async function executeRefineExcelPages(
 
 // ---------------- PDF → Word 変換 ----------------
 async function executeConvertPdfToWord(
-  args: { fileUrl?: string; mode?: "layout" | "editable" },
+  args: { fileUrl?: string; fileQuery?: string; mode?: "layout" | "editable" },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, mode = "layout" } = args ?? {};
+  let { fileUrl, fileQuery, mode = "layout" } = args ?? {};
+  let spFileName: string | undefined;
+
+  if (fileUrl && /\.pptx(\?|$)/i.test(fileUrl)) {
+    console.error(`[convert_pdf_to_word] fileUrl is PPTX, not PDF: ${fileUrl.substring(0, 80)}`);
+    return { error: "変換対象はPDFファイルを指定してください。PPTXファイルはWord変換に使用できません。" };
+  }
+
+  // SP fileQuery → SAS URL解決
+  if (fileQuery?.trim() && !fileUrl?.trim()) {
+    const spResult = await resolveSpFileToSasUrl(fileQuery, /\.pdf$/i, chatThread, "convert_pdf_to_word");
+    if ("error" in spResult) return spResult;
+    if ("multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+    spFileName = spResult.fileName;
+    console.log(`[convert_pdf_to_word] Resolved SP file: ${spResult.fileName}`);
+  }
+
+  // fileUrl未指定の場合はスレッド内の最新PDFを自動解決
+  if (!fileUrl?.trim()) {
+    const latest = (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
+    if (/\.pdf($|\?)/i.test(latest)) fileUrl = latest;
+  }
 
   if (!fileUrl?.trim()) {
     return {
@@ -5088,7 +5255,7 @@ async function executeConvertPdfToWord(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_word", mode }),
+      body: JSON.stringify({ fileUrl, instruction: "", threadId: chatThread.id, action: "pdf_to_word", mode, outputBaseName: spFileName }),
     });
 
     if (!res.ok) {

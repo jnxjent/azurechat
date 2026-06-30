@@ -1004,7 +1004,13 @@ async function resolveEditExcelScriptPath(): Promise<string> {
   throw new Error(`edit_excel.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<string> {
+function encodeRFC5987ValueChars(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/g, (c) =>
+    `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+async function uploadExcelToBlob(buffer: Buffer, fileName: string, displayName?: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "xlsx";
@@ -1021,7 +1027,7 @@ async function uploadExcelToBlob(buffer: Buffer, fileName: string): Promise<stri
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(displayName ?? fileName)}`,
     },
   });
 
@@ -1121,7 +1127,7 @@ async function resolveConvertPdfToWordScriptPath(): Promise<string> {
   throw new Error(`pdf_to_word.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "layout" | "editable" = "layout") {
+async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "layout" | "editable" = "layout", hintFileName?: string) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2docx-"));
   const inputPath = path.join(tempDir, "input.pdf");
   const outputPath = path.join(tempDir, "output.docx");
@@ -1158,11 +1164,12 @@ async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "
 
     const outputBuffer = await fs.readFile(outputPath);
     const fileName = `${threadId || uniqueId()}_converted_${uniqueId()}.docx`;
-    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
+    const displayName = hintFileName ? buildOutputFileName(hintFileName, ".docx") : undefined;
+    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName, displayName);
 
     return {
       downloadUrl,
-      fileName,
+      fileName: displayName ?? fileName,
       paragraphs: Number(pythonResult.paragraphs ?? 0),
       tables: Number(pythonResult.tables ?? 0),
       engine: String(pythonResult.engine ?? ""),
@@ -1287,7 +1294,7 @@ async function buildAccountNameCorrectionPlan(excelBuffer: Buffer): Promise<Exce
   return { sheetEdits };
 }
 
-async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUrl?: string) {
+async function runPythonPdfToExcel(inputBuffer: Buffer, _threadId: string, fileUrl?: string, hintFileName?: string) {
   const inputExt = fileUrl ? (getFileExtension(fileUrl) || ".pdf") : ".pdf";
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pdf2xl-"));
   const inputPath = path.join(tempDir, `input${inputExt}`);
@@ -1345,7 +1352,8 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
 
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const fileName = buildOutputFileName(fileUrl, "_変換後.xlsx");
-    const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
+    const displayName = hintFileName ? buildOutputFileName(hintFileName, "_変換後.xlsx") : undefined;
+    const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName, displayName);
 
     // シート名一覧を取得（refine_excel_pages ツールがLLMに提示するため）
     let sheetNames: string[] = [];
@@ -1358,7 +1366,7 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, threadId: string, fileUr
 
     return {
       downloadUrl,
-      fileName,
+      fileName: displayName ?? fileName,
       sheetNames,
       sheets: Number(pythonResult.sheets ?? 0),
       tables: Number(pythonResult.tables ?? 0),
@@ -1482,7 +1490,7 @@ async function extractDocSummary(buffer: Buffer): Promise<WordDocSummary> {
     if (text.trim()) paragraphs.push({ style, text: text.trim() });
   }
 
-  return { paragraphs: paragraphs.slice(0, 50), totalParagraphs: paragraphs.length };
+  return { paragraphs: paragraphs.slice(0, 200), totalParagraphs: paragraphs.length };
 }
 
 async function buildWordEditPlan(
@@ -1561,6 +1569,111 @@ Return JSON only.`;
   parsed.formatRuns ??= [];
   parsed.addParagraphs ??= [];
   return parsed;
+}
+
+const WORD_EDIT_CHUNK_SIZE = 12;
+
+async function buildWordReplaceTextChunk(
+  openai: ReturnType<typeof OpenAIInstance>,
+  paragraphs: DocParagraph[],
+  instruction: string
+): Promise<{ entries: Array<{ find: string; replace: string }>; skipped: boolean }> {
+  const paraLines = paragraphs.map((p, i) => `[${i + 1}] ${p.text}`).join("\n");
+  const res = await openai.chat.completions.create({
+    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    messages: [
+      {
+        role: "system",
+        content: `You find and fix text errors (誤字・誤記) in Japanese document paragraphs.
+Return JSON only: {"replaceText":[{"find":"wrong text","replace":"correct text"}]}
+Rules:
+- "find" must be exact text found in the provided paragraphs.
+- Only fix actual typos/errors per the instruction.
+- Return {"replaceText":[]} if no errors found in this chunk.
+- Keep JSON minimal.`,
+      },
+      {
+        role: "user",
+        content: `Instruction: ${instruction}\n\nParagraphs:\n${paraLines}\n\nReturn JSON only.`,
+      },
+    ],
+    response_format: { type: "json_object" },
+    max_completion_tokens: 3000,
+  });
+  if (res.choices[0]?.finish_reason === "length") {
+    console.warn("[buildWordReplaceTextChunk] chunk truncated, skipping");
+    return { entries: [], skipped: true };
+  }
+  const raw = res.choices[0]?.message?.content ?? "{}";
+  try {
+    const p = JSON.parse(raw) as { replaceText?: Array<{ find: string; replace?: string }> };
+    const entries = Array.isArray(p.replaceText)
+      ? p.replaceText.filter((e): e is { find: string; replace: string } =>
+          typeof e.find === "string" && e.find.trim() !== "" && typeof e.replace === "string"
+        )
+      : [];
+    return { entries, skipped: false };
+  } catch {
+    console.warn("[buildWordReplaceTextChunk] JSON parse failed");
+    return { entries: [], skipped: true };
+  }
+}
+
+async function buildWordEditPlanChunked(
+  summary: WordDocSummary,
+  instruction: string
+): Promise<{ plan: WordEditPlan; skippedChunks: number }> {
+  const openai = OpenAIInstance();
+  const { paragraphs } = summary;
+
+  const allReplaceText: Array<{ find: string; replace: string }> = [];
+  let skippedChunks = 0;
+  for (let i = 0; i < paragraphs.length; i += WORD_EDIT_CHUNK_SIZE) {
+    const chunk = paragraphs.slice(i, i + WORD_EDIT_CHUNK_SIZE);
+    const { entries, skipped } = await buildWordReplaceTextChunk(openai, chunk, instruction);
+    allReplaceText.push(...entries);
+    if (skipped) skippedChunks++;
+  }
+  const chunkCount = Math.ceil(paragraphs.length / WORD_EDIT_CHUNK_SIZE);
+  console.log(`[buildWordEditPlan] replaceText total=${allReplaceText.length} chunks=${chunkCount} skipped=${skippedChunks}`);
+
+  let formatRuns: WordEditPlan["formatRuns"] = [];
+  let addParagraphs: WordEditPlan["addParagraphs"] = [];
+  const needsFormatOrAdd =
+    /(bold|太字|フォント|font|fontSize|color|色|italic|斜体|段落|追加|add)/i.test(instruction);
+  if (needsFormatOrAdd) {
+    const res2 = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [
+        {
+          role: "system",
+          content: `You convert a Word formatting or paragraph-addition request into JSON.
+Return JSON only: {"formatRuns":[],"addParagraphs":[]}
+formatRuns: [{matchText?,bold?,italic?,fontSize?,fontColor?,fontFace?}]
+  - matchText: omit to apply to ALL paragraphs. fontSize: points. fontColor: 6-digit hex. fontFace: exact name.
+addParagraphs: [{text,style?,bold?,fontSize?}] appended at document end.
+  - style: "Normal"|"Heading1"|"Heading2"|"List Bullet"
+NEVER add a summary of changes as addParagraphs. Keep JSON minimal.`,
+        },
+        { role: "user", content: `Instruction: ${instruction}\n\nReturn JSON only.` },
+      ],
+      response_format: { type: "json_object" },
+      max_completion_tokens: 2000,
+    });
+    const raw2 = res2.choices[0]?.message?.content ?? "{}";
+    try {
+      const p2 = JSON.parse(raw2) as { formatRuns?: WordEditPlan["formatRuns"]; addParagraphs?: WordEditPlan["addParagraphs"] };
+      formatRuns = Array.isArray(p2.formatRuns) ? p2.formatRuns : [];
+      addParagraphs = Array.isArray(p2.addParagraphs) ? p2.addParagraphs : [];
+    } catch {
+      console.warn("[buildWordEditPlan] formatRuns/addParagraphs parse failed");
+    }
+  }
+
+  return {
+    plan: { replaceText: allReplaceText, formatRuns, addParagraphs, trackChanges: false },
+    skippedChunks,
+  };
 }
 
 async function resolveEditWordScriptPath(): Promise<string> {
@@ -1974,7 +2087,7 @@ export async function POST(req: NextRequest) {
     // PDF → Excel 変換
     if (action === "pdf_to_excel") {
       const pdfBuffer = await downloadBlob(fileUrl, threadId);
-      const result = await runPythonPdfToExcel(pdfBuffer, threadId, fileUrl);
+      const result = await runPythonPdfToExcel(pdfBuffer, threadId, fileUrl, outputBaseName);
       console.log("[pdf-to-excel] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
     }
@@ -1983,7 +2096,7 @@ export async function POST(req: NextRequest) {
     if (action === "pdf_to_word") {
       const pdfBuffer = await downloadBlob(fileUrl, threadId);
       const wordMode = mode === "editable" ? "editable" : "layout";
-      const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode);
+      const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode, outputBaseName);
       console.log("[pdf-to-word] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
     }
@@ -2002,6 +2115,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "plan.slideEdits is required" }, { status: 400 });
       }
       // deckEdits / imageInserts は内容増量では不要のため除去。item 単位バリデーション付き。
+      // ただし accentColor が正規 hex で明示された場合はデッキ色変更として safeplan に含める
+      const incomingDeckAccent = normalizeHexColor(String((incomingPlan as any).deckEdits?.accentColor ?? ""));
       const safeplan: EditPlan = {
         slideEdits: incomingPlan.slideEdits
           .map((se) => {
@@ -2056,6 +2171,7 @@ export async function POST(req: NextRequest) {
             };
           })
           .filter((se): se is NonNullable<typeof se> => se !== null),
+        ...(incomingDeckAccent ? { deckEdits: { accentColor: incomingDeckAccent, preserveTextColors: true } } : {}),
       };
       const pptxBuffer = await downloadBlob(fileUrl, threadId);
       const safeBaseName = outputBaseName ?? "内容増量";
@@ -2112,7 +2228,7 @@ export async function POST(req: NextRequest) {
     if (isWordFile(ext)) {
       const wordBuffer = await downloadBlob(fileUrl, threadId);
       const summary = await extractDocSummary(wordBuffer);
-      const plan = await buildWordEditPlan(summary, instruction);
+      const { plan, skippedChunks } = await buildWordEditPlanChunked(summary, instruction);
       plan.trackChanges = !!trackChanges;
 
       console.log("[edit-word] plan:", JSON.stringify(plan));
@@ -2121,7 +2237,10 @@ export async function POST(req: NextRequest) {
       const originalFileName = (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })();
 
       const result = await runPythonEditWord(wordBuffer, plan, threadId, originalFileName || undefined);
-      return NextResponse.json({ ok: true, ...result });
+      const wordWarning = skippedChunks > 0
+        ? `${skippedChunks}件の段落チャンクが処理できませんでした。修正漏れの可能性があります。`
+        : undefined;
+      return NextResponse.json({ ok: true, ...result, ...(wordWarning ? { warning: wordWarning } : {}) });
     }
 
     // PPTX フロー（既存）
