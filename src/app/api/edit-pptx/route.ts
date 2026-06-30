@@ -2132,7 +2132,7 @@ export async function POST(req: NextRequest) {
     // deckEdits はユーザーが明示的にスライド追加・削除を要求した場合のみ許可
     // (それ以外の編集指示で accentColor/fontFace が混入すると別物化する)
     const deckEditAllowed =
-      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更)|フォント.{0,8}(変え|変更)|アクセント/.test(instruction);
+      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更|かえ|にして|替え)|フォント.{0,8}(変え|変更|かえ)|アクセント|(緑|青|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|green|blue|red|yellow|purple|orange|pink|navy|gray).{0,10}(にして|にかえ|に変え|に変更)/.test(instruction);
     if (!deckEditAllowed && plan.deckEdits) {
       console.log("[edit-pptx] stripping deckEdits (not explicitly requested)");
       plan = { ...plan, deckEdits: undefined };
@@ -2144,7 +2144,9 @@ export async function POST(req: NextRequest) {
     const result = await runPythonEdit(pptxBuffer, plan, threadId, outputBaseName);
 
     // 変更なし検証: 0件置換は無言成功ではなくエラーとして返す
-    if ((result.changedSlides ?? 0) <= 0 && (plan.imageInserts?.length ?? 0) === 0) {
+    // deckEdits（テーマ色・フォント変更）はchangedSlides=0でもtheme XMLが更新されるため除外
+    const hasDeckChange = !!(plan.deckEdits?.accentColor || plan.deckEdits?.fontFace);
+    if ((result.changedSlides ?? 0) <= 0 && (plan.imageInserts?.length ?? 0) === 0 && !hasDeckChange) {
       return NextResponse.json({
         ok: false,
         error: "置換対象が見つからず、内容は変更されませんでした。文字列が複数のrunに分割されているか、指定した文字列が見つかりません。",
