@@ -147,7 +147,15 @@ def try_get_rgb(color_format) -> tuple[int, int, int] | None:
     return None
 
 
-def recolor_fill(shape, target_hex: str) -> bool:
+def _palette_hex_for_rgb(rgb: tuple[int, int, int], palette: dict) -> str | None:
+    """明度でセマンティックロールを判定してパレット色を返す。明度>0.75は背景扱いでスキップ。"""
+    _, _, lig = rgb_to_hsl(rgb)
+    if lig > 0.75:
+        return None  # 薄い背景色はスキップ（theme経由で制御）
+    return palette.get("accentA" if lig < 0.45 else "accentB")
+
+
+def recolor_fill(shape, target_hex: str | None, palette: dict | None = None) -> bool:
     try:
         fill = shape.fill
         if fill.type != MSO_FILL_TYPE.SOLID:
@@ -155,13 +163,21 @@ def recolor_fill(shape, target_hex: str) -> bool:
         rgb = try_get_rgb(fill.fore_color)
         if not rgb or is_neutral(rgb):
             return False
-        fill.fore_color.rgb = RGBColor.from_string(recolor_preserving_tone(rgb, target_hex))
+        if palette:
+            new_hex = _palette_hex_for_rgb(rgb, palette)
+            if not new_hex:
+                return False
+        elif target_hex:
+            new_hex = recolor_preserving_tone(rgb, target_hex)
+        else:
+            return False
+        fill.fore_color.rgb = RGBColor.from_string(new_hex)
         return True
     except Exception:
         return False
 
 
-def recolor_line(shape, target_hex: str) -> bool:
+def recolor_line(shape, target_hex: str | None, palette: dict | None = None) -> bool:
     """既存の枠線色を直接 XML で書き換える。
     python-pptx の shape.line アクセサは使わない
     （アクセスだけで <a:ln> が生成される／<a:noFill> が <a:solidFill> に変換されるため）。
@@ -189,13 +205,21 @@ def recolor_line(shape, target_hex: str) -> bool:
             return False
         if is_neutral(rgb):
             return False
-        srgb.set("val", recolor_preserving_tone(rgb, target_hex))
+        if palette:
+            new_hex = _palette_hex_for_rgb(rgb, palette)
+            if not new_hex:
+                return False
+        elif target_hex:
+            new_hex = recolor_preserving_tone(rgb, target_hex)
+        else:
+            return False
+        srgb.set("val", new_hex)
         return True
     except Exception:
         return False
 
 
-def recolor_slide_background(slide, target_hex: str) -> bool:
+def recolor_slide_background(slide, target_hex: str | None, palette: dict | None = None) -> bool:
     """Recolor the slide's background fill (<p:bg>) if it is a non-neutral solid color."""
     try:
         background = slide.background
@@ -205,13 +229,21 @@ def recolor_slide_background(slide, target_hex: str) -> bool:
         rgb = try_get_rgb(fill.fore_color)
         if not rgb or is_neutral(rgb):
             return False
-        fill.fore_color.rgb = RGBColor.from_string(recolor_preserving_tone(rgb, target_hex))
+        if palette:
+            new_hex = _palette_hex_for_rgb(rgb, palette)
+            if not new_hex:
+                return False
+        elif target_hex:
+            new_hex = recolor_preserving_tone(rgb, target_hex)
+        else:
+            return False
+        fill.fore_color.rgb = RGBColor.from_string(new_hex)
         return True
     except Exception:
         return False
 
 
-def recolor_table(shape, target_hex: str) -> bool:
+def recolor_table(shape, target_hex: str | None, palette: dict | None = None) -> bool:
     if not hasattr(shape, "has_table") or not shape.has_table:
         return False
     changed = False
@@ -222,27 +254,48 @@ def recolor_table(shape, target_hex: str) -> bool:
                 if fill.type == MSO_FILL_TYPE.SOLID:
                     rgb = try_get_rgb(fill.fore_color)
                     if rgb and not is_neutral(rgb):
-                        fill.fore_color.rgb = RGBColor.from_string(
-                            recolor_preserving_tone(rgb, target_hex)
-                        )
+                        if palette:
+                            new_hex = _palette_hex_for_rgb(rgb, palette)
+                            if not new_hex:
+                                continue
+                        elif target_hex:
+                            new_hex = recolor_preserving_tone(rgb, target_hex)
+                        else:
+                            continue
+                        fill.fore_color.rgb = RGBColor.from_string(new_hex)
                         changed = True
             except Exception:
                 pass
     return changed
 
 
-def update_theme_colors(pptx_path: Path, target_hex: str) -> None:
+def update_theme_colors(pptx_path: Path, target_hex: str | None, palette: dict | None = None) -> None:
     ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
-    variant_map = {
-        "accent1": target_hex,
-        "accent2": shift_lightness(target_hex, 0.12),
-        "accent3": shift_lightness(target_hex, -0.10),
-        "accent4": shift_lightness(target_hex, 0.2),
-        "accent5": shift_lightness(target_hex, -0.18),
-        "accent6": shift_lightness(target_hex, 0.04),
-        "hlink": target_hex,
-        "folHlink": shift_lightness(target_hex, -0.12),
-    }
+    if palette:
+        variant_map = {
+            "dk1":     palette.get("bodyText", target_hex or "1D2435"),
+            "lt1":     palette.get("canvas", "FFFFFF"),
+            "accent1": palette.get("accentA", target_hex or "000000"),
+            "accent2": palette.get("accentB", target_hex or "000000"),
+            "accent3": palette.get("sectionBg", "EEEEEE"),
+            "accent4": palette.get("tableAltBg", "F5F5F5"),
+            "accent5": palette.get("mutedText", "666666"),
+            "accent6": palette.get("border", "DDDDDD"),
+            "hlink":   palette.get("accentB", target_hex or "0563C1"),
+        }
+    elif target_hex:
+        variant_map = {
+            "accent1": target_hex,
+            "accent2": shift_lightness(target_hex, 0.12),
+            "accent3": shift_lightness(target_hex, -0.10),
+            "accent4": shift_lightness(target_hex, 0.2),
+            "accent5": shift_lightness(target_hex, -0.18),
+            "accent6": shift_lightness(target_hex, 0.04),
+            "hlink":   target_hex,
+            "folHlink": shift_lightness(target_hex, -0.12),
+        }
+    else:
+        return
 
     with zipfile.ZipFile(pptx_path, "r") as zin:
         entries: dict[str, bytes] = {}
@@ -919,7 +972,12 @@ def _remove_body_content_shapes(slide, slide_height: int) -> None:
             continue
 
 
-def _set_textbox_text(shape, heading: str, body: str) -> None:
+def _set_textbox_text(shape, heading: str, body: str, card_h: int = 2200000, heading_color: str = "1F2937", body_color: str = "4B5563") -> None:
+    scale = min(1.3, max(1.0, card_h / 2200000))
+    heading_pt = round(17 * scale)
+    body_pt = round(13 * scale)
+    space_pt = round(8 * scale)
+
     tf = shape.text_frame
     tf.clear()
     tf.margin_left = Emu(120000)
@@ -932,19 +990,19 @@ def _set_textbox_text(shape, heading: str, body: str) -> None:
     p.alignment = PP_ALIGN.LEFT
     if p.runs:
         p.runs[0].font.bold = True
-        p.runs[0].font.size = Pt(15)
-        p.runs[0].font.color.rgb = RGBColor(31, 41, 55)
+        p.runs[0].font.size = Pt(heading_pt)
+        p.runs[0].font.color.rgb = RGBColor.from_string(heading_color)
     if body:
         p2 = tf.add_paragraph()
         p2.text = body
         p2.alignment = PP_ALIGN.LEFT
-        p2.space_before = Pt(6)
+        p2.space_before = Pt(space_pt)
         if p2.runs:
-            p2.runs[0].font.size = Pt(10)
-            p2.runs[0].font.color.rgb = RGBColor(75, 85, 99)
+            p2.runs[0].font.size = Pt(body_pt)
+            p2.runs[0].font.color.rgb = RGBColor.from_string(body_color)
 
 
-def convert_slide_to_cards(slide, action: dict, slide_width: int, slide_height: int) -> bool:
+def convert_slide_to_cards(slide, action: dict, slide_width: int, slide_height: int, deck_accent: str | None = None, palette: dict | None = None) -> bool:
     cards = action.get("cards") or []
     if not isinstance(cards, list):
         return False
@@ -972,13 +1030,18 @@ def convert_slide_to_cards(slide, action: dict, slide_width: int, slide_height: 
     card_w = int((slide_width - margin_x * 2 - gap_x * (cols - 1)) / cols)
     card_h = int((content_bottom - content_top - gap_y * (rows - 1)) / rows)
     accent_colors = ["2563EB", "059669", "D97706", "7C3AED", "DC2626", "0891B2"]
+    surface = palette.get("surface", "FFFFFF") if palette else "FFFFFF"
+    border_color = palette.get("border", "D1D5DB") if palette else "D1D5DB"
+    heading_color = palette.get("bodyText", "1F2937") if palette else "1F2937"
+    body_color = palette.get("mutedText", "4B5563") if palette else "4B5563"
+    palette_accent = palette.get("accentA") if palette else None
 
     for i, card in enumerate(clean_cards):
         row = i // cols
         col = i % cols
         left = margin_x + col * (card_w + gap_x)
         top = content_top + row * (card_h + gap_y)
-        accent = accent_colors[i % len(accent_colors)]
+        accent = deck_accent or palette_accent or accent_colors[i % len(accent_colors)]
 
         rect = slide.shapes.add_shape(
             MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
@@ -988,10 +1051,10 @@ def convert_slide_to_cards(slide, action: dict, slide_width: int, slide_height: 
             Emu(card_h),
         )
         rect.fill.solid()
-        rect.fill.fore_color.rgb = RGBColor(255, 255, 255)
-        rect.line.color.rgb = RGBColor.from_string("D1D5DB")
+        rect.fill.fore_color.rgb = RGBColor.from_string(surface)
+        rect.line.color.rgb = RGBColor.from_string(border_color)
         rect.line.width = Pt(1.1)
-        _set_textbox_text(rect, card["heading"], card["body"])
+        _set_textbox_text(rect, card["heading"], card["body"], card_h, heading_color, body_color)
 
         dot_size = int(min(card_w, card_h) * 0.12)
         dot = slide.shapes.add_shape(
@@ -1024,6 +1087,9 @@ def main() -> None:
 
     deck_edits = plan.get("deckEdits") or {}
     target_hex = normalize_hex(deck_edits.get("accentColor"))
+    palette: dict | None = deck_edits.get("palette") if isinstance(deck_edits.get("palette"), dict) else None
+    palette_key: str | None = deck_edits.get("paletteKey") or None
+    effective_hex = target_hex or (palette.get("accentA") if palette else None)
     font_face = (deck_edits.get("fontFace") or "").strip() or None
 
     slide_edit_map = {
@@ -1065,8 +1131,8 @@ def main() -> None:
         slide_edit = slide_edit_map.get(slide_index) or {}
         replacements = slide_edit.get("replaceText") or []
 
-        if target_hex:
-            if recolor_slide_background(slide, target_hex):
+        if effective_hex or palette:
+            if recolor_slide_background(slide, effective_hex, palette):
                 slide_changed = True
 
         add_bullets_list = slide_edit.get("addBullets") or []
@@ -1077,12 +1143,12 @@ def main() -> None:
         # replaceText/appendToRun で変更されたシェイプ名を追跡（overflow auto-fit のため）
         text_changed_shapes: set[str] = set()
         for shape in iter_shapes(slide.shapes):
-            if target_hex:
-                if recolor_fill(shape, target_hex):
+            if effective_hex or palette:
+                if recolor_fill(shape, effective_hex, palette):
                     slide_changed = True
-                if recolor_line(shape, target_hex):
+                if recolor_line(shape, effective_hex, palette):
                     slide_changed = True
-                if recolor_table(shape, target_hex):
+                if recolor_table(shape, effective_hex, palette):
                     slide_changed = True
             if font_face and apply_font_face(shape, font_face):
                 slide_changed = True
@@ -1116,6 +1182,8 @@ def main() -> None:
             convert_to_cards_action,
             int(prs.slide_width),
             int(prs.slide_height),
+            effective_hex,
+            palette,
         ):
             slide_changed = True
 
@@ -1146,8 +1214,8 @@ def main() -> None:
 
     chars_after = count_all_run_chars(prs)
     prs.save(str(output_path))
-    if target_hex:
-        update_theme_colors(output_path, target_hex)
+    if effective_hex or palette:
+        update_theme_colors(output_path, effective_hex, palette)
 
     # 変更スライドの overflow 候補を検出（決定的チェック）
     overflow_report: list[str] = []
@@ -1167,6 +1235,7 @@ def main() -> None:
       "insertedImages": inserted_images,
       "charsBefore": chars_before,
       "charsAfter": chars_after,
+      **({"paletteKey": palette_key} if palette_key else {}),
     }
     if out_of_range_indices:
         result["outOfRangeSlides"] = out_of_range_indices

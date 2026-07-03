@@ -68,8 +68,11 @@ async function resolvePythonScriptPath(): Promise<string> {
 
 // ── Blob アップロード ────────────────────────────────────────────────────
 async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName?: string): Promise<string> {
-  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
-  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) {
+    throw new Error("Azure Storage Account not configured correctly, check environment variables.");
+  }
   const client = BlobServiceClient.fromConnectionString(
     `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
   );
@@ -86,6 +89,24 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
     expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     permissions: BlobSASPermissions.parse("r"),
   });
+}
+
+async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key || !threadId?.trim()) return;
+
+  const client = BlobServiceClient.fromConnectionString(
+    `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+  );
+  const cc = client.getContainerClient("pptx");
+  await cc.createIfNotExists({ access: "blob" });
+  await cc
+    .getBlockBlobClient(`thread-${threadId}-pptx-pointer.json`)
+    .uploadData(
+      Buffer.from(JSON.stringify({ containerName: "pptx", blobName, fileName, savedAt: new Date().toISOString() })),
+      { blobHTTPHeaders: { blobContentType: "application/json" } }
+    );
 }
 
 // ── POST ─────────────────────────────────────────────────────────────────
@@ -157,6 +178,9 @@ export async function POST(req: NextRequest) {
       const displayFileName = `${safeBase}.pptx`;
       const blobKey = `pptx_${uniqueId().slice(0, 8)}.pptx`;
       const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
+      if (threadId?.trim()) {
+        await savePptxPointer(threadId, blobKey, displayFileName);
+      }
 
       return NextResponse.json({ ok: true, downloadUrl, fileName: displayFileName, palette });
     } finally {

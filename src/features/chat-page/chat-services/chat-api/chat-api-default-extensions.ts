@@ -10,7 +10,7 @@ import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
-import { BlobServiceClient } from "@azure/storage-blob";
+import { BlobServiceClient, BlobSASPermissions } from "@azure/storage-blob";
 import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -19,6 +19,7 @@ import {
   canonicalizeMode,
   type ThinkingModeInput,
 } from "@/features/chat-page/chat-services/chat-api/reasoning-utils";
+import { resolvePptxPaletteInstruction, PPTX_NAMED_PALETTES, PPTX_PALETTE_KEYS, buildPaletteFromKey, pptxPaletteListText } from "@/features/pptx/palette";
 
 type ThinkingModeAPI = "normal" | "thinking" | "fast";
 
@@ -817,8 +818,41 @@ async function resolveLatestImageUrlFromThread(chatThreadId: string): Promise<st
   }
 }
 
-/** Markdownリンクの表示名（displayName）も含めて返す版 */
+// edit-pptx が書き込んだポインターから最新PPTXのblobName/fileNameを読み取り、
+// 毎回新SASを発行して返す。会話履歴のSAS URLに依存しないため安全。
+async function resolvePptxFromPointer(chatThreadId: string): Promise<{ url: string; displayName: string | null } | null> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) return null;
+  try {
+    const svc = BlobServiceClient.fromConnectionString(
+      `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+    );
+    const pointerBlob = svc.getContainerClient("pptx")
+      .getBlockBlobClient(`thread-${chatThreadId}-pptx-pointer.json`);
+    const buf = await pointerBlob.downloadToBuffer();
+    const { containerName, blobName, fileName } = JSON.parse(buf.toString()) as {
+      containerName: string; blobName: string; fileName: string;
+    };
+    const sasUrl = await svc.getContainerClient(containerName)
+      .getBlockBlobClient(blobName)
+      .generateSasUrl({
+        expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        permissions: BlobSASPermissions.parse("r"),
+      });
+    return { url: sasUrl, displayName: fileName.replace(/\.pptx$/i, "").trim() || null };
+  } catch {
+    return null;
+  }
+}
+
+/** ポインター優先・会話履歴fallbackで最新PPTXのURL+表示名を返す */
 async function resolveLatestPptxInfoFromThread(chatThreadId: string): Promise<{ url: string; displayName: string | null } | null> {
+  // まずポインターから（毎回新SASを発行するため安定）
+  const fromPointer = await resolvePptxFromPointer(chatThreadId);
+  if (fromPointer) return fromPointer;
+
+  // fallback: 会話履歴Markdownリンクから抽出（SASがLLMに壊された可能性あり）
   try {
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
     if (historyResponse.status !== "OK") return null;
@@ -1348,18 +1382,18 @@ export const GetDefaultExtensions = async (props: {
             enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra"],
             description:
               "【カラーパレット選択】コンテンツの業種・用途・ターゲット感から必ず判断して設定すること。\n" +
-              "  navy_orange   = 紺×オレンジ → IT・AI・DX・経営・役員・システム・テクノロジー企業（落ち着いたプロ感）\n" +
-              "  forest_amber  = 深緑×琥珀  → 採用・人材募集・インターン・新卒リクルート・人の成長・農業・食品・エコ\n" +
+              "  navy_orange   = ネイビー×オレンジ → IT・AI・DX・経営・役員・システム・テクノロジー企業（落ち着いたプロ感）\n" +
+              "  forest_amber  = 深緑×アンバー    → 採用・人材募集・インターン・新卒リクルート・人の成長・農業・食品・エコ\n" +
               "    ↑「人が育つ・生命感・成長」イメージ → 採用/研修/インターン系はこれ\n" +
-              "  burgundy_gold = 深赤×金    → 伝統・高級・老舗・製造業・工業・ものづくり・品質重視\n" +
-              "  teal_coral    = 青緑×珊瑚  → 産廃・廃棄物処理・リサイクル・医療・ヘルス・動的な産業系企業\n" +
+              "  burgundy_gold = バーガンディ×ゴールド → 伝統・高級・老舗・製造業・工業・ものづくり・品質重視\n" +
+              "  teal_coral    = ティール×コーラル → 産廃・廃棄物処理・リサイクル・医療・ヘルス・動的な産業系企業\n" +
               "    ↑廃棄物処理業・環境サービス会社の会社紹介はこれ（会社の動的でモダンな印象）\n" +
-              "  charcoal_terra= 炭×煉瓦   → 建設・土木・インフラ・重工業・プラント・施設管理\n" +
+              "  charcoal_terra= チャコール×テラコッタ → 建設・土木・インフラ・重工業・プラント・施設管理\n" +
               "【判断例】\n" +
-              "  産廃会社の会社紹介 → teal_coral\n" +
-              "  DX人材採用・インターン募集 → forest_amber\n" +
-              "  AzureChat/AI/DX経営報告 → navy_orange\n" +
-              "  廃棄物処理施設・プラント建設 → charcoal_terra",
+              "  産廃会社の会社紹介 → teal_coral（ティール×コーラル）\n" +
+              "  DX人材採用・インターン募集 → forest_amber（深緑×アンバー）\n" +
+              "  AzureChat/AI/DX経営報告 → navy_orange（ネイビー×オレンジ）\n" +
+              "  廃棄物処理施設・プラント建設 → charcoal_terra（チャコール×テラコッタ）",
           },
         },
         required: ["title", "slides"],
@@ -1389,10 +1423,10 @@ export const GetDefaultExtensions = async (props: {
         "【絶対禁止】このスレッドにPPTXが既に存在する状態で、文字数増やす・詳しくする・元資料から補足・内容増量・説明追加・修正・変更などの依頼の場合、このツール（create_pptx）は絶対に使用禁止。必ず edit_pptx を使うこと。\n" +
         "【禁止】会話中にPPTXリンクが存在する状態で「ロゴを追加して」「画像を入れて」「添付を表紙に」などと言われた場合、絶対にこのツールを使わないこと。\n" +
         "【palette 選択】ユーザーの業種・用途・ターゲット層を読み取り、必ず palette を設定すること。\n" +
-        "  IT/AI/DX/経営/役員向け → navy_orange\n" +
-        "  採用・人材募集・インターン・新卒向け → forest_amber（人の成長・緑のイメージ）\n" +
-        "  産廃・廃棄物処理・リサイクル・環境サービス → teal_coral（動的な産業系）\n" +
-        "  伝統・製造・老舗 → burgundy_gold、建設・土木・インフラ → charcoal_terra\n" +
+        "  IT/AI/DX/経営/役員向け → navy_orange（ネイビー×オレンジ）\n" +
+        "  採用・人材募集・インターン・新卒向け → forest_amber（深緑×アンバー、人の成長・緑のイメージ）\n" +
+        "  産廃・廃棄物処理・リサイクル・環境サービス → teal_coral（ティール×コーラル、動的な産業系）\n" +
+        "  伝統・製造・老舗 → burgundy_gold（バーガンディ×ゴールド）、建設・土木・インフラ → charcoal_terra（チャコール×テラコッタ）\n" +
         "ユーザーが業種・用途を言及した場合は designInstruction に業種感を含めること。\n" +
         "【重要】会社紹介・提案書の場合、slides の bullets には [会社名] [設立年] 等のプレースホルダーを使わず、知っている限りの具体的な情報を入れること（ツール実行時に自動でWeb検索して補完される）。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [ミダック会社紹介.pptx](downloadUrl)）。",
@@ -1525,7 +1559,7 @@ export const GetDefaultExtensions = async (props: {
           instruction: {
             type: "string",
             description:
-              "ユーザーの編集指示。例: '色を青に変えて', 'フォントを游ゴシックに', '全体のトーンを力強く', '3枚目のタイトルをXXXに変えて', 'ロゴを追加して', '表紙に画像を追加'",
+              "ユーザーの編集指示。例: '色を青に変えて', 'フォントを游ゴシックに', '全体のトーンを力強く', '3枚目のタイトルをXXXに変えて', 'ロゴを追加して', '表紙に画像を追加'\n【重要】ユーザーが複数の編集を同時に依頼している場合（例: 'カード型デザインにして、かつ色を赤に変えて'）は、色変更を含むすべての指示を一つのinstructionにまとめて渡すこと。分割して別々に呼び出さないこと。",
           },
           imageUrl: {
             type: "string",
@@ -1538,13 +1572,19 @@ export const GetDefaultExtensions = async (props: {
       description:
         "このスレッドで生成・編集した既存PPTXを自然言語の指示に従って改良するツール。\n" +
         "【絶対ルール】会話中にPPTXが生成・編集された実績がある場合は、必ずこのツールを使うこと。create_pptx / convert_doc_to_pptx は使わないこと。\n" +
+        "【即時実行ルール・確認禁止】色変更・色パレット変更・基調色変更・再実行・繰り返し要求はユーザーへの確認なしに即このツールを呼ぶこと。\n" +
+        "以下のような『確認待ち』返答は厳禁：「問題なければ実行します」「実行してよいですか」「よろしいですか」。\n" +
+        "「再実行して」「もう一度やって」「もう1回」と言われたら、直近PPTXを対象に同じ instruction でこのツールを即時呼ぶこと。\n" +
         "【最優先ケース】以下は必ずこのツールを使う：\n" +
         "- 「ロゴを追加して」「画像を追加して」「添付画像を入れて」「表紙にロゴを入れて」など画像・ロゴ挿入\n" +
-        "- 「色を変えて」「緑にして」「赤くして」「青にして」などの色変更\n" +
+        "- 「色を変えて」「緑にして」「バーガンディ基調に」「ティール×コーラルにして」など色変更・色パレット変更\n" +
+        "【色変更の実装範囲】色パレット指定（ネイビー×オレンジ等）はパレット定義に基づきテーマカラー・図形塗り・テキスト色を一括変更する。基調色のみ指定した場合はhue-shiftで全体の色味を変更する。スライドマスターXML直接書き換え・外部フォントの埋め込みなどは非対応。実装範囲を超えた説明をしないこと。\n" +
+        "「バーガンディ基調」「バーガンディ×ゴールド」は burgundy_gold パレットとして処理される。\n" +
+        "【利用可能な色】基本色：赤・青・緑・紺・紫・オレンジ・黄・ピンク。色パレット（指定すると基調色で全体の色味を変更）：ネイビー×オレンジ（IT/DX）・深緑×アンバー（採用/農業）・バーガンディ×ゴールド（製造/老舗）・ティール×コーラル（産廃/医療）・チャコール×テラコッタ（建設/土木）。「どんな色が使えますか？」「色の種類は？」「どの色味があるの？」などの色一覧照会は、このツールを呼ばずに直接この一覧を回答すること。\n" +
         "- 「フォントを変えて」「もっとポップに」などデザイン変更\n" +
         "- 「〜に変えて」「〜を修正して」などテキスト編集\n" +
+        "【fileUrl】「直近のPPT」「このPPT」「最後のファイル」と言われた場合は fileUrl を省略すること（スレッド内の直近PPTXを自動取得）。\n" +
         "【imageUrl】ユーザーが画像をアップロードしている場合（会話コンテキストの file_url: 行に png/jpg/webp のURL）、imageUrl にそのURLを必ず設定すること。\n" +
-        "fileUrlは省略可（スレッド内の直近PPTXを自動取得）。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [AzureChat機能紹介_ロゴ追加.pptx](downloadUrl)）。",
       name: "edit_pptx",
     },
@@ -1573,7 +1613,8 @@ export const GetDefaultExtensions = async (props: {
       description:
         "SharePointのSLライブラリにあるPPTXファイルを自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：ユーザーがSP/SL上のPPTXの色・フォント・テキストを変更したい場合。\n" +
-        "例: 「SPにある営業資料をMatrix風の色にして」「SLの〇〇.pptxのフォントを変えて」\n" +
+        "【即時実行ルール】色変更・再実行要求はユーザーへの確認なしに即このツールを呼ぶこと。「実行してよいですか」などの確認待ち返答は禁止。\n" +
+        "例: 「SPにある営業資料をバーガンディ基調にして」「SLの〇〇.pptxのフォントを変えて」\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "edit_sp_pptx",
     },
@@ -4046,20 +4087,25 @@ async function buildRegenerationSlidesForLayoutChange(
 ): Promise<PptxRegenSlide[]> {
   const openai = OpenAIInstance();
   const pageMentions = extractPageMentions(instruction);
-  const targetList = Array.from(targetSlideIndices).sort((a, b) => a - b);
-  const targetHint =
-    "【変更対象スライド（必ずこれだけを変更すること。対象外スライドはコード側で元データに置換されるため変更不要）】\n" +
-    `slideIndex: ${targetList.join(", ")}\n\n`;
   const pageHint = pageMentions.size > 0
     ? "【ページ番号→slideIndex】\n" +
       Array.from(pageMentions.entries()).map(([p, i]) => `Page${p}=slideIndex ${i}`).join("\n") + "\n\n"
     : "";
 
+  // slideIndex→配列位置のMapを作成（非連番・欠番に対応）
+  const slideIndexToArrayPos = new Map(slides.map((s, i) => [s.slideIndex, i]));
+
+  // 元のレイアウト情報を保持した baseSlides（非対象スライドは戻り値でそのまま使う）
+  // NOTE: この関数の戻り値は呼び出し元でレイアウト変換対象スライドのみに使用される
   const baseSlides: PptxRegenSlide[] = slides.map((s) => ({
     title: s.title || `スライド${s.slideIndex + 1}`,
     bullets: (s.bullets ?? []).filter(Boolean).slice(0, 6),
-    layoutType: "bullets",
+    // 非対象スライドのlayoutTypeはここでは不明なためbulletsに初期化（呼び出し元が対象スライドのみを参照）
+    layoutType: "bullets" as const,
   }));
+
+  // 対象スライドのみをLLMに送る（全スライド送付するとLLMが枚数を誤って返すことがある）
+  const targetSlides = slides.filter((s) => targetSlideIndices.has(s.slideIndex));
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 60_000);
@@ -4070,18 +4116,16 @@ async function buildRegenerationSlidesForLayoutChange(
       messages: [{
         role: "user",
         content:
-          "既存PPTXを、ユーザー指示に従って再生成用のslides JSONへ変換してください。\n" +
+          "以下のスライドをユーザー指示に従って変換し、slides JSONで返してください。\n" +
           `ユーザー指示: ${instruction}\n\n` +
-          targetHint +
           pageHint +
           "必須ルール:\n" +
-          "1. スライド枚数と順序は絶対に変えない。\n" +
-          "2. 変更対象外のスライドは一切変更しない。title / bullets を元のまま返すだけでよい（コード側で対象外スライドは元データに置換されるため、layoutType の値を含めて LLM 側の出力は無視されます）。\n" +
-          "3. 「カード型」「カード表示」「card」指定のページは layoutType='card_grid' にし、cards を3〜4件作る。cards は bullets の内容を見出し+本文に分ける。\n" +
-          "4. 「箇条書きを4に増やす」「4項目」指定のページは bullets をちょうど4件にする。既存内容を保ち、不足分だけ自然に補う。\n" +
-          "5. 各bulletは45〜90文字程度、cards.headingは18文字以内、cards.bodyは90文字以内。\n" +
-          "6. 返却は JSON のみ。形式: {\"slides\":[{\"title\":\"...\",\"bullets\":[\"...\"],\"layoutType\":\"card_grid\",\"cards\":[{\"iconKey\":\"gear\",\"heading\":\"...\",\"body\":\"...\"}]}]}\n\n" +
-          "既存スライド:\n" + JSON.stringify(slides.map((s) => ({
+          "1. 渡したスライドと同じ枚数を返す。各スライドに元の slideIndex をそのまま含めること。\n" +
+          "2. 「カード型」「カード表示」「card」指定のページは layoutType='card_grid' にし、cards を3〜4件作る。cards は bullets の内容を見出し+本文に分ける。\n" +
+          "3. 「箇条書きを4に増やす」「4項目」指定のページは bullets をちょうど4件にする。既存内容を保ち、不足分だけ自然に補う。\n" +
+          "4. 各bulletは45〜90文字程度、cards.headingは18文字以内、cards.bodyは90文字以内。\n" +
+          "5. 返却は JSON のみ。形式: {\"slides\":[{\"slideIndex\":7,\"title\":\"...\",\"bullets\":[\"...\"],\"layoutType\":\"card_grid\",\"cards\":[{\"iconKey\":\"gear\",\"heading\":\"...\",\"body\":\"...\"}]}]}\n\n" +
+          "対象スライド:\n" + JSON.stringify(targetSlides.map((s) => ({
             slideIndex: s.slideIndex,
             title: s.title,
             bullets: s.bullets,
@@ -4089,7 +4133,7 @@ async function buildRegenerationSlidesForLayoutChange(
           }))),
       }],
       response_format: { type: "json_object" },
-      max_completion_tokens: 6000,
+      max_completion_tokens: 4000,
     }, { signal: controller.signal });
   } catch (e: any) {
     if (e?.name === "AbortError" || String(e?.message ?? "").toLowerCase().includes("abort")) {
@@ -4108,18 +4152,29 @@ async function buildRegenerationSlidesForLayoutChange(
   }
 
   const rawSlides = (parsed as any)?.slides;
-  if (!Array.isArray(rawSlides) || rawSlides.length !== slides.length) {
-    throw new Error("レイアウト再生成用のスライド数が一致しませんでした。");
+  if (!Array.isArray(rawSlides) || rawSlides.length === 0) {
+    throw new Error("レイアウト再生成用のJSON形式が不正でした（slides配列なし）。");
   }
 
-  return rawSlides.map((raw: any, i: number): PptxRegenSlide => {
-    const original = baseSlides[i];
-    const slideIndex = slides[i]?.slideIndex ?? i;
+  if (rawSlides.length !== targetSlides.length) {
+    console.warn(
+      `[buildRegenerationSlidesForLayoutChange] slide count mismatch: LLM=${rawSlides.length} expected=${targetSlides.length}. Merging returned target slides only.`
+    );
+  }
 
-    // コード側ガード: 対象外スライドは LLM 出力を無視して元データを返す
-    if (!targetSlideIndices.has(slideIndex)) {
-      return original;
-    }
+  // baseSlides（全スライド）をコピーし、対象スライドのみLLM出力で上書き
+  const result: PptxRegenSlide[] = [...baseSlides];
+
+  // LLMが返したslideIndexを優先、なければ送付順でfallback（複数スライド対象時の順序ズレ対策）
+  rawSlides.forEach((raw: any, i: number) => {
+    const rawSlideIndex = typeof raw.slideIndex === "number" && targetSlideIndices.has(raw.slideIndex)
+      ? raw.slideIndex
+      : targetSlides[i]?.slideIndex;
+    if (rawSlideIndex === undefined) return;
+
+    const arrayPos = slideIndexToArrayPos.get(rawSlideIndex);
+    if (arrayPos === undefined) return;
+    const original = baseSlides[arrayPos];
 
     const bullets = Array.isArray(raw.bullets)
       ? raw.bullets.map((b: unknown) => String(b ?? "").trim()).filter(Boolean).slice(0, 6)
@@ -4141,8 +4196,9 @@ async function buildRegenerationSlidesForLayoutChange(
     if (layoutType === "card_grid") {
       normalized.cards = cards && cards.length >= 2 ? cards.slice(0, 4) : cardsFromBulletsForRegen(normalized.bullets);
     }
-    return normalized;
+    result[arrayPos] = normalized;
   });
+  return result;
 }
 
 async function buildBulletAddPlan(
@@ -4375,22 +4431,20 @@ async function executeEditPptx(
   const hasLayoutIntent =
     /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|デザイン.{0,4}(変え|変更|替え|を変)|レイアウト.{0,4}(変え|変更|変換|をカード)|項目数|箇条書き|bullet)/i.test(instruction);
   const hasColorIntent =
-    /(色|色味|カラー|トーン|tone|緑|青|赤|黄|紫|オレンジ|ピンク|グレー|グリーン|ブルー|レッド|navy|orange|green|blue|red|yellow|purple|pink|gray)/i.test(instruction);
-  const isColorOnlyEdit = hasColorIntent && !hasLayoutIntent;
+    /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
+  // 数字参照（"3で"等）も色変更として扱うため先に解決しておく
+  const preResolved = resolvePptxPaletteInstruction(instruction);
+  const isColorOnlyEdit = (!!preResolved || hasColorIntent) && !hasLayoutIntent;
   const isLayoutConversionRequest = !isColorOnlyEdit && hasLayoutIntent;
-  // layout_regen パス内で色指定を検出するためのルックアップ（route.ts の parseDirectAccentColor と同値）
-  const detectLayoutAccentColor = (s: string): string | null => {
-    const t = s.toLowerCase();
-    if (/(赤|red)/.test(t)) return "C00000";
-    if (/(青|blue)/.test(t)) return "2F5597";
-    if (/(緑|green)/.test(t)) return "548235";
-    if (/(紫|purple)/.test(t)) return "7030A0";
-    if (/(オレンジ|orange|橙)/.test(t)) return "C55A11";
-    if (/(黄|yellow)/.test(t)) return "BF9000";
-    if (/(ピンク|pink)/.test(t)) return "C0508A";
-    return null;
-  };
+  // 色検出は resolvePptxPaletteInstruction (@/features/pptx/palette) に統合済み
   if (isLayoutConversionRequest) {
+    // 色が未指定の場合は変換前にユーザーへ確認を求める（LLM呼び出しも省略）
+    const layoutResolved = preResolved;
+    if (!layoutResolved) {
+      return {
+        message: `カード型に変更するには色の指定が必要です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「スライド3をカード型にして、ティール×コーラルで」のようにまとめてご指定ください。`,
+      };
+    }
     try {
       const t0 = Date.now();
       const extractRes = await fetch(`${baseUrl}/api/edit-pptx`, {
@@ -4434,13 +4488,21 @@ async function executeEditPptx(
       if (slideEdits.length === 0) {
         throw new Error("card conversion plan is empty");
       }
+      // layoutResolved は try ブロック外で確定済み（null なら早期リターン済み）
       const directEditRes = await fetch(`${baseUrl}/api/edit-pptx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           fileUrl,
           action: "apply_pptx_plan",
-          plan: { slideEdits },
+          plan: {
+            slideEdits,
+            deckEdits: {
+              accentColor: layoutResolved.accentColor,
+              ...(layoutResolved.paletteKey ? { paletteKey: layoutResolved.paletteKey, palette: layoutResolved.palette } : {}),
+              preserveTextColors: true,
+            },
+          },
           threadId: chatThread.id,
           outputBaseName: directOutputName,
         }),
@@ -4453,53 +4515,105 @@ async function executeEditPptx(
       const directEditJson = await directEditRes.json();
       if (!directEditJson?.downloadUrl) throw new Error("PowerPoint layout edit did not return a download URL");
       const directDisplayName = `${directOutputName}.pptx`;
-      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} total=${Date.now() - t0}ms`);
-      // 複合指示（カード型 + 色変更）の場合、レイアウト編集済みファイルに対してデッキ色を適用する
-      // hasColorIntent（単語存在チェック）ではなく、明示的な色変更要求のみに限定する
-      const hasExplicitDeckColorIntent =
-        /(色|色味).{0,8}(変え|変更|かえ|にして|替え)|(緑|青|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|green|blue|red|yellow|purple|orange|pink|navy|gray).{0,10}(にして|にかえ|に変え|に変更)/i.test(instruction);
-      if (hasExplicitDeckColorIntent) {
-        const accentColor = detectLayoutAccentColor(instruction);
-        if (accentColor) {
-          try {
-            const colorRes = await fetch(`${baseUrl}/api/edit-pptx`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                fileUrl: directEditJson.downloadUrl,
-                action: "apply_pptx_plan",
-                plan: { slideEdits: [], deckEdits: { accentColor, preserveTextColors: true } },
-                threadId: chatThread.id,
-                outputBaseName: directOutputName,
-              }),
-            });
-            if (colorRes.ok) {
-              const colorJson = await colorRes.json();
-              if (colorJson?.downloadUrl) {
-                console.log(`[layout_direct_edit] color_pass accentColor=#${accentColor}`);
-                return {
-                  downloadUrl: colorJson.downloadUrl,
-                  fileName: colorJson.fileName ?? directDisplayName,
-                  displayName: directDisplayName,
-                  message: "指定スライドをカード型に変更し、デッキ全体の色も変更しました。",
-                };
-              }
-            }
-            console.warn("[layout_direct_edit] color pass failed, returning layout-only result");
-          } catch (e) {
-            console.warn("[layout_direct_edit] color pass error:", e);
-          }
-        }
-      }
+      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} paletteKey=${layoutResolved.paletteKey ?? "none"} total=${Date.now() - t0}ms`);
       return {
         downloadUrl: directEditJson.downloadUrl,
         fileName: directEditJson.fileName ?? directDisplayName,
         displayName: directDisplayName,
-        message: "指定スライドだけをカード型に直接編集しました。対象外スライドは再生成していません。",
+        message: "指定スライドをカード型に変更し、デッキ全体の色も変更しました。",
       };
     } catch (e: any) {
       console.error("[edit_pptx] layout direct edit failed:", e);
       return { error: `カード型への直接編集に失敗しました: ${String(e?.message ?? e)}` };
+    }
+  }
+
+  // ── 全パターン試作: 全5パレットを同一PPTXに適用して番号付きリストで返す ────────
+  const isAllPatternsRequest = /(全パターン|全色|全パレット|すべてのパターン|全種類)/.test(instruction);
+  if (isAllPatternsRequest) {
+    const baseName = cleanBaseName || "PPT";
+    const results: Array<{ key: string; labelJa: string; downloadUrl: string; fileName: string }> = [];
+    for (const key of PPTX_PALETTE_KEYS) {
+      const meta = PPTX_NAMED_PALETTES[key];
+      const palette = buildPaletteFromKey(key)!;
+      const outputName = `${baseName}_${meta.labelJa}`;
+      try {
+        const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-azurechat-internal-pptx-batch": "1" },
+          body: JSON.stringify({
+            fileUrl,
+            action: "apply_pptx_plan",
+            plan: { slideEdits: [], deckEdits: { accentColor: meta.main, paletteKey: key, palette, preserveTextColors: true } },
+            threadId: chatThread.id,
+            outputBaseName: outputName,
+            skipPptxPointer: true,
+          }),
+        });
+        if (res.ok) {
+          const j = await res.json();
+          if (j?.downloadUrl) results.push({ key, labelJa: meta.labelJa, downloadUrl: j.downloadUrl, fileName: j.fileName ?? `${outputName}.pptx` });
+        }
+      } catch (e: any) { console.warn("[pptx_palette_batch] failed", key, e?.message ?? e); }
+    }
+    if (results.length === 0) return { error: "全パターン生成に失敗しました。" };
+    const lines = results.map((r, i) => {
+      const meta = PPTX_NAMED_PALETTES[r.key];
+      return `${i + 1}. **${r.labelJa}**（${meta.mood}・${meta.recommendedFor}向け）— [ダウンロード](${r.downloadUrl})`;
+    }).join("\n");
+    return {
+      downloadUrl: results[0].downloadUrl,
+      fileName: results[0].fileName,
+      displayName: results[0].fileName,
+      message: `全${results.length}パターンを生成しました。\n\n${lines}`,
+    };
+  }
+
+  // ── 色変更のみ: LLMに頼らず resolvePptxPaletteInstruction で決定論的に処理 ────────
+  // buildEditPlan経由だとLLMがaccentColor:nullを返すことがあり不安定なため直接apply_pptx_planを呼ぶ
+  if (isColorOnlyEdit) {
+    const colorResolved = preResolved;
+    if (!colorResolved) {
+      return {
+        message: `現在サポートされている色変更は以下です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「ティール×コーラルにして」「バーガンディ×ゴールドにして」「赤にして」\n\n番号で指定も可能です（例: 「3でやって」→ バーガンディ×ゴールド）`,
+      };
+    }
+    const colorOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "色変更";
+    try {
+      const colorRes = await fetch(`${baseUrl}/api/edit-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileUrl,
+          action: "apply_pptx_plan",
+          plan: {
+            slideEdits: [],
+            deckEdits: {
+              accentColor: colorResolved.accentColor,
+              ...(colorResolved.paletteKey ? { paletteKey: colorResolved.paletteKey, palette: colorResolved.palette } : {}),
+              preserveTextColors: true,
+            },
+          },
+          threadId: chatThread.id,
+          outputBaseName: colorOutputName,
+        }),
+      });
+      if (!colorRes.ok) {
+        const t = await colorRes.text().catch(() => "");
+        throw new Error(`color change failed: HTTP ${colorRes.status} ${t}`);
+      }
+      const colorJson = await colorRes.json();
+      if (!colorJson?.downloadUrl) throw new Error("color change returned no downloadUrl");
+      const colorDisplayName = `${colorOutputName}.pptx`;
+      return {
+        downloadUrl: colorJson.downloadUrl,
+        fileName: colorJson.fileName ?? colorDisplayName,
+        displayName: colorDisplayName,
+        message: "プレゼンテーション全体の色を変更しました。",
+      };
+    } catch (e: any) {
+      console.error("[edit_pptx] color change failed:", e);
+      return { error: `色の変更に失敗しました: ${String(e?.message ?? e)}` };
     }
   }
 
