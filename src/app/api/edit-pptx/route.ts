@@ -1505,7 +1505,7 @@ function parseExplicitWordReplacements(instruction: string): Array<{ find: strin
     replacements.push({ find: f, replace: r });
   }
 
-  // 「A」→「B」 / 『A』→『B』 / "A"→"B" 形式
+  // 「A」→「B」 / 『A』→『B』 / "A"->"B" 形式
   const re1 = /[「『"']([^」』"']+)[」』"']\s*(?:\u2192|->|=>)\s*[「『"']([^」』"']*)[」』"']/g;
   let m: RegExpExecArray | null;
   while ((m = re1.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
@@ -1513,6 +1513,10 @@ function parseExplicitWordReplacements(instruction: string): Array<{ find: strin
   // 【誤】A【正】B 形式（同一行 or 改行・空白ありも許容）
   const re2 = /【誤】\s*([^【】\r\n]+?)\s*(?:\r?\n\s*)?【正】\s*([^【】\r\n]*)/g;
   while ((m = re2.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  // 「A」を「B」に 形式（「太平興産」を「大平興産」に全件置換、など）
+  const re3 = /[「『"']([^」』"']+)[」』"']\s*を\s*[「『"']([^」』"']*)[」』"']\s*に/g;
+  while ((m = re3.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
 
   return replacements;
 }
