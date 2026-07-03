@@ -380,7 +380,7 @@ function parseAzureBlobUrl(fileUrl: string): {
     if (parts.length < 2) return null;
     return {
       containerName: parts[0],
-      blobPath: parts.slice(1).join("/"),
+      blobPath: decodeURIComponent(parts.slice(1).join("/")),
     };
   } catch {
     return null;
@@ -461,8 +461,6 @@ async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: s
   const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   const containerName = "pptx";
 
-  // fromConnectionString 内部の SharedKeyCredential をそのまま使い、
-  // generateSasUrl() で SAS を生成する（手動 StorageSharedKeyCredential + sas.toString() より安全）
   const svc = BlobServiceClient.fromConnectionString(
     `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
   );
@@ -479,10 +477,9 @@ async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: s
     },
   });
 
-  return bbc.generateSasUrl({
-    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    permissions: BlobSASPermissions.parse("r"),
-  });
+  // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
+  // pptx コンテナは access:blob 公開済みなので直接URLを返す（blobKeyをURL-encode）
+  return `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
 }
 
 // スレッドごとの最新PPTXポインターを pptx コンテナに保存。
@@ -1494,6 +1491,32 @@ async function extractDocSummary(buffer: Buffer): Promise<WordDocSummary> {
 
 const WORD_EDIT_CHUNK_SIZE = 12;
 
+function parseExplicitWordReplacements(instruction: string): Array<{ find: string; replace: string }> {
+  const replacements: Array<{ find: string; replace: string }> = [];
+  const seen = new Set<string>();
+
+  function addPair(find: string | undefined, replace: string) {
+    const f = find?.trim();
+    const r = replace.trim();
+    if (!f) return;
+    const key = f + "\0" + r;
+    if (seen.has(key)) return;
+    seen.add(key);
+    replacements.push({ find: f, replace: r });
+  }
+
+  // 「A」→「B」 / 『A』→『B』 / "A"→"B" 形式
+  const re1 = /[「『"']([^」』"']+)[」』"']\s*(?:\u2192|->|=>)\s*[「『"']([^」』"']*)[」』"']/g;
+  let m: RegExpExecArray | null;
+  while ((m = re1.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  // 【誤】A【正】B 形式（同一行 or 改行・空白ありも許容）
+  const re2 = /【誤】\s*([^【】\r\n]+?)\s*(?:\r?\n\s*)?【正】\s*([^【】\r\n]*)/g;
+  while ((m = re2.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  return replacements;
+}
+
 async function buildWordReplaceTextChunk(
   openai: ReturnType<typeof OpenAIInstance>,
   paragraphs: DocParagraph[],
@@ -1544,9 +1567,18 @@ async function buildWordEditPlanChunked(
   summary: WordDocSummary,
   instruction: string
 ): Promise<{ plan: WordEditPlan; skippedChunks: number }> {
-  const openai = OpenAIInstance();
   const { paragraphs } = summary;
 
+  const explicitReplaceText = parseExplicitWordReplacements(instruction);
+  if (explicitReplaceText.length > 0) {
+    console.log(`[buildWordEditPlan] explicit replaceText total=${explicitReplaceText.length}`);
+    return {
+      plan: { replaceText: explicitReplaceText, formatRuns: [], addParagraphs: [], trackChanges: false },
+      skippedChunks: 0,
+    };
+  }
+
+  const openai = OpenAIInstance();
   const allReplaceText: Array<{ find: string; replace: string }> = [];
   let skippedChunks = 0;
   for (let i = 0; i < paragraphs.length; i += WORD_EDIT_CHUNK_SIZE) {
@@ -1889,7 +1921,11 @@ async function runPythonEdit(
       .trim()
       .slice(0, 60);
     const displayFileName = safeDisplay ? `${safeDisplay}.pptx` : undefined;
-    const blobKey = `pptx_${uniqueId().slice(0, 8)}.pptx`;  // ASCII のみ（URL短縮）
+    // 表示名をblobKeyに含めることでURLからファイル名が正しく取れるようにする
+    const uid = uniqueId().slice(0, 6);
+    const blobKey = safeDisplay
+      ? `${safeDisplay.slice(0, 54)}_${uid}.pptx`
+      : `pptx_${uid}.pptx`;
     const fileName = displayFileName ?? blobKey;
     const downloadUrl = await uploadToBlob(outputBuffer, blobKey, displayFileName);
 
@@ -1897,6 +1933,7 @@ async function runPythonEdit(
     if (_threadId && !options?.skipPptxPointer) {
       try {
         await savePptxPointer(_threadId, blobKey, fileName);
+        console.log(`[edit-pptx] savePptxPointer ok: blobKey=${blobKey} fileName=${fileName}`);
       } catch (e) {
         console.warn("[edit-pptx] savePptxPointer failed:", e);
       }
@@ -1921,6 +1958,9 @@ async function runPythonEdit(
       insertedImages,
       charsBefore: Number(pythonResult.charsBefore ?? 0),
       charsAfter: Number(pythonResult.charsAfter ?? 0),
+      changedFills: Number(pythonResult.changedFills ?? 0),
+      changedLines: Number(pythonResult.changedLines ?? 0),
+      changedTexts: Number(pythonResult.changedTexts ?? 0),
       ...(imageWarning ? { imageWarning } : {}),
       ...(Array.isArray(pythonResult.outOfRangeSlides) && pythonResult.outOfRangeSlides.length > 0
         ? { outOfRangeSlides: pythonResult.outOfRangeSlides as number[] }
@@ -2117,7 +2157,7 @@ export async function POST(req: NextRequest) {
           deckEdits: {
             accentColor: incomingDeckAccent || incomingPalette?.accentA,
             ...(incomingPaletteKey ? { paletteKey: incomingPaletteKey, palette: incomingPalette as Record<string, string> } : {}),
-            preserveTextColors: true,
+            preserveTextColors: incomingDeck.preserveTextColors !== false,
           },
         } : {}),
       };
@@ -2126,7 +2166,7 @@ export async function POST(req: NextRequest) {
       const slideCountBefore = slidesBefore.length;
       const safeBaseName = outputBaseName ?? "内容増量";
       const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName, { skipPptxPointer: !!skipPptxPointer && isInternalPptxBatch });
-      console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
+      console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} fills=${result.changedFills} lines=${result.changedLines} texts=${result.changedTexts} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
       if (result.totalSlides !== slideCountBefore) {
         console.error(`[apply_pptx_plan] slide count changed ${slideCountBefore} → ${result.totalSlides}`);
         return NextResponse.json({

@@ -4,7 +4,6 @@ import { NextRequest, NextResponse } from "next/server";
 import PptxGenJS from "pptxgenjs";
 import JSZip from "jszip";
 import {
-  BlobSASPermissions,
   BlobServiceClient,
 } from "@azure/storage-blob";
 import { uniqueId } from "@/features/common/util";
@@ -1518,13 +1517,9 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
       blobContentDisposition: `attachment; filename*=UTF-8''${encodedFileName}`,
     },
   });
-  // generateSasUrl は BlockBlobClient が StorageSharedKeyCredential を持つ場合のみ使用可能
-  // fromConnectionString（アカウントキー含む）で作成した場合は使用可能
-  const sasUrl = await blockBlobClient.generateSasUrl({
-    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    permissions: BlobSASPermissions.parse("r"),
-  });
-  return sasUrl;
+  // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
+  // pptx コンテナは access:blob 公開済みなので直接URLを返す（blobKeyをURL-encode）
+  return `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
@@ -4623,7 +4618,7 @@ export async function POST(req: NextRequest) {
       ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
       : (threadId ?? uniqueId());
     const displayFileName = `${safeBase}.pptx`;          // 日本語名：リンク表示・DL名
-    const blobKey = `pptx_${shortId}.pptx`;              // ASCII のみ：Blob key（URL短縮）
+    const blobKey = `${safeBase}_${shortId}.pptx`;        // 表示名+短ID：URLからファイル名が正しく取れる
     const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
     if (threadId?.trim()) {
       await savePptxPointer(threadId, blobKey, displayFileName);

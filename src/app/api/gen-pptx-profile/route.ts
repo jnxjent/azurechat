@@ -7,7 +7,6 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import {
-  BlobSASPermissions,
   BlobServiceClient,
 } from "@azure/storage-blob";
 import { uniqueId } from "@/features/common/util";
@@ -85,10 +84,10 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
       blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName ?? blobKey)}`,
     },
   });
-  return bc.generateSasUrl({
-    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    permissions: BlobSASPermissions.parse("r"),
-  });
+  // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
+  // pptx コンテナは access:blob 公開済みなので直接URLを返す
+  // blobKeyをURL-encodeして返す（日本語ファイル名対応）
+  return `https://${acc}.blob.core.windows.net/pptx/${encodeURIComponent(blobKey)}`;
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
@@ -176,7 +175,7 @@ export async function POST(req: NextRequest) {
         ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
         : (threadId ?? uniqueId());
       const displayFileName = `${safeBase}.pptx`;
-      const blobKey = `pptx_${uniqueId().slice(0, 8)}.pptx`;
+      const blobKey = `${safeBase}_${uniqueId().slice(0, 6)}.pptx`;  // 表示名+短ID
       const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
       if (threadId?.trim()) {
         await savePptxPointer(threadId, blobKey, displayFileName);

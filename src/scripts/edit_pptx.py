@@ -148,11 +148,22 @@ def try_get_rgb(color_format) -> tuple[int, int, int] | None:
 
 
 def _palette_hex_for_rgb(rgb: tuple[int, int, int], palette: dict) -> str | None:
-    """明度でセマンティックロールを判定してパレット色を返す。明度>0.75は背景扱いでスキップ。"""
+    """明度でセマンティックロールを判定してパレット色を返す。
+    is_neutral() で lig>0.95 (ほぼ白) と sat<0.12 は呼び元でフィルタ済み。"""
     _, _, lig = rgb_to_hsl(rgb)
     if lig > 0.75:
-        return None  # 薄い背景色はスキップ（theme経由で制御）
+        # 淡色背景 (sectionBg 相当) — 完全な白は is_neutral() で除去済み
+        return palette.get("sectionBg")
     return palette.get("accentA" if lig < 0.45 else "accentB")
+
+
+def _text_hex_for_rgb(rgb: tuple[int, int, int], palette: dict) -> str | None:
+    """テキストランの色をパレットにマッピングする。
+    白文字・低彩度グレーは呼び元の is_neutral() でフィルタ済み。"""
+    _, _, lig = rgb_to_hsl(rgb)
+    if lig < 0.45:
+        return palette.get("bodyText")   # 暗色テキスト → bodyText
+    return palette.get("accentB")        # 中間明度の強調テキスト → accentB
 
 
 def recolor_fill(shape, target_hex: str | None, palette: dict | None = None) -> bool:
@@ -266,6 +277,47 @@ def recolor_table(shape, target_hex: str | None, palette: dict | None = None) ->
                         changed = True
             except Exception:
                 pass
+    return changed
+
+
+def recolor_text_runs(shape, target_hex: str | None, palette: dict | None = None) -> int:
+    """shape のテキストランの明示的 RGB 色を新パレット / アクセント色に置換。
+    テーブルセル内テキストも対象。戻り値: 変更したランの数。"""
+
+    def _recolor_frame(text_frame) -> int:
+        cnt = 0
+        for para in text_frame.paragraphs:
+            for run in para.runs:
+                try:
+                    fc = run.font.color
+                    if fc.type != MSO_COLOR_TYPE.RGB:
+                        continue
+                    rgb = try_get_rgb(fc)
+                    if not rgb or is_neutral(rgb):
+                        continue
+                    if palette:
+                        new_hex = _text_hex_for_rgb(rgb, palette)
+                    elif target_hex:
+                        new_hex = recolor_preserving_tone(rgb, target_hex)
+                    else:
+                        continue
+                    if new_hex:
+                        fc.rgb = RGBColor.from_string(new_hex)
+                        cnt += 1
+                except Exception:
+                    pass
+        return cnt
+
+    changed = 0
+    if getattr(shape, "has_text_frame", False):
+        changed += _recolor_frame(shape.text_frame)
+    if getattr(shape, "has_table", False):
+        for row in shape.table.rows:
+            for cell in row.cells:
+                try:
+                    changed += _recolor_frame(cell.text_frame)
+                except Exception:
+                    pass
     return changed
 
 
@@ -1091,6 +1143,7 @@ def main() -> None:
     palette_key: str | None = deck_edits.get("paletteKey") or None
     effective_hex = target_hex or (palette.get("accentA") if palette else None)
     font_face = (deck_edits.get("fontFace") or "").strip() or None
+    preserve_text_colors: bool = bool(deck_edits.get("preserveTextColors", True))
 
     slide_edit_map = {
         int(item.get("slideIndex")): item
@@ -1113,6 +1166,9 @@ def main() -> None:
     changed_slides: set[int] = set()
     inserted_images: int = 0
     layout_warnings: list[str] = []
+    changed_fills: int = 0
+    changed_texts: int = 0
+    changed_lines: int = 0
 
     # 範囲外 slideIndex の検出（②）
     total_slides = len(prs.slides)
@@ -1134,6 +1190,7 @@ def main() -> None:
         if effective_hex or palette:
             if recolor_slide_background(slide, effective_hex, palette):
                 slide_changed = True
+                changed_fills += 1
 
         add_bullets_list = slide_edit.get("addBullets") or []
         copy_shape_block_action = slide_edit.get("copyShapeBlock")
@@ -1146,10 +1203,18 @@ def main() -> None:
             if effective_hex or palette:
                 if recolor_fill(shape, effective_hex, palette):
                     slide_changed = True
+                    changed_fills += 1
                 if recolor_line(shape, effective_hex, palette):
                     slide_changed = True
+                    changed_lines += 1
                 if recolor_table(shape, effective_hex, palette):
                     slide_changed = True
+                    changed_fills += 1
+                if not preserve_text_colors:
+                    n = recolor_text_runs(shape, effective_hex, palette)
+                    if n > 0:
+                        slide_changed = True
+                        changed_texts += n
             if font_face and apply_font_face(shape, font_face):
                 slide_changed = True
             if replacements and replace_text(shape, replacements):
@@ -1236,6 +1301,8 @@ def main() -> None:
       "charsBefore": chars_before,
       "charsAfter": chars_after,
       **({"paletteKey": palette_key} if palette_key else {}),
+      **({"changedFills": changed_fills, "changedLines": changed_lines, "changedTexts": changed_texts}
+         if (effective_hex or palette) else {}),
     }
     if out_of_range_indices:
         result["outOfRangeSlides"] = out_of_range_indices

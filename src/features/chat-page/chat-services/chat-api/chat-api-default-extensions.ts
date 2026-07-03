@@ -10,7 +10,7 @@ import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
-import { BlobServiceClient, BlobSASPermissions } from "@azure/storage-blob";
+import { BlobServiceClient } from "@azure/storage-blob";
 import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -834,23 +834,26 @@ async function resolvePptxFromPointer(chatThreadId: string): Promise<{ url: stri
     const { containerName, blobName, fileName } = JSON.parse(buf.toString()) as {
       containerName: string; blobName: string; fileName: string;
     };
-    const sasUrl = await svc.getContainerClient(containerName)
-      .getBlockBlobClient(blobName)
-      .generateSasUrl({
-        expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        permissions: BlobSASPermissions.parse("r"),
-      });
-    return { url: sasUrl, displayName: fileName.replace(/\.pptx$/i, "").trim() || null };
-  } catch {
+    // SAS URLは LLM/Markdown で sig= が破壊されるため直接公開URLを返す
+    // pptx コンテナは access:blob 公開済みなので SAS 不要
+    const directUrl = `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobName)}`;
+    console.log(`[resolvePptxFromPointer] found pointer blobName=${blobName} fileName=${fileName}`);
+    return { url: directUrl, displayName: fileName.replace(/\.pptx$/i, "").trim() || null };
+  } catch (e) {
+    console.warn("[resolvePptxFromPointer] failed:", String((e as any)?.message ?? e).slice(0, 120));
     return null;
   }
 }
 
 /** ポインター優先・会話履歴fallbackで最新PPTXのURL+表示名を返す */
 async function resolveLatestPptxInfoFromThread(chatThreadId: string): Promise<{ url: string; displayName: string | null } | null> {
-  // まずポインターから（毎回新SASを発行するため安定）
+  // まずポインターから（直接公開URLを返すため安定）
   const fromPointer = await resolvePptxFromPointer(chatThreadId);
-  if (fromPointer) return fromPointer;
+  if (fromPointer) {
+    console.log(`[resolveLatestPptx] using pointer url=${fromPointer.url.slice(0, 80)} display=${fromPointer.displayName}`);
+    return fromPointer;
+  }
+  console.warn(`[resolveLatestPptx] pointer not found for thread=${chatThreadId}, falling back to history`);
 
   // fallback: 会話履歴Markdownリンクから抽出（SASがLLMに壊された可能性あり）
   try {
@@ -4500,7 +4503,7 @@ async function executeEditPptx(
             deckEdits: {
               accentColor: layoutResolved.accentColor,
               ...(layoutResolved.paletteKey ? { paletteKey: layoutResolved.paletteKey, palette: layoutResolved.palette } : {}),
-              preserveTextColors: true,
+              preserveTextColors: false,
             },
           },
           threadId: chatThread.id,
@@ -4544,7 +4547,7 @@ async function executeEditPptx(
           body: JSON.stringify({
             fileUrl,
             action: "apply_pptx_plan",
-            plan: { slideEdits: [], deckEdits: { accentColor: meta.main, paletteKey: key, palette, preserveTextColors: true } },
+            plan: { slideEdits: [], deckEdits: { accentColor: meta.main, paletteKey: key, palette, preserveTextColors: false } },
             threadId: chatThread.id,
             outputBaseName: outputName,
             skipPptxPointer: true,
@@ -4591,7 +4594,7 @@ async function executeEditPptx(
             deckEdits: {
               accentColor: colorResolved.accentColor,
               ...(colorResolved.paletteKey ? { paletteKey: colorResolved.paletteKey, palette: colorResolved.palette } : {}),
-              preserveTextColors: true,
+              preserveTextColors: false,
             },
           },
           threadId: chatThread.id,
