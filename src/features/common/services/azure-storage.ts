@@ -1,10 +1,11 @@
-import { BlobSASPermissions, BlobServiceClient, generateBlobSASQueryParameters, RestError, StorageSharedKeyCredential } from "@azure/storage-blob";
+import { BlobSASPermissions, BlobServiceClient, RestError } from "@azure/storage-blob";
 import { ServerActionResponse } from "../server-action-response";
 
 // initialize the blobServiceClient
 const InitBlobServiceClient = () => {
-  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
+  // trim() で環境変数末尾の改行・空白を除去（混入すると署名が狂う）
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
 
   if (!acc || !key)
     throw new Error(
@@ -13,9 +14,7 @@ const InitBlobServiceClient = () => {
 
   const connectionString = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
 
-  const blobServiceClient =
-    BlobServiceClient.fromConnectionString(connectionString);
-  return blobServiceClient;
+  return BlobServiceClient.fromConnectionString(connectionString);
 };
 
 export const UploadBlob = async (
@@ -52,23 +51,17 @@ export const GenerateSasUrl = async (
   containerName: string,
   blobPath: string
 ): Promise<ServerActionResponse<string>> => {
-  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME as string;
-  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY as string;
-  
-  const sharedKeyCredential = new StorageSharedKeyCredential(acc, key);
-  const blobServiceClient = InitBlobServiceClient();
-  const containerClient = blobServiceClient.getContainerClient(containerName);
-  const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
-  const sasToken = generateBlobSASQueryParameters({
-    containerName: containerName,
-    blobName: blobPath,
-    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    permissions: BlobSASPermissions.parse("r")
-  }, sharedKeyCredential);
-  const sasUrl = `${blockBlobClient.url}?${sasToken}`;
-  return {
-    status: "OK",
-    response: sasUrl
+  try {
+    const blockBlobClient = InitBlobServiceClient()
+      .getContainerClient(containerName)
+      .getBlockBlobClient(blobPath);
+    const sasUrl = await blockBlobClient.generateSasUrl({
+      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      permissions: BlobSASPermissions.parse("r"),
+    });
+    return { status: "OK", response: sasUrl };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `GenerateSasUrl failed: ${String(e)}` }] };
   }
 }
   

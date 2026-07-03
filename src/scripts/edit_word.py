@@ -152,9 +152,15 @@ def apply_replace_text(doc, replacements: list) -> int:
             replace = rep.get("replace", "")
             if not find:
                 continue
+            single_run_found = False
             for run in para.runs:
                 if find in run.text:
                     run.text = run.text.replace(find, replace)
+                    para_changed = True
+                    single_run_found = True
+            # Cross-run fallback: find が複数 run にまたがる場合
+            if not single_run_found and find in para.text:
+                if _replace_text_cross_run(para, find, replace):
                     para_changed = True
         if para_changed:
             changed += 1
@@ -314,7 +320,167 @@ def _make_comment_ref_run(comment_id: int) -> Any:
     return r_ref
 
 
+# ─── Cross-run helper: 複数runにまたがる find_str を扱う ─────────────────────
+
+def _get_all_runs_info(para):
+    """直接の <w:r> 子要素を (element, text, abs_start) のリストで返す。"""
+    items = []
+    abs_pos = 0
+    for child in para._p:
+        if child.tag == qn("w:r"):
+            txt = "".join(t.text or "" for t in child.iter(qn("w:t")))
+            items.append((child, txt, abs_pos))
+            abs_pos += len(txt)
+    return items
+
+
+def _make_run_copy_with_text(run_el, text: str):
+    """run_el を deepcopy してテキストだけを置き換えた要素を返す。"""
+    new_run = copy.deepcopy(run_el)
+    t_nodes = list(new_run.iter(qn("w:t")))
+    t_el = t_nodes[0] if t_nodes else None
+    for extra_t in t_nodes[1:]:
+        parent = extra_t.getparent()
+        if parent is not None:
+            parent.remove(extra_t)
+    if t_el is None:
+        t_el = OxmlElement("w:t")
+        new_run.append(t_el)
+    t_el.text = text
+    t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    return new_run
+
+
+def _replace_text_cross_run(para, find_str: str, replace_str: str) -> bool:
+    """
+    非track版: find_str が複数 run にまたがる場合の置換。
+    連結テキストで置換し、first run に結果を置き、残りの run を削除する。
+    """
+    r_items = _get_all_runs_info(para)
+    if not r_items:
+        return False
+    full_text = "".join(txt for _, txt, _ in r_items)
+    if find_str not in full_text:
+        return False
+    new_text = full_text.replace(find_str, replace_str)
+    first_run_el = r_items[0][0]
+    t_el = first_run_el.find(qn("w:t"))
+    if t_el is None:
+        t_el = OxmlElement("w:t")
+        first_run_el.append(t_el)
+    t_el.text = new_text
+    t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    for run_el, _, _ in r_items[1:]:
+        para._p.remove(run_el)
+    return True
+
+
+def _replace_text_cross_run_tracked(
+    para, find_str: str, replace_str: str,
+    author: str, date: str, rev: list,
+    comments: "CommentsManager | None" = None,
+) -> bool:
+    """
+    Track Changes版: find_str が複数 run にまたがる場合の置換。
+    連結テキスト上で find_str を検索し、<w:del>/<w:ins> として挿入する。
+    """
+    r_items = _get_all_runs_info(para)
+    if not r_items:
+        return False
+    full_text = "".join(txt for _, txt, _ in r_items)
+    if find_str not in full_text:
+        return False
+
+    # 全出現箇所を収集
+    occ_list = []
+    sp = 0
+    while True:
+        idx = full_text.find(find_str, sp)
+        if idx == -1:
+            break
+        occ_list.append((idx, idx + len(find_str)))
+        sp = idx + 1
+
+    if not occ_list:
+        return False
+
+    new_els = []
+    cursor = 0
+    r_idx = 0
+    r_offset = 0
+
+    def advance_plain(up_to):
+        nonlocal cursor, r_idx, r_offset
+        while cursor < up_to and r_idx < len(r_items):
+            run_el, run_text, run_abs = r_items[r_idx]
+            take_end = min(up_to, run_abs + len(run_text))
+            take_text = run_text[r_offset: take_end - run_abs]
+            if take_text:
+                new_els.append(_make_run_copy_with_text(run_el, take_text))
+            if take_end >= run_abs + len(run_text):
+                r_idx += 1
+                r_offset = 0
+            else:
+                r_offset = take_end - run_abs
+            cursor = take_end
+
+    def skip_to(up_to):
+        nonlocal cursor, r_idx, r_offset
+        while cursor < up_to and r_idx < len(r_items):
+            run_el, run_text, run_abs = r_items[r_idx]
+            skip_end = min(up_to, run_abs + len(run_text))
+            if skip_end >= run_abs + len(run_text):
+                r_idx += 1
+                r_offset = 0
+            else:
+                r_offset = skip_end - run_abs
+            cursor = skip_end
+
+    for occ_start, occ_end in occ_list:
+        advance_plain(occ_start)
+
+        match_rPr = _rPr_copy(r_items[r_idx][0]) if r_idx < len(r_items) else OxmlElement("w:rPr")
+
+        comment_id = None
+        if comments is not None:
+            comment_text = (
+                f"「{find_str}」→「{replace_str}」" if replace_str
+                else f"「{find_str}」を削除"
+            )
+            comment_id = comments.add_comment(comment_text, author, date)
+            cs = OxmlElement("w:commentRangeStart")
+            cs.set(qn("w:id"), str(comment_id))
+            new_els.append(cs)
+
+        new_els.append(_wrap_del(rev[0], author, date, _make_del_run(match_rPr, find_str)))
+        rev[0] += 1
+
+        if replace_str:
+            new_els.append(_wrap_ins(rev[0], author, date, _make_ins_run(match_rPr, replace_str)))
+            rev[0] += 1
+
+        if comment_id is not None:
+            ce = OxmlElement("w:commentRangeEnd")
+            ce.set(qn("w:id"), str(comment_id))
+            new_els.append(ce)
+            new_els.append(_make_comment_ref_run(comment_id))
+
+        skip_to(occ_end)
+
+    advance_plain(len(full_text))
+
+    # 先頭 run の直前に新要素を順番通りに挿入し、旧 run を全て削除
+    first_run_el = r_items[0][0]
+    for el in new_els:
+        first_run_el.addprevious(el)
+    for run_el, _, _ in r_items:
+        para._p.remove(run_el)
+
+    return True
+
+
 def apply_replace_text_tracked(
+
     doc,
     replacements: list,
     author: str,
@@ -335,10 +501,12 @@ def apply_replace_text_tracked(
             if not find_str:
                 continue
 
+            single_run_found = False
             for run in list(para.runs):
                 if find_str not in run.text:
                     continue
 
+                single_run_found = True
                 original_text = run.text
                 rPr_elem = _rPr_copy(run._r)
                 parent = run._r.getparent()
@@ -386,6 +554,13 @@ def apply_replace_text_tracked(
                     parent.insert(insert_pos, _make_comment_ref_run(comment_id))
 
                 para_changed = True
+
+            # Cross-run fallback: find_str が複数 run にまたがる場合
+            if not single_run_found and find_str in para.text:
+                if _replace_text_cross_run_tracked(
+                    para, find_str, replace_str, author, date, rev, comments
+                ):
+                    para_changed = True
         if para_changed:
             changed += 1
     return changed

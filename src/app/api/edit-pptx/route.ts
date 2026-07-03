@@ -17,6 +17,7 @@ import {
 } from "@azure/storage-blob";
 import { OpenAIInstance, OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { uniqueId } from "@/features/common/util";
+import { resolvePptxPaletteInstruction, buildPaletteFromKey, PPTX_NAMED_PALETTES, PptxPalette } from "@/features/pptx/palette";
 
 const execFileAsync = promisify(execFile);
 
@@ -35,6 +36,8 @@ type ImageInsert = {
 type EditPlan = {
   deckEdits?: {
     accentColor?: string | null;
+    paletteKey?: string | null;
+    palette?: Record<string, string> | null;
     fontFace?: string | null;
     preserveTextColors?: boolean;
   };
@@ -180,17 +183,7 @@ async function extractSlidesStructured(
   return result;
 }
 
-function parseDirectAccentColor(instruction: string): string | undefined {
-  const t = instruction.toLowerCase();
-  if (/(赤|red)/.test(t)) return "C00000";
-  if (/(青|blue)/.test(t)) return "2F5597";
-  if (/(緑|green)/.test(t)) return "548235";
-  if (/(紫|purple)/.test(t)) return "7030A0";
-  if (/(オレンジ|orange|橙)/.test(t)) return "C55A11";
-  if (/(黄|yellow)/.test(t)) return "BF9000";
-  if (/(ピンク|pink)/.test(t)) return "C0508A";
-  return undefined;
-}
+// parseDirectAccentColor は resolvePptxPaletteInstruction (@/features/pptx/palette) に統合済み
 
 // URL付きの画像挿入指示をLLM不要で直接EditPlanに変換する
 function tryBuildDirectPlan(instruction: string, _slides: unknown[]): EditPlan | null {
@@ -343,13 +336,17 @@ Return JSON only.`;
   parsed.deckEdits ??= {};
   parsed.slideEdits ??= [];
 
-  const directAccent = parseDirectAccentColor(instruction);
   // imageInserts がある場合は画像プロンプト内の色指定（「青系アイコン」等）を
-  // デッキ全体の色変更と誤認しないよう parseDirectAccentColor を適用しない。
-  // LLM が明示的に accentColor を返した場合のみデッキ色を変更する。
+  // デッキ全体の色変更と誤認しないよう resolvePptxPaletteInstruction を適用しない。
   const hasImageInserts = (parsed.imageInserts?.length ?? 0) > 0;
-  if (!normalizeHexColor(parsed.deckEdits.accentColor) && directAccent && !hasImageInserts) {
-    parsed.deckEdits.accentColor = directAccent;
+  const directResolved = !hasImageInserts && !normalizeHexColor(parsed.deckEdits.accentColor)
+    ? resolvePptxPaletteInstruction(instruction) : null;
+  if (directResolved) {
+    parsed.deckEdits.accentColor = directResolved.accentColor;
+    if (directResolved.paletteKey) {
+      parsed.deckEdits.paletteKey = directResolved.paletteKey;
+      parsed.deckEdits.palette = directResolved.palette as Record<string, string>;
+    }
   } else {
     parsed.deckEdits.accentColor = normalizeHexColor(parsed.deckEdits.accentColor) ?? null;
   }
@@ -383,7 +380,7 @@ function parseAzureBlobUrl(fileUrl: string): {
     if (parts.length < 2) return null;
     return {
       containerName: parts[0],
-      blobPath: parts.slice(1).join("/"),
+      blobPath: decodeURIComponent(parts.slice(1).join("/")),
     };
   } catch {
     return null;
@@ -416,51 +413,39 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
   }
 
   const blobRef = parseAzureBlobUrl(fileUrl);
-  if (blobRef && (res.status === 403 || res.status === 404)) {
+  // 400: SAS署名不正、403: 認証失敗（SAS期限切れ等）、404: blob削除済み
+  if (blobRef && (res.status === 400 || res.status === 403 || res.status === 404)) {
     const directBuffer = await downloadBlobDirectFromStorage(
       blobRef.containerName,
       blobRef.blobPath
     );
     if (directBuffer) {
       console.warn(
-        `[edit-pptx] recovered blob download via account key: ${blobRef.containerName}/${blobRef.blobPath}`
+        `[edit-pptx] recovered blob download via account key (HTTP ${res.status}): ${blobRef.containerName}/${blobRef.blobPath}`
       );
       return directBuffer;
     }
   }
 
+  // dl-link コンテナは {threadId}/{filename} 構造なので threadId prefix で検索できる
+  // pptx コンテナは blobKey が pptx_{uniqueId}.pptx で threadId prefix と無関係のため検索不可
   if (
-    (res.status === 403 || res.status === 404) &&
-    blobRef &&
-    (blobRef.containerName === "dl-link" || blobRef.containerName === "pptx")
+    (res.status === 400 || res.status === 403 || res.status === 404) &&
+    blobRef?.containerName === "dl-link"
   ) {
     const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME;
     const key = process.env.AZURE_STORAGE_ACCOUNT_KEY;
     if (acc && key) {
-      const connStr = `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`;
-      const svc = BlobServiceClient.fromConnectionString(connStr);
-      const cc = svc.getContainerClient(blobRef.containerName);
-
-      if (blobRef.containerName === "dl-link") {
-        // dl-link は {threadId}/{filename} 構造
-        const blobPathParts = blobRef.blobPath.split("/").filter(Boolean);
-        const effectiveThreadId = threadId?.trim() || blobPathParts[0];
-        if (effectiveThreadId) {
-          for await (const blob of cc.listBlobsFlat({ prefix: `${effectiveThreadId}/` })) {
-            if (blob.name.toLowerCase().endsWith(".pptx")) {
-              return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
-            }
-          }
-        }
-      } else {
-        // pptx コンテナは {threadId}_edited_{uniqueId}.pptx などフラット構造
-        // threadId プレフィックスで前方一致検索（スラッシュなし）
-        const effectiveThreadId = threadId?.trim();
-        if (effectiveThreadId) {
-          for await (const blob of cc.listBlobsFlat({ prefix: effectiveThreadId })) {
-            if (blob.name.toLowerCase().endsWith(".pptx")) {
-              return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
-            }
+      const svc = BlobServiceClient.fromConnectionString(
+        `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+      );
+      const cc = svc.getContainerClient("dl-link");
+      const blobPathParts = blobRef.blobPath.split("/").filter(Boolean);
+      const effectiveThreadId = threadId?.trim() || blobPathParts[0];
+      if (effectiveThreadId) {
+        for await (const blob of cc.listBlobsFlat({ prefix: `${effectiveThreadId}/` })) {
+          if (blob.name.toLowerCase().endsWith(".pptx")) {
+            return await cc.getBlockBlobClient(blob.name).downloadToBuffer();
           }
         }
       }
@@ -471,11 +456,11 @@ async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer>
 }
 
 async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: string): Promise<string> {
-  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
-  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
+  // trim() で環境変数末尾の改行・空白を除去（混入すると StorageSharedKeyCredential の署名が狂う）
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   const containerName = "pptx";
 
-  const cred = new StorageSharedKeyCredential(acc, key);
   const svc = BlobServiceClient.fromConnectionString(
     `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
   );
@@ -488,20 +473,30 @@ async function uploadToBlob(buffer: Buffer, blobKey: string, displayFileName?: s
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName ?? blobKey)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(displayFileName ?? blobKey)}`,
     },
   });
 
-  const sas = generateBlobSASQueryParameters(
-    {
-      containerName,
-      blobName: blobKey,
-      expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-      permissions: BlobSASPermissions.parse("r"),
-    },
-    cred
+  // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
+  // pptx コンテナは access:blob 公開済みなので直接URLを返す（blobKeyをURL-encode）
+  return `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
+}
+
+// スレッドごとの最新PPTXポインターを pptx コンテナに保存。
+// 再編集時はこのポインターから新SASを発行し、会話履歴のSAS URLに依存しない。
+async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) return;
+  const svc = BlobServiceClient.fromConnectionString(
+    `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
   );
-  return `${bbc.url}?${sas}`;
+  const cc = svc.getContainerClient("pptx");
+  await cc.createIfNotExists({ access: "blob" });
+  await cc.getBlockBlobClient(`thread-${threadId}-pptx-pointer.json`).uploadData(
+    Buffer.from(JSON.stringify({ containerName: "pptx", blobName, fileName, savedAt: new Date().toISOString() })),
+    { blobHTTPHeaders: { blobContentType: "application/json" } }
+  );
 }
 
 // ─────────────────────────────────────────────
@@ -1385,7 +1380,7 @@ async function runPythonPdfToExcel(inputBuffer: Buffer, _threadId: string, fileU
 async function runPythonRefineExcelPages(
   excelBuffer: Buffer,
   targetSheets: string[],
-  threadId: string,
+  _threadId: string,
   outputFileName?: string
 ): Promise<{ downloadUrl: string; fileName: string; refined: number; skipped: number }> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-refine-"));
@@ -1493,85 +1488,38 @@ async function extractDocSummary(buffer: Buffer): Promise<WordDocSummary> {
   return { paragraphs: paragraphs.slice(0, 200), totalParagraphs: paragraphs.length };
 }
 
-async function buildWordEditPlan(
-  summary: WordDocSummary,
-  instruction: string
-): Promise<WordEditPlan> {
-  const openai = OpenAIInstance();
-
-  const systemPrompt = `You convert a natural-language Word document editing request into a safe JSON edit plan.
-Return JSON only in this shape:
-{
-  "replaceText": [{ "find": "old text", "replace": "new text" }],
-  "formatRuns": [
-    {
-      "matchText": "paragraph text to find (omit to apply to ALL paragraphs)",
-      "bold": true,
-      "italic": false,
-      "fontSize": 14,
-      "fontColor": "RRGGBB",
-      "fontFace": "Yu Gothic"
-    }
-  ],
-  "addParagraphs": [
-    {
-      "text": "paragraph text to append",
-      "style": "Normal",
-      "bold": false,
-      "fontSize": 12
-    }
-  ]
-}
-
-Rules:
-- replaceText: use when the user wants to change specific wording.
-- formatRuns: use when the user wants to apply bold/italic/font size/color/font face.
-  - matchText: substring found in the target paragraph. OMIT matchText entirely (do not include the key) when the user wants to format ALL paragraphs or the whole document.
-  - fontSize: points. If the user says "4倍" or "4x", multiply the likely current size (11pt default) by 4 → 44. "2倍" → 22. "大きく" → 18.
-  - fontColor: 6-digit hex without #.
-  - fontFace: font name string. "ゴシック" → "Yu Gothic", "明朝" → "Yu Mincho", "メイリオ" → "Meiryo". Use the exact font name as a string.
-- addParagraphs: use when the user wants to INSERT or APPEND new text to the document.
-  - style: "Normal" | "Heading1" | "Heading2" | "List Bullet" (default "Normal").
-  - Paragraphs are appended at the end of the document.
-  - NEVER use addParagraphs to append a summary of changes made (e.g. "修正箇所一覧", "変更点一覧"). Word comments are inserted automatically at each change location.
-- Only emit operations the user actually requested. Keep JSON minimal.`;
-
-  const userPrompt = `Instruction: ${instruction}
-
-Document summary:
-${JSON.stringify(summary, null, 2)}
-
-Return JSON only.`;
-
-  const res = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    response_format: { type: "json_object" },
-    max_completion_tokens: 4000,
-  });
-
-  const raw = res.choices[0]?.message?.content ?? "{}";
-  const finishReason = res.choices[0]?.finish_reason;
-  if (finishReason === "length") {
-    console.warn("[buildWordEditPlan] LLM response truncated (finish_reason=length). Plan may be incomplete.");
-  }
-  let parsed: WordEditPlan;
-  try {
-    parsed = JSON.parse(raw) as WordEditPlan;
-  } catch {
-    console.error("[buildWordEditPlan] JSON.parse failed. raw=", raw.slice(0, 200));
-    throw new Error("編集プランの生成に失敗しました（JSONパースエラー）。指示を短くして再試行してください。");
-  }
-  parsed.replaceText ??= [];
-  parsed.formatRuns ??= [];
-  parsed.addParagraphs ??= [];
-  return parsed;
-}
 
 const WORD_EDIT_CHUNK_SIZE = 12;
+
+function parseExplicitWordReplacements(instruction: string): Array<{ find: string; replace: string }> {
+  const replacements: Array<{ find: string; replace: string }> = [];
+  const seen = new Set<string>();
+
+  function addPair(find: string | undefined, replace: string) {
+    const f = find?.trim();
+    const r = replace.trim();
+    if (!f) return;
+    const key = f + "\0" + r;
+    if (seen.has(key)) return;
+    seen.add(key);
+    replacements.push({ find: f, replace: r });
+  }
+
+  // 「A」→「B」 / 『A』→『B』 / "A"->"B" 形式
+  const re1 = /[「『"']([^」』"']+)[」』"']\s*(?:\u2192|->|=>)\s*[「『"']([^」』"']*)[」』"']/g;
+  let m: RegExpExecArray | null;
+  while ((m = re1.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  // 【誤】A【正】B 形式（同一行 or 改行・空白ありも許容）
+  const re2 = /【誤】\s*([^【】\r\n]+?)\s*(?:\r?\n\s*)?【正】\s*([^【】\r\n]*)/g;
+  while ((m = re2.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  // 「A」を「B」に 形式（「太平興産」を「大平興産」に全件置換、など）
+  const re3 = /[「『"']([^」』"']+)[」』"']\s*を\s*[「『"']([^」』"']*)[」』"']\s*に/g;
+  while ((m = re3.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
+
+  return replacements;
+}
 
 async function buildWordReplaceTextChunk(
   openai: ReturnType<typeof OpenAIInstance>,
@@ -1623,9 +1571,18 @@ async function buildWordEditPlanChunked(
   summary: WordDocSummary,
   instruction: string
 ): Promise<{ plan: WordEditPlan; skippedChunks: number }> {
-  const openai = OpenAIInstance();
   const { paragraphs } = summary;
 
+  const explicitReplaceText = parseExplicitWordReplacements(instruction);
+  if (explicitReplaceText.length > 0) {
+    console.log(`[buildWordEditPlan] explicit replaceText total=${explicitReplaceText.length}`);
+    return {
+      plan: { replaceText: explicitReplaceText, formatRuns: [], addParagraphs: [], trackChanges: false },
+      skippedChunks: 0,
+    };
+  }
+
+  const openai = OpenAIInstance();
   const allReplaceText: Array<{ find: string; replace: string }> = [];
   let skippedChunks = 0;
   for (let i = 0; i < paragraphs.length; i += WORD_EDIT_CHUNK_SIZE) {
@@ -1711,7 +1668,7 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string, displayName?: 
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayName ?? fileName)}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(displayName ?? fileName)}`,
     },
   });
 
@@ -1855,7 +1812,13 @@ async function resolveEditPptxScriptPath(): Promise<string> {
   throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
 }
 
-async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: string, fileBaseName?: string) {
+async function runPythonEdit(
+  inputBuffer: Buffer,
+  plan: EditPlan,
+  _threadId: string,
+  fileBaseName?: string,
+  options?: { skipPptxPointer?: boolean }
+) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
   const inputPath = path.join(tempDir, "input.pptx");
   const outputPath = path.join(tempDir, "output.pptx");
@@ -1962,9 +1925,23 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
       .trim()
       .slice(0, 60);
     const displayFileName = safeDisplay ? `${safeDisplay}.pptx` : undefined;
-    const blobKey = `pptx_${uniqueId().slice(0, 8)}.pptx`;  // ASCII のみ（URL短縮）
+    // 表示名をblobKeyに含めることでURLからファイル名が正しく取れるようにする
+    const uid = uniqueId().slice(0, 6);
+    const blobKey = safeDisplay
+      ? `${safeDisplay.slice(0, 54)}_${uid}.pptx`
+      : `pptx_${uid}.pptx`;
     const fileName = displayFileName ?? blobKey;
     const downloadUrl = await uploadToBlob(outputBuffer, blobKey, displayFileName);
+
+    // 最新PPTXポインターを更新（再編集時に会話履歴SAS URLではなくポインターを使う）
+    if (_threadId && !options?.skipPptxPointer) {
+      try {
+        await savePptxPointer(_threadId, blobKey, fileName);
+        console.log(`[edit-pptx] savePptxPointer ok: blobKey=${blobKey} fileName=${fileName}`);
+      } catch (e) {
+        console.warn("[edit-pptx] savePptxPointer failed:", e);
+      }
+    }
 
     const insertedImages = Number(pythonResult.insertedImages ?? 0);
     const imageWarning =
@@ -1985,6 +1962,9 @@ async function runPythonEdit(inputBuffer: Buffer, plan: EditPlan, threadId: stri
       insertedImages,
       charsBefore: Number(pythonResult.charsBefore ?? 0),
       charsAfter: Number(pythonResult.charsAfter ?? 0),
+      changedFills: Number(pythonResult.changedFills ?? 0),
+      changedLines: Number(pythonResult.changedLines ?? 0),
+      changedTexts: Number(pythonResult.changedTexts ?? 0),
       ...(imageWarning ? { imageWarning } : {}),
       ...(Array.isArray(pythonResult.outOfRangeSlides) && pythonResult.outOfRangeSlides.length > 0
         ? { outOfRangeSlides: pythonResult.outOfRangeSlides as number[] }
@@ -2046,7 +2026,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -2059,7 +2039,9 @@ export async function POST(req: NextRequest) {
       excelFileUrl?: string;
       targetSheets?: string[];
       outputFileName?: string;
+      skipPptxPointer?: boolean;
     };
+    const isInternalPptxBatch = req.headers.get("x-azurechat-internal-pptx-batch") === "1";
 
     // Excel 指定シート精度向上（GPT-4V リファイン）— fileUrl 不要なので先に処理
     if (action === "refine_excel_pages") {
@@ -2115,8 +2097,12 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "plan.slideEdits is required" }, { status: 400 });
       }
       // deckEdits / imageInserts は内容増量では不要のため除去。item 単位バリデーション付き。
-      // ただし accentColor が正規 hex で明示された場合はデッキ色変更として safeplan に含める
-      const incomingDeckAccent = normalizeHexColor(String((incomingPlan as any).deckEdits?.accentColor ?? ""));
+      // accentColor / paletteKey が明示された場合はデッキ色変更として safeplan に含める
+      const incomingDeck = (incomingPlan as any).deckEdits ?? {};
+      const incomingDeckAccent = normalizeHexColor(String(incomingDeck.accentColor ?? ""));
+      const incomingPaletteKey = typeof incomingDeck.paletteKey === "string" && incomingDeck.paletteKey in PPTX_NAMED_PALETTES
+        ? incomingDeck.paletteKey : undefined;
+      const incomingPalette: PptxPalette | undefined = incomingPaletteKey ? buildPaletteFromKey(incomingPaletteKey) : undefined;
       const safeplan: EditPlan = {
         slideEdits: incomingPlan.slideEdits
           .map((se) => {
@@ -2171,12 +2157,27 @@ export async function POST(req: NextRequest) {
             };
           })
           .filter((se): se is NonNullable<typeof se> => se !== null),
-        ...(incomingDeckAccent ? { deckEdits: { accentColor: incomingDeckAccent, preserveTextColors: true } } : {}),
+        ...(incomingDeckAccent || incomingPaletteKey ? {
+          deckEdits: {
+            accentColor: incomingDeckAccent || incomingPalette?.accentA,
+            ...(incomingPaletteKey ? { paletteKey: incomingPaletteKey, palette: incomingPalette as Record<string, string> } : {}),
+            preserveTextColors: incomingDeck.preserveTextColors !== false,
+          },
+        } : {}),
       };
       const pptxBuffer = await downloadBlob(fileUrl, threadId);
+      const slidesBefore = await extractSlidesStructured(pptxBuffer);
+      const slideCountBefore = slidesBefore.length;
       const safeBaseName = outputBaseName ?? "内容増量";
-      const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName);
-      console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
+      const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName, { skipPptxPointer: !!skipPptxPointer && isInternalPptxBatch });
+      console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} fills=${result.changedFills} lines=${result.changedLines} texts=${result.changedTexts} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
+      if (result.totalSlides !== slideCountBefore) {
+        console.error(`[apply_pptx_plan] slide count changed ${slideCountBefore} → ${result.totalSlides}`);
+        return NextResponse.json({
+          ok: false,
+          error: `スライド数が変化しました（${slideCountBefore}枚 → ${result.totalSlides}枚）。編集ではなく再生成が発生した可能性があります。`,
+        });
+      }
 
       // 対応3: addBullets/copyShapeBlock 後に Vision レビューして目視警告を返す
       let applyVisualWarnings: string[] | undefined;
@@ -2251,7 +2252,7 @@ export async function POST(req: NextRequest) {
     // deckEdits はユーザーが明示的にスライド追加・削除を要求した場合のみ許可
     // (それ以外の編集指示で accentColor/fontFace が混入すると別物化する)
     const deckEditAllowed =
-      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更|かえ|にして|替え)|フォント.{0,8}(変え|変更|かえ)|アクセント|(緑|青|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|green|blue|red|yellow|purple|orange|pink|navy|gray).{0,10}(にして|にかえ|に変え|に変更)/.test(instruction);
+      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更|かえ|にして|替え)|フォント.{0,8}(変え|変更|かえ)|アクセント|(緑|青|紺|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|深緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|サンゴ|フォレスト|green|blue|red|yellow|purple|orange|pink|navy|gray|teal|coral|amber|burgundy|forest|charcoal|terra).{0,12}(にして|にかえ|に変え|に変更)|ネイビー.{0,2}オレンジ|深緑.{0,2}アンバー|バーガンディ.{0,2}ゴールド|ティール.{0,2}コーラル|チャコール.{0,2}テラコッタ|navy.orange|forest.amber|burgundy.gold|teal.coral|charcoal.terra/.test(instruction);
     if (!deckEditAllowed && plan.deckEdits) {
       console.log("[edit-pptx] stripping deckEdits (not explicitly requested)");
       plan = { ...plan, deckEdits: undefined };

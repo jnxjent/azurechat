@@ -4,11 +4,11 @@ import { NextRequest, NextResponse } from "next/server";
 import PptxGenJS from "pptxgenjs";
 import JSZip from "jszip";
 import {
-  BlobSASPermissions,
   BlobServiceClient,
 } from "@azure/storage-blob";
 import { uniqueId } from "@/features/common/util";
 import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
+import { PptxPalette as Palette, PPTX_NAMED_PALETTES, buildPaletteFromKey } from "@/features/pptx/palette";
 
 // ── SVGアイコン（process-cards用） ────────────────────────────────────────────
 function _svgUri(svg: string): string {
@@ -240,22 +240,7 @@ export type GenPptxRequest = {
   palette?: string;
 };
 
-type Palette = {
-  canvas: string;
-  surface: string;
-  titleBg: string;
-  headerBg: string;
-  accentA: string;
-  accentB: string;
-  headerText: string;
-  bodyText: string;
-  mutedText: string;
-  sectionBg: string;
-  tableHeaderBg: string;
-  tableHeaderText: string;
-  tableAltBg: string;
-  border: string;
-};
+// Palette type is imported from @/features/pptx/palette
 
 type SlideVisualType =
   | "editorial"
@@ -346,41 +331,9 @@ const PALETTE = {
 // ヘッダースタイル: 全幅バンド禁止 — 常に左アクセントバー+テキストのみ
 const STRICT_HEADER_STYLE = "minimal" as const;
 
-// ── 5パレット定義（gen_pptx_profile.py の PALETTES と役割キーを同期） ───────
-// 役割キー: main / accent / accent_light / main_light / text_muted
-// 背景・帯上文字は全パレット共通で FFFFFF 固定。
-const PPTX_PALETTES: Record<string, {
-  main: string; accent: string; accent_light: string; main_light: string; text_muted: string;
-}> = {
-  navy_orange:    { main: "13294B", accent: "F5821F", accent_light: "EEF2F9", main_light: "E4E8F0", text_muted: "6B7488" },
-  forest_amber:   { main: "1B4D3E", accent: "F4A300", accent_light: "FBEFD5", main_light: "E3EDE8", text_muted: "5E6E66" },
-  burgundy_gold:  { main: "8C1D18", accent: "E0A33B", accent_light: "F7ECD6", main_light: "F3E5E4", text_muted: "6E5A58" },
-  teal_coral:     { main: "0E4D5C", accent: "EE6C4D", accent_light: "FBE6DE", main_light: "DCE9EC", text_muted: "5A6B70" },
-  charcoal_terra: { main: "333333", accent: "C15F3C", accent_light: "F3E3DA", main_light: "ECECEA", text_muted: "6E6E6E" },
-};
-
-/**
- * パレット名から Palette 型を構築する。
- * 既存の buildStrictPalette / PALETTE と同じ役割マッピングを使用。
- */
+// PPTX_PALETTES は @/features/pptx/palette の PPTX_NAMED_PALETTES として共通化済み
 function buildPaletteFromName(name: string): Palette {
-  const src = PPTX_PALETTES[name] ?? PPTX_PALETTES["navy_orange"];
-  return {
-    canvas:          "FFFFFF",           // 背景は常に白
-    surface:         "FFFFFF",           // カード白
-    titleBg:         src.main,
-    headerBg:        src.main,
-    accentA:         src.main,           // 帯・アイコン円・構造主色
-    accentB:         src.accent,         // 強調差し色（5-10%）
-    headerText:      "FFFFFF",
-    bodyText:        src.main,
-    mutedText:       src.text_muted,
-    sectionBg:       src.accent_light,   // コールアウト・強調ボックス背景
-    tableHeaderBg:   src.main,
-    tableHeaderText: "FFFFFF",
-    tableAltBg:      src.main_light,     // テーブル交互行
-    border:          src.main_light,     // 区切り線・カード枠
-  };
+  return (buildPaletteFromKey(name) ?? buildPaletteFromKey("navy_orange"))!;
 }
 
 // 7色 → Palette 14色マッピング（全 variant 共通）
@@ -1544,8 +1497,11 @@ async function patchEastAsianFont(buffer: Buffer): Promise<Buffer> {
 }
 
 async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName?: string): Promise<string> {
-  const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
-  const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) {
+    throw new Error("Azure Storage Account not configured correctly, check environment variables.");
+  }
   const containerName = "pptx";
   const blobServiceClient = BlobServiceClient.fromConnectionString(
     `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
@@ -1561,13 +1517,27 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
       blobContentDisposition: `attachment; filename*=UTF-8''${encodedFileName}`,
     },
   });
-  // generateSasUrl は BlockBlobClient が StorageSharedKeyCredential を持つ場合のみ使用可能
-  // fromConnectionString（アカウントキー含む）で作成した場合は使用可能
-  const sasUrl = await blockBlobClient.generateSasUrl({
-    expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    permissions: BlobSASPermissions.parse("r"),
-  });
-  return sasUrl;
+  // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
+  // pptx コンテナは access:blob 公開済みなので直接URLを返す（blobKeyをURL-encode）
+  return `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
+}
+
+async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key || !threadId?.trim()) return;
+
+  const blobServiceClient = BlobServiceClient.fromConnectionString(
+    `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+  );
+  const containerClient = blobServiceClient.getContainerClient("pptx");
+  await containerClient.createIfNotExists({ access: "blob" });
+  await containerClient
+    .getBlockBlobClient(`thread-${threadId}-pptx-pointer.json`)
+    .uploadData(
+      Buffer.from(JSON.stringify({ containerName: "pptx", blobName, fileName, savedAt: new Date().toISOString() })),
+      { blobHTTPHeaders: { blobContentType: "application/json" } }
+    );
 }
 
 const W = 13.33;
@@ -4119,7 +4089,7 @@ export async function POST(req: NextRequest) {
 
     // 固定パレット適用: リクエストで palette 名が指定された場合は優先、なければキーワード選択
     const strictKey = selectStrictPaletteKey(instructionText, promptIntent ?? undefined);
-    const namedPalette = typeof requestedPalette === "string" && requestedPalette in PPTX_PALETTES
+    const namedPalette = typeof requestedPalette === "string" && requestedPalette in PPTX_NAMED_PALETTES
       ? requestedPalette : null;
     designBrief.palette = namedPalette
       ? buildPaletteFromName(namedPalette)
@@ -4648,8 +4618,11 @@ export async function POST(req: NextRequest) {
       ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
       : (threadId ?? uniqueId());
     const displayFileName = `${safeBase}.pptx`;          // 日本語名：リンク表示・DL名
-    const blobKey = `pptx_${shortId}.pptx`;              // ASCII のみ：Blob key（URL短縮）
+    const blobKey = `${safeBase}_${shortId}.pptx`;        // 表示名+短ID：URLからファイル名が正しく取れる
     const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
+    if (threadId?.trim()) {
+      await savePptxPointer(threadId, blobKey, displayFileName);
+    }
     return NextResponse.json({ ok: true, downloadUrl, fileName: displayFileName });
   } catch (e: any) {
     console.error("[gen-pptx] error:", e);
