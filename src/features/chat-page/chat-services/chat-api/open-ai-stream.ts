@@ -8,6 +8,30 @@ import {
   ChatThreadModel,
 } from "../models";
 
+/**
+ * LLM が壊れた Markdown リンクを生成した場合に修復する。
+ * 壊れたパターン例: https://[host](https://host/path?sig=...)/path?sig=...
+ * 正しい形式:      [fileName](https://host/path?sig=...)
+ */
+function repairBrokenMarkdownUrls(text: string): string {
+  // Pattern: https://[linkText](https://innerUrl)/trailing
+  // The innerUrl inside () is the complete correct URL.
+  return text.replace(
+    /https?:\/\/\[([^\]]*)\]\((https?:\/\/[^)]+)\)([^\s"'<>\]]*)/g,
+    (_match, _linkText, innerUrl, trailing) => {
+      // trailing may be empty or a duplicate path fragment — discard it
+      const fullUrl = trailing
+        ? innerUrl.includes("?") ? innerUrl : innerUrl + trailing
+        : innerUrl;
+      const pathPart = fullUrl.split("?")[0];
+      const fileName =
+        decodeURIComponent(pathPart.split("/").filter(Boolean).pop() ?? "") ||
+        "ファイルをダウンロード";
+      return `[${fileName}](${fullUrl})`;
+    }
+  );
+}
+
 export const OpenAIStream = (props: {
   runner: ChatCompletionStreamingRunner;
   chatThread: ChatThreadModel;
@@ -124,16 +148,21 @@ export const OpenAIStream = (props: {
           closeController();
         })
         .on("finalContent", async (content: string) => {
+          const repairedContent = repairBrokenMarkdownUrls(content);
+          if (repairedContent !== content) {
+            console.warn("[open-ai-stream] repaired broken markdown URL in finalContent");
+          }
+
           await CreateChatMessage({
             name: AI_NAME,
-            content: content,
+            content: repairedContent,
             role: "assistant",
             chatThreadId: chatThread.id,
           });
 
           const response: AzureChatCompletion = {
             type: "finalContent",
-            response: content,
+            response: repairedContent,
           };
           streamResponse(response.type, JSON.stringify(response));
           closeController();

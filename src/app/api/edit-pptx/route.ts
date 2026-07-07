@@ -406,7 +406,30 @@ async function downloadBlobDirectFromStorage(
   }
 }
 
+/**
+ * `https://blob.core.windows.net/...` のようにストレージアカウント名が欠落した Blob URL を
+ * AZURE_STORAGE_ACCOUNT_NAME を補って正規化する。
+ * 正常な URL はそのまま返す。
+ */
+function repairBlobUrl(url: string): string {
+  try {
+    const obj = new URL(url);
+    if (obj.hostname === "blob.core.windows.net") {
+      const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+      if (acc) {
+        obj.hostname = `${acc}.blob.core.windows.net`;
+        const repaired = obj.toString();
+        console.warn(`[repairBlobUrl] account name missing → repaired: ${repaired.substring(0, 100)}`);
+        return repaired;
+      }
+      console.error(`[repairBlobUrl] malformed blob URL and AZURE_STORAGE_ACCOUNT_NAME not set: ${url.substring(0, 100)}`);
+    }
+  } catch {}
+  return url;
+}
+
 async function downloadBlob(fileUrl: string, threadId?: string): Promise<Buffer> {
+  fileUrl = repairBlobUrl(fileUrl);
   const res = await fetch(fileUrl);
   if (res.ok) {
     return Buffer.from(await res.arrayBuffer());
@@ -533,7 +556,8 @@ function buildOutputFileName(sourceUrl: string | undefined, suffix: string): str
   // 空・UUID のみ・先頭が threadId パターンの場合はフォールバック
   if (!base || /^[0-9a-f-]{32,}$/i.test(base)) base = "output";
   // Blob Storage で使えない文字を除去（最大100文字）
-  const safe = base.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
+  // 　 = 全角スペース（SAS署名ミスマッチの原因）、  = NBSP も除去
+  const safe = base.replace(/[　 ﻿<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
   return `${safe}${suffix}`;
 }
 
@@ -1005,10 +1029,19 @@ function encodeRFC5987ValueChars(value: string): string {
   );
 }
 
+/** Blob 名として安全な文字列に正規化する（全角スペース等がSAS署名ミスマッチを引き起こすため）。 */
+function sanitizeBlobName(name: string): string {
+  return name
+    .replace(/[　 ﻿]/g, "_")   // 全角スペース(U+3000)・NBSP(U+00A0)・BOM(U+FEFF)
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+}
+
 async function uploadExcelToBlob(buffer: Buffer, fileName: string, displayName?: string): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "xlsx";
+
+  const safeBlobName = sanitizeBlobName(fileName);
 
   const cred = new StorageSharedKeyCredential(acc, key);
   const svc = BlobServiceClient.fromConnectionString(
@@ -1017,7 +1050,7 @@ async function uploadExcelToBlob(buffer: Buffer, fileName: string, displayName?:
   const cc = svc.getContainerClient(containerName);
   await cc.createIfNotExists({ access: "blob" });
 
-  const bbc = cc.getBlockBlobClient(fileName);
+  const bbc = cc.getBlockBlobClient(safeBlobName);
   await bbc.uploadData(buffer, {
     blobHTTPHeaders: {
       blobContentType:
@@ -1029,7 +1062,7 @@ async function uploadExcelToBlob(buffer: Buffer, fileName: string, displayName?:
   const sas = generateBlobSASQueryParameters(
     {
       containerName,
-      blobName: fileName,
+      blobName: safeBlobName,
       expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
@@ -1499,6 +1532,7 @@ function parseExplicitWordReplacements(instruction: string): Array<{ find: strin
     const f = find?.trim();
     const r = replace.trim();
     if (!f) return;
+    if (f === r) return;  // sameText: 無意味なペアを候補生成段階で除外
     const key = f + "\0" + r;
     if (seen.has(key)) return;
     seen.add(key);
@@ -1521,23 +1555,66 @@ function parseExplicitWordReplacements(instruction: string): Array<{ find: strin
   return replacements;
 }
 
+/** 全角スペース・連続空白を半角1スペースに正規化して比較用文字列を返す */
+function normalizeJa(text: string): string {
+  return text.replace(/[\s　]+/g, " ").trim();
+}
+
+/** find === replace、または空白正規化で同一になるエントリを除去してログを出す */
+function filterReplaceText(
+  entries: Array<{ find: string; replace: string }>
+): Array<{ find: string; replace: string }> {
+  const result: Array<{ find: string; replace: string }> = [];
+  let droppedSame = 0;
+  let droppedNormSame = 0;
+
+  for (const e of entries) {
+    if (e.find === e.replace) {
+      console.log(`[word-filter] drop sameText: "${e.find}"`);
+      droppedSame++;
+      continue;
+    }
+    if (normalizeJa(e.find) === normalizeJa(e.replace)) {
+      console.log(`[word-filter] drop normalizedSame: "${e.find}" → "${e.replace}"`);
+      droppedNormSame++;
+      continue;
+    }
+    result.push(e);
+  }
+
+  console.log(
+    `[word-filter] candidates=${entries.length} droppedSame=${droppedSame} droppedNormSame=${droppedNormSame} applied=${result.length}`
+  );
+  return result;
+}
+
 async function buildWordReplaceTextChunk(
   openai: ReturnType<typeof OpenAIInstance>,
   paragraphs: DocParagraph[],
   instruction: string
 ): Promise<{ entries: Array<{ find: string; replace: string }>; skipped: boolean }> {
+  const wordModel =
+    process.env.AZURE_OPENAI_WORD_EDIT_DEPLOYMENT_NAME ||
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!;
   const paraLines = paragraphs.map((p, i) => `[${i + 1}] ${p.text}`).join("\n");
   const res = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model: wordModel,
     messages: [
       {
         role: "system",
         content: `You find and fix text errors (誤字・誤記) in Japanese document paragraphs.
 Return JSON only: {"replaceText":[{"find":"wrong text","replace":"correct text"}]}
 Rules:
-- "find" must be exact text found in the provided paragraphs.
-- Only fix actual typos/errors per the instruction.
-- Return {"replaceText":[]} if no errors found in this chunk.
+- "find" must be exact text that appears verbatim in the provided paragraphs.
+- Fix the following types of errors:
+  1. Typos and notation errors (誤字・誤記) per the instruction.
+  2. Full/half-width character mistakes (全半角ミス).
+  3. Proper noun errors explicitly stated in the instruction.
+  4. Proper noun variants within the paragraphs: if two spellings that differ by 1–2 characters appear to refer to the same entity (e.g. 「太平興産」vs「大平興産」), and you are highly confident one is wrong based on context or the instruction, include the correction. Do NOT correct solely based on frequency — only include it if context strongly supports it.
+- Do NOT paraphrase, improve expressions, or adjust writing style (e.g. do NOT change 「処理していい」→「処理できる」or「濾した」→「ろ過した」).
+- If not highly confident, omit the entry.
+- "find" and "replace" must differ; never output the same text in both fields.
+- Return {"replaceText":[]} if no clear errors found.
 - Keep JSON minimal.`,
       },
       {
@@ -1573,34 +1650,47 @@ async function buildWordEditPlanChunked(
 ): Promise<{ plan: WordEditPlan; skippedChunks: number }> {
   const { paragraphs } = summary;
 
-  const explicitReplaceText = parseExplicitWordReplacements(instruction);
-  if (explicitReplaceText.length > 0) {
-    console.log(`[buildWordEditPlan] explicit replaceText total=${explicitReplaceText.length}`);
-    return {
-      plan: { replaceText: explicitReplaceText, formatRuns: [], addParagraphs: [], trackChanges: false },
-      skippedChunks: 0,
-    };
-  }
+  // 1. 明示ペアを抽出・フィルタ（sameText / normalizedSame を除去済み）
+  const explicitReplaceText = filterReplaceText(parseExplicitWordReplacements(instruction));
+  console.log(`[buildWordEditPlan] explicit count=${explicitReplaceText.length}`);
 
   const openai = OpenAIInstance();
-  const allReplaceText: Array<{ find: string; replace: string }> = [];
+  const wordModel =
+    process.env.AZURE_OPENAI_WORD_EDIT_DEPLOYMENT_NAME ||
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!;
+  console.log(`[word-edit] using deployment ${wordModel}`);
+
+  // 2. 本文チャンクを LLM でレビュー（explicit があっても必ず走らせる）
+  //    explicit リストにない誤記（例: 太平興産）を拾うために早期 return しない。
+  const llmRaw: Array<{ find: string; replace: string }> = [];
   let skippedChunks = 0;
   for (let i = 0; i < paragraphs.length; i += WORD_EDIT_CHUNK_SIZE) {
     const chunk = paragraphs.slice(i, i + WORD_EDIT_CHUNK_SIZE);
     const { entries, skipped } = await buildWordReplaceTextChunk(openai, chunk, instruction);
-    allReplaceText.push(...entries);
+    llmRaw.push(...entries);
     if (skipped) skippedChunks++;
   }
   const chunkCount = Math.ceil(paragraphs.length / WORD_EDIT_CHUNK_SIZE);
-  console.log(`[buildWordEditPlan] replaceText total=${allReplaceText.length} chunks=${chunkCount} skipped=${skippedChunks}`);
 
+  // 3. explicit を優先してマージ：explicit の find キーと重複する LLM 候補は除外
+  const explicitFinds = new Set(explicitReplaceText.map((e) => e.find));
+  const llmAdditional = filterReplaceText(llmRaw.filter((e) => !explicitFinds.has(e.find)));
+
+  const allReplaceText = [...explicitReplaceText, ...llmAdditional];
+
+  console.log(
+    `[buildWordEditPlan] explicit=${explicitReplaceText.length} llm_additional=${llmAdditional.length}` +
+    ` final_applied=${allReplaceText.length} chunks=${chunkCount} skipped=${skippedChunks}`
+  );
+
+  // 4. フォーマット / 段落追加
   let formatRuns: WordEditPlan["formatRuns"] = [];
   let addParagraphs: WordEditPlan["addParagraphs"] = [];
   const needsFormatOrAdd =
     /(bold|太字|フォント|font|fontSize|color|色|italic|斜体|段落|追加|add)/i.test(instruction);
   if (needsFormatOrAdd) {
     const res2 = await openai.chat.completions.create({
-      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      model: wordModel,
       messages: [
         {
           role: "system",
@@ -1632,6 +1722,7 @@ NEVER add a summary of changes as addParagraphs. Keep JSON minimal.`,
     skippedChunks,
   };
 }
+
 
 async function resolveEditWordScriptPath(): Promise<string> {
   const candidates = [
