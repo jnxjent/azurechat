@@ -1805,8 +1805,11 @@ export const GetDefaultExtensions = async (props: {
         required: ["content"],
       },
       description:
-        "ユーザーが指定したテキストや内容からWordファイル（.docx）を新規作成するツール。\n" +
-        "使用タイミング：ユーザーが「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合。\n" +
+        "ユーザーが会話中で直接提供したテキスト・内容からWordファイル（.docx）を新規作成するツール。\n" +
+        "使用タイミング：ユーザーが会話中で直接テキストを渡して「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合のみ。\n" +
+        "【禁止】SharePoint/SL の文書検索（sl_doc_search）で取得したコンテンツや、既存PDFや既存docxを変換・編集する目的には絶対に使わないこと。\n" +
+        "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
+        "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
         "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
       name: "create_word",
@@ -5006,7 +5009,7 @@ async function executeEditWord(
   args: { fileUrl?: string; instruction: string; trackChanges?: boolean },
   chatThread: ChatThreadModel
 ) {
-  const { fileUrl, instruction, trackChanges } = args ?? {};
+  let { fileUrl, instruction, trackChanges } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
@@ -5018,6 +5021,22 @@ async function executeEditWord(
         "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
     };
   }
+
+  // account name 欠落 Blob URL を補正（LLM が直接 effectiveFileUrl を渡してきた場合への保険）
+  try {
+    const obj = new URL(fileUrl);
+    if (obj.hostname === "blob.core.windows.net") {
+      const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+      if (acc) {
+        obj.hostname = `${acc}.blob.core.windows.net`;
+        fileUrl = obj.toString();
+        console.warn(`[executeEditWord] repaired missing account in fileUrl → ${fileUrl.substring(0, 100)}`);
+      } else {
+        console.error(`[executeEditWord] malformed fileUrl (missing account): ${fileUrl.substring(0, 100)}`);
+        return { error: "WordファイルのURLが不正です（ストレージアカウント名が欠落しています）。" };
+      }
+    }
+  } catch {}
 
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
@@ -5271,7 +5290,9 @@ async function executeRefineExcelPages(
 
   // ptr.fileName からベース名を取り出して出力ファイル名を決定
   // _revN があればインクリメント、なければ _rev1 を付与（_精度向上後 は旧命名なので除去）
-  const baseName = ptr.fileName?.replace(/\.xlsx$/i, "").replace(/(_精度向上後)+$/, "") ?? "output";
+  const rawBaseName = ptr.fileName?.replace(/\.xlsx$/i, "").replace(/(_精度向上後)+$/, "") ?? "output";
+  // 全角スペース等を除去（SAS署名ミスマッチ防止）
+  const baseName = rawBaseName.replace(/[　 ﻿<>:"/\\|?*\x00-\x1f]/g, "_");
   const revMatch = baseName.match(/^(.*?)_rev(\d+)$/);
   const outputFileName = revMatch
     ? `${revMatch[1]}_rev${parseInt(revMatch[2]) + 1}.xlsx`
@@ -5916,7 +5937,26 @@ async function executeEditSpWord(
     }
   }
 
-  const { fileName, sourceUrl, effectiveFileUrl } = chosen;
+  const { fileName, sourceUrl } = chosen;
+  // account name 欠落 Blob URL（例: https://blob.core.windows.net/...）を補正する
+  const effectiveFileUrl = (() => {
+    const raw = chosen.effectiveFileUrl ?? "";
+    try {
+      const obj = new URL(raw);
+      if (obj.hostname === "blob.core.windows.net") {
+        const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+        if (acc) {
+          obj.hostname = `${acc}.blob.core.windows.net`;
+          const fixed = obj.toString();
+          console.warn(`[edit_sp_word] repaired missing account in effectiveFileUrl → ${fixed.substring(0, 100)}`);
+          return fixed;
+        }
+        console.error(`[edit_sp_word] malformed effectiveFileUrl (missing account): ${raw.substring(0, 100)}`);
+      }
+    } catch {}
+    return raw;
+  })();
+
   console.log(`[edit_sp_word] target: ${fileName} sourceUrl=${sourceUrl.substring(0, 100)}`);
 
   // 4. SAS URL を解決する

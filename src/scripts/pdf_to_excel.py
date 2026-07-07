@@ -796,6 +796,7 @@ def _call_vision_for_table(
     page_pngs: list[bytes],
     sheet_name: str,
     existing_data: list[list[str]] | None = None,
+    deployment_override: str | None = None,
 ) -> list[list[str]]:
     """GPT-4V でExcelシートの各ページ画像（複数可）からテーブルを再抽出する。
     existing_data（全行×全列の現在値）を渡すと、構造を固定したまま文字化け・数値誤りのみ修正するモードになる。
@@ -807,7 +808,7 @@ def _call_vision_for_table(
 
     key = os.environ.get("AZURE_OPENAI_VISION_API_KEY", "")
     instance = os.environ.get("AZURE_OPENAI_VISION_API_INSTANCE_NAME", "")
-    deployment = os.environ.get("AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME", "")
+    deployment = deployment_override or os.environ.get("AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME", "")
     api_version = os.environ.get("AZURE_OPENAI_VISION_API_VERSION", "2024-12-01-preview")
 
     if not (key and instance and deployment):
@@ -867,9 +868,8 @@ def _call_vision_for_table(
             "- 説明文は不要。JSONのみ返すこと"
         )
 
-    # existing_data モードは画像テキスト確認が目的なので auto でトークン節約
-    # ゼロ抽出モード（existing_data なし）は high で精度優先
-    img_detail = "auto" if existing_data else "high"
+    # refine モード（existing_data あり）でも high を使用：miniモデルは auto だと精度が落ちる
+    img_detail = "high"
 
     # 各ページを個別の image_url ブロックとして追加
     content: list[dict] = []
@@ -929,6 +929,10 @@ def _refine_pages_with_vision(
     target_sheets: list[str],
 ) -> dict:
     """指定Excelシートを画像化→GPT-4Vで再抽出して置き換える。元PDFは使用しない。"""
+    # 追加編集専用デプロイ（精度重視モデル）が設定されていればそちらを使う
+    refine_deployment = os.environ.get("AZURE_OPENAI_VISION_REFINE_DEPLOYMENT_NAME") or None
+    if refine_deployment:
+        print(f"[pdf_to_excel] refine: using deployment '{refine_deployment}'", file=sys.stderr)
     wb = openpyxl.load_workbook(excel_path)
     refined = 0
     skipped = 0
@@ -954,7 +958,7 @@ def _refine_pages_with_vision(
             skipped += 1
             continue
 
-        rows = _call_vision_for_table(page_pngs, sheet_name, existing_data=existing_data or None)
+        rows = _call_vision_for_table(page_pngs, sheet_name, existing_data=existing_data or None, deployment_override=refine_deployment)
         if not rows:
             print(f"[pdf_to_excel] Vision returned no data for sheet '{sheet_name}', skipping", file=sys.stderr)
             skipped += 1
