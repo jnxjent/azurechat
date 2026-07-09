@@ -71,15 +71,22 @@ def _convert_with_pdf2docx(pdf_path: str, output_path: str) -> dict | None:
             print("[pdf_to_word] pdf2docx produced no output file.", file=sys.stderr)
             return None
 
-        # 簡易的にパラグラフ数・テーブル数を取得
+        # パラグラフ数・テーブル数を確認し、空ならスキャンPDFとみなしてフォールバック
         if HAS_PYTHON_DOCX:
             doc = python_docx.Document(output_path)
+            n_paras = len([p for p in doc.paragraphs if p.text.strip()])
+            n_tables = len(doc.tables)
+            if n_paras == 0 and n_tables == 0:
+                print("[pdf_to_word] pdf2docx produced empty docx; falling back.", file=sys.stderr)
+                return None
             return {
-                "paragraphs": len([p for p in doc.paragraphs if p.text.strip()]),
-                "tables": len(doc.tables),
+                "paragraphs": n_paras,
+                "tables": n_tables,
                 "engine": "pdf2docx",
             }
-        return {"paragraphs": 0, "tables": 0, "engine": "pdf2docx"}
+        # python-docx が使えない場合は中身を検証できないので DI にフォールバック
+        print("[pdf_to_word] python-docx unavailable; cannot verify pdf2docx output, falling back.", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[pdf_to_word] pdf2docx failed: {e}", file=sys.stderr)
         return None

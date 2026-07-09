@@ -749,8 +749,67 @@ function extractLatestPdfOrDocxUrlFromMessages(messages: string[]): string | nul
   return null;
 }
 
+async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{ url: string; fileName: string; savedAt: number } | null> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) return null;
+  try {
+    const buf = await BlobServiceClient.fromConnectionString(
+      `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+    ).getContainerClient("docx")
+      .getBlockBlobClient(`thread-${chatThreadId}-word-pointer.json`)
+      .downloadToBuffer();
+    const { blobName, fileName, savedAt } = JSON.parse(buf.toString()) as {
+      blobName: string; fileName: string; savedAt: number;
+    };
+    if (!blobName) return null;
+    // SASを再発行（docxコンテナのアクセスレベルに依存せず確実にDL可能）
+    const sasRes = await GenerateSasUrl("docx", blobName);
+    if (sasRes.status !== "OK") {
+      console.warn(`[resolveLatestDocxFromPointer] SAS generation failed for ${fileName}`);
+      return null;
+    }
+    console.log(`[resolveLatestDocxFromPointer] found: ${fileName}`);
+    return { url: sasRes.response, fileName, savedAt: savedAt ?? 0 };
+  } catch {
+    return null;
+  }
+}
+
 async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
+    // ポインターと最新アップロードを並行取得して新しい方を使う（Excelと同パターン）
+    const [ptr, docsResponse] = await Promise.all([
+      resolveLatestDocxFromPointer(chatThreadId),
+      FindAllChatDocuments(chatThreadId),
+    ]);
+
+    const latestUploadDoc = docsResponse.status === "OK"
+      ? docsResponse.response
+          .filter((doc) => /\.docx$/i.test(doc.name))
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
+      : null;
+    const latestUploadTime = latestUploadDoc ? new Date(latestUploadDoc.createdAt).getTime() : 0;
+
+    if (ptr?.url) {
+      if (latestUploadTime > (ptr.savedAt ?? 0)) {
+        // 新規アップロードがポインターより新しい → アップロードを優先
+        console.log(`[resolveLatestDocx] newer upload (${latestUploadDoc!.name}) > pointer, using upload`);
+        const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc!.name}`);
+        if (sasRes.status === "OK") return sasRes.response;
+      }
+      console.log(`[resolveLatestDocx] using pointer: ${ptr.url.substring(0, 80)}`);
+      return ptr.url;
+    }
+
+    // ポインターなし: ChatDocuments の最新アップロードを優先（Excelと同パターン）
+    if (latestUploadDoc) {
+      console.log(`[resolveLatestDocx] no pointer, using latest upload: ${latestUploadDoc.name}`);
+      const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc.name}`);
+      if (sasRes.status === "OK") return sasRes.response;
+    }
+
+    // フォールバック: チャット履歴から
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
     if (historyResponse.status !== "OK") return null;
     const messages = historyResponse.response
@@ -1382,7 +1441,7 @@ export const GetDefaultExtensions = async (props: {
           },
           palette: {
             type: "string",
-            enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra"],
+            enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra", "coral_orange"],
             description:
               "【カラーパレット選択】コンテンツの業種・用途・ターゲット感から必ず判断して設定すること。\n" +
               "  navy_orange   = ネイビー×オレンジ → IT・AI・DX・経営・役員・システム・テクノロジー企業（落ち着いたプロ感）\n" +
@@ -1392,8 +1451,11 @@ export const GetDefaultExtensions = async (props: {
               "  teal_coral    = ティール×コーラル → 産廃・廃棄物処理・リサイクル・医療・ヘルス・動的な産業系企業\n" +
               "    ↑廃棄物処理業・環境サービス会社の会社紹介はこれ（会社の動的でモダンな印象）\n" +
               "  charcoal_terra= チャコール×テラコッタ → 建設・土木・インフラ・重工業・プラント・施設管理\n" +
+              "  coral_orange  = 深緑×コーラルオレンジ → 産廃・環境サービス・営業資料（暖色系・フレッシュ感を重視する場合）\n" +
+              "    ↑teal_coralよりも暖色寄りの配色。ユーザーが「コーラルオレンジ」「サンゴオレンジ」と言った場合はこれ\n" +
               "【判断例】\n" +
-              "  産廃会社の会社紹介 → teal_coral（ティール×コーラル）\n" +
+              "  産廃会社の会社紹介（モダン） → teal_coral（ティール×コーラル）\n" +
+              "  産廃・環境会社の営業資料（暖色系希望） → coral_orange（深緑×コーラルオレンジ）\n" +
               "  DX人材採用・インターン募集 → forest_amber（深緑×アンバー）\n" +
               "  AzureChat/AI/DX経営報告 → navy_orange（ネイビー×オレンジ）\n" +
               "  廃棄物処理施設・プラント建設 → charcoal_terra（チャコール×テラコッタ）",
@@ -1410,7 +1472,7 @@ export const GetDefaultExtensions = async (props: {
         "  この場合、まず sl_doc_search や会話コンテキストでPDF内容を把握し、前の会話のスライド構成をベースに各スライドの bullets を肉付けした上で slides パラメータに設定して呼ぶこと。\n" +
         "【提案書モード】ユーザーが「提案書」「営業資料」「お客様向け」「しっかりした資料」と言った場合は proposalMode=true にして、12〜16枚構成で作ること。\n" +
         "【経営向け再構築モード】複数の定期レポートや四半期報告書（例: Q1〜Q4 議事録・活動報告PDF）から経営層・役員向けPPTを作る場合：\n" +
-        "  ① slides パラメータを時系列（Q1→Q4）で組まないこと。以下の9カテゴリで構成すること:\n" +
+        "  ① slides パラメータを時系列（Q1→Q4）で組まないこと。以下の9カテゴリ【全て必須・省略禁止】で構成すること:\n" +
         "    1. 目的・位置づけ（なぜこのツール/施策が必要か）\n" +
         "    2. 現在使える主な機能（ビジネス機能として整理。技術仕様でなく「何ができるか」「何の業務に使えるか」）\n" +
         "    3. 利用状況・KPI・運用実績（アクティブ率・件数・満足度などの数値。四半期をまたぐ場合はトレンドを統合）\n" +
@@ -1419,7 +1481,7 @@ export const GetDefaultExtensions = async (props: {
         "    6. コスト・投資対効果（費用・ROI・削減効果）\n" +
         "    7. 課題・リスク・改善要望\n" +
         "    8. 今後のロードマップ\n" +
-        "    9. 経営判断が必要な論点（意思決定を促す締めスライド）\n" +
+        "    9. 経営判断が必要な論点（意思決定を促す締めスライド） → layoutType='closing' を必ず設定すること\n" +
         "  ② 各カテゴリのbulletsは、全ての参照ドキュメントから関連情報を集約・統合して記述すること。\n" +
         "  ③ スライドタイトルに「Q1」「Q2」「Q3」「Q4」「第1四半期」などの時系列ラベルを含めないこと。\n" +
         "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更・ロゴ追加・画像追加・添付画像挿入はすべて edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
@@ -1428,11 +1490,12 @@ export const GetDefaultExtensions = async (props: {
         "【palette 選択】ユーザーの業種・用途・ターゲット層を読み取り、必ず palette を設定すること。\n" +
         "  IT/AI/DX/経営/役員向け → navy_orange（ネイビー×オレンジ）\n" +
         "  採用・人材募集・インターン・新卒向け → forest_amber（深緑×アンバー、人の成長・緑のイメージ）\n" +
-        "  産廃・廃棄物処理・リサイクル・環境サービス → teal_coral（ティール×コーラル、動的な産業系）\n" +
+        "  産廃・廃棄物処理・リサイクル・環境サービス（モダン） → teal_coral（ティール×コーラル）\n" +
+        "  産廃・環境サービス（暖色系・フレッシュ感希望） → coral_orange（深緑×コーラルオレンジ）\n" +
         "  伝統・製造・老舗 → burgundy_gold（バーガンディ×ゴールド）、建設・土木・インフラ → charcoal_terra（チャコール×テラコッタ）\n" +
         "ユーザーが業種・用途を言及した場合は designInstruction に業種感を含めること。\n" +
         "【重要】会社紹介・提案書の場合、slides の bullets には [会社名] [設立年] 等のプレースホルダーを使わず、知っている限りの具体的な情報を入れること（ツール実行時に自動でWeb検索して補完される）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [ミダック会社紹介.pptx](downloadUrl)）。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_pptx",
     },
   });
@@ -1495,7 +1558,7 @@ export const GetDefaultExtensions = async (props: {
         "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること（blob.core.windows.net のURLを優先）。\n" +
         "検索結果の引用（citation本文中）に含まれるSharePointのリンクは使わないこと。'file_url:' 行から得たBlobURLであれば使ってよい。\n" +
         "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_doc_to_pptx",
     },
   });
@@ -1529,7 +1592,7 @@ export const GetDefaultExtensions = async (props: {
         "例: 「SPの営業資料2024.pdfをPPTにして」「SLにある〇〇をスライドにして」\n" +
         "【重要】会話コンテキストに file_url が既にある場合は convert_doc_to_pptx を使うこと（このツールは不要）。\n" +
         "【禁止】ExcelへのPDF変換は convert_pdf_to_excel を使うこと。WordへのPDF変換は convert_pdf_to_word を使うこと。このツールはPPT/スライド専用。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。\n" +
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。\n" +
         "複数候補がある場合はリストを提示してユーザーに選ばせること。",
       name: "convert_sp_to_pptx",
     },
@@ -1583,12 +1646,12 @@ export const GetDefaultExtensions = async (props: {
         "- 「色を変えて」「緑にして」「バーガンディ基調に」「ティール×コーラルにして」など色変更・色パレット変更\n" +
         "【色変更の実装範囲】色パレット指定（ネイビー×オレンジ等）はパレット定義に基づきテーマカラー・図形塗り・テキスト色を一括変更する。基調色のみ指定した場合はhue-shiftで全体の色味を変更する。スライドマスターXML直接書き換え・外部フォントの埋め込みなどは非対応。実装範囲を超えた説明をしないこと。\n" +
         "「バーガンディ基調」「バーガンディ×ゴールド」は burgundy_gold パレットとして処理される。\n" +
-        "【利用可能な色】基本色：赤・青・緑・紺・紫・オレンジ・黄・ピンク。色パレット（指定すると基調色で全体の色味を変更）：ネイビー×オレンジ（IT/DX）・深緑×アンバー（採用/農業）・バーガンディ×ゴールド（製造/老舗）・ティール×コーラル（産廃/医療）・チャコール×テラコッタ（建設/土木）。「どんな色が使えますか？」「色の種類は？」「どの色味があるの？」などの色一覧照会は、このツールを呼ばずに直接この一覧を回答すること。\n" +
+        "【利用可能な色】基本色：赤・青・緑・紺・紫・オレンジ・黄・ピンク。色パレット（指定すると基調色で全体の色味を変更）：ネイビー×オレンジ（IT/DX）・深緑×アンバー（採用/農業）・バーガンディ×ゴールド（製造/老舗）・ティール×コーラル（産廃/医療）・チャコール×テラコッタ（建設/土木）・深緑×コーラルオレンジ（産廃/環境/暖色系）。「どんな色が使えますか？」「色の種類は？」「どの色味があるの？」などの色一覧照会は、このツールを呼ばずに直接この一覧を回答すること。\n" +
         "- 「フォントを変えて」「もっとポップに」などデザイン変更\n" +
         "- 「〜に変えて」「〜を修正して」などテキスト編集\n" +
         "【fileUrl】「直近のPPT」「このPPT」「最後のファイル」と言われた場合は fileUrl を省略すること（スレッド内の直近PPTXを自動取得）。\n" +
         "【imageUrl】ユーザーが画像をアップロードしている場合（会話コンテキストの file_url: 行に png/jpg/webp のURL）、imageUrl にそのURLを必ず設定すること。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [AzureChat機能紹介_ロゴ追加.pptx](downloadUrl)）。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをそのまま含めたりMarkdownリンクとして再出力することは不要。完了・変更内容を一言で伝えるだけでよい。",
       name: "edit_pptx",
     },
   });
@@ -1618,7 +1681,7 @@ export const GetDefaultExtensions = async (props: {
         "使用タイミング：ユーザーがSP/SL上のPPTXの色・フォント・テキストを変更したい場合。\n" +
         "【即時実行ルール】色変更・再実行要求はユーザーへの確認なしに即このツールを呼ぶこと。「実行してよいですか」などの確認待ち返答は禁止。\n" +
         "例: 「SPにある営業資料をバーガンディ基調にして」「SLの〇〇.pptxのフォントを変えて」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_pptx",
     },
   });
@@ -1653,7 +1716,7 @@ export const GetDefaultExtensions = async (props: {
         "SharePointのSLライブラリにあるExcelファイル（.xlsx/.xls/.xlsm）を自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：ユーザーがSP/SL上のExcelのグラフ作成・セル編集・書式変更などを求める場合。\n" +
         "例: 「SPにある売上データ.xlsxをグラフ化して」「SLの〇〇.xlsxに折れ線グラフを追加して」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_excel",
     },
   });
@@ -1682,7 +1745,7 @@ export const GetDefaultExtensions = async (props: {
         "SharePointのSLライブラリにあるWordファイル（.docx）を自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：ユーザーがSP/SL上のWordファイルのテキスト置換・書式変更を求める場合。\n" +
         "例: 「SPにある議事録のフォントを変えて」「SLの〇〇.docxの社名を置換して」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_word",
     },
   });
@@ -1718,7 +1781,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーが指定したテキストや表データからExcelファイル（.xlsx）を新規作成するツール。\n" +
         "使用タイミング：ユーザーが「Excelにして」「Excelで出力して」「表をExcelにして」「xlsx にして」と言い、かつアップロードファイルがない場合。\n" +
         "既存Excelファイルの編集は edit_excel ツールを使うこと（このツールは新規作成専用）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_excel",
     },
   });
@@ -1768,7 +1831,7 @@ export const GetDefaultExtensions = async (props: {
         "使用タイミング：ExcelファイルへのセルA値変更・テキスト置換・書式変更（太字・色・罫線・枠・border）・整形・見やすくする・グラフ作成/修正（折れ線グラフ・棒グラフ・散布図・円グラフ・チャート・タイトル変更・縦軸/横軸ラベル変更・単位変更・目盛調整）等を求める場合。\n" +
         "重要：グラフ・縦軸・横軸・単位に関する指示は必ずこのツールで処理すること。「画像なので数値が読めない」は誤り — このツールがExcelの元データを直接読み取る。\n" +
         "fileUrl が省略された場合はスレッド内の最新Excelを自動的に使用する。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_excel",
     },
   });
@@ -1811,7 +1874,7 @@ export const GetDefaultExtensions = async (props: {
         "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
         "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_word",
     },
   });
@@ -1852,7 +1915,7 @@ export const GetDefaultExtensions = async (props: {
         "このスレッドのWordファイル（アップロードまたはcreate_wordで作成）を自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：Wordファイルへのテキスト置換・書式変更（太字・色・フォントサイズ）を求める場合。\n" +
         "fileUrl が省略された場合はスレッド内の最新Wordを自動的に使用する。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_word",
     },
   });
@@ -1890,7 +1953,7 @@ export const GetDefaultExtensions = async (props: {
         "- スレッド内アップロードPDFの場合: fileUrl にURLを指定（省略時はスレッド内の最新PDFを自動使用）。\n" +
         "- SharePoint/SL上のPDFの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
         "mode=layout: 見た目・レイアウト再現優先。mode=editable: テキスト・表の編集を優先。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_pdf_to_word",
     },
   });
@@ -1923,7 +1986,7 @@ export const GetDefaultExtensions = async (props: {
         "- SharePoint/SL上のPDF/Wordの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "【禁止】既にExcel変換済みのスレッドで「再変換して」「もう一度変換して」と言われた場合はこのツールを使わないこと。その場合は refine_excel_pages を使うこと。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_pdf_to_excel",
     },
   });
@@ -1960,13 +2023,12 @@ export const GetDefaultExtensions = async (props: {
         "  - 「P2の精度を上げて」「タブ3を修正して」→ targetSheets に該当シート名を指定\n" +
         "  - 「再変換して」「全部やり直して」「もう一度変換して」→ targetSheets を空配列にする（全シート対象）\n" +
         "【禁止】「再変換して」はPDFからの再変換ではない。convert_pdf_to_excel を呼び直してはいけない。\n" +
-        "【重要】1回の呼び出しで1シートを処理する。シートを処理するたびに、処理したシート名とその時点の downloadUrl を\n" +
-        "Markdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示してから、次のシートの処理に進むこと。\n" +
+        "【重要】1回の呼び出しで1シートを処理する。シートを処理するたびに、処理したシート名を一言伝えてから、次のシートの処理に進むこと。\n" +
         "ツールの返り値に remainingSheets が含まれていてかつ空でない場合は、直ちに targetSheets=remainingSheets で再度このツールを呼び出すこと。\n" +
         "targetSheets: 精度を上げるシート名の配列。空配列または省略で全シートを対象にする。\n" +
         "ユーザーが「タブN」と言った場合は以下のシート名一覧のN番目を指定すること。" +
         sheetNamesContext + "\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "refine_excel_pages",
     },
   });
@@ -3129,8 +3191,9 @@ async function restructureSlidesForExecutive(
 複数の四半期レポートや会議録をマージしたスライドJSONと、各PDFの中間要約を受け取り、経営層向けの9カテゴリ構成に再整理してください。${summaryBlock}
 
 再整理ルール:
-1. 以下の9カテゴリ軸でスライドを構成すること:
+1. 以下の9カテゴリ軸でスライドを構成すること（全カテゴリ必須・省略禁止）:
    目的・位置づけ → 主な機能 → 利用状況・KPI → 拡張・連携状況 → セキュリティ・ガバナンス → コスト・投資対効果 → 課題・リスク → ロードマップ → 経営判断が必要な論点
+   ※「経営判断が必要な論点」スライドは必ず最後に含め、layoutType を "closing" に設定すること
 2. 各PDFの中間要約を「事実プール」として扱い、四半期ごとの時系列構造は崩す
 3. 固有名詞・数値・四半期由来の根拠（例: Q1実績◯件、Q3計画）は削除せずカテゴリのbulletsに組み込む
 4. bullets: 各bullet 45〜90文字、1カテゴリあたり3〜5項目（数値・固有名詞は短縮しない）
@@ -3171,6 +3234,17 @@ ${JSON.stringify(mergedSlides)}
     if (!hasStructure) {
       console.warn("[restructureExec] structure broken, using original");
       return mergedSlides;
+    }
+
+    // 「経営判断が必要な論点」スライドに closing を強制補正（LLM が bullets で返しても上書き）
+    const closingTitleRe = /経営判断|意思決定.*論点|論点.*意思決定/;
+    const lastIdx = restructured.length - 1;
+    for (let i = lastIdx; i >= Math.max(0, lastIdx - 1); i--) {
+      if (closingTitleRe.test(restructured[i].title ?? "")) {
+        restructured[i] = { ...restructured[i], layoutType: "closing" };
+        console.log(`[restructureExec] forced closing layout on slide ${i + 1}: ${restructured[i].title}`);
+        break;
+      }
     }
 
     console.log(`[restructureExec] restructured ${mergedSlides.length} → ${restructured.length} slides`);
@@ -3738,20 +3812,30 @@ function nextRevisionBaseName(inputBaseName: string): string {
  */
 function extractPageMentions(instruction: string): Map<number, number> {
   const result = new Map<number, number>();
-  // Page/ページ: 後続のカンマ区切り数字列に対応 (例: Page2,4,7)
+  // マッチ直後の先頭が「助詞（は/が/を/も）+ 否定・除外語」のパターンのみスキップ。
+  // 「以外」はここに含めない：「P5,6,7,8以外は変えないで」でP5-P8が誤スキップされるため。
+  const NEGATION_RE = /^[はがをも]\s*(?:しない|除外|対象外|除く|除いて|含まない|変えない|やらない|変更しない|変更済み|前回|すでに)/;
+  const isNegated = (src: string, matchEnd: number): boolean =>
+    NEGATION_RE.test(src.slice(matchEnd, matchEnd + 30));
+
+  // Page/ページ: 後続のカンマ区切り数字列に対応 (例: Page2,4,7 / ページ5,6,7,8)
   const pageRe = /(?:Page|ページ)\s*(\d+(?:\s*[,，、]\s*\d+)*)/gi;
   let m: RegExpExecArray | null;
   while ((m = pageRe.exec(instruction)) !== null) {
+    if (isNegated(instruction, m.index + m[0].length)) continue;
     for (const part of m[1].split(/[,，、]/)) {
       const n = parseInt(part.trim(), 10);
       if (!isNaN(n) && n >= 1) result.set(n, n - 1);
     }
   }
-  // P単体 (例: P5) — "Page" や "PPTX" と区別するため前後をチェック
-  const pRe = /(?<![A-Za-z])P\s*(\d+)(?![A-Za-z])/g;
+  // P単体またはP+カンマリスト (例: P5 / P5,6,7,8) — "Page" や "PPTX" と区別するため前後をチェック
+  const pRe = /(?<![A-Za-z])P\s*(\d+(?:\s*[,，、]\s*\d+)*)(?![A-Za-z])/g;
   while ((m = pRe.exec(instruction)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (!isNaN(n) && n >= 1) result.set(n, n - 1);
+    if (isNegated(instruction, m.index + m[0].length)) continue;
+    for (const part of m[1].split(/[,，、]/)) {
+      const n = parseInt(part.trim(), 10);
+      if (!isNaN(n) && n >= 1) result.set(n, n - 1);
+    }
   }
   return result;
 }
@@ -4435,22 +4519,30 @@ async function executeEditPptx(
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
   // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
   const hasLayoutIntent =
-    /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|デザイン.{0,4}(変え|変更|替え|を変)|レイアウト.{0,4}(変え|変更|変換|をカード)|項目数|箇条書き|bullet)/i.test(instruction);
+    /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|レイアウト.{0,6}(をカード|カード)|項目数|箇条書き|bullet)/i.test(instruction);
   const hasColorIntent =
     /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
+  // 「色は不変で」「既存配色のまま」など色を変えないと明示された場合のみ true
+  // 「既存配色」「維持」単独ではマッチさせない（「既存配色の雰囲気を維持しつつ赤系に」で誤判定されるため）
+  const preserveColorIntent =
+    /(?:色|色味|配色|カラー).{0,8}(?:不変|そのまま|変えない|変更しない|いじらない|触らない)/.test(instruction) ||
+    /(?:既存配色|現在の配色|今の配色).{0,6}(?:のまま|そのまま)/.test(instruction);
   // 数字参照（"3で"等）も色変更として扱うため先に解決しておく
   const preResolved = resolvePptxPaletteInstruction(instruction);
-  const isColorOnlyEdit = (!!preResolved || hasColorIntent) && !hasLayoutIntent;
+  const isColorOnlyEdit = !preserveColorIntent && (!!preResolved || hasColorIntent) && !hasLayoutIntent;
   const isLayoutConversionRequest = !isColorOnlyEdit && hasLayoutIntent;
   // 色検出は resolvePptxPaletteInstruction (@/features/pptx/palette) に統合済み
   if (isLayoutConversionRequest) {
-    // 色が未指定の場合は変換前にユーザーへ確認を求める（LLM呼び出しも省略）
-    const layoutResolved = preResolved;
-    if (!layoutResolved) {
+    console.log(`[edit_pptx:layout] hasLayoutIntent=${hasLayoutIntent} hasColorIntent=${hasColorIntent} preserveColorIntent=${preserveColorIntent} preResolved=${preResolved ? JSON.stringify(preResolved) : "null"}`);
+    // 色変更の意図はあるが具体的な色が解決できない場合のみ確認を返す
+    // 「色は不変で」等の配色維持指示がある場合は確認しない
+    // （「色も変えて」「いい感じの色に」等 → hasColorIntent=true だが preResolved=null）
+    if (!preserveColorIntent && hasColorIntent && !preResolved) {
       return {
-        message: `カード型に変更するには色の指定が必要です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「スライド3をカード型にして、ティール×コーラルで」のようにまとめてご指定ください。`,
+        message: `カード型に変更します。色も変更する場合は色を指定してください。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「P3をカード型にして、ティール×コーラルで」のようにまとめて指定するか、色指定なしで「P3をカード型にして」とお送りください（既存配色を維持してカード型に変換します）。`,
       };
     }
+    // 色指定がある場合は同時に色変更も実行、ない場合は既存配色を維持してカード型変換のみ実行
     try {
       const t0 = Date.now();
       const extractRes = await fetch(`${baseUrl}/api/edit-pptx`, {
@@ -4464,6 +4556,13 @@ async function executeEditPptx(
         throw new Error(extractJson.error ?? "slide extraction returned empty");
       }
 
+      // 診断ログ: LLMが送ってきた instruction 全文と pageMentions を出力（再発時の原因特定用）
+      const dbgPages = extractPageMentions(instruction);
+      console.log(`[layout_regen] instruction=${instruction.slice(0, 150)}`);
+      if (dbgPages.size > 0) {
+        console.log(`[layout_regen] pageMentions(pages)=${JSON.stringify(Array.from(dbgPages.keys()))}`);
+      }
+
       // 対象スライドを解決（ページ番号 → タイトル/本文マッチの優先順）
       const layoutTargetIndices = resolveTargetSlideIndices(instruction, extractJson.slides);
       if (!layoutTargetIndices || layoutTargetIndices.size === 0) {
@@ -4471,6 +4570,18 @@ async function executeEditPptx(
           error: "対象スライドを1つに絞れませんでした（キーワードが複数のスライドに同じ割合で一致しています）。スライドタイトル（例: 「AzureChatのコア機能」のスライドをカード型に）またはページ番号（例: Page3をカード型に）で一意に指定してください。",
         };
       }
+
+      // P1（表紙スライド）ガード: slideIndex=0 はカード型変換するとレイアウトが崩れるため常に除外
+      // （明示的に "P1" / "表紙" と指定されても変換不可。専用レイアウトが必要なため）
+      if (layoutTargetIndices.has(0)) {
+        layoutTargetIndices.delete(0);
+        if (layoutTargetIndices.size === 0) {
+          return {
+            error: "表紙スライド（P1）はカード型に変換できません。カード型に変更したいスライドのページ番号を指定してください（例：P3をカード型に変えて）。",
+          };
+        }
+      }
+
       console.log(`[layout_regen] targetSlideIndices: [${Array.from(layoutTargetIndices).join(",")}]`);
 
       const slides = await buildRegenerationSlidesForLayoutChange(extractJson.slides, instruction, layoutTargetIndices);
@@ -4494,7 +4605,6 @@ async function executeEditPptx(
       if (slideEdits.length === 0) {
         throw new Error("card conversion plan is empty");
       }
-      // layoutResolved は try ブロック外で確定済み（null なら早期リターン済み）
       const directEditRes = await fetch(`${baseUrl}/api/edit-pptx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4503,11 +4613,14 @@ async function executeEditPptx(
           action: "apply_pptx_plan",
           plan: {
             slideEdits,
-            deckEdits: {
-              accentColor: layoutResolved.accentColor,
-              ...(layoutResolved.paletteKey ? { paletteKey: layoutResolved.paletteKey, palette: layoutResolved.palette } : {}),
-              preserveTextColors: false,
-            },
+            // 色指定があり、かつ色維持指示がない場合のみ deckEdits を付与
+            ...(!preserveColorIntent && preResolved ? {
+              deckEdits: {
+                accentColor: preResolved.accentColor,
+                ...(preResolved.paletteKey ? { paletteKey: preResolved.paletteKey, palette: preResolved.palette } : {}),
+                preserveTextColors: false,
+              },
+            } : {}),
           },
           threadId: chatThread.id,
           outputBaseName: directOutputName,
@@ -4521,12 +4634,15 @@ async function executeEditPptx(
       const directEditJson = await directEditRes.json();
       if (!directEditJson?.downloadUrl) throw new Error("PowerPoint layout edit did not return a download URL");
       const directDisplayName = `${directOutputName}.pptx`;
-      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} paletteKey=${layoutResolved.paletteKey ?? "none"} total=${Date.now() - t0}ms`);
+      const shouldApplyColor = !preserveColorIntent && !!preResolved;
+      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} paletteKey=${preResolved?.paletteKey ?? "none"} shouldApplyColor=${shouldApplyColor} total=${Date.now() - t0}ms`);
       return {
         downloadUrl: directEditJson.downloadUrl,
         fileName: directEditJson.fileName ?? directDisplayName,
         displayName: directDisplayName,
-        message: "指定スライドをカード型に変更し、デッキ全体の色も変更しました。",
+        message: shouldApplyColor
+          ? "指定スライドをカード型に変更し、デッキ全体の色も変更しました。"
+          : "指定スライドをカード型に変更しました。",
       };
     } catch (e: any) {
       console.error("[edit_pptx] layout direct edit failed:", e);
@@ -4534,7 +4650,7 @@ async function executeEditPptx(
     }
   }
 
-  // ── 全パターン試作: 全5パレットを同一PPTXに適用して番号付きリストで返す ────────
+  // ── 全パターン試作: 全6パレットを同一PPTXに適用して番号付きリストで返す ────────
   const isAllPatternsRequest = /(全パターン|全色|全パレット|すべてのパターン|全種類)/.test(instruction);
   if (isAllPatternsRequest) {
     const baseName = cleanBaseName || "PPT";
@@ -4565,12 +4681,13 @@ async function executeEditPptx(
     if (results.length === 0) return { error: "全パターン生成に失敗しました。" };
     const lines = results.map((r, i) => {
       const meta = PPTX_NAMED_PALETTES[r.key];
-      return `${i + 1}. **${r.labelJa}**（${meta.mood}・${meta.recommendedFor}向け）— [ダウンロード](${r.downloadUrl})`;
+      return `${i + 1}. **${r.labelJa}**（${meta.mood}・${meta.recommendedFor}向け）`;
     }).join("\n");
     return {
       downloadUrl: results[0].downloadUrl,
       fileName: results[0].fileName,
       displayName: results[0].fileName,
+      downloads: results.map((r) => ({ url: r.downloadUrl, label: r.labelJa, fileName: r.fileName })),
       message: `全${results.length}パターンを生成しました。\n\n${lines}`,
     };
   }
@@ -4581,7 +4698,7 @@ async function executeEditPptx(
     const colorResolved = preResolved;
     if (!colorResolved) {
       return {
-        message: `現在サポートされている色変更は以下です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「ティール×コーラルにして」「バーガンディ×ゴールドにして」「赤にして」\n\n番号で指定も可能です（例: 「3でやって」→ バーガンディ×ゴールド）`,
+        message: `どの配色に変更しますか？\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「ティール×コーラルにして」「バーガンディ×ゴールドにして」「赤にして」\n\n番号で指定も可能です（例: 「3でやって」→ バーガンディ×ゴールド）`,
       };
     }
     const colorOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "色変更";

@@ -1,6 +1,6 @@
 import { Markdown } from "@/features/ui/markdown/markdown";
 import { normalizePhoneForTel, splitTextWithPhones } from "@/lib/linkifyPhone";
-import { FunctionSquare } from "lucide-react";
+import { Download, FunctionSquare } from "lucide-react";
 import React, { useEffect, useRef } from "react";
 import {
   Accordion,
@@ -333,8 +333,53 @@ const MessageContent: React.FC<MessageContentProps> = ({ message }) => {
   }
 
   if (message.role === "tool" || message.role === "function") {
+    const toolJson = toJson(message.content);
+    const toolObj = typeof toolJson === "object" && toolJson !== null
+      ? (toolJson as Record<string, unknown>) : null;
+    const toolDownloadUrl = toolObj?.downloadUrl as string | undefined;
+    const toolDisplayName = (toolObj?.displayName ?? toolObj?.fileName) as string | undefined;
+    const isBlobUrl =
+      typeof toolDownloadUrl === "string" &&
+      /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(toolDownloadUrl);
+
+    // 複数ダウンロード（全パターン生成等）: downloads 配列が優先
+    type ToolDownloadItem = { url: string; label?: string; fileName?: string };
+    const rawDownloads = toolObj?.downloads;
+    const validDownloads: ToolDownloadItem[] = Array.isArray(rawDownloads)
+      ? (rawDownloads as ToolDownloadItem[]).filter(
+          (d) => typeof d?.url === "string" &&
+                 /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(d.url)
+        )
+      : [];
+
     return (
-      <div className="py-3">
+      <div className="py-3 space-y-2">
+        {validDownloads.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {validDownloads.map((d, idx) => (
+              <a
+                key={idx}
+                href={d.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+              >
+                <Download size={14} strokeWidth={2} />
+                {d.label ?? d.fileName ?? "ダウンロード"}
+              </a>
+            ))}
+          </div>
+        ) : isBlobUrl && toolDownloadUrl ? (
+          <a
+            href={toolDownloadUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+          >
+            <Download size={14} strokeWidth={2} />
+            {toolDisplayName ?? "ダウンロード"}
+          </a>
+        ) : null}
         <Accordion
           type="multiple"
           className="bg-background rounded-md border p-2"

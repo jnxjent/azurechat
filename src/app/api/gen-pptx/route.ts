@@ -1510,16 +1510,25 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
   await containerClient.createIfNotExists({ access: "blob" });
   // Blob key は ASCII のみ（URLを短く保つ）。DL時のファイル名は Content-Disposition で指定
   const blockBlobClient = containerClient.getBlockBlobClient(blobKey);
-  const encodedFileName = encodeURIComponent(displayFileName ?? blobKey);
   await blockBlobClient.uploadData(buffer, {
     blobHTTPHeaders: {
       blobContentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      blobContentDisposition: `attachment; filename*=UTF-8''${encodedFileName}`,
+      blobContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName ?? blobKey)}`,
     },
   });
   // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
   // pptx コンテナは access:blob 公開済みなので直接URLを返す（blobKeyをURL-encode）
-  return `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
+  const blobUrl = `https://${acc}.blob.core.windows.net/${containerName}/${encodeURIComponent(blobKey)}`;
+  const expectedHost = `${acc}.blob.core.windows.net`;
+  try {
+    const parsed = new URL(blobUrl);
+    if (parsed.hostname !== expectedHost) {
+      console.warn(`[gen-pptx:uploadToBlob] hostname mismatch: expected=${expectedHost} got=${parsed.hostname}, fixing`);
+      parsed.hostname = expectedHost;
+      return parsed.toString();
+    }
+  } catch {}
+  return blobUrl;
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
@@ -4613,12 +4622,11 @@ export async function POST(req: NextRequest) {
     }
     // ─────────────────────────────────────────────────────────────────────
 
-    const shortId = uniqueId().slice(0, 8);
     const safeBase = fileBaseName
       ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
       : (threadId ?? uniqueId());
     const displayFileName = `${safeBase}.pptx`;          // 日本語名：リンク表示・DL名
-    const blobKey = `${safeBase}_${shortId}.pptx`;        // 表示名+短ID：URLからファイル名が正しく取れる
+    const blobKey = `${safeBase}_${uniqueId().slice(0, 8)}.pptx`; // 表示名+短IDでURLからファイル名が正しく取れる
     const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
     if (threadId?.trim()) {
       await savePptxPointer(threadId, blobKey, displayFileName);

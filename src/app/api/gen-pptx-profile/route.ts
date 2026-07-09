@@ -32,6 +32,8 @@ const PYTHON_PALETTES = {
   // 建設・インフラ・重厚産業 系（落ち着いたアース系）
   charcoal_terra: { label: "チャコール×テラ（建設・土木・インフラ・重工）",
     keywords: ["建設","土木","インフラ","アース","重機","工事","施設","建物","鉄道","電力","ガス","プラント"] },
+  coral_orange:   { label: "深緑×コーラルオレンジ（産廃・環境サービス・営業資料）",
+    keywords: ["コーラルオレンジ","サンゴオレンジ","サンゴ色オレンジ","珊瑚橙","深緑オレンジ","暖色産廃","coral_orange"] },
 } as const;
 
 type PythonPaletteName = keyof typeof PYTHON_PALETTES;
@@ -86,8 +88,18 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
   });
   // SAS URLはMarkdown/LLMで sig= が破壊される (Signature size is invalid) ため
   // pptx コンテナは access:blob 公開済みなので直接URLを返す
-  // blobKeyをURL-encodeして返す（日本語ファイル名対応）
-  return `https://${acc}.blob.core.windows.net/pptx/${encodeURIComponent(blobKey)}`;
+  // blobKey は「日本語名_短ID.pptx」形式。URLからブラウザがファイル名を正しく取得できる。
+  const blobUrl = `https://${acc}.blob.core.windows.net/pptx/${encodeURIComponent(blobKey)}`;
+  const expectedHost = `${acc}.blob.core.windows.net`;
+  try {
+    const parsed = new URL(blobUrl);
+    if (parsed.hostname !== expectedHost) {
+      console.warn(`[gen-pptx-profile:uploadToBlob] hostname mismatch: expected=${expectedHost} got=${parsed.hostname}, fixing`);
+      parsed.hostname = expectedHost;
+      return parsed.toString();
+    }
+  } catch {}
+  return blobUrl;
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
