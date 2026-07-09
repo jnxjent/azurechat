@@ -6,6 +6,7 @@ import { ChatMessageArea } from "@/features/ui/chat/chat-message-area/chat-messa
 import ChatMessageContainer from "@/features/ui/chat/chat-message-area/chat-message-container";
 import ChatMessageContentArea from "@/features/ui/chat/chat-message-area/chat-message-content";
 import { useChatScrollAnchor } from "@/features/ui/chat/chat-message-area/use-chat-scroll-anchor";
+import { Download } from "lucide-react";
 import { useSession } from "next-auth/react";
 import { FC, useEffect, useRef } from "react";
 import { ExtensionModel } from "../extensions-page/extension-services/models";
@@ -65,7 +66,27 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
       />
       <ChatMessageContainer ref={current}>
         <ChatMessageContentArea>
-          {messages.map((message) => {
+          {messages.map((message, index) => {
+            // アシスタントメッセージの直前にある tool メッセージの downloadUrl を取得
+            // → 「Page 8をカード型デザインにしました。」の下にもダウンロードボタンを表示
+            let assistantDownloadUrl: string | null = null;
+            let assistantDownloadName: string | null = null;
+            if (message.role === "assistant" && index > 0) {
+              const prev = messages[index - 1];
+              if (prev.role === "tool" || prev.role === "function") {
+                try {
+                  const obj = JSON.parse(prev.content);
+                  if (
+                    typeof obj?.downloadUrl === "string" &&
+                    /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(obj.downloadUrl)
+                  ) {
+                    assistantDownloadUrl = obj.downloadUrl;
+                    assistantDownloadName = obj.displayName ?? obj.fileName ?? null;
+                  }
+                } catch {}
+              }
+            }
+
             return (
               <ChatMessageArea
                 key={message.id}
@@ -81,6 +102,17 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
                 }
               >
                 <MessageContent message={message} />
+                {assistantDownloadUrl && (
+                  <a
+                    href={assistantDownloadUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-2 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+                  >
+                    <Download size={14} strokeWidth={2} />
+                    {assistantDownloadName ?? "ダウンロード"}
+                  </a>
+                )}
               </ChatMessageArea>
             );
           })}

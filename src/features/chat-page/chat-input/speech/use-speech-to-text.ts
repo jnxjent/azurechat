@@ -61,17 +61,21 @@ class SpeechToText {
     speechRecognizer = recognizer;
     isStarting = false;
 
+    // 息継ぎ区切りの「。」を「、」に変換（会話終了時に stopRecognition で句点に戻す）
+    const toComma = (t: string) => t.replace(/。$/, "、");
+
     recognizer.recognizing = (s, e) => {
       if (currentSessionId !== mySession || !e.result.text) return;
+      const interim = toComma(e.result.text);
       chatStore.updateInput(
-        confirmedText ? confirmedText + "\n" + e.result.text : e.result.text
+        confirmedText ? confirmedText + "\n" + interim : interim
       );
     };
 
     recognizer.recognized = (s, e) => {
       if (currentSessionId !== mySession) return;
       if (e.result.text) {
-        confirmedText += (confirmedText ? "\n" : "") + e.result.text;
+        confirmedText += (confirmedText ? "\n" : "") + toComma(e.result.text);
         chatStore.updateInput(confirmedText);
       }
     };
@@ -105,6 +109,11 @@ class SpeechToText {
         isStopping = false;
         r.close();
         return;
+      }
+      // 会話終了時: 末尾の読点を句点に変換
+      const finalText = confirmedText.replace(/、$/, "。");
+      if (finalText !== confirmedText) {
+        chatStore.updateInput(finalText);
       }
       speechRecognizer = undefined;
       confirmedText = "";
