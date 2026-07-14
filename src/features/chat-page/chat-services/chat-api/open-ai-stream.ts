@@ -65,6 +65,9 @@ export const OpenAIStream = (props: {
       };
 
       let lastMessage = "";
+      // functionCallResult をまとめて収集し finalContent で DB 保存する
+      // （revalidate 後の props.messages でも tool メッセージが残るようにするため）
+      const pendingToolResults: string[] = [];
 
       // 🔹 ツール呼び出し（GPT-5 runTools → functionCall にマッピング）
       runner
@@ -97,6 +100,9 @@ export const OpenAIStream = (props: {
               typeof fnResult === "string"
                 ? fnResult
                 : JSON.stringify(fnResult);
+
+            // SSE 送信と同時に DB 保存用に収集（finalContent で保存）
+            pendingToolResults.push(payload);
 
             const response: AzureChatCompletion = {
               type: "functionCallResult",
@@ -151,6 +157,17 @@ export const OpenAIStream = (props: {
           const repairedContent = repairBrokenMarkdownUrls(content);
           if (repairedContent !== content) {
             console.warn("[open-ai-stream] repaired broken markdown URL in finalContent");
+          }
+
+          // tool results を assistant より先に保存することで
+          // revalidate 後の props.messages でも messages[index-1] が tool になる
+          for (const result of pendingToolResults) {
+            await CreateChatMessage({
+              name: "tool",
+              content: result,
+              role: "tool",
+              chatThreadId: chatThread.id,
+            });
           }
 
           await CreateChatMessage({

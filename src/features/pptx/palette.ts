@@ -21,7 +21,7 @@ export const PPTX_NAMED_PALETTES: Record<string, NamedPaletteBase> = {
     labelJa:"ティール×コーラル",    shortDesc:"青緑×珊瑚色", mood:"清潔・温かい・誠実", recommendedFor:"医療・環境・産廃" },
   charcoal_terra: { main:"333333", accent:"C15F3C", accent_light:"F3E3DA", main_light:"ECECEA", text_muted:"6E6E6E",
     labelJa:"チャコール×テラコッタ", shortDesc:"炭色×煉瓦色", mood:"重厚・実直・安定", recommendedFor:"建設・土木・インフラ" },
-  coral_orange:   { main:"1B5E3B", accent:"E07038", accent_light:"FCEADE", main_light:"E1EDE6", text_muted:"5B6E62",
+  coral_orange:   { main:"183F34", accent:"E07038", accent_light:"FCEADE", main_light:"E1EDE6", text_muted:"5B6E62",
     labelJa:"深緑×コーラルオレンジ", shortDesc:"深緑×珊瑚橙", mood:"活力・誠実・フレッシュ", recommendedFor:"産廃・環境サービス・営業資料（暖色系）" },
 };
 
@@ -120,13 +120,19 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
   }
 
   // 数字参照: "1で"/"2で"... → palette by index (色名未検出時のみ)
-  // 候補を個別評価し、ページ番号文脈（P3で/スライド3で/ページ3で等）のみ除外
+  // 候補を個別評価し、ページ番号文脈・箇条書き/項目数文脈は除外
   let paletteNumMatch: RegExpMatchArray | null = null;
   const paletteNumberRe = /([1-6１-６])番?[でに]/g;
   let m: RegExpExecArray | null;
   while ((m = paletteNumberRe.exec(s)) !== null) {
-    const before = s.slice(Math.max(0, m.index - 10), m.index);
+    const before = s.slice(Math.max(0, m.index - 12), m.index);
+    const after = s.slice(m.index + m[0].length, m.index + m[0].length + 8);
+    // ページ・スライド番号文脈を除外
     if (/[Pp](?:age)?\s*$/.test(before) || /スライド\s*$/.test(before) || /ページ\s*$/.test(before)) continue;
+    // 箇条書き・項目数の数量指定文脈を除外（「項目数を4に」「箇条書きを4に」等）
+    if (/(項目数?|箇条書き|bullet|ブレット)\s*(?:を|は|が|の)?\s*$/.test(before)) continue;
+    // 数字の直後が数量単位・増減動詞の場合も除外（「4つに」→after="つ"、「4に増やし」→after="増やし"）
+    if (/^(?:つ|個|項目|bullet|ブレット|増やし?|追加|足し?)/.test(after)) continue;
     paletteNumMatch = m;
     break;
   }

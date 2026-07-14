@@ -66,6 +66,13 @@ type EditPlan = {
         iconKey?: string;
       }>;
     };
+    repeatCopyShapeBlock?: {
+      headingShapeName: string;
+      descShapeName: string;
+      groupShapeNames?: string[];
+      newItems: Array<{ headingText: string; descText: string }>;
+      targetItemCount?: number;
+    };
   }>;
   imageInserts?: ImageInsert[];
 };
@@ -532,6 +539,9 @@ async function savePptxPointer(threadId: string, blobName: string, fileName: str
     { blobHTTPHeaders: { blobContentType: "application/json" } }
   );
 }
+
+import { loadDeckSpecForUrl } from "@/lib/deck-spec-storage";
+import type { DeckSpec } from "@/types/deck-spec";
 
 // Word ポインター保存（次回 edit_word 呼び出しで修正済みファイルを参照できるよう）
 // blobName を保存し読み取り時にSAS再発行 → docxコンテナのアクセスレベルに依存しない
@@ -1906,7 +1916,12 @@ async function runPythonEditWord(
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const blobKey = `${threadId || uniqueId()}_edited_${uniqueId()}.docx`;
     const displayName = originalFileName
-      ? `${originalFileName.replace(/\.docx$/i, "")}_rev1.docx`
+      ? (() => {
+          const base = originalFileName.replace(/\.docx$/i, "");
+          const m = base.match(/^(.+)_rev(\d+)$/);
+          if (m) return `${m[1]}_rev${parseInt(m[2], 10) + 1}.docx`;
+          return `${base}_rev1.docx`;
+        })()
       : blobKey;
     const downloadUrl = await uploadWordToBlob(outputBuffer, blobKey, displayName);
 
@@ -2122,6 +2137,7 @@ async function runPythonEdit(
     return {
       downloadUrl,
       fileName,
+      blobKey,
       outputBuffer,
       changedSlides: Number(pythonResult.changedSlides ?? 0),
       changedSlideIndices: Array.isArray(pythonResult.changedSlideIndices)
@@ -2144,6 +2160,9 @@ async function runPythonEdit(
         : {}),
       ...(Array.isArray(pythonResult.layoutWarnings) && pythonResult.layoutWarnings.length > 0
         ? { layoutWarnings: pythonResult.layoutWarnings as string[] }
+        : {}),
+      ...(pythonResult.itemCountResults && typeof pythonResult.itemCountResults === "object"
+        ? { itemCountResults: pythonResult.itemCountResults as Record<string, { added: number; required_add: number; final_count: number | null; target_count: number | null; success: boolean }> }
         : {}),
     };
   } finally {
@@ -2196,7 +2215,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -2210,6 +2229,9 @@ export async function POST(req: NextRequest) {
       targetSheets?: string[];
       outputFileName?: string;
       skipPptxPointer?: boolean;
+      /** 項目数SET検証モード: Python結果を全件検証しポインターを手動保存する */
+      targetItemCount?: number;
+      originalFileName?: string;
     };
     const isInternalPptxBatch = req.headers.get("x-azurechat-internal-pptx-batch") === "1";
 
@@ -2316,7 +2338,47 @@ export async function POST(req: NextRequest) {
             const validConvertToCards = validCards.length > 0
               ? { cards: validCards }
               : undefined;
-            const hasValid = validReplace.length > 0 || validBullets.length > 0 || !!validCopyBlock || !!validConvertToCards;
+            const rawCopyLayoutRef = (se as any).copySlideLayoutFromReference;
+            const validCopyLayoutRef =
+              rawCopyLayoutRef &&
+              typeof rawCopyLayoutRef.referenceSlideIndex === "number" &&
+              rawCopyLayoutRef.referenceSlideIndex >= 0
+                ? {
+                    referenceSlideIndex: rawCopyLayoutRef.referenceSlideIndex,
+                    preserveTargetText: rawCopyLayoutRef.preserveTargetText !== false,
+                  }
+                : undefined;
+            const rawRepeatCopyBlock = (se as any).repeatCopyShapeBlock;
+            const validRepeatCopyBlock = (() => {
+              if (!rawRepeatCopyBlock) return undefined;
+              const rHeading = String(rawRepeatCopyBlock.headingShapeName ?? "").trim();
+              const rDesc    = String(rawRepeatCopyBlock.descShapeName ?? "").trim();
+              if (!rHeading || !rDesc) return undefined;
+              const rItems = Array.isArray(rawRepeatCopyBlock.newItems)
+                ? rawRepeatCopyBlock.newItems
+                    .map((item: any) => ({
+                      headingText: String(item?.headingText ?? "").trim().slice(0, 80),
+                      descText:    String(item?.descText    ?? "").trim().slice(0, 120),
+                    }))
+                    .filter((item: any) => item.headingText || item.descText)
+                : [];
+              if (rItems.length === 0) return undefined;
+              const rRawGroup = rawRepeatCopyBlock.groupShapeNames;
+              const rGroupNames = Array.isArray(rRawGroup) && rRawGroup.length >= 2
+                ? (rRawGroup as unknown[]).map((n) => String(n).trim()).filter(Boolean)
+                : undefined;
+              const rTargetCount = typeof rawRepeatCopyBlock.targetItemCount === "number" && rawRepeatCopyBlock.targetItemCount > 0
+                ? rawRepeatCopyBlock.targetItemCount
+                : undefined;
+              return {
+                headingShapeName: rHeading,
+                descShapeName: rDesc,
+                newItems: rItems,
+                ...(rGroupNames ? { groupShapeNames: rGroupNames } : {}),
+                ...(rTargetCount !== undefined ? { targetItemCount: rTargetCount } : {}),
+              };
+            })();
+            const hasValid = validReplace.length > 0 || validBullets.length > 0 || !!validCopyBlock || !!validConvertToCards || !!validCopyLayoutRef || !!validRepeatCopyBlock;
             if (!hasValid) return null;
             return {
               slideIndex: se.slideIndex,
@@ -2324,6 +2386,8 @@ export async function POST(req: NextRequest) {
               ...(validBullets.length > 0 ? { addBullets: validBullets } : {}),
               ...(validCopyBlock ? { copyShapeBlock: validCopyBlock } : {}),
               ...(validConvertToCards ? { convertToCards: validConvertToCards } : {}),
+              ...(validCopyLayoutRef ? { copySlideLayoutFromReference: validCopyLayoutRef } : {}),
+              ...(validRepeatCopyBlock ? { repeatCopyShapeBlock: validRepeatCopyBlock } : {}),
             };
           })
           .filter((se): se is NonNullable<typeof se> => se !== null),
@@ -2336,10 +2400,15 @@ export async function POST(req: NextRequest) {
         } : {}),
       };
       const pptxBuffer = await downloadBlob(fileUrl, threadId);
+      // DeckSpec ロード（TypeScript 再描画ルーティング実装時に使用）
+      const existingDeckSpec: DeckSpec | null = await loadDeckSpecForUrl(fileUrl).catch(() => null);
+      void existingDeckSpec; // 現時点では参照のみ——TypeScript 再描画パスで利用予定
       const slidesBefore = await extractSlidesStructured(pptxBuffer);
       const slideCountBefore = slidesBefore.length;
       const safeBaseName = outputBaseName ?? "内容増量";
-      const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName, { skipPptxPointer: !!skipPptxPointer && isInternalPptxBatch });
+      // targetItemCount が指定された場合は auto pointer-save をスキップし、後で検証後に手動保存する
+      const isItemCountMode = typeof bodyTargetItemCount === "number";
+      const result = await runPythonEdit(pptxBuffer, safeplan, threadId, safeBaseName, { skipPptxPointer: (!!skipPptxPointer && isInternalPptxBatch) || isItemCountMode });
       console.log(`[apply_pptx_plan] changedSlides=${result.changedSlides} fills=${result.changedFills} lines=${result.changedLines} texts=${result.changedTexts} charsBefore=${result.charsBefore} charsAfter=${result.charsAfter}`);
       if (result.totalSlides !== slideCountBefore) {
         console.error(`[apply_pptx_plan] slide count changed ${slideCountBefore} → ${result.totalSlides}`);
@@ -2355,6 +2424,7 @@ export async function POST(req: NextRequest) {
         (se) =>
           Array.isArray((se as any).addBullets) ||
           (se as any).copyShapeBlock ||
+          (se as any).repeatCopyShapeBlock ||
           (se as any).convertToCards ||
           Array.isArray((se as any).replaceText)
       );
@@ -2370,6 +2440,40 @@ export async function POST(req: NextRequest) {
         ).replace(/\/+$/, "");
         const warnings = await runVisionReviewAfterEdit(result.outputBuffer, result.changedSlideIndices, baseUrl);
         if (warnings.length > 0) applyVisualWarnings = warnings;
+      }
+
+      // NOTE: Python パス編集では DeckSpec を保存しない。
+
+      // 項目数SETモード: Python itemCountResults を全件検証し、全成功後にポインターを保存する
+      if (isItemCountMode) {
+        const itemResults = result.itemCountResults;
+        if (!itemResults || typeof itemResults !== "object") {
+          return NextResponse.json({ ok: false, error: "Python が itemCountResults を返しませんでした。スクリプトのバージョンを確認してください。" });
+        }
+        const failedEdits: Array<{ si: number; rc: { final_count: number | null; added: number; required_add: number } | null }> = [];
+        for (const edit of safeplan.slideEdits ?? []) {
+          const si = (edit as any).slideIndex as number;
+          const rc = (itemResults as Record<string, any>)[String(si)] ?? null;
+          if (!rc || rc.success !== true || rc.final_count !== bodyTargetItemCount) {
+            failedEdits.push({ si, rc });
+          }
+        }
+        if (failedEdits.length > 0) {
+          const failedNums = failedEdits.map(({ si, rc }) =>
+            rc ? `P${si + 1}（${rc.final_count ?? "?"}/${bodyTargetItemCount}項目）` : `P${si + 1}（結果なし）`
+          ).join("、");
+          return NextResponse.json({ ok: false, error: `${failedNums} の項目数を ${bodyTargetItemCount} にできませんでした。スライドのスペースが不足している可能性があります。` });
+        }
+        // 全成功: ポインターを保存
+        if (threadId?.trim()) {
+          try {
+            await savePptxPointer(threadId, result.blobKey, result.fileName);
+            console.log(`[apply_pptx_plan] item_count pointer saved blobKey=${result.blobKey}`);
+          } catch (e) {
+            console.warn("[apply_pptx_plan] pointer save failed:", e);
+            return NextResponse.json({ ok: false, error: "ポインター保存に失敗しました。再度お試しください。" });
+          }
+        }
       }
 
       const { outputBuffer: _applyBuf, ...applyResult } = result;
@@ -2405,9 +2509,10 @@ export async function POST(req: NextRequest) {
       console.log("[edit-word] plan:", JSON.stringify(plan));
 
       const rawName = fileUrl.split("?")[0].split("/").pop() ?? "";
-      const originalFileName = (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })();
+      const urlDerivedName = (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })();
+      const originalFileName = bodyOriginalFileName?.trim() || urlDerivedName || undefined;
 
-      const result = await runPythonEditWord(wordBuffer, plan, threadId, originalFileName || undefined);
+      const result = await runPythonEditWord(wordBuffer, plan, threadId, originalFileName);
       if (result.blobName) {
         await saveWordPointer(threadId, result.blobName, result.fileName ?? "");
       }

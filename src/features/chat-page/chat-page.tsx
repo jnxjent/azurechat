@@ -23,23 +23,20 @@ interface ChatPageProps {
   chatThread: ChatThreadModel;
   chatDocuments: Array<ChatDocumentModel>;
   extensions: Array<ExtensionModel>;
-  isAdmin: boolean; // ← 追加
+  isAdmin: boolean;
 }
 
-// ChatMessageArea が受け取れるロール（UI 用）
 type ChatUiRole = "user" | "system" | "assistant" | "tool";
 
 function toUiRole(role: ChatMessageModel["role"]): ChatUiRole {
-  if (role === "function") {
-    return "assistant";
-  }
+  if (role === "function") return "assistant";
   return role as ChatUiRole;
 }
 
+const BLOB_URL_RE = /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i;
+
 export const ChatPage: FC<ChatPageProps> = (props) => {
   const { data: session } = useSession();
-
-  // Server Component 側で確定済みの isAdmin を使う
   const isAdmin = props.isAdmin;
 
   useEffect(() => {
@@ -51,9 +48,7 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
   }, [props.messages, session?.user?.name, props.chatThread]);
 
   const { messages, loading } = useChat();
-
   const current = useRef<HTMLDivElement>(null);
-
   useChatScrollAnchor({ ref: current });
 
   return (
@@ -67,21 +62,21 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
       <ChatMessageContainer ref={current}>
         <ChatMessageContentArea>
           {messages.map((message, index) => {
-            // アシスタントメッセージの直前にある tool メッセージの downloadUrl を取得
-            // → 「Page 8をカード型デザインにしました。」の下にもダウンロードボタンを表示
             let assistantDownloadUrl: string | null = null;
             let assistantDownloadName: string | null = null;
             if (message.role === "assistant" && index > 0) {
-              const prev = messages[index - 1];
-              if (prev.role === "tool" || prev.role === "function") {
+              for (let i = index - 1; i >= 0; i--) {
+                const prev = messages[i];
+                if (prev.role !== "tool" && prev.role !== "function") break;
                 try {
                   const obj = JSON.parse(prev.content);
                   if (
                     typeof obj?.downloadUrl === "string" &&
-                    /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(obj.downloadUrl)
+                    BLOB_URL_RE.test(obj.downloadUrl)
                   ) {
                     assistantDownloadUrl = obj.downloadUrl;
                     assistantDownloadName = obj.displayName ?? obj.fileName ?? null;
+                    break;
                   }
                 } catch {}
               }
@@ -103,15 +98,17 @@ export const ChatPage: FC<ChatPageProps> = (props) => {
               >
                 <MessageContent message={message} />
                 {assistantDownloadUrl && (
-                  <a
-                    href={assistantDownloadUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="mt-2 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
-                  >
-                    <Download size={14} strokeWidth={2} />
-                    {assistantDownloadName ?? "ダウンロード"}
-                  </a>
+                  <div className="not-prose mt-2">
+                    <a
+                      href={assistantDownloadUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+                    >
+                      <Download size={14} strokeWidth={2} />
+                      {assistantDownloadName ?? "ダウンロード"}
+                    </a>
+                  </div>
                 )}
               </ChatMessageArea>
             );

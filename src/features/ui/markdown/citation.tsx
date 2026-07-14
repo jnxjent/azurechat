@@ -22,16 +22,28 @@ export const citation = {
   },
 };
 
-export const Citation: FC<Props> = (props: Props) => {
-  const citations = props.items.reduce((acc, citation) => {
-    const { name } = citation;
-    if (!acc[name]) {
-      acc[name] = [];
-    }
-    acc[name].push(citation);
-    return acc;
-  }, {} as Record<string, Citation[]>);
+const isBlobCitationId = (id: string): boolean =>
+  /^https?:\/\//i.test(id) ||
+  /blob\.core\.windows\.net/i.test(id) ||
+  /[?&]sig=/i.test(id);
 
+export const Citation: FC<Props> = (props: Props) => {
+  // Filter out invalid citations (blob URLs, SAS URLs, empty ids)
+  const validItems = props.items.filter(
+    (c) => !!c.id && !isBlobCitationId(c.id) && !isBlobCitationId(c.name)
+  );
+
+  const citations = validItems.reduce(
+    (acc, cit) => {
+      const { name } = cit;
+      if (!acc[name]) acc[name] = [];
+      acc[name].push(cit);
+      return acc;
+    },
+    {} as Record<string, Citation[]>
+  );
+
+  // All hooks must be declared before early return
   const [urlCache, setUrlCache] = useState<Record<string, string>>({});
 
   const resolveUrl = useCallback(
@@ -60,13 +72,11 @@ export const Citation: FC<Props> = (props: Props) => {
   const handleClick = useCallback(
     async (e: React.MouseEvent, fileName: string) => {
       e.preventDefault();
-      // キャッシュ済みなら直接 noopener で開く（ポップアップブロック回避 + 安全）
       const cached = urlCache[fileName];
       if (cached) {
         window.open(cached, "_blank", "noopener,noreferrer");
         return;
       }
-      // 未キャッシュ: noopener なしで空タブを開き、取得後に URL をセット
       const newTab = window.open("", "_blank");
       const url = await resolveUrl(fileName);
       if (url && newTab) {
@@ -78,39 +88,33 @@ export const Citation: FC<Props> = (props: Props) => {
     [urlCache, resolveUrl]
   );
 
+  if (validItems.length === 0) return null;
+
   return (
     <div className="interactive-citation p-4 border mt-4 flex flex-col rounded-md gap-2">
-      {Object.entries(citations).map(([name, items], index: number) => {
-        return (
-          <div key={index} className="flex flex-col gap-2">
-            <div className="font-semibold text-sm">
-              <a
-                className="text-primary underline hover:opacity-80 cursor-pointer"
-                href={urlCache[name] ?? "#"}
-                target="_blank"
-                rel="noopener noreferrer"
-                onMouseEnter={() => handleMouseEnter(name)}
-                onClick={(e) => handleClick(e, name)}
-              >
-                {name}
-              </a>
-            </div>
-            <div className="flex gap-2">
-              {items.map((item, index: number) => {
-                return (
-                  <div key={index}>
-                    <CitationSlider
-                      index={index + 1}
-                      name={item.name}
-                      id={item.id}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+      {Object.entries(citations).map(([name, items], index: number) => (
+        <div key={index} className="flex flex-col gap-2">
+          <div className="font-semibold text-sm">
+            <a
+              className="text-primary underline hover:opacity-80 cursor-pointer"
+              href={urlCache[name] ?? "#"}
+              target="_blank"
+              rel="noopener noreferrer"
+              onMouseEnter={() => handleMouseEnter(name)}
+              onClick={(e) => handleClick(e, name)}
+            >
+              {name}
+            </a>
           </div>
-        );
-      })}
+          <div className="flex gap-2">
+            {items.map((item, idx: number) => (
+              <div key={idx}>
+                <CitationSlider index={idx + 1} name={item.name} id={item.id} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 };

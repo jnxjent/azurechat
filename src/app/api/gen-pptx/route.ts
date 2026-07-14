@@ -9,6 +9,9 @@ import {
 import { uniqueId } from "@/features/common/util";
 import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
 import { PptxPalette as Palette, PPTX_NAMED_PALETTES, buildPaletteFromKey } from "@/features/pptx/palette";
+import { saveDeckSpec, saveIllustrationBlob, loadIllustrationBlob, markPptxAsOurs } from "@/lib/deck-spec-storage";
+import type { DeckSpec, DeckSpecSlide, DeckSpecItem } from "@/types/deck-spec";
+// PptxCard は同ファイル内で定義済み（import不要）
 
 // ── SVGアイコン（process-cards用） ────────────────────────────────────────────
 function _svgUri(svg: string): string {
@@ -4066,9 +4069,187 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   });
 }
 
+// ── DeckSpec TypeScript再描画ハンドラ ─────────────────────────────────────────
+// DeckSpec.slides の rawSlide データと genMeta からパレット/テーマを再構築し、
+// TypeScript レンダラ（buildCardGridSlide 等）で全スライドを再描画する。
+// 呼び出し元は更新済み DeckSpec（items/rawSlide を差し替え済み）を渡すこと。
+async function handleRerenderFromDeckSpec(body: {
+  action: "rerender_from_deckspec";
+  deckSpec: DeckSpec;
+  threadId?: string;
+  outputBaseName?: string;
+}): Promise<NextResponse> {
+  const { deckSpec, threadId, outputBaseName } = body;
+  if (!deckSpec || !Array.isArray(deckSpec.slides) || deckSpec.slides.length === 0) {
+    return NextResponse.json({ ok: false, error: "deckSpec is required and must have slides" }, { status: 400 });
+  }
+
+  try {
+    const genMeta = deckSpec.genMeta;
+    const rerenderFaithful = genMeta.mode === "faithful";
+
+    // パレット復元: スナップショット優先（LLM調整・accentOverride・normalizePaletteDiversity反映済み）
+    // スナップショットがない旧 DeckSpec は paletteKey からの再構築にフォールバック
+    const palette: Palette = genMeta.paletteSnapshot
+      ? (genMeta.paletteSnapshot as unknown as Palette)
+      : (deckSpec.paletteKey ? buildPaletteFromKey(deckSpec.paletteKey) : null) ?? buildStrictPalette("calm");
+
+    // テーマ再構築（genMeta に保存したフィールドから — 固定値ではなく保存値を使う）
+    const theme: Theme = {
+      palette,
+      fontFace: getFontFace("", genMeta.fontFace),
+      titleFontSize: genMeta.titleFontSize ?? 24,
+      bodyFontSize:  genMeta.bodyFontSize  ?? 17,
+      smallFontSize: genMeta.smallFontSize ?? 11,
+      execMode:    genMeta.execMode    ?? false,
+      playfulMode: genMeta.playfulMode ?? false,
+      minimalMode: genMeta.minimalMode ?? false,
+      language: (genMeta.language ?? "ja") as "ja" | "en",
+      useJapaneseLabels: genMeta.useJapaneseLabels ?? true,
+      cardStyle:    (genMeta.cardStyle    ?? "default")         as Theme["cardStyle"],
+      headerStyle:  (genMeta.headerStyle  ?? "minimal")         as Theme["headerStyle"],
+      visualStyle:  (genMeta.visualStyle  ?? "corporate-light") as Theme["visualStyle"],
+      deckPurpose:  (genMeta.deckPurpose  ?? "other")           as Theme["deckPurpose"],
+    };
+
+    // DeckDesignBrief（buildTitleSlide 用 — 保存値を使ってカバーを元どおりに復元）
+    const rerenderBrief: DeckDesignBrief = {
+      palette,
+      coverKicker:   genMeta.coverKicker   ?? "",
+      coverSubtitle: genMeta.coverSubtitle ?? "",
+      footerNote:    genMeta.footerNote    ?? "",
+      mood:          genMeta.mood          ?? "",
+      styleSpec: {
+        deckPurpose: (genMeta.deckPurpose  ?? "other")           as DeckStyleSpec["deckPurpose"],
+        visualStyle: (genMeta.visualStyle  ?? "corporate-light") as DeckStyleSpec["visualStyle"],
+        cardStyle:   (genMeta.cardStyle    ?? "default")         as DeckStyleSpec["cardStyle"],
+        headerStyle: (genMeta.headerStyle  ?? "minimal")         as DeckStyleSpec["headerStyle"],
+      },
+      visualHints: [],
+    };
+
+    const pptx = new PptxGenJS();
+    pptx.layout = "LAYOUT_WIDE";
+    pptx.theme  = { headFontFace: "Meiryo", bodyFontFace: "Meiryo" };
+    pptx.author = "azurechat";
+    pptx.subject = genMeta.title;
+
+    // 非faithfulモード: 表紙スライドを先頭に追加（DeckSpec には含まれていない）
+    // イラスト読み込み（初回生成時に保存済みの場合）
+    // キーが存在するのにロードできない場合は「不変」要件に反するためエラーにする
+    let rerenderIllustration: GeneratedIllustration | null = null;
+    if (genMeta.illustrationBlobKey) {
+      const dataUri = await loadIllustrationBlob(genMeta.illustrationBlobKey);
+      if (!dataUri) {
+        console.error(`[rerender_from_deckspec] illustration blob load failed key=${genMeta.illustrationBlobKey}`);
+        return NextResponse.json(
+          { ok: false, error: "保存済みイラストを復元できませんでした。再度お試しください。" },
+          { status: 500 }
+        );
+      }
+      rerenderIllustration = { dataUri, prompt: genMeta.illustrationPrompt ?? "" };
+    }
+
+    // ページ数は 表紙(1) + コンテンツ(slides.length) = slides.length + 1
+    if (!rerenderFaithful) {
+      buildTitleSlide(pptx, genMeta.title, rerenderBrief, theme, deckSpec.slides.length + 1, rerenderIllustration);
+    }
+
+    // コンテンツスライド（pptxSlideIndex 昇順で描画）
+    const sortedSlides = [...deckSpec.slides].sort((a, b) => a.pptxSlideIndex - b.pptxSlideIndex);
+    let rerenderIllustrationPlaced = false;
+    for (const specSlide of sortedSlides) {
+      const slide = upgradeTextOnlySlide(specSlide.rawSlide as unknown as PptxSlide);
+      const resolvedLt = resolveLayoutType(slide);
+      const visual: SlideVisualHint = {
+        title: slide.title ?? "",
+        visualType: (specSlide.visualHint?.visualType ?? "spotlight") as SlideVisualType,
+      };
+      // 初回生成と同じ条件: 最初の bullets スライドにのみイラストを配置
+      const slideIllustration =
+        !rerenderIllustrationPlaced && rerenderIllustration && resolvedLt === "bullets"
+          ? rerenderIllustration
+          : null;
+
+      switch (resolvedLt) {
+        case "title":            buildSectionSlide(pptx, slide.title, theme); break;
+        case "card_grid":        buildCardGridSlide(pptx, slide, theme); break;
+        case "icon_rows":        buildIconRowsSlide(pptx, slide, theme); break;
+        case "timeline":         buildTimelineSlide(pptx, slide, theme); break;
+        case "roadmap":          buildTimelineSlide(pptx, slide, theme); break;
+        case "stat_callouts":    buildStatCalloutsSlide(pptx, slide, theme); break;
+        case "metric-cards":     buildMetricCardsSlide(pptx, slide, theme); break;
+        case "conversation":     buildConversationSlide(pptx, slide, theme); break;
+        case "company-overview": buildCompanyOverviewSlide(pptx, slide, theme); break;
+        case "process-cards":    buildProcessCardsSlide(pptx, slide, theme); break;
+        case "closing":          buildClosingSlide(pptx, slide, theme); break;
+        case "table":            buildTableSlide(pptx, slide, theme, visual, false); break;
+        case "multi-column":     buildMultiColumnSlide(pptx, slide, theme, visual, false); break;
+        case "diagram":          buildDiagramSlide(pptx, slide, theme, visual, false); break;
+        default:
+          buildBulletsSlide(pptx, slide, theme, visual, slideIllustration, false);
+          if (slideIllustration) rerenderIllustrationPlaced = true;
+          break;
+      }
+    }
+
+    // PPTX 書き出し + 東アジアフォントパッチ
+    let buffer = await patchEastAsianFont((await pptx.write({ outputType: "nodebuffer" })) as Buffer);
+
+    // バリデーション
+    const isZip = buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B;
+    const hasSlides = isZip && buffer.includes(Buffer.from("ppt/slides/slide"));
+    if (!isZip || !hasSlides) {
+      console.error("[rerender_from_deckspec] generated PPTX is invalid ZIP or has no slides");
+      return NextResponse.json({ ok: false, error: "TypeScript re-render produced invalid PPTX" }, { status: 500 });
+    }
+
+    // アップロード
+    const safeBase = (outputBaseName ?? genMeta.title ?? uniqueId())
+      .replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40) || uniqueId();
+    const displayFileName = `${safeBase}.pptx`;
+    const blobKey = `${safeBase}_${uniqueId().slice(0, 8)}.pptx`;
+    const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
+
+    // DeckSpec をポインター更新より先に保存する
+    // 順序: PPTX upload → DeckSpec save → pointer update
+    // DeckSpec 失敗時はポインターを更新せずエラーにする（DeckSpec なしで新 PPTX を指す状態を防ぐ）
+    const saved = await saveDeckSpec(blobKey, {
+      ...deckSpec,
+      revision: deckSpec.revision + 1,
+      savedAt: new Date().toISOString(),
+    });
+    if (!saved) {
+      console.error(`[rerender_from_deckspec] DeckSpec save failed for blobKey=${blobKey} — aborting pointer update`);
+      return NextResponse.json({ ok: false, error: "DeckSpec の保存に失敗しました。再度お試しください。" }, { status: 500 });
+    }
+
+    const marked = await markPptxAsOurs(blobKey, deckSpec.deckId);
+    if (!marked) {
+      console.error(`[rerender_from_deckspec] markPptxAsOurs failed for blobKey=${blobKey} — aborting pointer update`);
+      return NextResponse.json({ ok: false, error: "PPTXメタデータのマーク付与に失敗しました。再度お試しください。" }, { status: 500 });
+    }
+
+    if (threadId?.trim()) {
+      await savePptxPointer(threadId, blobKey, displayFileName);
+    }
+
+    console.log(`[rerender_from_deckspec] done deckId=${deckSpec.deckId} rev=${deckSpec.revision + 1} slides=${sortedSlides.length} blobKey=${blobKey}`);
+    return NextResponse.json({ ok: true, downloadUrl, fileName: displayFileName });
+  } catch (e: any) {
+    console.error("[rerender_from_deckspec] failed:", e);
+    return NextResponse.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const body: GenPptxRequest = await req.json();
+    const rawBody = await req.json();
+    // DeckSpec TypeScript再描画リクエストは早期ディスパッチ（LLM不使用）
+    if ((rawBody as any).action === "rerender_from_deckspec") {
+      return handleRerenderFromDeckSpec(rawBody as Parameters<typeof handleRerenderFromDeckSpec>[0]);
+    }
+    const body: GenPptxRequest = rawBody as GenPptxRequest;
     const { title, slides, threadId, fontFace, designInstruction, deckPreferences, mode, fileBaseName, promptIntent, palette: requestedPalette } = body;
     if (!title || !slides || slides.length === 0) {
       return NextResponse.json({ error: "title and slides are required" }, { status: 400 });
@@ -4321,6 +4502,9 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Phase 2: Vision レビュー → パッチ適用 → 再生成 ──────────────────
+    // Vision が patchedSlides を生成し再描画に成功した場合のみ finalSlidesForSpec を更新する。
+    // バリデーション失敗時は sanitizedSlides にとどまる（DeckSpec の整合性を保証するため）。
+    let finalSlidesForSpec = sanitizedSlides;
     if (!faithfulMode && process.env.PPTX_VISION_REVIEW_ENABLED === "true") {
       try {
         const reviewForm = new FormData();
@@ -4609,6 +4793,9 @@ export async function POST(req: NextRequest) {
               if (!isZip2 || !hasSlides2) {
                 console.warn("[gen-pptx] Re-generated PPTX invalid — keeping original buffer");
                 buffer = await patchEastAsianFont((await pptx.write({ outputType: "nodebuffer" })) as Buffer);
+              } else {
+                // 再生成バッファが有効な場合のみ patchedSlides を DeckSpec 構築に使用する
+                finalSlidesForSpec = patchedSlides;
               }
             }
             if (buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B) {
@@ -4625,12 +4812,127 @@ export async function POST(req: NextRequest) {
     const safeBase = fileBaseName
       ? fileBaseName.replace(/\.pptx$/i, "").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 40)
       : (threadId ?? uniqueId());
-    const displayFileName = `${safeBase}.pptx`;          // 日本語名：リンク表示・DL名
-    const blobKey = `${safeBase}_${uniqueId().slice(0, 8)}.pptx`; // 表示名+短IDでURLからファイル名が正しく取れる
+    const displayFileName = `${safeBase}.pptx`;
+    const blobKey = `${safeBase}_${uniqueId().slice(0, 8)}.pptx`;
     const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
-    if (threadId?.trim()) {
-      await savePptxPointer(threadId, blobKey, displayFileName);
+
+    // ── DeckSpec 構築（Vision完了後の最終スライドから生成） ────────────────────────
+    // finalSlidesForSpec: Vision再描画成功 → patchedSlides、失敗/スキップ → sanitizedSlides
+    // 非faithfulモードでは表紙が index=0 に挿入されるため、pptxSlideIndex = i + 1 とする。
+    {
+      const _deckId = uniqueId().slice(0, 12);
+      const _deckSlides: DeckSpecSlide[] = finalSlidesForSpec.map((slideRaw, i) => {
+        const slide = upgradeTextOnlySlide(slideRaw);
+        const resolvedLt = resolveLayoutType(slide);
+        // card_grid / icon_rows は renderer 同様に cards→steps の順で参照
+        const rawCards: PptxCard[] = (slide.cards ?? []).length > 0
+          ? slide.cards!
+          : (slide.steps ?? []).map((st) => ({
+              iconKey: st.iconKey,
+              heading: st.title,
+              body: st.body,
+            }));
+        let items: DeckSpecItem[] = [];
+        if (resolvedLt === "card_grid" || resolvedLt === "icon_rows") {
+          items = rawCards.map((c, j) => ({
+            id: `${_deckId}-s${i}-i${j}`,
+            heading: c.heading ?? "",
+            body: c.body ?? "",
+            iconKey: c.iconKey,
+          }));
+        } else if (resolvedLt === "diagram") {
+          // diagram レンダラーは visualBlocks を参照するため bullets ではなく visualBlocks からitems構築
+          items = (slide.visualBlocks ?? []).map((vb: PptxVisualBlock, j: number) => ({
+            id: `${_deckId}-s${i}-i${j}`,
+            body: vb.text ?? "",
+          }));
+        } else {
+          items = (slide.bullets ?? []).map((b: string, j: number) => ({
+            id: `${_deckId}-s${i}-i${j}`,
+            body: b ?? "",
+          }));
+        }
+        return {
+          id: `${_deckId}-s${i}`,
+          title: slide.title ?? "",
+          layoutType: resolvedLt as DeckSpecSlide["layoutType"],
+          items,
+          // 非faithfulモードでは表紙(index 0)が先に追加されるため +1
+          pptxSlideIndex: faithfulMode ? i : i + 1,
+          rawSlide: slide as unknown as Record<string, unknown>,
+          visualHint: designBrief.visualHints[i]?.visualType
+            ? { visualType: designBrief.visualHints[i].visualType }
+            : undefined,
+        };
+      });
+      // イラストを別 Blob に保存してキーを取得
+      // 保存失敗時はイラストなし DeckSpec を保存しない（次回編集でイラストが消えることを防ぐ）
+      let _illustrationBlobKey: string | undefined;
+      let _illustrationPrompt: string | undefined;
+      if (coverIllustration?.dataUri) {
+        const illustKey = await saveIllustrationBlob(blobKey, coverIllustration.dataUri);
+        if (!illustKey) {
+          console.error(`[gen-pptx] illustration blob save failed for blobKey=${blobKey}`);
+          return NextResponse.json({ ok: false, error: "イラストの保存に失敗しました。再度お試しください。" }, { status: 500 });
+        }
+        _illustrationBlobKey = illustKey;
+        _illustrationPrompt  = coverIllustration.prompt || undefined;
+      }
+
+      const saved = await saveDeckSpec(blobKey, {
+        version: 1,
+        deckId: _deckId,
+        revision: 1,
+        paletteKey: namedPalette ?? strictKey ?? undefined,
+        slides: _deckSlides,
+        genMeta: {
+          title,
+          palette: namedPalette ?? undefined,
+          // 解決済みフォント名を保存（リクエストパラメータではなく theme.fontFace）
+          fontFace: theme.fontFace,
+          designInstruction: designInstruction ?? undefined,
+          mode: mode ?? undefined,
+          // TypeScript再描画用フィールド（handleRerenderFromDeckSpecで利用）
+          coverSubtitle: designBrief.coverSubtitle || undefined,
+          coverKicker:   designBrief.coverKicker   || undefined,
+          footerNote:    designBrief.footerNote    || undefined,
+          mood:          designBrief.mood          || undefined,
+          // LLM調整・accentOverride反映済みの最終パレット全14色スナップショット
+          paletteSnapshot: theme.palette as unknown as Record<string, string>,
+          // 生成イラスト参照（本体は別 Blob）
+          illustrationBlobKey: _illustrationBlobKey,
+          illustrationPrompt:  _illustrationPrompt,
+          cardStyle: theme.cardStyle,
+          headerStyle: theme.headerStyle,
+          visualStyle: theme.visualStyle,
+          deckPurpose: theme.deckPurpose,
+          execMode: theme.execMode || undefined,
+          playfulMode: theme.playfulMode || undefined,
+          minimalMode: theme.minimalMode || undefined,
+          language: theme.language,
+          useJapaneseLabels: theme.useJapaneseLabels,
+          titleFontSize: theme.titleFontSize,
+          bodyFontSize:  theme.bodyFontSize,
+          smallFontSize: theme.smallFontSize,
+        },
+        savedAt: new Date().toISOString(),
+      });
+      if (!saved) {
+        console.error(`[gen-pptx] DeckSpec save failed for blobKey=${blobKey}`);
+        return NextResponse.json({ ok: false, error: "プレゼンテーションのメタデータ保存に失敗しました。再度お試しください。" }, { status: 500 });
+      }
+
+      const marked = await markPptxAsOurs(blobKey, _deckId);
+      if (!marked) {
+        console.error(`[gen-pptx] markPptxAsOurs failed for blobKey=${blobKey} — aborting pointer update`);
+        return NextResponse.json({ ok: false, error: "PPTXメタデータのマーク付与に失敗しました。再度お試しください。" }, { status: 500 });
+      }
+
+      if (threadId?.trim()) {
+        await savePptxPointer(threadId, blobKey, displayFileName);
+      }
     }
+
     return NextResponse.json({ ok: true, downloadUrl, fileName: displayFileName });
   } catch (e: any) {
     console.error("[gen-pptx] error:", e);

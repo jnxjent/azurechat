@@ -107,6 +107,20 @@ const linkifyPhoneInTableRow = (line: string): string => {
 const normalizeContent = (src: string): string => {
   if (!src) return "";
 
+  // 【1】citation タグに blob URL が含まれる行を URL 除去より先に消す
+  //     （先に URL を消すと sig= チェックが効かなくなるため順序が重要）
+  src = src.replace(
+    /^[^\n]*\{%\s*citation\b[^%]*https?:\/\/[^%]*%\}[^\n]*/gim,
+    ""
+  );
+
+  // 【2】LLM が誤って出力した blob SAS URL を除去（画像アイコン・リンク・raw URL）
+  // アシスタントメッセージの blob URL は常にダウンロード用途の誤出力（UI が自動表示する）
+  // ※ 画像生成ツールの結果は multiModalImage フィールドで別途表示されるため影響なし
+  src = src.replace(/!\[[^\]]*\]\(https?:\/\/[^)]*\.blob\.core\.windows\.net[^)]*\)/gi, "");
+  src = src.replace(/\[[^\]]*\]\(https?:\/\/[^)]*\.blob\.core\.windows\.net[^)]*\)/gi, "");
+  src = src.replace(/https?:\/\/\S*\.blob\.core\.windows\.net\S*/gi, "");
+
   let inCodeBlock = false;
 
   const lines = src.split(/\r?\n/).map((line) => {
@@ -118,7 +132,11 @@ const normalizeContent = (src: string): string => {
     }
 
     if (inCodeBlock) return line;
-    if (line.includes("{% citation")) return line;
+    if (line.includes("{% citation")) {
+      // blob SAS URL を含む citation タグは除去（ファイル変換ツールの誤出力）
+      if (line.includes("blob.core.windows.net") || line.includes("sig=")) return "";
+      return line;
+    }
 
     const looksLikeTableRow =
       trimmed.startsWith("|") && trimmed.includes("|") && !trimmed.startsWith("|-");
