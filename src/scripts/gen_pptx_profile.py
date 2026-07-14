@@ -45,6 +45,7 @@ PALETTES = {
     'burgundy_gold':  {'main': '8C1D18', 'accent': 'E0A33B', 'accent_light': 'F7ECD6', 'main_light': 'F3E5E4', 'text_muted': '6E5A58'},
     'teal_coral':     {'main': '0E4D5C', 'accent': 'EE6C4D', 'accent_light': 'FBE6DE', 'main_light': 'DCE9EC', 'text_muted': '5A6B70'},
     'charcoal_terra': {'main': '333333', 'accent': 'C15F3C', 'accent_light': 'F3E3DA', 'main_light': 'ECECEA', 'text_muted': '6E6E6E'},
+    'coral_orange':   {'main': '1B5E3B', 'accent': 'E07038', 'accent_light': 'FCEADE', 'main_light': 'E1EDE6', 'text_muted': '5B6E62'},
 }
 DEFAULT_PALETTE = 'navy_orange'
 

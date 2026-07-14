@@ -11,6 +11,8 @@ import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
+import { loadDeckSpecForUrl, checkPptxIsOurs } from "@/lib/deck-spec-storage";
+import type { DeckSpec, DeckSpecItem } from "@/types/deck-spec";
 import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
 
@@ -598,7 +600,7 @@ function isHttpUrl(value: string): boolean {
 }
 
 function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
-  const urlPattern = /https?:\/\/[^\s)\]]+\.pptx(?:\?[^\s)\]]*)?/gi;
+  const urlPattern = /https?:\/\/[^\s)"'\]]+\.pptx(?:\?[^\s)"'\]]*)?/gi;
   for (const message of messages) {
     const matches = message.match(urlPattern);
     if (matches?.length) {
@@ -611,7 +613,7 @@ function extractLatestPptxUrlFromMessages(messages: string[]): string | null {
 /** Markdownリンク [DisplayName.pptx](URL) からURL+表示名を両方取得する */
 function extractLatestPptxInfoFromMessages(messages: string[]): { url: string; displayName: string | null } | null {
   const mdPattern = /\[([^\]]+?\.pptx)\]\((https?:\/\/[^\s)]+\.pptx(?:\?[^\s)]*)?)\)/gi;
-  const urlPattern = /https?:\/\/[^\s)\]]+\.pptx(?:\?[^\s)\]]*)?/gi;
+  const urlPattern = /https?:\/\/[^\s)"'\]]+\.pptx(?:\?[^\s)"'\]]*)?/gi;
   for (const message of messages) {
     mdPattern.lastIndex = 0;
     let mdMatch: RegExpExecArray | null;
@@ -749,8 +751,67 @@ function extractLatestPdfOrDocxUrlFromMessages(messages: string[]): string | nul
   return null;
 }
 
+async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{ url: string; fileName: string; savedAt: number } | null> {
+  const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!acc || !key) return null;
+  try {
+    const buf = await BlobServiceClient.fromConnectionString(
+      `DefaultEndpointsProtocol=https;AccountName=${acc};AccountKey=${key};EndpointSuffix=core.windows.net`
+    ).getContainerClient("docx")
+      .getBlockBlobClient(`thread-${chatThreadId}-word-pointer.json`)
+      .downloadToBuffer();
+    const { blobName, fileName, savedAt } = JSON.parse(buf.toString()) as {
+      blobName: string; fileName: string; savedAt: number;
+    };
+    if (!blobName) return null;
+    // SASを再発行（docxコンテナのアクセスレベルに依存せず確実にDL可能）
+    const sasRes = await GenerateSasUrl("docx", blobName);
+    if (sasRes.status !== "OK") {
+      console.warn(`[resolveLatestDocxFromPointer] SAS generation failed for ${fileName}`);
+      return null;
+    }
+    console.log(`[resolveLatestDocxFromPointer] found: ${fileName}`);
+    return { url: sasRes.response, fileName, savedAt: savedAt ?? 0 };
+  } catch {
+    return null;
+  }
+}
+
 async function resolveLatestDocxUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
+    // ポインターと最新アップロードを並行取得して新しい方を使う（Excelと同パターン）
+    const [ptr, docsResponse] = await Promise.all([
+      resolveLatestDocxFromPointer(chatThreadId),
+      FindAllChatDocuments(chatThreadId),
+    ]);
+
+    const latestUploadDoc = docsResponse.status === "OK"
+      ? docsResponse.response
+          .filter((doc) => /\.docx$/i.test(doc.name))
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
+      : null;
+    const latestUploadTime = latestUploadDoc ? new Date(latestUploadDoc.createdAt).getTime() : 0;
+
+    if (ptr?.url) {
+      if (latestUploadTime > (ptr.savedAt ?? 0)) {
+        // 新規アップロードがポインターより新しい → アップロードを優先
+        console.log(`[resolveLatestDocx] newer upload (${latestUploadDoc!.name}) > pointer, using upload`);
+        const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc!.name}`);
+        if (sasRes.status === "OK") return sasRes.response;
+      }
+      console.log(`[resolveLatestDocx] using pointer: ${ptr.url.substring(0, 80)}`);
+      return ptr.url;
+    }
+
+    // ポインターなし: ChatDocuments の最新アップロードを優先（Excelと同パターン）
+    if (latestUploadDoc) {
+      console.log(`[resolveLatestDocx] no pointer, using latest upload: ${latestUploadDoc.name}`);
+      const sasRes = await GenerateSasUrl("dl-link", `${chatThreadId}/${latestUploadDoc.name}`);
+      if (sasRes.status === "OK") return sasRes.response;
+    }
+
+    // フォールバック: チャット履歴から
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
     if (historyResponse.status !== "OK") return null;
     const messages = historyResponse.response
@@ -1382,7 +1443,7 @@ export const GetDefaultExtensions = async (props: {
           },
           palette: {
             type: "string",
-            enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra"],
+            enum: ["navy_orange", "forest_amber", "burgundy_gold", "teal_coral", "charcoal_terra", "coral_orange"],
             description:
               "【カラーパレット選択】コンテンツの業種・用途・ターゲット感から必ず判断して設定すること。\n" +
               "  navy_orange   = ネイビー×オレンジ → IT・AI・DX・経営・役員・システム・テクノロジー企業（落ち着いたプロ感）\n" +
@@ -1392,8 +1453,11 @@ export const GetDefaultExtensions = async (props: {
               "  teal_coral    = ティール×コーラル → 産廃・廃棄物処理・リサイクル・医療・ヘルス・動的な産業系企業\n" +
               "    ↑廃棄物処理業・環境サービス会社の会社紹介はこれ（会社の動的でモダンな印象）\n" +
               "  charcoal_terra= チャコール×テラコッタ → 建設・土木・インフラ・重工業・プラント・施設管理\n" +
+              "  coral_orange  = 深緑×コーラルオレンジ → 産廃・環境サービス・営業資料（暖色系・フレッシュ感を重視する場合）\n" +
+              "    ↑teal_coralよりも暖色寄りの配色。ユーザーが「コーラルオレンジ」「サンゴオレンジ」と言った場合はこれ\n" +
               "【判断例】\n" +
-              "  産廃会社の会社紹介 → teal_coral（ティール×コーラル）\n" +
+              "  産廃会社の会社紹介（モダン） → teal_coral（ティール×コーラル）\n" +
+              "  産廃・環境会社の営業資料（暖色系希望） → coral_orange（深緑×コーラルオレンジ）\n" +
               "  DX人材採用・インターン募集 → forest_amber（深緑×アンバー）\n" +
               "  AzureChat/AI/DX経営報告 → navy_orange（ネイビー×オレンジ）\n" +
               "  廃棄物処理施設・プラント建設 → charcoal_terra（チャコール×テラコッタ）",
@@ -1410,7 +1474,7 @@ export const GetDefaultExtensions = async (props: {
         "  この場合、まず sl_doc_search や会話コンテキストでPDF内容を把握し、前の会話のスライド構成をベースに各スライドの bullets を肉付けした上で slides パラメータに設定して呼ぶこと。\n" +
         "【提案書モード】ユーザーが「提案書」「営業資料」「お客様向け」「しっかりした資料」と言った場合は proposalMode=true にして、12〜16枚構成で作ること。\n" +
         "【経営向け再構築モード】複数の定期レポートや四半期報告書（例: Q1〜Q4 議事録・活動報告PDF）から経営層・役員向けPPTを作る場合：\n" +
-        "  ① slides パラメータを時系列（Q1→Q4）で組まないこと。以下の9カテゴリで構成すること:\n" +
+        "  ① slides パラメータを時系列（Q1→Q4）で組まないこと。以下の9カテゴリ【全て必須・省略禁止】で構成すること:\n" +
         "    1. 目的・位置づけ（なぜこのツール/施策が必要か）\n" +
         "    2. 現在使える主な機能（ビジネス機能として整理。技術仕様でなく「何ができるか」「何の業務に使えるか」）\n" +
         "    3. 利用状況・KPI・運用実績（アクティブ率・件数・満足度などの数値。四半期をまたぐ場合はトレンドを統合）\n" +
@@ -1419,7 +1483,7 @@ export const GetDefaultExtensions = async (props: {
         "    6. コスト・投資対効果（費用・ROI・削減効果）\n" +
         "    7. 課題・リスク・改善要望\n" +
         "    8. 今後のロードマップ\n" +
-        "    9. 経営判断が必要な論点（意思決定を促す締めスライド）\n" +
+        "    9. 経営判断が必要な論点（意思決定を促す締めスライド） → layoutType='closing' を必ず設定すること\n" +
         "  ② 各カテゴリのbulletsは、全ての参照ドキュメントから関連情報を集約・統合して記述すること。\n" +
         "  ③ スライドタイトルに「Q1」「Q2」「Q3」「Q4」「第1四半期」などの時系列ラベルを含めないこと。\n" +
         "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更・ロゴ追加・画像追加・添付画像挿入はすべて edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
@@ -1428,11 +1492,12 @@ export const GetDefaultExtensions = async (props: {
         "【palette 選択】ユーザーの業種・用途・ターゲット層を読み取り、必ず palette を設定すること。\n" +
         "  IT/AI/DX/経営/役員向け → navy_orange（ネイビー×オレンジ）\n" +
         "  採用・人材募集・インターン・新卒向け → forest_amber（深緑×アンバー、人の成長・緑のイメージ）\n" +
-        "  産廃・廃棄物処理・リサイクル・環境サービス → teal_coral（ティール×コーラル、動的な産業系）\n" +
+        "  産廃・廃棄物処理・リサイクル・環境サービス（モダン） → teal_coral（ティール×コーラル）\n" +
+        "  産廃・環境サービス（暖色系・フレッシュ感希望） → coral_orange（深緑×コーラルオレンジ）\n" +
         "  伝統・製造・老舗 → burgundy_gold（バーガンディ×ゴールド）、建設・土木・インフラ → charcoal_terra（チャコール×テラコッタ）\n" +
         "ユーザーが業種・用途を言及した場合は designInstruction に業種感を含めること。\n" +
         "【重要】会社紹介・提案書の場合、slides の bullets には [会社名] [設立年] 等のプレースホルダーを使わず、知っている限りの具体的な情報を入れること（ツール実行時に自動でWeb検索して補完される）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [ミダック会社紹介.pptx](downloadUrl)）。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_pptx",
     },
   });
@@ -1495,7 +1560,7 @@ export const GetDefaultExtensions = async (props: {
         "【重要】fileUrlは必ず会話コンテキストの 'file_url:' または 'fileUrl:' で始まる行から取得すること（blob.core.windows.net のURLを優先）。\n" +
         "検索結果の引用（citation本文中）に含まれるSharePointのリンクは使わないこと。'file_url:' 行から得たBlobURLであれば使ってよい。\n" +
         "「そのまま変換」「忠実に変換」「原本に近く」など正確な再現が求められる場合は mode='faithful' を指定すること。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_doc_to_pptx",
     },
   });
@@ -1529,7 +1594,7 @@ export const GetDefaultExtensions = async (props: {
         "例: 「SPの営業資料2024.pdfをPPTにして」「SLにある〇〇をスライドにして」\n" +
         "【重要】会話コンテキストに file_url が既にある場合は convert_doc_to_pptx を使うこと（このツールは不要）。\n" +
         "【禁止】ExcelへのPDF変換は convert_pdf_to_excel を使うこと。WordへのPDF変換は convert_pdf_to_word を使うこと。このツールはPPT/スライド専用。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。\n" +
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。\n" +
         "複数候補がある場合はリストを提示してユーザーに選ばせること。",
       name: "convert_sp_to_pptx",
     },
@@ -1545,7 +1610,7 @@ export const GetDefaultExtensions = async (props: {
             ...args,
             fileUrl:
               String(args?.fileUrl ?? "").trim() ||
-              (await resolveLatestPptxUrlFromThread(props.chatThread.id)) ||
+              (await resolveLatestPptxInfoFromThread(props.chatThread.id))?.url ||
               "",
           },
           props.chatThread
@@ -1569,6 +1634,19 @@ export const GetDefaultExtensions = async (props: {
             description:
               "挿入する画像のURL。会話コンテキストに 'file_url:' で始まる画像（png/jpg/jpeg/webp等）がある場合、そのURLをここに設定すること。ロゴ・添付画像挿入の場合は必須。DALL-Eで生成しないこと。",
           },
+          targetPages: {
+            type: "array",
+            items: { type: "integer", minimum: 1 },
+            description:
+              "項目数変更の対象ページ番号リスト（1-based）。例: 「P2,P4の項目数を4つに」→ [2,4]。instructionと重複してもよい。項目数変更（targetItemCount指定時）は必ず設定すること。",
+          },
+          targetItemCount: {
+            type: "integer",
+            minimum: 1,
+            maximum: 20,
+            description:
+              "変更後の独立項目数。「4つに」「4枚に」「4項目に」など数値が明示されている場合に設定する。targetPagesと一緒に指定すること。",
+          },
         },
         required: ["instruction"],
       },
@@ -1583,12 +1661,12 @@ export const GetDefaultExtensions = async (props: {
         "- 「色を変えて」「緑にして」「バーガンディ基調に」「ティール×コーラルにして」など色変更・色パレット変更\n" +
         "【色変更の実装範囲】色パレット指定（ネイビー×オレンジ等）はパレット定義に基づきテーマカラー・図形塗り・テキスト色を一括変更する。基調色のみ指定した場合はhue-shiftで全体の色味を変更する。スライドマスターXML直接書き換え・外部フォントの埋め込みなどは非対応。実装範囲を超えた説明をしないこと。\n" +
         "「バーガンディ基調」「バーガンディ×ゴールド」は burgundy_gold パレットとして処理される。\n" +
-        "【利用可能な色】基本色：赤・青・緑・紺・紫・オレンジ・黄・ピンク。色パレット（指定すると基調色で全体の色味を変更）：ネイビー×オレンジ（IT/DX）・深緑×アンバー（採用/農業）・バーガンディ×ゴールド（製造/老舗）・ティール×コーラル（産廃/医療）・チャコール×テラコッタ（建設/土木）。「どんな色が使えますか？」「色の種類は？」「どの色味があるの？」などの色一覧照会は、このツールを呼ばずに直接この一覧を回答すること。\n" +
+        "【利用可能な色】基本色：赤・青・緑・紺・紫・オレンジ・黄・ピンク。色パレット（指定すると基調色で全体の色味を変更）：ネイビー×オレンジ（IT/DX）・深緑×アンバー（採用/農業）・バーガンディ×ゴールド（製造/老舗）・ティール×コーラル（産廃/医療）・チャコール×テラコッタ（建設/土木）・深緑×コーラルオレンジ（産廃/環境/暖色系）。「どんな色が使えますか？」「色の種類は？」「どの色味があるの？」などの色一覧照会は、このツールを呼ばずに直接この一覧を回答すること。\n" +
         "- 「フォントを変えて」「もっとポップに」などデザイン変更\n" +
         "- 「〜に変えて」「〜を修正して」などテキスト編集\n" +
         "【fileUrl】「直近のPPT」「このPPT」「最後のファイル」と言われた場合は fileUrl を省略すること（スレッド内の直近PPTXを自動取得）。\n" +
         "【imageUrl】ユーザーが画像をアップロードしている場合（会話コンテキストの file_url: 行に png/jpg/webp のURL）、imageUrl にそのURLを必ず設定すること。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式でユーザーに提示すること。リンクテキストは displayName フィールドを使うこと（例: [AzureChat機能紹介_ロゴ追加.pptx](downloadUrl)）。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをそのまま含めたりMarkdownリンクとして再出力することは不要。完了・変更内容を一言で伝えるだけでよい。",
       name: "edit_pptx",
     },
   });
@@ -1618,7 +1696,7 @@ export const GetDefaultExtensions = async (props: {
         "使用タイミング：ユーザーがSP/SL上のPPTXの色・フォント・テキストを変更したい場合。\n" +
         "【即時実行ルール】色変更・再実行要求はユーザーへの確認なしに即このツールを呼ぶこと。「実行してよいですか」などの確認待ち返答は禁止。\n" +
         "例: 「SPにある営業資料をバーガンディ基調にして」「SLの〇〇.pptxのフォントを変えて」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_pptx",
     },
   });
@@ -1653,7 +1731,7 @@ export const GetDefaultExtensions = async (props: {
         "SharePointのSLライブラリにあるExcelファイル（.xlsx/.xls/.xlsm）を自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：ユーザーがSP/SL上のExcelのグラフ作成・セル編集・書式変更などを求める場合。\n" +
         "例: 「SPにある売上データ.xlsxをグラフ化して」「SLの〇〇.xlsxに折れ線グラフを追加して」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_excel",
     },
   });
@@ -1680,9 +1758,10 @@ export const GetDefaultExtensions = async (props: {
       },
       description:
         "SharePointのSLライブラリにあるWordファイル（.docx）を自然言語の指示に従って編集するツール。\n" +
-        "使用タイミング：ユーザーがSP/SL上のWordファイルのテキスト置換・書式変更を求める場合。\n" +
+        "使用タイミング：ユーザーがSP/SL上のWordファイルのテキスト置換・書式変更を求める場合（初回のみ）。\n" +
         "例: 「SPにある議事録のフォントを変えて」「SLの〇〇.docxの社名を置換して」\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "重要：このスレッドで既にWordを編集済み（edit_sp_wordまたはedit_wordで修正版を作成済み）の場合は、このツールを再度使わずに edit_word を使うこと（最新の修正版に追加編集が適用される）。\n" +
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_sp_word",
     },
   });
@@ -1718,7 +1797,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーが指定したテキストや表データからExcelファイル（.xlsx）を新規作成するツール。\n" +
         "使用タイミング：ユーザーが「Excelにして」「Excelで出力して」「表をExcelにして」「xlsx にして」と言い、かつアップロードファイルがない場合。\n" +
         "既存Excelファイルの編集は edit_excel ツールを使うこと（このツールは新規作成専用）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_excel",
     },
   });
@@ -1768,7 +1847,7 @@ export const GetDefaultExtensions = async (props: {
         "使用タイミング：ExcelファイルへのセルA値変更・テキスト置換・書式変更（太字・色・罫線・枠・border）・整形・見やすくする・グラフ作成/修正（折れ線グラフ・棒グラフ・散布図・円グラフ・チャート・タイトル変更・縦軸/横軸ラベル変更・単位変更・目盛調整）等を求める場合。\n" +
         "重要：グラフ・縦軸・横軸・単位に関する指示は必ずこのツールで処理すること。「画像なので数値が読めない」は誤り — このツールがExcelの元データを直接読み取る。\n" +
         "fileUrl が省略された場合はスレッド内の最新Excelを自動的に使用する。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_excel",
     },
   });
@@ -1811,7 +1890,7 @@ export const GetDefaultExtensions = async (props: {
         "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
         "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "create_word",
     },
   });
@@ -1851,8 +1930,9 @@ export const GetDefaultExtensions = async (props: {
       description:
         "このスレッドのWordファイル（アップロードまたはcreate_wordで作成）を自然言語の指示に従って編集するツール。\n" +
         "使用タイミング：Wordファイルへのテキスト置換・書式変更（太字・色・フォントサイズ）を求める場合。\n" +
+        "edit_sp_word でSharePointのWordを編集した後にさらに追加修正する場合も、このツールを使うこと（fileUrlを省略すると最新の修正版が自動使用される）。\n" +
         "fileUrl が省略された場合はスレッド内の最新Wordを自動的に使用する。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "edit_word",
     },
   });
@@ -1890,7 +1970,7 @@ export const GetDefaultExtensions = async (props: {
         "- スレッド内アップロードPDFの場合: fileUrl にURLを指定（省略時はスレッド内の最新PDFを自動使用）。\n" +
         "- SharePoint/SL上のPDFの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
         "mode=layout: 見た目・レイアウト再現優先。mode=editable: テキスト・表の編集を優先。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_pdf_to_word",
     },
   });
@@ -1923,7 +2003,7 @@ export const GetDefaultExtensions = async (props: {
         "- SharePoint/SL上のPDF/Wordの場合: fileQuery にファイル名を指定。fileUrlにファイル名を入れてはいけない。\n" +
         "テーブルはシートに、テーブルがない場合はテキストを「Text」シートに出力する。\n" +
         "【禁止】既にExcel変換済みのスレッドで「再変換して」「もう一度変換して」と言われた場合はこのツールを使わないこと。その場合は refine_excel_pages を使うこと。\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンク（`[text](url)`）・画像リンク（`![text](url)`）・生URL問わず一切再出力しないこと。完了を一言で伝えるだけでよい。",
       name: "convert_pdf_to_excel",
     },
   });
@@ -1960,13 +2040,12 @@ export const GetDefaultExtensions = async (props: {
         "  - 「P2の精度を上げて」「タブ3を修正して」→ targetSheets に該当シート名を指定\n" +
         "  - 「再変換して」「全部やり直して」「もう一度変換して」→ targetSheets を空配列にする（全シート対象）\n" +
         "【禁止】「再変換して」はPDFからの再変換ではない。convert_pdf_to_excel を呼び直してはいけない。\n" +
-        "【重要】1回の呼び出しで1シートを処理する。シートを処理するたびに、処理したシート名とその時点の downloadUrl を\n" +
-        "Markdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示してから、次のシートの処理に進むこと。\n" +
+        "【重要】1回の呼び出しで1シートを処理する。シートを処理するたびに、処理したシート名を一言伝えてから、次のシートの処理に進むこと。\n" +
         "ツールの返り値に remainingSheets が含まれていてかつ空でない場合は、直ちに targetSheets=remainingSheets で再度このツールを呼び出すこと。\n" +
         "targetSheets: 精度を上げるシート名の配列。空配列または省略で全シートを対象にする。\n" +
         "ユーザーが「タブN」と言った場合は以下のシート名一覧のN番目を指定すること。" +
         sheetNamesContext + "\n" +
-        "ツールが返した downloadUrl を必ずMarkdownリンク形式 [ファイル名](downloadUrl) でユーザーに提示すること。",
+        "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンク（`[text](url)`）・画像リンク（`![text](url)`）・生URL問わず一切再出力しないこと。完了を一言で伝えるだけでよい。",
       name: "refine_excel_pages",
     },
   });
@@ -3129,8 +3208,9 @@ async function restructureSlidesForExecutive(
 複数の四半期レポートや会議録をマージしたスライドJSONと、各PDFの中間要約を受け取り、経営層向けの9カテゴリ構成に再整理してください。${summaryBlock}
 
 再整理ルール:
-1. 以下の9カテゴリ軸でスライドを構成すること:
+1. 以下の9カテゴリ軸でスライドを構成すること（全カテゴリ必須・省略禁止）:
    目的・位置づけ → 主な機能 → 利用状況・KPI → 拡張・連携状況 → セキュリティ・ガバナンス → コスト・投資対効果 → 課題・リスク → ロードマップ → 経営判断が必要な論点
+   ※「経営判断が必要な論点」スライドは必ず最後に含め、layoutType を "closing" に設定すること
 2. 各PDFの中間要約を「事実プール」として扱い、四半期ごとの時系列構造は崩す
 3. 固有名詞・数値・四半期由来の根拠（例: Q1実績◯件、Q3計画）は削除せずカテゴリのbulletsに組み込む
 4. bullets: 各bullet 45〜90文字、1カテゴリあたり3〜5項目（数値・固有名詞は短縮しない）
@@ -3171,6 +3251,17 @@ ${JSON.stringify(mergedSlides)}
     if (!hasStructure) {
       console.warn("[restructureExec] structure broken, using original");
       return mergedSlides;
+    }
+
+    // 「経営判断が必要な論点」スライドに closing を強制補正（LLM が bullets で返しても上書き）
+    const closingTitleRe = /経営判断|意思決定.*論点|論点.*意思決定/;
+    const lastIdx = restructured.length - 1;
+    for (let i = lastIdx; i >= Math.max(0, lastIdx - 1); i--) {
+      if (closingTitleRe.test(restructured[i].title ?? "")) {
+        restructured[i] = { ...restructured[i], layoutType: "closing" };
+        console.log(`[restructureExec] forced closing layout on slide ${i + 1}: ${restructured[i].title}`);
+        break;
+      }
     }
 
     console.log(`[restructureExec] restructured ${mergedSlides.length} → ${restructured.length} slides`);
@@ -3738,22 +3829,113 @@ function nextRevisionBaseName(inputBaseName: string): string {
  */
 function extractPageMentions(instruction: string): Map<number, number> {
   const result = new Map<number, number>();
-  // Page/ページ: 後続のカンマ区切り数字列に対応 (例: Page2,4,7)
+  // マッチ直後の先頭が「助詞（は/が/を/も）+ 否定・除外語」のパターンのみスキップ。
+  // 「以外」はここに含めない：「P5,6,7,8以外は変えないで」でP5-P8が誤スキップされるため。
+  const NEGATION_RE = /^[はがをも]\s*(?:しない|除外|対象外|除く|除いて|含まない|変えない|やらない|変更しない|変更済み|前回|すでに)/;
+  const isNegated = (src: string, matchEnd: number): boolean =>
+    NEGATION_RE.test(src.slice(matchEnd, matchEnd + 30));
+
+  // Page/ページ: 後続のカンマ区切り数字列に対応 (例: Page2,4,7 / ページ5,6,7,8)
   const pageRe = /(?:Page|ページ)\s*(\d+(?:\s*[,，、]\s*\d+)*)/gi;
   let m: RegExpExecArray | null;
   while ((m = pageRe.exec(instruction)) !== null) {
+    if (isNegated(instruction, m.index + m[0].length)) continue;
     for (const part of m[1].split(/[,，、]/)) {
       const n = parseInt(part.trim(), 10);
       if (!isNaN(n) && n >= 1) result.set(n, n - 1);
     }
   }
-  // P単体 (例: P5) — "Page" や "PPTX" と区別するため前後をチェック
-  const pRe = /(?<![A-Za-z])P\s*(\d+)(?![A-Za-z])/g;
+  // P単体またはP+カンマリスト (例: P5 / P5,6,7,8) — "Page" や "PPTX" と区別するため前後をチェック
+  const pRe = /(?<![A-Za-z])P\s*(\d+(?:\s*[,，、]\s*\d+)*)(?![A-Za-z])/g;
   while ((m = pRe.exec(instruction)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (!isNaN(n) && n >= 1) result.set(n, n - 1);
+    if (isNegated(instruction, m.index + m[0].length)) continue;
+    for (const part of m[1].split(/[,，、]/)) {
+      const n = parseInt(part.trim(), 10);
+      if (!isNaN(n) && n >= 1) result.set(n, n - 1);
+    }
   }
   return result;
+}
+
+/**
+ * "P2をP3と同じ箇条書きデザインに" のような指示から target/reference ページ番号を抽出する。
+ * target = 変更対象スライド(1-based, 複数可), reference = 参照元スライド(1-based)。
+ * 両方見つからない場合は null を返す。
+ */
+function extractReferenceCopyPages(instruction: string): { targetPages: number[]; referencePage: number } | null {
+  // カード型/Box変換が明示されている場合は参照コピーではない
+  // 例:「P2,3のデザインをカード型に変更」「P2,3をカード型にして」
+  if (/(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|レイアウト.{0,6}(をカード|カード))/i.test(instruction)) {
+    return null;
+  }
+
+  let m: RegExpExecArray | null;
+
+  /** a〜b の整数配列を生成 */
+  const mkRange = (a: number, b: number): number[] => {
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    return Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+  };
+  /** "P6,7, P8" / "P6とP7" → [6,7,8]（重複除去済み） */
+  const parseNumList = (s: string): number[] =>
+    Array.from(new Set(Array.from(s.matchAll(/\d+/g)).map((n) => parseInt(n[0], 10))));
+
+  // SEP = 列挙区切り文字クラス（, 、 ・ と 及び および）
+  const SEP = String.raw`(?:\s*[,、・]\s*|\s*(?:と|及び|および)\s*)`;
+
+  // ── 範囲指定パターン（単ページより先に評価）──────────────────────────────
+  // "P6から9をP5と同じ" / "P6〜9をP5と同じ" / "P6からP9をP5と同じ"
+  m = /(?<![A-Za-z])P\s*(\d+)\s*(?:から|〜|~|-)\s*P?\s*(\d+)[^\d]{0,20}?(?<![A-Za-z])P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き|に合わせ|と合わせ)/i.exec(instruction);
+  if (m) return { targetPages: mkRange(parseInt(m[1], 10), parseInt(m[2], 10)), referencePage: parseInt(m[3], 10) };
+
+  // "P5と同じ...P6から9" (reference が先)
+  m = /(?<![A-Za-z])P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)[^\d]{0,20}?(?<![A-Za-z])P\s*(\d+)\s*(?:から|〜|~|-)\s*P?\s*(\d+)/i.exec(instruction);
+  if (m) return { targetPages: mkRange(parseInt(m[2], 10), parseInt(m[3], 10)), referencePage: parseInt(m[1], 10) };
+
+  // "6から9ページをP5と同じ" / "6〜9ページをP5と同じ"
+  m = /(\d+)\s*(?:から|〜|~|-)\s*(\d+)\s*(?:ページ目?|枚目|スライド)[^\d]{0,20}?(?<![A-Za-z])P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)/i.exec(instruction);
+  if (m) return { targetPages: mkRange(parseInt(m[1], 10), parseInt(m[2], 10)), referencePage: parseInt(m[3], 10) };
+
+  // ── 列挙指定パターン（範囲の後・単ページの前）──────────────────────────────
+  // "P6,7をP5と同じ" / "P6, P7をP5と同じ" / "P6とP7をP5と同じ" / "P6・7をP5と同じ"
+  m = new RegExp(
+    String.raw`(P\s*\d+(?:${SEP}P?\s*\d+)+)[^\d]{0,40}?P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き|に合わせ|と合わせ)`,
+    "i"
+  ).exec(instruction);
+  if (m) return { targetPages: parseNumList(m[1]), referencePage: parseInt(m[2], 10) };
+
+  // "P5と同じ...P6,7" (reference が先)
+  m = new RegExp(
+    String.raw`P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)[^\d]{0,40}?(P\s*\d+(?:${SEP}P?\s*\d+)+)`,
+    "i"
+  ).exec(instruction);
+  if (m) return { targetPages: parseNumList(m[2]), referencePage: parseInt(m[1], 10) };
+
+  // "6,7ページをP5と同じ" / "6と7ページをP5と同じ"
+  m = new RegExp(
+    String.raw`(\d+(?:${SEP}\d+)+)\s*(?:ページ目?|枚目|スライド)[^\d]{0,40}?P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)`,
+    "i"
+  ).exec(instruction);
+  if (m) return { targetPages: parseNumList(m[1]), referencePage: parseInt(m[2], 10) };
+
+  // ── 単ページパターン ──────────────────────────────────────────────────────
+  // "P2をP3と同じ" / "P2をP3の箇条書き" / "P2をP3風に"
+  m = /(?<![A-Za-z])P\s*(\d+)[^\d]*?(?<![A-Za-z])P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き|に合わせ|と合わせ)/i.exec(instruction);
+  if (m) return { targetPages: [parseInt(m[1], 10)], referencePage: parseInt(m[2], 10) };
+
+  // "P3と同じ...P2を変えて" (reference が先に来るパターン)
+  m = /(?<![A-Za-z])P\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)[^\d]*?(?<![A-Za-z])P\s*(\d+)(?:を|に|は)/i.exec(instruction);
+  if (m) return { targetPages: [parseInt(m[2], 10)], referencePage: parseInt(m[1], 10) };
+
+  // "2ページ目を3ページ目と同じ"
+  m = /(\d+)(?:ページ目?|枚目)(?:を|は)[^\d]*?(\d+)(?:ページ目?|枚目)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)/i.exec(instruction);
+  if (m) return { targetPages: [parseInt(m[1], 10)], referencePage: parseInt(m[2], 10) };
+
+  // "Page2をPage3と同じ"
+  m = /Page\s*(\d+)[^\d]*?Page\s*(\d+)(?:と同じ|風|のデザイン|のレイアウト|の箇条書き)/i.exec(instruction);
+  if (m) return { targetPages: [parseInt(m[1], 10)], referencePage: parseInt(m[2], 10) };
+
+  return null;
 }
 
 // ---------------- スライドタイトル/本文によるターゲット解決 ----------------
@@ -4053,6 +4235,28 @@ type SlideAddBullet = {
   addBullets?: Array<{ afterText: string; texts: string[] }>;
   copyShapeBlock?: CopyShapeBlock;
 };
+type RepeatCopyShapeBlock = {
+  headingShapeName: string;
+  descShapeName: string;
+  groupShapeNames?: string[];
+  newItems: Array<{ headingText: string; descText: string }>;
+  targetItemCount?: number;
+};
+type SlideItemCountEdit = {
+  slideIndex: number;
+  repeatCopyShapeBlock: RepeatCopyShapeBlock;
+};
+type ItemCountPlanEntry = {
+  slideIndex: number;
+  currentCount: number;
+  newItemsCount: number;
+  skipped: boolean;
+};
+type ItemCountAdjustPlan = {
+  slideEdits: SlideItemCountEdit[];
+  entries: ItemCountPlanEntry[];
+  targetSlideIndices: Set<number> | null;
+};
 
 type PptxRegenSlide = {
   title: string;
@@ -4205,6 +4409,527 @@ async function buildRegenerationSlidesForLayoutChange(
     result[arrayPos] = normalized;
   });
   return result;
+}
+
+/**
+ * 「項目数をNにする」指示から目標項目数を抽出する。
+ * "追加/足し" による相対指定とは区別する（「4つ追加して」→ null）。
+ */
+function extractTargetItemCount(instruction: string): number | null {
+  // 全角数字を半角に正規化してから処理する
+  const norm = instruction.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  let m: RegExpExecArray | null;
+  // "項目数をNつに" / "項目数をNに"
+  m = /項目数を(\d+)\s*(?:つ|個)?\s*に/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  // "箇条書きをNつに" / "箇条書きをNに"
+  m = /箇条書きを(\d+)\s*(?:つ|個)?\s*に/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  // "N項目にして" (absolute SET)
+  m = /(\d+)\s*項目(?:にして|にする|になる)/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  // "Nつにして" / "N個にして" with strong bullet context
+  if (/項目数|箇条書き/.test(norm)) {
+    m = /(\d+)\s*(?:つ|個)にして/.exec(norm);
+    if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  }
+  // "カードをN枚に" / "カードをNつに" / "カードをN個に"
+  m = /カード.{0,10}(\d+)\s*(?:枚|つ|個)/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  // "N枚にして" / "N枚に増やして" など
+  m = /(\d+)\s*枚\s*に/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  // "項目をNつに" / "項目をN個に"（「項目数」より広いパターン）
+  m = /項目.{0,6}(\d+)\s*(?:つ|個)?\s*に/.exec(norm);
+  if (m) { const n = parseInt(m[1]); if (n >= 1 && n <= 20) return n; }
+  return null;
+}
+
+/**
+ * 「項目数をNにする」専用プラン生成。
+ * LLM に現在の項目数・最後のペア shape 名・新規項目テキストを生成させ、
+ * repeatCopyShapeBlock アクションを組み立てる。
+ */
+// ── DeckSpec カード拡張: 既存 items に不足分を LLM で補完して全カードリストを返す ──
+// card_grid は最大6枚、icon_rows は最大4枚に制限する（レンダラ上限に合わせる）。
+async function buildNewCardsForDeckSpec(
+  existingItems: DeckSpecItem[],
+  slideTitle: string,
+  targetCount: number,
+  layoutType: "card_grid" | "icon_rows"
+): Promise<Array<{ heading: string; body: string; iconKey?: string }>> {
+  const maxItems = layoutType === "icon_rows" ? 4 : 6;
+  const effectiveTarget = Math.min(targetCount, maxItems);
+  const addCount = effectiveTarget - existingItems.length;
+
+  const existingCards = existingItems.map(i => ({ heading: i.heading ?? "", body: i.body, iconKey: i.iconKey }));
+  if (addCount <= 0) return existingCards.slice(0, effectiveTarget);
+
+  const ICON_CYCLE = ["gear", "lightbulb", "rocket", "chart", "star", "verified"];
+  const openai = OpenAIInstance();
+
+  const existingJson = JSON.stringify(
+    existingItems.map(i => ({ heading: i.heading ?? "", body: i.body }))
+  );
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45_000);
+  let completion;
+  try {
+    completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [{
+        role: "user",
+        content:
+          `スライド「${slideTitle}」に現在以下のカード項目があります:\n${existingJson}\n\n` +
+          `このスライドのカード数を${effectiveTarget}枚にするため、${addCount}枚追加してください。\n` +
+          `既存項目と重複せず、スライドのテーマに沿った内容で。\n` +
+          `headingは20文字以内、bodyは50文字以内。\n` +
+          `JSON形式: { "newItems": [{ "heading": "...", "body": "..." }] }`,
+      }],
+      response_format: { type: "json_object" },
+      max_completion_tokens: 1024,
+    }, { signal: controller.signal });
+  } catch (e: any) {
+    if (e?.name === "AbortError" || String(e?.message ?? "").toLowerCase().includes("abort")) {
+      throw new Error("LLMの応答がタイムアウトしました(45秒)。再度お試しください。");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const parsed: unknown = JSON.parse(completion.choices[0]?.message?.content ?? "{}");
+  const rawNewItems: Array<{ heading?: string; body?: string }> =
+    Array.isArray((parsed as any).newItems) ? (parsed as any).newItems : [];
+
+  // heading・body が両方とも非空のものだけを有効とする
+  const validNewItems = rawNewItems
+    .slice(0, addCount)
+    .filter(item => String(item.heading ?? "").trim().length > 0 && String(item.body ?? "").trim().length > 0);
+
+  if (validNewItems.length < addCount) {
+    throw new Error(
+      `LLMが必要なカード数（${addCount}件）を生成できませんでした（有効: ${validNewItems.length}件）。再度お試しください。`
+    );
+  }
+
+  return [
+    ...existingCards,
+    ...validNewItems.map((item, idx) => ({
+      heading: String(item.heading ?? "").trim(),
+      body: String(item.body ?? "").trim(),
+      iconKey: ICON_CYCLE[(existingItems.length + idx) % ICON_CYCLE.length],
+    })),
+  ].slice(0, effectiveTarget);
+}
+
+// ── DeckSpec 箇条書き拡張: bullets レイアウトの項目数を目標値に調整する ──
+async function buildNewBulletsForDeckSpec(
+  existingItems: DeckSpecItem[],
+  slideTitle: string,
+  targetCount: number
+): Promise<string[]> {
+  const maxItems = 8;
+  const effectiveTarget = Math.min(targetCount, maxItems);
+  const existingBullets = existingItems.map(i => i.body).filter(Boolean);
+
+  if (existingBullets.length >= effectiveTarget) {
+    return existingBullets.slice(0, effectiveTarget);
+  }
+
+  const addCount = effectiveTarget - existingBullets.length;
+  const openai = OpenAIInstance();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45_000);
+  let completion;
+  try {
+    completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [{
+        role: "user",
+        content:
+          `スライド「${slideTitle}」に現在以下の箇条書きがあります:\n${JSON.stringify(existingBullets)}\n\n` +
+          `このスライドの箇条書き数を${effectiveTarget}件にするため、${addCount}件追加してください。\n` +
+          `既存と重複せず、スライドのテーマに沿った内容で。各項目は40〜90文字以内。\n` +
+          `JSON形式: { "newBullets": ["...", "..."] }`,
+      }],
+      response_format: { type: "json_object" },
+      max_completion_tokens: 512,
+    }, { signal: controller.signal });
+  } catch (e: any) {
+    if (e?.name === "AbortError" || String(e?.message ?? "").toLowerCase().includes("abort")) {
+      throw new Error("LLMの応答がタイムアウトしました(45秒)。再度お試しください。");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const parsed: unknown = JSON.parse(completion.choices[0]?.message?.content ?? "{}");
+  const rawNew: unknown[] = Array.isArray((parsed as any).newBullets) ? (parsed as any).newBullets : [];
+  const validNew = rawNew.slice(0, addCount).map(b => String(b ?? "").trim()).filter(Boolean);
+
+  if (validNew.length < addCount) {
+    throw new Error(
+      `LLMが必要な箇条書き数（${addCount}件）を生成できませんでした（有効: ${validNew.length}件）。再度お試しください。`
+    );
+  }
+
+  return [...existingBullets, ...validNew].slice(0, effectiveTarget);
+}
+
+type DiagramBlock = { kind: string; role?: string; groupId?: string; text: string; x: number; y: number; w: number; h: number; emphasis?: boolean };
+type DiagramConnector = { from: number; to: number; label?: string; style?: string; relationshipType?: string };
+
+type DiagramLayout = "horizontal" | "vertical" | "grid";
+
+function clampDiagramPercent(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * visualBlocks の座標は gen-pptx の renderer と同じ 0..100 の百分率。
+ * 項目追加時だけ再配置し、既存の装飾属性は呼び出し側で維持する。
+ */
+function layoutDiagramBlocks(blocks: DiagramBlock[], layout: DiagramLayout): DiagramBlock[] {
+  const count = blocks.length;
+  if (count === 0) return [];
+
+  // 非 faithful の右サマリーパネルにも重ならない安全領域（百分率）
+  const area = { x: 4, y: 10, w: 72, h: 78 };
+  const gapX = 3;
+  const gapY = 5;
+
+  if (layout === "horizontal") {
+    const w = (area.w - gapX * (count - 1)) / count;
+    const heights = blocks.map(b => b.h).sort((a, b) => a - b);
+    const h = clampDiagramPercent(heights[Math.floor(count / 2)] ?? 35, 22, 58);
+    const y = area.y + (area.h - h) / 2;
+    return blocks.map((block, index) => ({
+      ...block,
+      x: area.x + index * (w + gapX),
+      y,
+      w,
+      h,
+    }));
+  }
+
+  if (layout === "vertical") {
+    const h = (area.h - gapY * (count - 1)) / count;
+    const widths = blocks.map(b => b.w).sort((a, b) => a - b);
+    const w = clampDiagramPercent(widths[Math.floor(count / 2)] ?? 42, 28, area.w);
+    const x = area.x + (area.w - w) / 2;
+    return blocks.map((block, index) => ({
+      ...block,
+      x,
+      y: area.y + index * (h + gapY),
+      w,
+      h,
+    }));
+  }
+
+  const cols = count <= 2 ? count : count <= 4 ? 2 : 3;
+  const rows = Math.ceil(count / cols);
+  const cellW = (area.w - gapX * (cols - 1)) / cols;
+  const cellH = (area.h - gapY * (rows - 1)) / rows;
+  return blocks.map((block, index) => {
+    const row = Math.floor(index / cols);
+    const col = index % cols;
+    const itemsInRow = Math.min(cols, count - row * cols);
+    const rowW = itemsInRow * cellW + (itemsInRow - 1) * gapX;
+    const rowX = area.x + (area.w - rowW) / 2;
+    return {
+      ...block,
+      x: rowX + col * (cellW + gapX),
+      y: area.y + row * (cellH + gapY),
+      w: cellW,
+      h: cellH,
+    };
+  });
+}
+
+function inferDiagramLayout(blocks: DiagramBlock[], connectors: DiagramConnector[]): DiagramLayout {
+  const sequential = connectors.length > 0 &&
+    connectors.length === blocks.length - 1 &&
+    connectors.every((c, i) => c.from === i && c.to === i + 1);
+  if (sequential) return "horizontal";
+  if (blocks.length < 2) return "horizontal";
+
+  const centersX = blocks.map(b => b.x + b.w / 2);
+  const centersY = blocks.map(b => b.y + b.h / 2);
+  const spreadX = Math.max(...centersX) - Math.min(...centersX);
+  const spreadY = Math.max(...centersY) - Math.min(...centersY);
+  if (spreadY <= 12) return "horizontal";
+  if (spreadX <= 12) return "vertical";
+  return "grid";
+}
+
+async function buildNewDiagramItemsForDeckSpec(
+  existingBlocks: DiagramBlock[],
+  existingConnectors: DiagramConnector[],
+  slideTitle: string,
+  targetCount: number
+): Promise<{ blocks: DiagramBlock[]; connectors: DiagramConnector[] }> {
+  const maxItems = 6;
+  if (!Number.isInteger(targetCount) || targetCount < 1) {
+    throw new Error(`diagramの項目数は1以上の整数で指定してください（指定値: ${targetCount}）。`);
+  }
+  const effectiveTarget = Math.min(targetCount, maxItems);
+  const existingTexts = existingBlocks.map(b => b.text).filter(Boolean);
+
+  let targetTexts: string[];
+  if (existingTexts.length >= effectiveTarget) {
+    targetTexts = existingTexts.slice(0, effectiveTarget);
+  } else {
+    const addCount = effectiveTarget - existingTexts.length;
+    const openai = OpenAIInstance();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45_000);
+    let completion;
+    try {
+      completion = await openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+        messages: [{
+          role: "user",
+          content:
+            `スライド「${slideTitle}」のダイアグラムに現在以下のノードがあります:\n${JSON.stringify(existingTexts)}\n\n` +
+            `ノード数を${effectiveTarget}件にするため、${addCount}件追加してください。\n` +
+            `既存と重複せず、スライドのテーマに沿った内容で。各テキストは10〜30文字以内（短め）。\n` +
+            `JSON形式: { "newTexts": ["...", "..."] }`,
+        }],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 256,
+      }, { signal: controller.signal });
+    } catch (e: any) {
+      if (e?.name === "AbortError" || String(e?.message ?? "").toLowerCase().includes("abort")) {
+        throw new Error("LLMの応答がタイムアウトしました(45秒)。再度お試しください。");
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const parsed: unknown = JSON.parse(completion.choices[0]?.message?.content ?? "{}");
+    const rawNew: unknown[] = Array.isArray((parsed as any).newTexts) ? (parsed as any).newTexts : [];
+    const validNew = rawNew.slice(0, addCount).map(t => String(t ?? "").trim()).filter(Boolean);
+    if (validNew.length < addCount) {
+      throw new Error(`LLMが必要なノード数（${addCount}件）を生成できませんでした（有効: ${validNew.length}件）。再度お試しください。`);
+    }
+    targetTexts = [...existingTexts, ...validNew];
+  }
+
+  const templateKind = existingBlocks[0]?.kind ?? "node";
+  const template = existingBlocks[existingBlocks.length - 1] ?? existingBlocks[0];
+  const baseBlocks: DiagramBlock[] = targetTexts.map((text, i) => {
+    const existing = existingBlocks[i];
+    if (existing) return { ...existing, text };
+    return {
+      kind: template?.kind ?? templateKind,
+      role: "supporting",
+      ...(template?.groupId ? { groupId: template.groupId } : {}),
+      text,
+      // 追加時は直後に百分率レイアウトへ配置するための仮値
+      x: 0,
+      y: 0,
+      w: template?.w ?? 24,
+      h: template?.h ?? 30,
+    };
+  });
+
+  // 減少時は残るブロックの元配置を完全維持。追加時だけ元構造を推定して再配置する。
+  const newBlocks = effectiveTarget <= existingBlocks.length
+    ? baseBlocks
+    : layoutDiagramBlocks(baseBlocks, inferDiagramLayout(existingBlocks, existingConnectors));
+
+  // コネクタ再構成: 元が連続(0→1, 1→2...)なら同パターンで再生成、そうでなければ範囲内のものだけ保持
+  const connStyle = existingConnectors[0]?.style ?? "arrow";
+  const connRelType = existingConnectors[0]?.relationshipType ?? "flow";
+  const wasSequential = existingConnectors.length > 0 &&
+    existingConnectors.length === existingBlocks.length - 1 &&
+    existingConnectors.every((c, i) => c.from === i && c.to === i + 1);
+
+  let newConnectors: DiagramConnector[];
+  if (wasSequential) {
+    newConnectors = Array.from({ length: effectiveTarget - 1 }, (_, i) => ({
+      ...(existingConnectors[i] ?? {}),
+      from: i,
+      to: i + 1,
+      style: existingConnectors[i]?.style ?? connStyle,
+      relationshipType: existingConnectors[i]?.relationshipType ?? connRelType,
+    }));
+  } else {
+    newConnectors = existingConnectors.filter(
+      c => Number.isInteger(c.from) && Number.isInteger(c.to) &&
+        c.from >= 0 && c.to >= 0 &&
+        c.from < effectiveTarget && c.to < effectiveTarget && c.from !== c.to
+    ).map(c => ({ ...c }));
+
+    // ハブ型など非連続diagramでは、既存の中心ノードから追加ノードへ接続する。
+    if (effectiveTarget > existingBlocks.length && existingConnectors.length > 0 && existingBlocks.length > 0) {
+      const degree = new Map<number, number>();
+      for (const c of existingConnectors) {
+        degree.set(c.from, (degree.get(c.from) ?? 0) + 1);
+        degree.set(c.to, (degree.get(c.to) ?? 0) + 1);
+      }
+      const hub = Array.from(degree.entries())
+        .filter(([index]) => index >= 0 && index < existingBlocks.length)
+        .sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0;
+      for (let i = existingBlocks.length; i < effectiveTarget; i++) {
+        newConnectors.push({ from: hub, to: i, style: connStyle, relationshipType: connRelType });
+      }
+    }
+  }
+
+  return { blocks: newBlocks, connectors: newConnectors };
+}
+
+async function buildItemCountAdjustPlan(
+  slides: Array<{ slideIndex: number; title: string; bullets: string[]; shapes: Array<{ name: string; texts: string[] }> }>,
+  instruction: string,
+  targetCount: number,
+  precomputedTargetSlideIndices?: Set<number>
+): Promise<ItemCountAdjustPlan> {
+  const openai = OpenAIInstance();
+
+  const pageMentions = extractPageMentions(instruction);
+  const targetSlideIndices = precomputedTargetSlideIndices ?? resolveTargetSlideIndices(instruction, slides);
+  const slidesForLLM = targetSlideIndices
+    ? slides.filter((s) => targetSlideIndices.has(s.slideIndex))
+    : slides;
+
+  const pageHint = pageMentions.size > 0
+    ? "【ページ番号→slideIndex変換（必ず従うこと）】\n" +
+      Array.from(pageMentions.entries()).map(([p, i]) => `  Page${p} → slideIndex: ${i}`).join("\n") + "\n\n"
+    : "";
+
+  const slidesJson = JSON.stringify(
+    slidesForLLM.map((s) => ({ slideIndex: s.slideIndex, title: s.title, shapes: s.shapes }))
+  );
+
+  const exampleOutput = JSON.stringify({
+    slides: [{
+      slideIndex: 2,
+      currentCount: 2,
+      headingShapeName: "Text7",
+      descShapeName: "Text8",
+      groupShapeNames: ["Text3","Text4","Text7","Text8"],
+      newItems: [
+        { headingText: "新見出し3", descText: "新説明文3" },
+        { headingText: "新見出し4", descText: "新説明文4" },
+      ],
+    }],
+  }, null, 2);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+  let completion;
+  try {
+    completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      messages: [{
+        role: "user",
+        content:
+          "以下は既存PPTXのスライドデータです。各対象スライドの独立項目数をちょうど " + targetCount + " 個にしてください。\n\n" +
+          pageHint +
+          "【独立項目の判定ルール】\n" +
+          "・「見出しshape（texts が1〜2行）＋説明shape（texts が1〜3行）」のペアが繰り返されているパターンでは、各ペアを1項目と数える\n" +
+          "・例: [{name:'Text3',texts:['見出しA']},{name:'Text4',texts:['説明A1','説明A2']},{name:'Text7',texts:['見出しB']},{name:'Text8',texts:['説明B1']}] → currentCount=2\n\n" +
+          "【各スライドについて出力すること】\n" +
+          "1. currentCount: 現在の独立項目数\n" +
+          "2. headingShapeName: 最後の見出しshape名（テキスト1〜2行のshape）\n" +
+          "3. descShapeName: 最後の説明shape名（テキスト1〜3行のshape）\n" +
+          "4. groupShapeNames: 全項目ブロックに属するshape名のリスト（headingShape/descShape を含む全ペア）\n" +
+          "5. newItems: スライドのテーマに沿った内容で **" + targetCount + " 件** 生成してください（Python側が actual_current を検出し必要な件数のみ採用します。0件は不可）\n\n" +
+          "【制約】\n" +
+          "・headingText は30文字以内、descText は60文字以内\n" +
+          "・新テキストはスライドのタイトル・テーマに沿った内容にすること\n" +
+          "・タイトルshape（最初の大きなshape）はグループに含めないこと\n\n" +
+          "【出力形式（JSON）】\n" + exampleOutput + "\n\n" +
+          "スライドデータ:\n" + slidesJson,
+      }],
+      response_format: { type: "json_object" },
+      max_completion_tokens: 4096,
+    }, { signal: controller.signal });
+  } catch (e: any) {
+    if (e?.name === "AbortError" || String(e?.message ?? "").toLowerCase().includes("abort")) {
+      throw new Error("LLMの応答がタイムアウトしました(60秒)。再度お試しください。");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (completion.choices[0]?.finish_reason === "length") {
+    throw new Error("LLMの応答が途中で途切れました。再度お試しください。");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(completion.choices[0]?.message?.content ?? "{}"); } catch {
+    throw new Error("LLMの返却形式が不正でした。再度お試しください。");
+  }
+
+  const rawSlides: any[] = (parsed as any)?.slides ?? [];
+  if (!Array.isArray(rawSlides) || rawSlides.length === 0) {
+    throw new Error("LLMがslidesを返しませんでした。対象スライドと要求を具体的に指定してください。");
+  }
+
+  const slideEdits: SlideItemCountEdit[] = [];
+  const entries: ItemCountPlanEntry[] = [];
+
+  for (const entry of rawSlides) {
+    let si: number = typeof entry.slideIndex === "number" ? entry.slideIndex : -1;
+    if (targetSlideIndices && !targetSlideIndices.has(si)) continue;
+    if (si < 0 || si >= slides.length) continue;
+
+    const slide = slides.find((s) => s.slideIndex === si);
+    const slideShapeNames = new Set((slide?.shapes ?? []).map((s) => s.name));
+
+    // LLM が targetCount 件生成してくる。Python が actual_current を検出して必要な件数のみ採用。
+    // LLM の currentCount によるスキップは廃止: Python に任せる（already-at-target は Python が success=true で返す）
+    const newItems: Array<{ headingText: string; descText: string }> = Array.isArray(entry.newItems)
+      ? entry.newItems
+          .map((item: any) => ({
+            headingText: String(item?.headingText ?? "").trim().slice(0, 80),
+            descText:    String(item?.descText    ?? "").trim().slice(0, 120),
+          }))
+          .filter((item: any) => item.headingText || item.descText)
+      : [];
+
+    if (newItems.length < 1) {
+      throw new Error(`P${si + 1}: LLMが項目テキストを生成しませんでした。再度お試しください。`);
+    }
+
+    const headingName = String(entry.headingShapeName ?? "").trim();
+    const descName    = String(entry.descShapeName ?? "").trim();
+    if (!headingName || !slideShapeNames.has(headingName)) {
+      console.warn(`[item_count_adjust] invalid headingShapeName slide=${si}: "${headingName}"`);
+      throw new Error(`P${si + 1}: 見出しshape "${headingName}" が見つかりません。再度お試しください。`);
+    }
+    if (!descName || !slideShapeNames.has(descName)) {
+      console.warn(`[item_count_adjust] invalid descShapeName slide=${si}: "${descName}"`);
+      throw new Error(`P${si + 1}: 説明shape "${descName}" が見つかりません。再度お試しください。`);
+    }
+
+    const rawGroup = entry.groupShapeNames;
+    const groupShapeNames = Array.isArray(rawGroup) && rawGroup.length >= 2
+      ? (rawGroup as unknown[]).map((n) => String(n).trim()).filter((n) => n && slideShapeNames.has(n))
+      : undefined;
+
+    const currentCount = typeof entry.currentCount === "number" ? entry.currentCount : -1;
+    console.log(`[item_count_adjust] slide=${si + 1} llmCurrent=${currentCount >= 0 ? currentCount : "?"} llmProvided=${newItems.length} pythonTarget=${targetCount} heading=${headingName} desc=${descName}`);
+    entries.push({ slideIndex: si, currentCount, newItemsCount: newItems.length, skipped: false });
+    slideEdits.push({
+      slideIndex: si,
+      repeatCopyShapeBlock: {
+        headingShapeName: headingName,
+        descShapeName: descName,
+        newItems,
+        targetItemCount: targetCount,
+        ...(groupShapeNames && groupShapeNames.length >= 2 ? { groupShapeNames } : {}),
+      },
+    });
+  }
+
+  return { slideEdits, entries, targetSlideIndices };
 }
 
 async function buildBulletAddPlan(
@@ -4377,10 +5102,10 @@ function buildEditLabel(instruction: string): string {
 
 // ---------------- 既存 PPTX 改良 ----------------
 async function executeEditPptx(
-  args: { fileUrl?: string; instruction: string; imageUrl?: string },
+  args: { fileUrl?: string; instruction: string; imageUrl?: string; targetPages?: number[]; targetItemCount?: number },
   chatThread: ChatThreadModel
 ) {
-  let { fileUrl, instruction, imageUrl: argImageUrl } = args ?? {};
+  let { fileUrl, instruction, imageUrl: argImageUrl, targetPages: argTargetPages, targetItemCount: argTargetItemCount } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
@@ -4400,8 +5125,14 @@ async function executeEditPptx(
   // fileUrl / baseUrl / cleanBaseName を内容増量・未対応判定より先に解決
   const originalFileUrl = fileUrl?.trim() ?? "";
   const threadPptxInfo = await resolveLatestPptxInfoFromThread(chatThread.id);
+  console.log(`[edit_pptx] incoming fileUrl=${originalFileUrl.slice(0, 80) || "(empty)"}`);
+  console.log(`[edit_pptx] pointer  fileUrl=${(threadPptxInfo?.url ?? "").slice(0, 80) || "(none)"}`);
+  // explicit fileUrl 優先: 省略時のみ pointer にフォールバック
   if (!fileUrl?.trim()) {
     fileUrl = threadPptxInfo?.url ?? "";
+    console.log(`[edit_pptx] chosen   fileUrl=${fileUrl.slice(0, 80) || "(empty)"} source=pointer`);
+  } else {
+    console.log(`[edit_pptx] chosen   fileUrl=${fileUrl.slice(0, 80)} source=explicit-arg`);
   }
   const baseUrl = (
     process.env.NEXTAUTH_URL ||
@@ -4432,25 +5163,214 @@ async function executeEditPptx(
     };
   }
 
+  // DeckSpec ロード（自システム生成PPTXの場合のみ存在する。外部PPTXはnull）
+  const deckSpec: DeckSpec | null = await loadDeckSpecForUrl(fileUrl).catch(() => null);
+  if (deckSpec) {
+    console.log(`[edit_pptx] deckSpec loaded deckId=${deckSpec.deckId} rev=${deckSpec.revision} slides=${deckSpec.slides.length}`);
+  } else {
+    console.log(`[edit_pptx] deckSpec not found → compatibility mode (Python shape analysis)`);
+  }
+
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
   // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
+  // 「箇条書き」「bullet」だけでは layout_regen に入れない（reference copy と混同するため）
+  const referenceCopyPages = extractReferenceCopyPages(instruction);
+  // 「カードをN枚に」「カードをN個に」はカード数調整（layout変換ではない）
+  // hasLayoutIntent のカード + に パターンが誤マッチするため先にガードする
+  const isCardCountAdjust =
+    /カード/.test(instruction) && /[\d０-９]+\s*(?:枚|つ|個)/.test(instruction);
   const hasLayoutIntent =
-    /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|デザイン.{0,4}(変え|変更|替え|を変)|レイアウト.{0,4}(変え|変更|変換|をカード)|項目数|箇条書き|bullet)/i.test(instruction);
+    referenceCopyPages
+      ? false  // reference copy はカード型変換ではないため layout_regen に流さない
+      : !isCardCountAdjust &&
+        /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|レイアウト.{0,6}(をカード|カード))/i.test(instruction);
   const hasColorIntent =
     /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
+  // 「色は不変で」「既存配色のまま」など色を変えないと明示された場合のみ true
+  // 「既存配色」「維持」単独ではマッチさせない（「既存配色の雰囲気を維持しつつ赤系に」で誤判定されるため）
+  const preserveColorIntent =
+    /(?:色|色味|配色|カラー).{0,8}(?:不変|そのまま|変えない|変更しない|いじらない|触らない)/.test(instruction) ||
+    /(?:既存配色|現在の配色|今の配色).{0,6}(?:のまま|そのまま)/.test(instruction);
   // 数字参照（"3で"等）も色変更として扱うため先に解決しておく
   const preResolved = resolvePptxPaletteInstruction(instruction);
-  const isColorOnlyEdit = (!!preResolved || hasColorIntent) && !hasLayoutIntent;
+  // 箇条書き追加意図が明確で色語がない場合は、数字パレット番号のみの preResolved で color-only にしない
+  // 例: 「P2の項目数を4に増やして」→ isBulletIntentEarly=true, hasColorIntent=false → isColorOnlyEdit=false
+  const _isBulletIntentEarly =
+    /(箇条書き|bullet|ブレット|項目|ポイント)/i.test(instruction) &&
+    /(追加|足し|足す|(増|ふ)や|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|項目|bullet|ブレット))/i.test(instruction);
+  const isColorOnlyEdit =
+    !preserveColorIntent && (!!preResolved || hasColorIntent) && !hasLayoutIntent &&
+    !(_isBulletIntentEarly && !hasColorIntent);
   const isLayoutConversionRequest = !isColorOnlyEdit && hasLayoutIntent;
   // 色検出は resolvePptxPaletteInstruction (@/features/pptx/palette) に統合済み
   if (isLayoutConversionRequest) {
-    // 色が未指定の場合は変換前にユーザーへ確認を求める（LLM呼び出しも省略）
-    const layoutResolved = preResolved;
-    if (!layoutResolved) {
+    console.log(`[edit_pptx:layout] hasLayoutIntent=${hasLayoutIntent} hasColorIntent=${hasColorIntent} preserveColorIntent=${preserveColorIntent} preResolved=${preResolved ? JSON.stringify(preResolved) : "null"}`);
+    // 色変更の意図はあるが具体的な色が解決できない場合のみ確認を返す
+    // 「色は不変で」等の配色維持指示がある場合は確認しない
+    // （「色も変えて」「いい感じの色に」等 → hasColorIntent=true だが preResolved=null）
+    if (!preserveColorIntent && hasColorIntent && !preResolved) {
       return {
-        message: `カード型に変更するには色の指定が必要です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「スライド3をカード型にして、ティール×コーラルで」のようにまとめてご指定ください。`,
+        message: `カード型に変更します。色も変更する場合は色を指定してください。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「P3をカード型にして、ティール×コーラルで」のようにまとめて指定するか、色指定なしで「P3をカード型にして」とお送りください（既存配色を維持してカード型に変換します）。`,
       };
     }
+    // ── DeckSpec あり: TypeScript 再描画でレイアウト変換（DeckSpec チェーン保全） ────
+    if (deckSpec) {
+      try {
+        const t0 = Date.now();
+        // 対象スライドを解決（ツール引数 targetPages 優先, なければ DeckSpec タイトル/items でマッチ）
+        const rawDsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
+          ? new Set(argTargetPages.map((p: number) => p - 1))
+          : resolveTargetSlideIndices(instruction, deckSpec.slides.map(ds => ({
+              slideIndex: ds.pptxSlideIndex,
+              title: ds.title,
+              bullets: ds.items.map(i => i.body),
+            })));
+
+        if (!rawDsTargetIndices || rawDsTargetIndices.size === 0) {
+          return {
+            error: "対象スライドを特定できませんでした。スライドタイトルまたはページ番号（例: P3をカード型に）で指定してください。",
+          };
+        }
+
+        // 表紙スライド (pptxSlideIndex=0) は DeckSpec.slides に含まれないため除外
+        if (rawDsTargetIndices.has(0)) {
+          rawDsTargetIndices.delete(0);
+          if (rawDsTargetIndices.size === 0) {
+            return {
+              error: "表紙スライド（P1）はカード型に変換できません。カード型に変更したいスライドのページ番号を指定してください（例：P3をカード型に変えて）。",
+            };
+          }
+        }
+
+        const validTargetIndices = new Set(Array.from(rawDsTargetIndices).filter(si =>
+          deckSpec.slides.some(ds => ds.pptxSlideIndex === si)
+        ));
+        if (validTargetIndices.size === 0) {
+          return { error: "対象スライドがDeckSpecに見つかりませんでした。ページ番号を確認してください。" };
+        }
+
+        console.log(`[layout_regen_deckspec] targets=[${Array.from(validTargetIndices).join(",")}]`);
+
+        // DeckSpec の items から LLM 入力用スライドを構築（Python extract 不要）
+        const syntheticSlides = deckSpec.slides.map(ds => ({
+          slideIndex: ds.pptxSlideIndex,
+          title: ds.title,
+          bullets: ds.items.map(i => [i.heading, i.body].filter(Boolean).join(": ")),
+          runs: [] as string[],
+          shapes: [] as Array<{ name: string; texts: string[] }>,
+        }));
+
+        // LLM でカード内容を再生成
+        const regenResult = await buildRegenerationSlidesForLayoutChange(syntheticSlides, instruction, validTargetIndices);
+        const dsIndexToPos = new Map(syntheticSlides.map((s, i) => [s.slideIndex, i]));
+
+        // DeckSpec スライドを更新（対象スライドのみ card_grid に変換）
+        const updatedDsSlides: DeckSpec["slides"] = deckSpec.slides.map(ds => {
+          if (!validTargetIndices.has(ds.pptxSlideIndex)) return ds;
+          const arrayPos = dsIndexToPos.get(ds.pptxSlideIndex);
+          if (arrayPos === undefined) return ds;
+          const regen = regenResult[arrayPos];
+          if (!regen) return ds;
+
+          const rawCards = (Array.isArray(regen.cards) && regen.cards.length >= 2)
+            ? regen.cards
+            : cardsFromBulletsForRegen(regen.bullets ?? []);
+          const cards = rawCards.slice(0, 4).map((c: { heading: string; body?: string; iconKey?: string }) => ({
+            heading: String(c.heading ?? "").trim(),
+            body: String(c.body ?? "").trim(),
+            iconKey: String(c.iconKey ?? "gear").trim() || "gear",
+          })).filter((c: { heading: string; body: string }) => c.heading || c.body);
+
+          if (cards.length === 0) {
+            console.warn(`[layout_regen_deckspec] no valid cards for pptxSlideIndex=${ds.pptxSlideIndex}, keeping original`);
+            return ds;
+          }
+
+          const updatedItems: DeckSpecItem[] = cards.map((c: { heading: string; body: string; iconKey: string }, j: number) => ({
+            id: `${deckSpec.deckId}-s${ds.pptxSlideIndex}-i${j}`,
+            heading: c.heading,
+            body: c.body,
+            iconKey: c.iconKey,
+          }));
+          return {
+            ...ds,
+            layoutType: "card_grid" as DeckSpec["slides"][number]["layoutType"],
+            items: updatedItems,
+            rawSlide: { ...ds.rawSlide, layoutType: "card_grid", cards } as Record<string, unknown>,
+          };
+        });
+
+        // 色変更がある場合は genMeta.paletteSnapshot を更新
+        const shouldApplyColor = !preserveColorIntent && !!preResolved;
+        let updatedGenMeta = deckSpec.genMeta;
+        if (shouldApplyColor) {
+          const newPaletteSnapshot = preResolved!.palette
+            ? (preResolved!.palette as unknown as Record<string, string>)
+            : {
+                ...(deckSpec.genMeta.paletteSnapshot ?? {}),
+                titleBg: preResolved!.accentColor,
+                headerBg: preResolved!.accentColor,
+                accentA: preResolved!.accentColor,
+                tableHeaderBg: preResolved!.accentColor,
+                bodyText: preResolved!.accentColor,
+              };
+          updatedGenMeta = {
+            ...deckSpec.genMeta,
+            paletteSnapshot: newPaletteSnapshot,
+            ...(preResolved!.paletteKey ? { palette: preResolved!.paletteKey } : {}),
+          };
+        }
+
+        const updatedDeckSpec: DeckSpec = {
+          ...deckSpec,
+          slides: updatedDsSlides,
+          genMeta: updatedGenMeta,
+          ...(shouldApplyColor && preResolved!.paletteKey ? { paletteKey: preResolved!.paletteKey } : {}),
+        };
+
+        const dsOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "layout_edit";
+        const dsRerenderRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "rerender_from_deckspec",
+            deckSpec: updatedDeckSpec,
+            threadId: chatThread.id,
+            outputBaseName: dsOutputName,
+          }),
+        });
+
+        if (!dsRerenderRes.ok) {
+          const t = await dsRerenderRes.text().catch(() => "");
+          throw new Error(`DeckSpec re-render failed: HTTP ${dsRerenderRes.status} ${t}`);
+        }
+        const dsRerenderJson = await dsRerenderRes.json();
+        if (!dsRerenderJson?.ok || !dsRerenderJson?.downloadUrl) {
+          throw new Error(dsRerenderJson?.error ?? "DeckSpec re-render returned no URL");
+        }
+
+        const dsDisplayName = `${dsOutputName}.pptx`;
+        console.log(`[layout_regen_deckspec] done targets=[${Array.from(validTargetIndices).join(",")}] color=${shouldApplyColor} total=${Date.now() - t0}ms`);
+        return {
+          downloadUrl: dsRerenderJson.downloadUrl,
+          fileName: dsRerenderJson.fileName ?? dsDisplayName,
+          displayName: dsDisplayName,
+          message: shouldApplyColor
+            ? "指定スライドをカード型に変更し、デッキ全体の色も変更しました。"
+            : "指定スライドをカード型に変更しました。",
+        };
+      } catch (e: any) {
+        console.error("[edit_pptx] DeckSpec layout regen failed:", e);
+        return { error: `カード型への変換に失敗しました: ${String(e?.message ?? e)}` };
+      }
+    }
+
+    // ── DeckSpec なし: Python apply_pptx_plan フォールバック（外部PPTX等） ────
+    // Blobメタデータで自システム生成PPTXと確認できた場合のみDeckSpec欠落エラー（外部PPTXは互換モード許可）
+    if (await checkPptxIsOurs(fileUrl ?? "")) {
+      return { error: "このPPTXの構造情報（DeckSpec）が見つかりません。PPTXを再生成してから再度お試しください。" };
+    }
+    // 色指定がある場合は同時に色変更も実行、ない場合は既存配色を維持してカード型変換のみ実行
     try {
       const t0 = Date.now();
       const extractRes = await fetch(`${baseUrl}/api/edit-pptx`, {
@@ -4464,6 +5384,13 @@ async function executeEditPptx(
         throw new Error(extractJson.error ?? "slide extraction returned empty");
       }
 
+      // 診断ログ: LLMが送ってきた instruction 全文と pageMentions を出力（再発時の原因特定用）
+      const dbgPages = extractPageMentions(instruction);
+      console.log(`[layout_regen] instruction=${instruction.slice(0, 150)}`);
+      if (dbgPages.size > 0) {
+        console.log(`[layout_regen] pageMentions(pages)=${JSON.stringify(Array.from(dbgPages.keys()))}`);
+      }
+
       // 対象スライドを解決（ページ番号 → タイトル/本文マッチの優先順）
       const layoutTargetIndices = resolveTargetSlideIndices(instruction, extractJson.slides);
       if (!layoutTargetIndices || layoutTargetIndices.size === 0) {
@@ -4471,6 +5398,18 @@ async function executeEditPptx(
           error: "対象スライドを1つに絞れませんでした（キーワードが複数のスライドに同じ割合で一致しています）。スライドタイトル（例: 「AzureChatのコア機能」のスライドをカード型に）またはページ番号（例: Page3をカード型に）で一意に指定してください。",
         };
       }
+
+      // P1（表紙スライド）ガード: slideIndex=0 はカード型変換するとレイアウトが崩れるため常に除外
+      // （明示的に "P1" / "表紙" と指定されても変換不可。専用レイアウトが必要なため）
+      if (layoutTargetIndices.has(0)) {
+        layoutTargetIndices.delete(0);
+        if (layoutTargetIndices.size === 0) {
+          return {
+            error: "表紙スライド（P1）はカード型に変換できません。カード型に変更したいスライドのページ番号を指定してください（例：P3をカード型に変えて）。",
+          };
+        }
+      }
+
       console.log(`[layout_regen] targetSlideIndices: [${Array.from(layoutTargetIndices).join(",")}]`);
 
       const slides = await buildRegenerationSlidesForLayoutChange(extractJson.slides, instruction, layoutTargetIndices);
@@ -4494,7 +5433,6 @@ async function executeEditPptx(
       if (slideEdits.length === 0) {
         throw new Error("card conversion plan is empty");
       }
-      // layoutResolved は try ブロック外で確定済み（null なら早期リターン済み）
       const directEditRes = await fetch(`${baseUrl}/api/edit-pptx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4503,11 +5441,14 @@ async function executeEditPptx(
           action: "apply_pptx_plan",
           plan: {
             slideEdits,
-            deckEdits: {
-              accentColor: layoutResolved.accentColor,
-              ...(layoutResolved.paletteKey ? { paletteKey: layoutResolved.paletteKey, palette: layoutResolved.palette } : {}),
-              preserveTextColors: false,
-            },
+            // 色指定があり、かつ色維持指示がない場合のみ deckEdits を付与
+            ...(!preserveColorIntent && preResolved ? {
+              deckEdits: {
+                accentColor: preResolved.accentColor,
+                ...(preResolved.paletteKey ? { paletteKey: preResolved.paletteKey, palette: preResolved.palette } : {}),
+                preserveTextColors: false,
+              },
+            } : {}),
           },
           threadId: chatThread.id,
           outputBaseName: directOutputName,
@@ -4521,12 +5462,15 @@ async function executeEditPptx(
       const directEditJson = await directEditRes.json();
       if (!directEditJson?.downloadUrl) throw new Error("PowerPoint layout edit did not return a download URL");
       const directDisplayName = `${directOutputName}.pptx`;
-      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} paletteKey=${layoutResolved.paletteKey ?? "none"} total=${Date.now() - t0}ms`);
+      const shouldApplyColor = !preserveColorIntent && !!preResolved;
+      console.log(`[layout_direct_edit] changedSlides=${directEditJson.changedSlides ?? 0} targets=${Array.from(layoutTargetIndices).join(",")} paletteKey=${preResolved?.paletteKey ?? "none"} shouldApplyColor=${shouldApplyColor} total=${Date.now() - t0}ms`);
       return {
         downloadUrl: directEditJson.downloadUrl,
         fileName: directEditJson.fileName ?? directDisplayName,
         displayName: directDisplayName,
-        message: "指定スライドをカード型に変更し、デッキ全体の色も変更しました。",
+        message: shouldApplyColor
+          ? "指定スライドをカード型に変更し、デッキ全体の色も変更しました。"
+          : "指定スライドをカード型に変更しました。",
       };
     } catch (e: any) {
       console.error("[edit_pptx] layout direct edit failed:", e);
@@ -4534,7 +5478,74 @@ async function executeEditPptx(
     }
   }
 
-  // ── 全パターン試作: 全5パレットを同一PPTXに適用して番号付きリストで返す ────────
+  // ── 参照スライドレイアウトコピー（P2をP3と同じ箇条書きに、P6から9をP5と同じ等） ──────
+  if (referenceCopyPages) {
+    const { targetPages, referencePage } = referenceCopyPages;
+    if (targetPages.some((p) => p < 1) || referencePage < 1) {
+      return { error: "ページ番号は1以上で指定してください。" };
+    }
+    // 参照元と同じページが含まれていた場合は除外（自己コピー防止）
+    const validTargets = targetPages.filter((p) => p !== referencePage);
+    if (validTargets.length === 0) {
+      return { error: "変更対象と参照元が同じページです。異なるページを指定してください。" };
+    }
+    const referenceSlideIndex = referencePage - 1;
+    const slideEdits = validTargets.map((targetPage) => ({
+      slideIndex: targetPage - 1,
+      copySlideLayoutFromReference: {
+        referenceSlideIndex,
+        preserveTargetText: true,
+      },
+    }));
+    const targetDesc = validTargets.length === 1
+      ? `P${validTargets[0]}`
+      : `P${validTargets[0]}〜P${validTargets[validTargets.length - 1]}`;
+    console.log(`[layout_ref_copy] targets=${targetDesc}(${validTargets.map((p) => p - 1).join(",")}) reference=P${referencePage}(idx=${referenceSlideIndex}) edits=${slideEdits.length}`);
+    try {
+      const t0 = Date.now();
+      const refCopyOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "layout_edit";
+      const refCopyRes = await fetch(`${baseUrl}/api/edit-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileUrl,
+          action: "apply_pptx_plan",
+          plan: {
+            slideEdits,
+            ...(!preserveColorIntent && preResolved ? {
+              deckEdits: {
+                accentColor: preResolved.accentColor,
+                ...(preResolved.paletteKey ? { paletteKey: preResolved.paletteKey, palette: preResolved.palette } : {}),
+                preserveTextColors: false,
+              },
+            } : {}),
+          },
+          threadId: chatThread.id,
+          outputBaseName: refCopyOutputName,
+        }),
+      });
+      if (!refCopyRes.ok) {
+        const t = await refCopyRes.text().catch(() => "");
+        console.error("[layout_ref_copy] failed:", refCopyRes.status, t);
+        throw new Error(`Reference layout copy failed: HTTP ${refCopyRes.status}`);
+      }
+      const refCopyJson = await refCopyRes.json();
+      if (!refCopyJson?.downloadUrl) throw new Error("Reference layout copy did not return a download URL");
+      const refCopyDisplayName = `${refCopyOutputName}.pptx`;
+      console.log(`[layout_ref_copy] done edits=${slideEdits.length} total=${Date.now() - t0}ms`);
+      return {
+        downloadUrl: refCopyJson.downloadUrl,
+        fileName: refCopyJson.fileName ?? refCopyDisplayName,
+        displayName: refCopyDisplayName,
+        message: `${targetDesc}のレイアウトをP${referencePage}と同じ箇条書きデザインに変更しました。`,
+      };
+    } catch (e: any) {
+      console.error("[layout_ref_copy] error:", e);
+      return { error: `レイアウトコピーに失敗しました: ${String(e?.message ?? e)}` };
+    }
+  }
+
+  // ── 全パターン試作: 全6パレットを同一PPTXに適用して番号付きリストで返す ────────
   const isAllPatternsRequest = /(全パターン|全色|全パレット|すべてのパターン|全種類)/.test(instruction);
   if (isAllPatternsRequest) {
     const baseName = cleanBaseName || "PPT";
@@ -4565,12 +5576,13 @@ async function executeEditPptx(
     if (results.length === 0) return { error: "全パターン生成に失敗しました。" };
     const lines = results.map((r, i) => {
       const meta = PPTX_NAMED_PALETTES[r.key];
-      return `${i + 1}. **${r.labelJa}**（${meta.mood}・${meta.recommendedFor}向け）— [ダウンロード](${r.downloadUrl})`;
+      return `${i + 1}. **${r.labelJa}**（${meta.mood}・${meta.recommendedFor}向け）`;
     }).join("\n");
     return {
       downloadUrl: results[0].downloadUrl,
       fileName: results[0].fileName,
       displayName: results[0].fileName,
+      downloads: results.map((r) => ({ url: r.downloadUrl, label: r.labelJa, fileName: r.fileName })),
       message: `全${results.length}パターンを生成しました。\n\n${lines}`,
     };
   }
@@ -4581,10 +5593,73 @@ async function executeEditPptx(
     const colorResolved = preResolved;
     if (!colorResolved) {
       return {
-        message: `現在サポートされている色変更は以下です。\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「ティール×コーラルにして」「バーガンディ×ゴールドにして」「赤にして」\n\n番号で指定も可能です（例: 「3でやって」→ バーガンディ×ゴールド）`,
+        message: `どの配色に変更しますか？\n\n**基本色：** 赤・青・緑・紺・紫・オレンジ・黄・ピンク\n\n**色パレット：**\n${pptxPaletteListText()}\n\n例：「ティール×コーラルにして」「バーガンディ×ゴールドにして」「赤にして」\n\n番号で指定も可能です（例: 「3でやって」→ バーガンディ×ゴールド）`,
       };
     }
     const colorOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "色変更";
+    // ── DeckSpec あり: TypeScript 再描画で色変更（DeckSpec チェーン保全） ────
+    if (deckSpec) {
+      try {
+        // フルパレットがある場合はそれを優先、単色指定の場合は既存スナップショットの主要フィールドを更新
+        const newPaletteSnapshot: Record<string, string> = colorResolved.palette
+          ? (colorResolved.palette as unknown as Record<string, string>)
+          : {
+              ...(deckSpec.genMeta.paletteSnapshot ?? {}),
+              titleBg: colorResolved.accentColor,
+              headerBg: colorResolved.accentColor,
+              accentA: colorResolved.accentColor,
+              tableHeaderBg: colorResolved.accentColor,
+              bodyText: colorResolved.accentColor,
+            };
+
+        const colorUpdatedDeckSpec: DeckSpec = {
+          ...deckSpec,
+          ...(colorResolved.paletteKey ? { paletteKey: colorResolved.paletteKey } : {}),
+          genMeta: {
+            ...deckSpec.genMeta,
+            paletteSnapshot: newPaletteSnapshot,
+            ...(colorResolved.paletteKey ? { palette: colorResolved.paletteKey } : {}),
+          },
+        };
+
+        const colorRerenderRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "rerender_from_deckspec",
+            deckSpec: colorUpdatedDeckSpec,
+            threadId: chatThread.id,
+            outputBaseName: colorOutputName,
+          }),
+        });
+
+        if (!colorRerenderRes.ok) {
+          const t = await colorRerenderRes.text().catch(() => "");
+          throw new Error(`DeckSpec color re-render failed: HTTP ${colorRerenderRes.status} ${t}`);
+        }
+        const colorRerenderJson = await colorRerenderRes.json();
+        if (!colorRerenderJson?.ok || !colorRerenderJson?.downloadUrl) {
+          throw new Error(colorRerenderJson?.error ?? "DeckSpec color re-render returned no URL");
+        }
+
+        const dsColorDisplayName = `${colorOutputName}.pptx`;
+        console.log(`[color_change_deckspec] done paletteKey=${colorResolved.paletteKey ?? "none"} accentColor=${colorResolved.accentColor}`);
+        return {
+          downloadUrl: colorRerenderJson.downloadUrl,
+          fileName: colorRerenderJson.fileName ?? dsColorDisplayName,
+          displayName: dsColorDisplayName,
+          message: "プレゼンテーション全体の色を変更しました。",
+        };
+      } catch (e: any) {
+        console.error("[edit_pptx] DeckSpec color change failed:", e);
+        return { error: `色の変更に失敗しました: ${String(e?.message ?? e)}` };
+      }
+    }
+    // ── DeckSpec なし: Python apply_pptx_plan フォールバック（外部PPTX等） ────
+    // Blobメタデータで自システム生成PPTXと確認できた場合のみDeckSpec欠落エラー（外部PPTXは互換モード許可）
+    if (await checkPptxIsOurs(fileUrl ?? "")) {
+      return { error: "このPPTXの構造情報（DeckSpec）が見つかりません。PPTXを再生成してから再度お試しください。" };
+    }
     try {
       const colorRes = await fetch(`${baseUrl}/api/edit-pptx`, {
         method: "POST",
@@ -4624,8 +5699,9 @@ async function executeEditPptx(
   }
 
   // ── 箇条書き/項目の明示的追加は内容増量より優先（先に計算して両方で使う）────────
-  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント)/i.test(instruction);
-  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|項目|bullet|ブレット))/i.test(instruction);
+  // 「枚」単独では「画像を2枚」「スライドを3枚」等の誤マッチが起きるため「カード」のみ追加
+  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント|カード)/i.test(instruction);
+  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|減らし?|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|枚|項目|bullet|ブレット))/i.test(instruction);
   const isBulletAddRequest = hasBulletWord && hasBulletIncrease;
 
   // ── 内容増量・詳細化リクエストの制御（箇条書き追加の明示がない場合のみ）────────
@@ -4696,6 +5772,325 @@ async function executeEditPptx(
 
   // ── 箇条書き追加リクエストの制御（未対応判定より前）────────
   if (isBulletAddRequest) {
+    // ツール引数 targetItemCount を優先し、なければ instruction から抽出
+    const targetItemCount = (typeof argTargetItemCount === "number" ? argTargetItemCount : null) ?? extractTargetItemCount(instruction);
+
+    // ── 項目数SET: 専用フロー ─────────────────────────────────────────────────────
+    if (targetItemCount !== null) {
+      if (!Number.isInteger(targetItemCount) || targetItemCount < 1 || targetItemCount > 20) {
+        return { error: "項目数は1～20の整数で指定してください。" };
+      }
+      if (argTargetPages !== undefined && (
+        !Array.isArray(argTargetPages) ||
+        argTargetPages.length === 0 ||
+        argTargetPages.some(page => !Number.isInteger(page) || page < 1)
+      )) {
+        return { error: "対象ページは1以上の整数で指定してください（例: P2、P4）。" };
+      }
+      try {
+        const t0 = Date.now();
+
+        // ── DeckSpec ルーティング: DeckSpec が存在する場合は必ずこのパスで処理する ──
+        // DeckSpec あり → card_grid/icon_rows は TypeScript 再描画。非対応レイアウトはエラー。
+        // DeckSpec なし（外部PPTX等）→ 従来 Python フロー。
+        if (deckSpec) {
+          const deckSpecSummary = deckSpec.slides.map(ds => ({
+            slideIndex: ds.pptxSlideIndex,
+            title: ds.title,
+            bullets: ds.items.map(i => i.body),
+          }));
+          // ツール引数 targetPages を優先し、なければ instruction から解析
+          const tsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
+            ? new Set(argTargetPages.map((p: number) => p - 1))
+            : resolveTargetSlideIndices(instruction, deckSpecSummary);
+
+          // 対象スライドを特定できなければエラー（Python へのサイレントフォールバック禁止）
+          if (!tsTargetIndices || tsTargetIndices.size === 0) {
+            return { error: "対象スライドを特定できませんでした。「P3のカードを4枚に」のようにページ番号を明示してください。" };
+          }
+
+          const allTargetSIs = Array.from(tsTargetIndices);
+          // layoutType ログ（デバッグ用 — LocalTest でP4のレイアウトを確認する）
+          console.log(`[item_count_deckspec] targets: ${allTargetSIs.map(si => {
+            const s = deckSpec.slides.find(ds => ds.pptxSlideIndex === si);
+            return `P${si+1}(${s?.layoutType ?? "unknown"})`;
+          }).join(", ")}`);
+
+          // card_grid/icon_rows / bullets / diagram の3系統に振り分け
+          const cardTargets = allTargetSIs.flatMap((si) => {
+            const specSlide = deckSpec.slides.find(ds => ds.pptxSlideIndex === si);
+            return specSlide && (specSlide.layoutType === "card_grid" || specSlide.layoutType === "icon_rows")
+              ? [{ si, specSlide }] : [];
+          });
+          const bulletTargets = allTargetSIs.flatMap((si) => {
+            const specSlide = deckSpec.slides.find(ds => ds.pptxSlideIndex === si);
+            return specSlide && specSlide.layoutType === "bullets"
+              ? [{ si, specSlide }] : [];
+          });
+          const diagramTargets = allTargetSIs.flatMap((si) => {
+            const specSlide = deckSpec.slides.find(ds => ds.pptxSlideIndex === si);
+            return specSlide && specSlide.layoutType === "diagram"
+              ? [{ si, specSlide }] : [];
+          });
+
+          const allHandledSIs = new Set([
+            ...cardTargets.map(t => t.si),
+            ...bulletTargets.map(t => t.si),
+            ...diagramTargets.map(t => t.si),
+          ]);
+
+          // 上記3系統以外のレイアウト（table/multi-column等）はエラー
+          const unhandledSIs = allTargetSIs.filter(si => !allHandledSIs.has(si));
+          if (unhandledSIs.length > 0) {
+            const slideNums = unhandledSIs.map(si => {
+              const specSlide = deckSpec.slides.find(ds => ds.pptxSlideIndex === si);
+              return `P${si + 1}（${specSlide?.layoutType ?? "不明"}）`;
+            }).join("、");
+            return { error: `${slideNums} のレイアウトは項目数変更に対応していません（card_grid/icon_rows/bullets/diagram のみ対応）。` };
+          }
+
+          // TypeScript 再描画:
+          //   card_grid/icon_rows → buildNewCardsForDeckSpec (rawSlide.cards を更新)
+          //   bullets             → buildNewBulletsForDeckSpec (rawSlide.bullets を更新)
+          //   diagram             → buildNewDiagramItemsForDeckSpec (rawSlide.visualBlocks/connectors を更新)
+          const updatedSlides: typeof deckSpec.slides = await Promise.all(
+            deckSpec.slides.map(async (specSlide) => {
+              const cardTarget = cardTargets.find(t => t.si === specSlide.pptxSlideIndex);
+              const bulletTarget = bulletTargets.find(t => t.si === specSlide.pptxSlideIndex);
+              const diagramTarget = diagramTargets.find(t => t.si === specSlide.pptxSlideIndex);
+
+              if (cardTarget) {
+                const newCards = await buildNewCardsForDeckSpec(
+                  specSlide.items, specSlide.title, targetItemCount,
+                  specSlide.layoutType as "card_grid" | "icon_rows"
+                );
+                const updatedItems: DeckSpecItem[] = newCards.map((c, j) => ({
+                  id: `${deckSpec.deckId}-s${specSlide.pptxSlideIndex}-i${j}`,
+                  heading: c.heading,
+                  body: c.body,
+                  iconKey: c.iconKey,
+                }));
+                return { ...specSlide, items: updatedItems, rawSlide: { ...specSlide.rawSlide, cards: newCards } };
+              }
+
+              if (bulletTarget) {
+                const newBullets = await buildNewBulletsForDeckSpec(
+                  specSlide.items, specSlide.title, targetItemCount
+                );
+                const updatedItems: DeckSpecItem[] = newBullets.map((b, j) => ({
+                  id: `${deckSpec.deckId}-s${specSlide.pptxSlideIndex}-i${j}`,
+                  body: b,
+                }));
+                return { ...specSlide, items: updatedItems, rawSlide: { ...specSlide.rawSlide, bullets: newBullets } };
+              }
+
+              if (diagramTarget) {
+                const existingBlocks = (Array.isArray(specSlide.rawSlide.visualBlocks)
+                  ? specSlide.rawSlide.visualBlocks
+                  : []) as DiagramBlock[];
+                const existingConnectors = (Array.isArray(specSlide.rawSlide.connectors)
+                  ? specSlide.rawSlide.connectors
+                  : []) as DiagramConnector[];
+                const { blocks: newBlocks, connectors: newConnectors } = await buildNewDiagramItemsForDeckSpec(
+                  existingBlocks, existingConnectors, specSlide.title, targetItemCount
+                );
+                const updatedItems: DeckSpecItem[] = newBlocks.map((b, j) => ({
+                  id: `${deckSpec.deckId}-s${specSlide.pptxSlideIndex}-i${j}`,
+                  body: b.text,
+                }));
+                return {
+                  ...specSlide,
+                  items: updatedItems,
+                  rawSlide: { ...specSlide.rawSlide, visualBlocks: newBlocks, connectors: newConnectors },
+                };
+              }
+
+              return specSlide;
+            })
+          );
+
+          // 実データ検証: 各対象スライドの items 件数と rawSlide の実体が目標に一致しているか確認
+          for (const si of allTargetSIs) {
+            const updated = updatedSlides.find(s => s.pptxSlideIndex === si);
+            if (!updated) throw new Error(`P${si + 1} の更新結果が見つかりませんでした。`);
+            const isCard = cardTargets.some(t => t.si === si);
+            const isDiagram = diagramTargets.some(t => t.si === si);
+            const cardSpecSlide = cardTargets.find(t => t.si === si)?.specSlide;
+            const maxAllowed = cardSpecSlide?.layoutType === "icon_rows" ? 4 : isDiagram ? 6 : isCard ? 6 : 8;
+            const expectedCount = Math.min(targetItemCount, maxAllowed);
+
+            if (updated.items.length !== expectedCount) {
+              throw new Error(`P${si + 1} の項目数が目標と一致しません（目標: ${expectedCount}、実際: ${updated.items.length}）。`);
+            }
+            // diagram追加検証: visualBlocks件数とconnectorのfrom/toが有効範囲内か
+            if (isDiagram) {
+              const vbs = updated.rawSlide.visualBlocks as DiagramBlock[] | undefined;
+              if (!vbs || vbs.length !== expectedCount) {
+                throw new Error(`P${si + 1} のvisualBlocks件数が目標と一致しません（目標: ${expectedCount}、実際: ${vbs?.length ?? 0}）。`);
+              }
+              const conns = updated.rawSlide.connectors as DiagramConnector[] | undefined;
+              if (conns) {
+                const invalid = conns.filter(c =>
+                  !Number.isInteger(c.from) || !Number.isInteger(c.to) ||
+                  c.from < 0 || c.to < 0 ||
+                  c.from >= expectedCount || c.to >= expectedCount ||
+                  c.from === c.to
+                );
+                if (invalid.length > 0) {
+                  throw new Error(`P${si + 1} のコネクタに範囲外の参照があります（ブロック数: ${expectedCount}）。`);
+                }
+              }
+            }
+          }
+
+          const updatedDeckSpec: DeckSpec = { ...deckSpec, slides: updatedSlides };
+          const tsOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "項目数調整";
+
+          const tsRes = await fetch(`${baseUrl}/api/gen-pptx`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "rerender_from_deckspec",
+              deckSpec: updatedDeckSpec,
+              threadId: chatThread.id,
+              outputBaseName: tsOutputName,
+            }),
+          });
+          if (!tsRes.ok) throw new Error(`TypeScript re-render failed: HTTP ${tsRes.status}`);
+          const tsJson = await tsRes.json();
+          if (!tsJson.ok || !tsJson.downloadUrl) throw new Error(tsJson.error ?? "re-render returned no URL");
+
+          // 実データの件数をメッセージに使う（要求値ではなく実際のitems.lengthを参照）
+          const targetDescs = allTargetSIs.sort((a, b) => a - b).map(si => `P${si + 1}`).join("・");
+          const perSlideDesc = allTargetSIs.sort((a, b) => a - b).map(si => {
+            const updated = updatedSlides.find(s => s.pptxSlideIndex === si);
+            return updated ? `${si + 1}枚目: ${updated.items.length}件` : `P${si + 1}`;
+          });
+          const allSameCount = allTargetSIs.every(si => {
+            const updated = updatedSlides.find(s => s.pptxSlideIndex === si);
+            const first = updatedSlides.find(s => s.pptxSlideIndex === allTargetSIs[0]);
+            return updated?.items.length === first?.items.length;
+          });
+          const firstUpdated = updatedSlides.find(s => s.pptxSlideIndex === allTargetSIs[0]);
+          const effectiveDesc = allSameCount
+            ? `${firstUpdated?.items.length ?? targetItemCount}件`
+            : perSlideDesc.join("・");
+          const capNote = allTargetSIs.some(si => {
+            const updated = updatedSlides.find(s => s.pptxSlideIndex === si);
+            return updated && updated.items.length < targetItemCount;
+          }) ? "（上限のため一部調整）" : "";
+          const displayName = `${tsOutputName}.pptx`;
+          console.log(`[item_count_deckspec] done ${targetDescs} count=${effectiveDesc} total=${Date.now() - t0}ms`);
+          return {
+            downloadUrl: tsJson.downloadUrl,
+            fileName: tsJson.fileName ?? displayName,
+            displayName,
+            message: `${targetDescs}の項目数を${effectiveDesc}に更新しました。${capNote}`,
+          };
+        }
+        // ── DeckSpec なし（外部PPTXなど）: 従来 Python フロー ──
+        // Blobメタデータで自システム生成PPTXと確認できた場合のみDeckSpec欠落エラー（外部PPTXは互換モード許可）
+        if (await checkPptxIsOurs(fileUrl ?? "")) {
+          return { error: "このPPTXの構造情報（DeckSpec）が見つかりません。PPTXを再生成してから再度お試しください。" };
+        }
+
+        // ツール引数 targetPages を最優先。なければ instruction から解析。
+        // ページ特定できない場合は全スライド処理を禁止してエラーにする。
+        let pyTargetSlideIndices: Set<number>;
+        if (Array.isArray(argTargetPages) && argTargetPages.length > 0) {
+          pyTargetSlideIndices = new Set(argTargetPages.map((p: number) => p - 1));
+          const pyPageNums = argTargetPages.sort((a,b)=>a-b).join(",");
+          const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
+          console.log(`[item_count_adjust] targetPages(tool)=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
+        } else {
+          const pyPageMentions = extractPageMentions(instruction);
+          if (pyPageMentions.size === 0) {
+            return { error: "対象ページを特定できませんでした。「P2,P4の項目数を4つに」のようにページ番号を明示してください。" };
+          }
+          pyTargetSlideIndices = new Set(pyPageMentions.values());
+          const pyPageNums = Array.from(pyPageMentions.keys()).sort((a,b)=>a-b).join(",");
+          const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
+          console.log(`[item_count_adjust] parsedPages(instruction) page=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
+        }
+
+        const extractRes = await fetch(`${baseUrl}/api/edit-pptx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileUrl, action: "extract_pptx_summary", threadId: chatThread.id }),
+        });
+        if (!extractRes.ok) throw new Error(`extract failed: HTTP ${extractRes.status}`);
+        const extractJson = await extractRes.json();
+        console.log(`[item_count_adjust] extract: ${Date.now() - t0}ms slides=${extractJson.slides?.length ?? 0}`);
+        if (!extractJson.ok || !Array.isArray(extractJson.slides) || extractJson.slides.length === 0) {
+          throw new Error(extractJson.error ?? "slide extraction returned empty");
+        }
+
+        const t1 = Date.now();
+        const { slideEdits, entries } = await buildItemCountAdjustPlan(
+          extractJson.slides, instruction, targetItemCount, pyTargetSlideIndices
+        );
+        console.log(`[item_count_adjust] llm_plan: ${Date.now() - t1}ms edits=${slideEdits.length} entries=${entries.length}`);
+
+        // ── 前検証: 全対象ページが LLM に解析されているか確認（Issue 5: 全指定ページを検証） ────
+        {
+          const analyzedSet = new Set(entries.map((e) => e.slideIndex));
+          const unanalyzed = Array.from(pyTargetSlideIndices).filter((si) => !analyzedSet.has(si));
+          if (unanalyzed.length > 0) {
+            const slideNums = unanalyzed.map((si) => `P${si + 1}`).join("、");
+            throw new Error(
+              `${slideNums} のshape構造を解析できませんでした。見出し/説明のペア構造がない可能性があります。`
+            );
+          }
+        }
+        if (slideEdits.length === 0) {
+          throw new Error("LLMが有効な編集プランを生成しませんでした。対象スライドを確認してください。");
+        }
+
+        const t2 = Date.now();
+        const itemOutputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "項目数調整";
+        // targetItemCount を渡すことで route.ts 側がポインター自動保存をスキップし、
+        // itemCountResults を全件検証した後にのみポインターを保存する
+        const applyRes = await fetch(`${baseUrl}/api/edit-pptx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileUrl,
+            action: "apply_pptx_plan",
+            threadId: chatThread.id,
+            outputBaseName: itemOutputName,
+            plan: { slideEdits },
+            targetItemCount,
+          }),
+        });
+        if (!applyRes.ok) throw new Error(`apply_pptx_plan failed: HTTP ${applyRes.status}`);
+        const applyJson = await applyRes.json();
+        console.log(
+          `[item_count_adjust] python_apply: ${Date.now() - t2}ms changedSlides=${applyJson.changedSlides}` +
+          ` total=${Date.now() - t0}ms`
+        );
+        // route.ts 側が itemCountResults を全件検証し、失敗時は ok:false + error を返す
+        // ポインターも route.ts 側で全成功後に保存済み
+        if (!applyJson.ok) throw new Error(applyJson.error ?? "apply_pptx_plan returned ok:false");
+        if (!applyJson.downloadUrl) throw new Error("apply_pptx_plan returned no URL");
+
+        const displayName = `${itemOutputName}.pptx`;
+        const itemLayoutWarnNote = Array.isArray(applyJson.layoutWarnings) && applyJson.layoutWarnings.length > 0
+          ? `\n⚠ ${(applyJson.layoutWarnings as string[]).join("\n")}`
+          : "";
+        const targetNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).map(si => `P${si + 1}`).join("・");
+        return {
+          downloadUrl: applyJson.downloadUrl,
+          fileName: applyJson.fileName ?? displayName,
+          displayName,
+          message: `${targetNums} の項目数を ${targetItemCount} に調整しました。レイアウトのはみ出しがないかご確認ください。${itemLayoutWarnNote}`,
+        };
+      } catch (e: any) {
+        console.error("[edit_pptx] item_count_adjust failed:", e);
+        return { error: `項目数調整に失敗しました: ${String(e?.message ?? e)}` };
+      }
+    }
+
+    // ── 通常の箇条書き追加（相対追加: addBullets / copyShapeBlock）────────
     try {
       const t0 = Date.now();
       const extractRes = await fetch(`${baseUrl}/api/edit-pptx`, {
@@ -5006,20 +6401,31 @@ async function executeCreateWord(
 
 // ---------------- Word 編集 ----------------
 async function executeEditWord(
-  args: { fileUrl?: string; instruction: string; trackChanges?: boolean },
+  args: { fileUrl?: string; instruction: string; trackChanges?: boolean; originalFileName?: string },
   chatThread: ChatThreadModel
 ) {
-  let { fileUrl, instruction, trackChanges } = args ?? {};
+  let { fileUrl, instruction, trackChanges, originalFileName } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
 
   if (!fileUrl?.trim()) {
-    return {
-      error:
-        "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
-    };
+    // Pointer check first — also recovers the display name for correct rev-numbering
+    const ptr = await resolveLatestDocxFromPointer(chatThread.id);
+    if (ptr?.url) {
+      fileUrl = ptr.url;
+      if (!originalFileName) originalFileName = ptr.fileName;
+    } else {
+      const resolved = await resolveLatestDocxUrlFromThread(chatThread.id);
+      if (!resolved) {
+        return {
+          error:
+            "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
+        };
+      }
+      fileUrl = resolved;
+    }
   }
 
   // account name 欠落 Blob URL を補正（LLM が直接 effectiveFileUrl を渡してきた場合への保険）
@@ -5047,7 +6453,7 @@ async function executeEditWord(
     const res = await fetch(`${baseUrl}/api/edit-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id, trackChanges: trackChanges ?? false }),
+      body: JSON.stringify({ fileUrl, instruction, threadId: chatThread.id, trackChanges: trackChanges ?? false, ...(originalFileName ? { originalFileName } : {}) }),
     });
 
     if (!res.ok) {
@@ -5848,6 +7254,18 @@ async function executeEditSpWord(
   if (!fileQuery?.trim()) return { error: "fileQuery（ファイル名またはキーワード）を指定してください。" };
   if (!instruction?.trim()) return { error: "instruction（編集内容）を指定してください。" };
 
+  // If this thread already has a modified Word that matches the queried file, redirect to
+  // executeEditWord so additional edits build on the latest revision, not the SP origin.
+  const existingPtr = await resolveLatestDocxFromPointer(chatThread.id);
+  if (existingPtr?.url) {
+    const ptrBase = existingPtr.fileName.toLowerCase().replace(/\.docx$/i, "").replace(/_rev\d+$/i, "");
+    const queryBase = fileQuery.trim().toLowerCase().replace(/\.docx$/i, "").replace(/_rev\d+$/i, "");
+    if (ptrBase && queryBase && (ptrBase === queryBase || ptrBase.includes(queryBase) || queryBase.includes(ptrBase))) {
+      console.log(`[edit_sp_word] pointer matched (${existingPtr.fileName}) → redirecting to executeEditWord for additional edit`);
+      return executeEditWord({ fileUrl: existingPtr.url, instruction, trackChanges: true, originalFileName: existingPtr.fileName }, chatThread);
+    }
+  }
+
   // 1. AI Search でアクセス可能な全 SL 文書を取得し、クライアント側でファイル名フィルタ
   const currentUser = await userSession();
   const deptLower = currentUser?.slDept?.toLowerCase() ?? undefined;
@@ -6013,7 +7431,7 @@ async function executeCreateImage(
   try {
     response = await openAI.images.generate(
       {
-        model: "gpt-image-1.5",
+        model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
         prompt,
       },
       { signal }

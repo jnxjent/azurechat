@@ -878,6 +878,8 @@ def copy_shape_block(slide, action: dict, slide_height: int) -> bool:
 
     # ── アンカー shape の特定（LLM 指定のテキスト shape 名、または heading+desc のみ）──
     anchor_names_set = set(group_shape_names) if group_shape_names else {heading_name, desc_name}
+    # heading/desc は LLM が groupShapeNames に含め忘れた場合でも常にアンカーとして保証する
+    anchor_names_set |= {heading_name, desc_name}
     anchor_shapes = [shapes_by_name[n] for n in anchor_names_set if n in shapes_by_name]
     if not anchor_shapes:
         anchor_shapes = [src_heading, src_desc]
@@ -979,6 +981,296 @@ def copy_shape_block(slide, action: dict, slide_height: int) -> bool:
         file=sys.stderr,
     )
     return True
+
+
+def repeat_copy_shape_block(slide, action: dict, slide_height: int) -> dict:
+    """
+    「項目数をNにする」用。
+    targetItemCount 指定時: 一括レイアウト計算（upward shift + gap圧縮）で全グループを配置。
+    targetItemCount 未指定時: copy_shape_block を逐次呼び出す従来モード。
+    Returns dict: {added, required_add, final_count, target_count, success}
+    """
+    from pptx.oxml.ns import qn
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    heading_name  = (action.get("headingShapeName") or "").strip()
+    desc_name     = (action.get("descShapeName")    or "").strip()
+    new_items     = list(action.get("newItems") or [])
+    initial_group = list(action.get("groupShapeNames") or [])
+    target_count  = action.get("targetItemCount")
+
+    def _result(added=0, required_add=0, final_count=None, success=False, layout_mode=None):
+        r: dict = {"added": added, "required_add": required_add,
+                   "final_count": final_count, "target_count": target_count, "success": success}
+        if layout_mode:
+            r["layout_mode"] = layout_mode
+        return r
+
+    if not (heading_name and desc_name) or not new_items:
+        print("[repeat_copy_shape_block] missing headingShapeName/descShapeName or empty newItems",
+              file=sys.stderr)
+        return _result(required_add=len(new_items))
+
+    # アンカーセット + 現在グループ検出（LLM currentCount 自己補正にも使用）
+    anchor_set = set(initial_group) | {heading_name, desc_name}
+    all_content = [s for s in slide.shapes if s.height <= slide_height * 0.6]
+    all_cl = _cluster_shapes_by_y_band(all_content, gap_emu=30_000)
+
+    # anchor shapes を含むクラスタを起点として検出
+    anchor_clusters = sorted(
+        [cl for cl in all_cl if any(s.name in anchor_set for s in cl["shapes"])],
+        key=lambda cl: cl["y_range"][0],
+    )
+    # LLM が groupShapeNames を部分的にしか返さない場合の補完:
+    # 最初〜最後 anchor クラスタの間にあり、かつ同程度の高さのクラスタも item 群に含める
+    if anchor_clusters:
+        tpl_h_est = anchor_clusters[-1]["y_range"][1] - anchor_clusters[-1]["y_range"][0]
+        h_lo, h_hi = tpl_h_est * 0.6, tpl_h_est * 1.4
+        anchor_ids   = {id(cl) for cl in anchor_clusters}
+        first_anchor_y = anchor_clusters[0]["y_range"][0]
+        last_anchor_y  = anchor_clusters[-1]["y_range"][1]
+        between = [
+            cl for cl in all_cl
+            if id(cl) not in anchor_ids
+            and cl["y_range"][0] >= first_anchor_y - 30_000
+            and cl["y_range"][1] <= last_anchor_y + 30_000
+            and h_lo <= (cl["y_range"][1] - cl["y_range"][0]) <= h_hi
+        ]
+        item_clusters = sorted(anchor_clusters + between, key=lambda cl: cl["y_range"][0])
+    else:
+        item_clusters = []
+    actual_current = len(item_clusters)
+
+    if isinstance(target_count, int) and target_count > 0:
+        required_add = max(0, target_count - actual_current)
+        if required_add == 0:
+            print(f"[repeat_copy_shape_block] already at target ({actual_current}), skip", file=sys.stderr)
+            return _result(added=0, required_add=0, final_count=actual_current, success=True)
+        print(
+            f"[repeat_copy_shape_block] targetCount={target_count} detected={actual_current} "
+            f"requiredAdd={required_add}",
+            file=sys.stderr,
+        )
+        if required_add < len(new_items):
+            new_items = new_items[:required_add]
+        elif required_add > len(new_items):
+            # newItems が足りない → 部分編集を防ぐため変更なしで即失敗返却
+            print(
+                f"[repeat_copy_shape_block] ERROR: need {required_add} but only "
+                f"{len(new_items)} items provided → abort (no partial edit)",
+                file=sys.stderr,
+            )
+            return _result(added=0, required_add=required_add,
+                           final_count=actual_current, success=False)
+    else:
+        required_add = len(new_items)
+
+    if not item_clusters:
+        print("[repeat_copy_shape_block] no item clusters found, abort", file=sys.stderr)
+        return _result(required_add=required_add)
+
+    template_cluster = item_clusters[-1]
+    template_h = template_cluster["y_range"][1] - template_cluster["y_range"][0]
+    n_existing = actual_current
+    n_new = len(new_items)
+    n_total = n_existing + n_new
+    first_y = item_clusters[0]["y_range"][0]
+
+    # ── BATCH LAYOUT MODE（targetItemCount 指定時）────────────────────────────
+    if isinstance(target_count, int) and target_count > 0:
+        # レイアウト定数
+        BOTTOM_MARGIN = 300_000   # ~8mm: スライド下端との最小距離
+        TOP_MARGIN    = 150_000   # ~4mm: タイトル下端からの最小距離
+        MAX_GAP       = 350_000   # ~1cm: グループ間隔の上限（広がりすぎ防止）
+        MIN_GAP       =  50_000   # ~1.4mm: グループ間隔の下限
+
+        # タイトル等の非アイテムクラスタから usable_top を決定
+        non_item_above = [
+            cl for cl in all_cl
+            if not any(s.name in anchor_set for s in cl["shapes"])
+            and cl["y_range"][1] <= first_y
+        ]
+        if non_item_above:
+            title_bot = max(cl["y_range"][1] for cl in non_item_above)
+            usable_top = title_bot + TOP_MARGIN
+        else:
+            usable_top = first_y
+
+        usable_bottom   = slide_height - BOTTOM_MARGIN
+        usable_h        = max(0, usable_bottom - usable_top)
+        # 各クラスタの実際の高さを使う（template_h で一律計算すると背高クラスタが誤差を生む）
+        existing_heights = [cl["y_range"][1] - cl["y_range"][0] for cl in item_clusters]
+        total_content_h  = sum(existing_heights) + template_h * n_new
+
+        def _try_layout(avail_h: int):
+            """avail_h に収まる (gap, block_h) を返す。収まらなければ None。"""
+            min_block = total_content_h + MIN_GAP * (n_total - 1)
+            if min_block > avail_h:
+                return None
+            raw_gap = (avail_h - total_content_h) / (n_total - 1) if n_total > 1 else 0
+            g  = int(min(MAX_GAP, max(MIN_GAP, raw_gap))) if n_total > 1 else 0
+            bh = total_content_h + g * (n_total - 1)
+            return g, bh
+
+        # 段階1: BOTTOM_MARGIN 確保・MAX_GAP 上限・縦中央寄せ
+        lo = _try_layout(usable_h)
+        if lo:
+            gap, block_h   = lo
+            layout_first_y = usable_top + max(0, (usable_h - block_h) // 2)
+            layout_mode    = "balanced"
+        else:
+            # 段階2: BOTTOM_MARGIN を犠牲にした tight 配置
+            tight_h = slide_height - usable_top
+            lo = _try_layout(tight_h)
+            if lo:
+                gap, block_h   = lo
+                layout_first_y = usable_top + max(0, (tight_h - block_h) // 2)
+                layout_mode    = "tight"
+            else:
+                print(
+                    f"[repeat_copy_shape_block] FAIL: need={total_content_h} "
+                    f"usable_h={usable_h} tight_h={tight_h} n={n_total} h={template_h}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"[repeat_copy_shape_block] total added=0/{n_new} "
+                    f"finalCount={actual_current} success=false",
+                    file=sys.stderr,
+                )
+                return _result(added=0, required_add=required_add,
+                               final_count=actual_current, success=False)
+
+        bottom_margin_actual = slide_height - (layout_first_y + block_h)
+        print(
+            f"[repeat_copy_shape_block] layout mode={layout_mode} "
+            f"usableTop={usable_top} usableBottom={usable_bottom} "
+            f"blockH={block_h} firstY={layout_first_y} gap={gap} "
+            f"bottomMargin={bottom_margin_actual}",
+            file=sys.stderr,
+        )
+
+        # 既存グループを layout_first_y から順に再配置（各自の実高さでステップ）
+        cur_y = layout_first_y
+        new_template_top = None
+        for i, grp in enumerate(item_clusters):
+            if i == len(item_clusters) - 1:
+                new_template_top = cur_y
+            delta = cur_y - grp["y_range"][0]
+            if delta != 0:
+                for shape in grp["shapes"]:
+                    _set_shape_y(shape._element, _get_shape_y(shape) + delta, NS_A)
+            cur_y += existing_heights[i] + gap  # 実高さでステップ（template_h ではない）
+
+        if new_template_top is None:
+            new_template_top = layout_first_y
+
+        # max shape ID 取得
+        existing_ids: set[int] = set()
+        for elem in slide.shapes._spTree.iter():
+            id_val = elem.get("id")
+            if id_val:
+                try:
+                    existing_ids.add(int(id_val))
+                except ValueError:
+                    pass
+        max_id = max(existing_ids, default=100)
+
+        def _set_text(sp_elem, text: str) -> None:
+            for t in sp_elem.findall(f".//{{{NS_A}}}t"):
+                t.text = ""
+            t_elems = sp_elem.findall(f".//{{{NS_A}}}t")
+            if t_elems:
+                t_elems[0].text = text
+
+        template_shapes = sorted(template_cluster["shapes"], key=_get_shape_y)
+        id_offset = 0
+
+        for item_idx, item in enumerate(new_items):
+            new_group_top = cur_y
+            heading_text = (item.get("headingText") or "").strip()
+            desc_text    = (item.get("descText")    or "").strip()
+
+            for i, src in enumerate(template_shapes):
+                offset_y = _get_shape_y(src) - new_template_top
+                new_y    = new_group_top + offset_y
+
+                new_elem = deepcopy(src._element)
+                cNvPr = new_elem.find(f".//{qn('p:cNvPr')}")
+                if cNvPr is not None:
+                    cNvPr.set("id",   str(max_id + id_offset + i + 1))
+                    cNvPr.set("name", cNvPr.get("name", "") + f"_new{item_idx + 1}")
+                _set_shape_y(new_elem, new_y, NS_A)
+
+                if src.name == heading_name and src.name == desc_name:
+                    # 同一shape: 見出しと説明を改行で結合して設定
+                    combined = "\n".join(t for t in [heading_text, desc_text] if t)
+                    if combined:
+                        _set_text(new_elem, combined)
+                elif src.name == heading_name and heading_text:
+                    _set_text(new_elem, heading_text)
+                elif src.name == desc_name and desc_text:
+                    _set_text(new_elem, desc_text)
+
+                slide.shapes._spTree.append(new_elem)
+
+            id_offset += len(template_shapes)
+            cur_y += template_h + gap
+            print(f"[repeat_copy_shape_block] item {item_idx + 1} added", file=sys.stderr)
+
+        added = len(new_items)
+        final_count = n_total
+        print(
+            f"[repeat_copy_shape_block] total added={added}/{required_add} "
+            f"finalCount={final_count} bottomMargin={bottom_margin_actual} success=true",
+            file=sys.stderr,
+        )
+        return _result(added=added, required_add=required_add,
+                       final_count=final_count, success=True, layout_mode=layout_mode)
+
+    # ── ITERATIVE MODE（targetItemCount 未指定時）─────────────────────────────
+    cur_heading = heading_name
+    cur_desc    = desc_name
+    accumulated_group = list(anchor_set)
+
+    added = 0
+    for idx, item in enumerate(new_items):
+        names_before = {s.name for s in slide.shapes}
+
+        single_action = {
+            "headingShapeName": cur_heading,
+            "descShapeName":    cur_desc,
+            "groupShapeNames":  accumulated_group,
+            "headingText":      (item.get("headingText") or "").strip(),
+            "descText":         (item.get("descText")    or "").strip(),
+        }
+        ok = copy_shape_block(slide, single_action, slide_height)
+        if not ok:
+            print(f"[repeat_copy_shape_block] item {idx + 1}/{len(new_items)} failed → stop",
+                  file=sys.stderr)
+            break
+
+        added += 1
+
+        all_after = {s.name: s for s in slide.shapes}
+        new_names = [n for n in all_after if n not in names_before]
+        new_h = next((n for n in new_names if n.startswith(cur_heading)), None)
+        new_d = next((n for n in new_names if n.startswith(cur_desc)),    None)
+
+        if new_h and new_d:
+            cur_heading = new_h
+            cur_desc    = new_d
+        else:
+            cur_heading = cur_heading + "_new"
+            cur_desc    = cur_desc    + "_new"
+
+        accumulated_group = accumulated_group + [cur_heading, cur_desc]
+        print(f"[repeat_copy_shape_block] item {idx + 1} added → next={cur_heading}/{cur_desc}",
+              file=sys.stderr)
+
+    print(f"[repeat_copy_shape_block] total added={added}/{len(new_items)}", file=sys.stderr)
+    success = added >= required_add
+    return _result(added=added, required_add=required_add,
+                   final_count=actual_current + added, success=success)
 
 
 def count_all_run_chars(prs) -> int:
@@ -1123,6 +1415,129 @@ def convert_slide_to_cards(slide, action: dict, slide_width: int, slide_height: 
     return True
 
 
+def _remap_relationships(sp_elem, ref_part, target_part) -> None:
+    """Remap all r:embed / r:link rIds in sp_elem from ref_part to target_part.
+
+    python-pptx stores image / hyperlink relationships per-slide in .rels files.
+    After deepcopying a shape element, the embedded rIds still point to the
+    source slide's relationships. This function re-registers each referenced
+    part (or external URL) in the target slide's part and updates the XML attrs
+    so the copied shape resolves correctly.
+    """
+    REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    embed_attr = f"{{{REL_NS}}}embed"
+    link_attr  = f"{{{REL_NS}}}link"
+
+    rId_cache: dict[str, str] = {}
+
+    for elem in sp_elem.iter():
+        for attr_name in (embed_attr, link_attr):
+            old_rId = elem.get(attr_name)
+            if not old_rId:
+                continue
+            if old_rId in rId_cache:
+                elem.set(attr_name, rId_cache[old_rId])
+                continue
+            try:
+                if old_rId not in ref_part.rels:
+                    continue
+                rel = ref_part.rels[old_rId]
+                if rel.is_external:
+                    new_rId = target_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+                else:
+                    source_part = ref_part.related_part(old_rId)
+                    new_rId = target_part.relate_to(source_part, rel.reltype)
+                rId_cache[old_rId] = new_rId
+                elem.set(attr_name, new_rId)
+            except Exception as exc:
+                print(
+                    f"[copy_layout] WARNING: failed to remap rId={old_rId}: {exc}",
+                    file=sys.stderr,
+                )
+
+
+def copy_slide_layout_from_reference(
+    prs,
+    target_slide_index: int,
+    reference_slide_index: int,
+    preserve_target_text: bool = True,
+) -> bool:
+    """Copy body shape layout/style from reference slide to target slide.
+
+    Steps:
+    1. Collect target slide's non-title text lines (if preserve_target_text).
+    2. Remove all body/content shapes from target slide.
+    3. Deep-copy content shapes from reference slide to target.
+    4. Replace text in copied shapes with preserved target texts.
+    """
+    total = len(prs.slides)
+    if not (0 <= target_slide_index < total) or not (0 <= reference_slide_index < total):
+        return False
+    if target_slide_index == reference_slide_index:
+        return False
+
+    target_slide = prs.slides[target_slide_index]
+    ref_slide = prs.slides[reference_slide_index]
+    slide_height = int(prs.slide_height)
+
+    # 1. Collect target non-title texts in order
+    target_texts: list[str] = []
+    if preserve_target_text:
+        for shape in list(iter_shapes(target_slide.shapes)):
+            if _is_title_like_shape(shape, slide_height):
+                continue
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            for para in shape.text_frame.paragraphs:
+                t = para.text.strip()
+                if t:
+                    target_texts.append(t)
+
+    # 2. Remove body/content shapes from target (title is kept by _remove_body_content_shapes)
+    _remove_body_content_shapes(target_slide, slide_height)
+
+    # 3. Deep-copy non-title shapes from reference to target.
+    # r:embed / r:link rIds are per-slide, so re-register each referenced part
+    # in target_slide.part before appending the element.
+    copied_any = False
+    for shape in list(iter_shapes(ref_slide.shapes)):
+        if _is_title_like_shape(shape, slide_height):
+            continue
+        sp_elem = deepcopy(shape._element)
+        _remap_relationships(sp_elem, ref_slide.part, target_slide.part)
+        target_slide.shapes._spTree.append(sp_elem)
+        copied_any = True
+
+    if not copied_any:
+        return False
+
+    # 4. Replace text in copied body shapes with preserved target texts.
+    #    target_texts が尽きた後の残余シェイプは空にして参照元テキストを残さない。
+    if preserve_target_text:
+        body_shapes = [
+            s for s in iter_shapes(target_slide.shapes)
+            if not _is_title_like_shape(s, slide_height) and getattr(s, "has_text_frame", False)
+        ]
+        text_idx = 0
+        for shape in body_shapes:
+            tf = shape.text_frame
+            for para in tf.paragraphs:
+                if not para.runs:
+                    continue
+                if text_idx < len(target_texts):
+                    # Keep run formatting; replace text content only
+                    para.runs[0].text = target_texts[text_idx]
+                    for run in para.runs[1:]:
+                        run.text = ""
+                    text_idx += 1
+                else:
+                    # target_texts 使い切り → 参照元テキストを残さないよう空にする
+                    for run in para.runs:
+                        run.text = ""
+
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -1169,6 +1584,7 @@ def main() -> None:
     changed_fills: int = 0
     changed_texts: int = 0
     changed_lines: int = 0
+    item_count_slide_results: dict[int, dict] = {}
 
     # 範囲外 slideIndex の検出（②）
     total_slides = len(prs.slides)
@@ -1194,7 +1610,9 @@ def main() -> None:
 
         add_bullets_list = slide_edit.get("addBullets") or []
         copy_shape_block_action = slide_edit.get("copyShapeBlock")
+        repeat_copy_block_action = slide_edit.get("repeatCopyShapeBlock")
         convert_to_cards_action = slide_edit.get("convertToCards")
+        copy_layout_ref_action = slide_edit.get("copySlideLayoutFromReference")
         # 挿入済み afterText を追跡（同一テキストが見出し枠・本文枠の両方にある場合の二重挿入防止）
         inserted_after_texts: set[str] = set()
         # replaceText/appendToRun で変更されたシェイプ名を追跡（overflow auto-fit のため）
@@ -1240,6 +1658,24 @@ def main() -> None:
         # copyShapeBlock: shape ペアコピー（shape ループ外で実行・slide_height を渡してオーバーフロー検知）
         if copy_shape_block_action and copy_shape_block(slide, copy_shape_block_action, int(prs.slide_height)):
             slide_changed = True
+
+        # repeatCopyShapeBlock: 「項目数をNにする」専用
+        if repeat_copy_block_action:
+            rc_res = repeat_copy_shape_block(slide, repeat_copy_block_action, int(prs.slide_height))
+            item_count_slide_results[slide_index] = rc_res
+            if rc_res["added"] > 0:
+                slide_changed = True
+            if rc_res.get("layout_mode") == "tight":
+                layout_warnings.append(
+                    f"P{slide_index + 1}: 項目数追加でスライド下端マージンを確保できませんでした"
+                )
+
+        # copySlideLayoutFromReference: 参照スライドのレイアウトをコピーしてターゲットテキストを流し込む
+        if copy_layout_ref_action:
+            ref_idx = int(copy_layout_ref_action.get("referenceSlideIndex", -1))
+            preserve_text = bool(copy_layout_ref_action.get("preserveTargetText", True))
+            if copy_slide_layout_from_reference(prs, slide_index, ref_idx, preserve_text):
+                slide_changed = True
 
         # 画像挿入（特定スライド指定 + slideIndex:-1 の全スライド共通）
         if convert_to_cards_action and convert_slide_to_cards(
@@ -1310,6 +1746,9 @@ def main() -> None:
         result["overflowCandidates"] = overflow_report
     if layout_warnings:
         result["layoutWarnings"] = layout_warnings
+    if item_count_slide_results:
+        # slideIndex (int key) を str key に変換して JSON 出力
+        result["itemCountResults"] = {str(k): v for k, v in item_count_slide_results.items()}
     print(json.dumps(result, ensure_ascii=False))
 
 

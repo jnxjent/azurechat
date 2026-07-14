@@ -1,6 +1,6 @@
 import { Markdown } from "@/features/ui/markdown/markdown";
 import { normalizePhoneForTel, splitTextWithPhones } from "@/lib/linkifyPhone";
-import { FunctionSquare } from "lucide-react";
+import { Download, FunctionSquare } from "lucide-react";
 import React, { useEffect, useRef } from "react";
 import {
   Accordion,
@@ -107,6 +107,20 @@ const linkifyPhoneInTableRow = (line: string): string => {
 const normalizeContent = (src: string): string => {
   if (!src) return "";
 
+  // 【1】citation タグに blob URL が含まれる行を URL 除去より先に消す
+  //     （先に URL を消すと sig= チェックが効かなくなるため順序が重要）
+  src = src.replace(
+    /^[^\n]*\{%\s*citation\b[^%]*https?:\/\/[^%]*%\}[^\n]*/gim,
+    ""
+  );
+
+  // 【2】LLM が誤って出力した blob SAS URL を除去（画像アイコン・リンク・raw URL）
+  // アシスタントメッセージの blob URL は常にダウンロード用途の誤出力（UI が自動表示する）
+  // ※ 画像生成ツールの結果は multiModalImage フィールドで別途表示されるため影響なし
+  src = src.replace(/!\[[^\]]*\]\(https?:\/\/[^)]*\.blob\.core\.windows\.net[^)]*\)/gi, "");
+  src = src.replace(/\[[^\]]*\]\(https?:\/\/[^)]*\.blob\.core\.windows\.net[^)]*\)/gi, "");
+  src = src.replace(/https?:\/\/\S*\.blob\.core\.windows\.net\S*/gi, "");
+
   let inCodeBlock = false;
 
   const lines = src.split(/\r?\n/).map((line) => {
@@ -118,7 +132,11 @@ const normalizeContent = (src: string): string => {
     }
 
     if (inCodeBlock) return line;
-    if (line.includes("{% citation")) return line;
+    if (line.includes("{% citation")) {
+      // blob SAS URL を含む citation タグは除去（ファイル変換ツールの誤出力）
+      if (line.includes("blob.core.windows.net") || line.includes("sig=")) return "";
+      return line;
+    }
 
     const looksLikeTableRow =
       trimmed.startsWith("|") && trimmed.includes("|") && !trimmed.startsWith("|-");
@@ -333,8 +351,53 @@ const MessageContent: React.FC<MessageContentProps> = ({ message }) => {
   }
 
   if (message.role === "tool" || message.role === "function") {
+    const toolJson = toJson(message.content);
+    const toolObj = typeof toolJson === "object" && toolJson !== null
+      ? (toolJson as Record<string, unknown>) : null;
+    const toolDownloadUrl = toolObj?.downloadUrl as string | undefined;
+    const toolDisplayName = (toolObj?.displayName ?? toolObj?.fileName) as string | undefined;
+    const isBlobUrl =
+      typeof toolDownloadUrl === "string" &&
+      /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(toolDownloadUrl);
+
+    // 複数ダウンロード（全パターン生成等）: downloads 配列が優先
+    type ToolDownloadItem = { url: string; label?: string; fileName?: string };
+    const rawDownloads = toolObj?.downloads;
+    const validDownloads: ToolDownloadItem[] = Array.isArray(rawDownloads)
+      ? (rawDownloads as ToolDownloadItem[]).filter(
+          (d) => typeof d?.url === "string" &&
+                 /^https?:\/\/[^/]+\.blob\.core\.windows\.net\//i.test(d.url)
+        )
+      : [];
+
     return (
-      <div className="py-3">
+      <div className="py-3 space-y-2">
+        {validDownloads.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {validDownloads.map((d, idx) => (
+              <a
+                key={idx}
+                href={d.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+              >
+                <Download size={14} strokeWidth={2} />
+                {d.label ?? d.fileName ?? "ダウンロード"}
+              </a>
+            ))}
+          </div>
+        ) : isBlobUrl && toolDownloadUrl ? (
+          <a
+            href={toolDownloadUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors"
+          >
+            <Download size={14} strokeWidth={2} />
+            {toolDisplayName ?? "ダウンロード"}
+          </a>
+        ) : null}
         <Accordion
           type="multiple"
           className="bg-background rounded-md border p-2"

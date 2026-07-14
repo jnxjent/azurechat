@@ -3,28 +3,26 @@ import "server-only";
 
 import { uniqueId } from "@/features/common/util";
 import { GetImageUrl, UploadImageToStore } from "@/features/chat-page/chat-services/chat-image-service";
-type ReasoningOptions = {
-  reasoning_effort?: "low" | "medium" | "high";
-  temperature?: number;
-};
+
+// gpt-image-2 supports: 1024x1024, 1024x1536, 1536x1024
+function compatSizeStr(size: string): string {
+  if (size === "1792x1024") return "1536x1024";
+  if (size === "1024x1792") return "1024x1536";
+  return size;
+}
 
 export async function executeCreateImage(
   args: { prompt: string; text?: string; size?: string },
   threadId: string,
   userMessage: string,
-  signal: AbortSignal,
-  modeOpts?: ReasoningOptions
+  signal: AbortSignal
 ) {
   const prompt = (args?.prompt || "").trim();
   const text = (args?.text || "").trim(); // プラカードに入れるテキスト
-  const size = (args?.size || "1024x1024").trim();
+  const size = compatSizeStr((args?.size || "1024x1024").trim());
 
   console.log("createImage called with prompt:", prompt);
   console.log("createImage text for placard:", text || "(none)");
-  console.log(
-    "🧩 reasoning_effort in request:",
-    modeOpts?.reasoning_effort || "none"
-  );
 
   if (!prompt) return "No prompt provided";
   if (prompt.length >= 4000)
@@ -35,7 +33,7 @@ export async function executeCreateImage(
   const apiKey = process.env.AZURE_OPENAI_API_KEY || "";
   const deployment = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT || "";
   const apiVersion =
-    process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview";
+    process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 
   if (!endpoint || !/^https:\/\/.+\.openai\.azure\.com$/i.test(endpoint)) {
     return {
@@ -70,9 +68,6 @@ export async function executeCreateImage(
           (text ? ". プラカードには何も書かれていない。文字は入れない。" : ""),
         n: 1,
         size,
-        response_format: "b64_json",
-        reasoning_effort: modeOpts?.reasoning_effort,
-        temperature: modeOpts?.temperature,
       }),
       signal,
       cache: "no-store",
@@ -80,6 +75,13 @@ export async function executeCreateImage(
 
     const responseText = await res.text();
     if (!res.ok) {
+      let errCode = "";
+      let errMsg = "";
+      try { const j = JSON.parse(responseText); errCode = j?.error?.code ?? ""; errMsg = j?.error?.message ?? ""; } catch {}
+      console.error("[image/create] API error", {
+        status: res.status, code: errCode, message: errMsg,
+        deployment, apiVersion, size,
+      });
       return {
         error: `There was an error creating the image: HTTP ${res.status}.`,
       };

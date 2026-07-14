@@ -19,12 +19,20 @@ const AZ_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT!;
 const AZ_KEY = process.env.AZURE_OPENAI_API_KEY!;
 const DEPLOYMENT = process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT!;
 const API_VERSION =
-  process.env.AZURE_OPENAI_API_VERSION || "2024-12-01-preview";
+  process.env.AZURE_OPENAI_IMAGE_API_VERSION || "2025-04-01-preview";
 
 const STORAGE_ACCOUNT_NAME = process.env.AZURE_STORAGE_ACCOUNT_NAME;
 const STORAGE_ACCOUNT_KEY = process.env.AZURE_STORAGE_ACCOUNT_KEY;
 const STORAGE_CONTAINER_NAME =
   process.env.AZURE_STORAGE_CONTAINER_NAME || "images";
+
+// -------------------- Size Compat ------------------
+// gpt-image-2 supports: 1024x1024, 1024x1536, 1536x1024
+function compatImageSize(w: number, h: number): { w: number; h: number } {
+  if (w === 1792 && h === 1024) return { w: 1536, h: 1024 };
+  if (w === 1024 && h === 1792) return { w: 1024, h: 1536 };
+  return { w, h };
+}
 
 // -------------------- Utils ------------------------
 function normalizeSpaces(input: string) {
@@ -450,6 +458,9 @@ async function generateImageWithGuards({
   height: number;
   timeoutMs: number;
 }): Promise<Buffer> {
+  const { w: cw, h: ch } = compatImageSize(width, height);
+  const sizeStr = `${cw}x${ch}`;
+
   const url = `${AZ_ENDPOINT.replace(
     /\/+$/,
     ""
@@ -465,14 +476,20 @@ async function generateImageWithGuards({
         headers: { "Content-Type": "application/json", "api-key": AZ_KEY },
         body: JSON.stringify({
           prompt: p,
-          size: `${width}x${height}`,
-          response_format: "b64_json",
+          size: sizeStr,
         }),
         signal: controller.signal,
       }).finally(() => clearTimeout(tm));
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
+        let errCode = "";
+        let errMsg = "";
+        try { const j = JSON.parse(text); errCode = j?.error?.code ?? ""; errMsg = j?.error?.message ?? ""; } catch {}
+        console.error("[gen-image] API error", {
+          status: res.status, code: errCode, message: errMsg,
+          deployment: DEPLOYMENT, apiVersion: API_VERSION, size: sizeStr,
+        });
         return { ok: false as const, status: res.status, text };
       }
 
