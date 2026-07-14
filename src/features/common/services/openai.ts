@@ -30,7 +30,9 @@ export const OpenAIEmbeddingInstance = () => {
   return openai;
 };
 
-// a new instance definition for DALL-E image generation
+let _dalleDeployMismatchWarned = false;
+
+// a new instance definition for DALL-E / gpt-image-2 image generation
 export const OpenAIDALLEInstance = () => {
   if (
     !process.env.AZURE_OPENAI_DALLE_API_KEY ||
@@ -42,12 +44,23 @@ export const OpenAIDALLEInstance = () => {
     );
   }
 
+  if (!_dalleDeployMismatchWarned) {
+    const dep1 = (process.env.AZURE_OPENAI_IMAGE_DEPLOYMENT ?? "").trim();
+    const dep2 = (process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME ?? "").trim();
+    if (dep1 && dep2 && dep1 !== dep2) {
+      console.warn(
+        `[openai] Deployment name mismatch: AZURE_OPENAI_IMAGE_DEPLOYMENT="${dep1}" vs AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME="${dep2}"`
+      );
+      _dalleDeployMismatchWarned = true;
+    }
+  }
+
   const openai = new OpenAI({
     apiKey: process.env.AZURE_OPENAI_DALLE_API_KEY,
     baseURL: `https://${process.env.AZURE_OPENAI_DALLE_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME}`,
     defaultQuery: {
       "api-version":
-        process.env.AZURE_OPENAI_DALLE_API_VERSION || "2023-12-01-preview",
+        process.env.AZURE_OPENAI_DALLE_API_VERSION || "2025-04-01-preview",
     },
     defaultHeaders: {
       "api-key": process.env.AZURE_OPENAI_DALLE_API_KEY,

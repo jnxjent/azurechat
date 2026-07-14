@@ -7431,7 +7431,7 @@ async function executeCreateImage(
   try {
     response = await openAI.images.generate(
       {
-        model: "gpt-image-1.5",
+        model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
         prompt,
       },
       { signal }

@@ -2046,7 +2046,7 @@ async function generateCoverIllustration(
         : "Tone: approachable, polished, optimistic, presentation-friendly.",
     ].join(" ");
     const response = await openai.images.generate({
-      model: "gpt-image-1.5",
+      model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
       prompt,
     });
     const b64 = response.data?.[0]?.b64_json;
