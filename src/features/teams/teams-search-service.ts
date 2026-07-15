@@ -37,9 +37,10 @@ export async function searchTeamsKnowledge(props: {
 
   const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
   if (!userEmail) {
-    throw new Error(
-      "Teams AI Search user is unresolved. Set TEAMS_TEST_USER_EMAIL for local Playground testing."
+    console.warn(
+      "[teams-search] skipped because the channel did not provide a resolvable user"
     );
+    return { context: "", sources: [], userEmail: "", dept: "" };
   }
 
   const access = resolveSlAccess(userEmail);

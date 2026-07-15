@@ -83,7 +83,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
     },
   });
 
-  app.on("message", async ({ activity, send }) => {
+  app.on("message", async ({ activity, send, api }) => {
     const text = activity.text?.trim() || "(empty message)";
     const conversationId = activity.conversation?.id;
 
@@ -93,6 +93,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
     }
 
     try {
+      const userEmail = await resolveActivityUserEmail({ activity, api });
       const officeRequest = parseTeamsOfficeRequest(text);
       if (officeRequest) {
         const startMessage =
@@ -103,12 +104,17 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         const officeReply = await executeTeamsOfficeRequest({
           request: officeRequest,
           conversationId,
+          userEmail,
         });
         await send(officeReply);
         return;
       }
 
-      const result = await createTeamsChatReply({ conversationId, message: text });
+      const result = await createTeamsChatReply({
+        conversationId,
+        message: text,
+        userEmail,
+      });
       await send(result.text);
     } catch (error) {
       console.error("[teams] AzureChat reply failed", error);
@@ -120,6 +126,62 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
   await app.initialize();
   return { app, adapter };
+}
+
+async function resolveActivityUserEmail(props: {
+  activity: {
+    channelId?: unknown;
+    conversation?: { id?: string };
+    from?: {
+      id?: string;
+      properties?: Record<string, unknown>;
+    };
+  };
+  api: {
+    conversations: {
+      members: (conversationId: string) => {
+        getById: (id: string) => Promise<{
+          email?: string;
+          userPrincipalName?: string;
+        }>;
+      };
+    };
+  };
+}): Promise<string | null> {
+  const directEmail = firstEmail(
+    props.activity.from?.properties?.email,
+    props.activity.from?.properties?.userPrincipalName
+  );
+  if (directEmail) return directEmail;
+
+  const conversationId = props.activity.conversation?.id;
+  const memberId = props.activity.from?.id;
+  if (
+    String(props.activity.channelId ?? "") !== "msteams" ||
+    !conversationId ||
+    !memberId
+  ) {
+    return null;
+  }
+
+  try {
+    const member = await props.api.conversations
+      .members(conversationId)
+      .getById(memberId);
+    return firstEmail(member.email, member.userPrincipalName);
+  } catch (error) {
+    console.warn("[teams] Failed to resolve conversation member", error);
+    return null;
+  }
+}
+
+function firstEmail(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim().toLowerCase();
+    if (normalized.includes("@")) return normalized;
+  }
+  return null;
 }
 
 function resolveClientId(): string | undefined {
