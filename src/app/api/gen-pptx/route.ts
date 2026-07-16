@@ -4159,7 +4159,10 @@ async function handleRerenderFromDeckSpec(body: {
     const sortedSlides = [...deckSpec.slides].sort((a, b) => a.pptxSlideIndex - b.pptxSlideIndex);
     let rerenderIllustrationPlaced = false;
     for (const specSlide of sortedSlides) {
-      const slide = upgradeTextOnlySlide(specSlide.rawSlide as unknown as PptxSlide);
+      const forceSimpleBullets = specSlide.rawSlide.__forceSimpleBullets === true;
+      const slide = forceSimpleBullets
+        ? ({ ...specSlide.rawSlide, layoutType: "bullets" } as unknown as PptxSlide)
+        : upgradeTextOnlySlide(specSlide.rawSlide as unknown as PptxSlide);
       const resolvedLt = resolveLayoutType(slide);
       const visual: SlideVisualHint = {
         title: slide.title ?? "",
@@ -4187,7 +4190,14 @@ async function handleRerenderFromDeckSpec(body: {
         case "multi-column":     buildMultiColumnSlide(pptx, slide, theme, visual, false); break;
         case "diagram":          buildDiagramSlide(pptx, slide, theme, visual, false); break;
         default:
-          buildBulletsSlide(pptx, slide, theme, visual, slideIllustration, false);
+          buildBulletsSlide(
+            pptx,
+            slide,
+            theme,
+            visual,
+            slideIllustration,
+            forceSimpleBullets
+          );
           if (slideIllustration) rerenderIllustrationPlaced = true;
           break;
       }

@@ -3822,13 +3822,34 @@ function nextRevisionBaseName(inputBaseName: string): string {
 }
 
 // ---------------- Page/P/ページ番号 → slideIndex 変換 ----------------
+function extractPageRangeMentions(instruction: string): Map<number, number> {
+  const result = new Map<number, number>();
+  const rangePatterns = [
+    /(?<![A-Za-z])P\s*(\d+)\s*(?:から|〜|～|~|[-–—])\s*P?\s*(\d+)/gi,
+    /(?:Page|ページ)\s*(\d+)\s*(?:から|〜|～|~|[-–—])\s*(?:(?:Page|ページ)\s*)?(\d+)/gi,
+  ];
+
+  for (const pattern of rangePatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(instruction)) !== null) {
+      const start = parseInt(match[1], 10);
+      const end = parseInt(match[2], 10);
+      if (start < 1 || end < start || end - start > 100) continue;
+      for (let page = start; page <= end; page++) {
+        result.set(page, page - 1);
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * instruction 内の "Page2,4,7" / "P5" / "ページ3" を抽出し、
  * Map<pageNumber(1-based), slideIndex(0-based)> を返す。
  * 「スライドN」表記は対象外（既存仕様を維持）。
  */
 function extractPageMentions(instruction: string): Map<number, number> {
-  const result = new Map<number, number>();
+  const result = extractPageRangeMentions(instruction);
   // マッチ直後の先頭が「助詞（は/が/を/も）+ 否定・除外語」のパターンのみスキップ。
   // 「以外」はここに含めない：「P5,6,7,8以外は変えないで」でP5-P8が誤スキップされるため。
   const NEGATION_RE = /^[はがをも]\s*(?:しない|除外|対象外|除く|除いて|含まない|変えない|やらない|変更しない|変更済み|前回|すでに)/;
@@ -5184,6 +5205,9 @@ async function executeEditPptx(
       ? false  // reference copy はカード型変換ではないため layout_regen に流さない
       : !isCardCountAdjust &&
         /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|レイアウト.{0,6}(をカード|カード))/i.test(instruction);
+  const hasSimpleBulletLayoutIntent =
+    !referenceCopyPages &&
+    /箇条書き.{0,8}(?:デザイン|レイアウト|形式|型|にして|へ変更|に変更|へ変え|に変え)/i.test(instruction);
   const hasColorIntent =
     /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
   // 「色は不変で」「既存配色のまま」など色を変えないと明示された場合のみ true
@@ -5218,8 +5242,11 @@ async function executeEditPptx(
       try {
         const t0 = Date.now();
         // 対象スライドを解決（ツール引数 targetPages 優先, なければ DeckSpec タイトル/items でマッチ）
-        const rawDsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
-          ? new Set(argTargetPages.map((p: number) => p - 1))
+        // instruction に範囲指定がある場合は、LLMが両端だけを targetPages に渡しても範囲全体を優先する。
+        const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+        const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+        const rawDsTargetIndices = (Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0)
+          ? new Set(effectiveTargetPages.map((p: number) => p - 1))
           : resolveTargetSlideIndices(instruction, deckSpec.slides.map(ds => ({
               slideIndex: ds.pptxSlideIndex,
               title: ds.title,
@@ -5392,7 +5419,12 @@ async function executeEditPptx(
       }
 
       // 対象スライドを解決（ページ番号 → タイトル/本文マッチの優先順）
-      const layoutTargetIndices = resolveTargetSlideIndices(instruction, extractJson.slides);
+      const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+      const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+      const layoutTargetIndices =
+        Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
+          ? new Set(effectiveTargetPages.map((p: number) => p - 1))
+          : resolveTargetSlideIndices(instruction, extractJson.slides);
       if (!layoutTargetIndices || layoutTargetIndices.size === 0) {
         return {
           error: "対象スライドを1つに絞れませんでした（キーワードが複数のスライドに同じ割合で一致しています）。スライドタイトル（例: 「AzureChatのコア機能」のスライドをカード型に）またはページ番号（例: Page3をカード型に）で一意に指定してください。",
@@ -5475,6 +5507,111 @@ async function executeEditPptx(
     } catch (e: any) {
       console.error("[edit_pptx] layout direct edit failed:", e);
       return { error: `カード型への直接編集に失敗しました: ${String(e?.message ?? e)}` };
+    }
+  }
+
+  // ── 単純な箇条書きレイアウトへの変換 ────────────────────────────────────
+  // 通常の文字編集へ流すと、既存テキストボックスへの追記になり重なるため、
+  // DeckSpec の項目を bullets として再構成してスライド全体を再描画する。
+  if (hasSimpleBulletLayoutIntent) {
+    if (!deckSpec) {
+      return {
+        error: "このPPTXの構造情報（DeckSpec）がないため、箇条書きデザインへ安全に変更できません。AzureChatで生成した元のPPTXから再度お試しください。",
+      };
+    }
+
+    try {
+      const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+      const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+      const targetIndices =
+        Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
+          ? new Set(effectiveTargetPages.map((page) => page - 1))
+          : resolveTargetSlideIndices(
+              instruction,
+              deckSpec.slides.map((slide) => ({
+                slideIndex: slide.pptxSlideIndex,
+                title: slide.title,
+                bullets: slide.items.map((item) => item.body),
+              }))
+            );
+
+      if (!targetIndices || targetIndices.size === 0) {
+        return {
+          error: "対象スライドを特定できませんでした。「P2を箇条書きデザインにして」のようにページ番号を指定してください。",
+        };
+      }
+      if (targetIndices.has(0)) {
+        return { error: "表紙スライド（P1）は箇条書きデザインに変更できません。" };
+      }
+
+      const validTargetIndices = new Set(
+        Array.from(targetIndices).filter((slideIndex) =>
+          deckSpec.slides.some((slide) => slide.pptxSlideIndex === slideIndex)
+        )
+      );
+      if (validTargetIndices.size === 0) {
+        return { error: "対象スライドがDeckSpecに見つかりませんでした。ページ番号を確認してください。" };
+      }
+
+      const updatedSlides: DeckSpec["slides"] = deckSpec.slides.map((slide) => {
+        if (!validTargetIndices.has(slide.pptxSlideIndex)) return slide;
+
+        const rawBullets = slide.items
+          .map((item) =>
+            [item.heading?.trim(), item.body.trim()].filter(Boolean).join("：")
+          )
+          .filter(Boolean);
+        const existingRawBullets = Array.isArray(slide.rawSlide.bullets)
+          ? slide.rawSlide.bullets.map((item) => String(item ?? "").trim()).filter(Boolean)
+          : [];
+        const bullets = rawBullets.length > 0 ? rawBullets : existingRawBullets;
+        if (bullets.length === 0) return slide;
+
+        const items: DeckSpecItem[] = bullets.map((body, index) => ({
+          id: `${deckSpec.deckId}-s${slide.pptxSlideIndex}-i${index}`,
+          body,
+        }));
+        return {
+          ...slide,
+          layoutType: "bullets",
+          items,
+          rawSlide: {
+            ...slide.rawSlide,
+            layoutType: "bullets",
+            bullets,
+            __forceSimpleBullets: true,
+          },
+        };
+      });
+
+      const outputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "箇条書き変更";
+      const rerenderResponse = await fetch(`${baseUrl}/api/gen-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "rerender_from_deckspec",
+          deckSpec: { ...deckSpec, slides: updatedSlides },
+          threadId: chatThread.id,
+          outputBaseName: outputName,
+        }),
+      });
+      const rerenderResult = await rerenderResponse.json().catch(() => ({}));
+      if (!rerenderResponse.ok || !rerenderResult?.ok || !rerenderResult?.downloadUrl) {
+        throw new Error(rerenderResult?.error ?? `HTTP ${rerenderResponse.status}`);
+      }
+
+      console.log(
+        `[simple_bullets_deckspec] done targets=[${Array.from(validTargetIndices).join(",")}]`
+      );
+      return {
+        downloadUrl: rerenderResult.downloadUrl,
+        fileName: rerenderResult.fileName ?? `${outputName}.pptx`,
+        displayName: `${outputName}.pptx`,
+        message: "指定スライドを箇条書きデザインに変更しました。",
+      };
+    } catch (error: any) {
+      console.error("[edit_pptx] simple bullet layout conversion failed:", error);
+      return { error: `箇条書きデザインへの変更に失敗しました: ${String(error?.message ?? error)}` };
     }
   }
 
