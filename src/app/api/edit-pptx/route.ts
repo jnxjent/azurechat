@@ -2425,6 +2425,7 @@ export async function POST(req: NextRequest) {
           Array.isArray((se as any).addBullets) ||
           (se as any).copyShapeBlock ||
           (se as any).repeatCopyShapeBlock ||
+          (se as any).copySlideLayoutFromReference ||
           (se as any).convertToCards ||
           Array.isArray((se as any).replaceText)
       );
