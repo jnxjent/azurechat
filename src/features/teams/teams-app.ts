@@ -8,6 +8,7 @@ import { isTeamsBraveSearchConfigured } from "./teams-brave-search-service";
 import {
   executeTeamsOfficeRequest,
   parseTeamsOfficeRequest,
+  type TeamsOfficeRequest,
 } from "./teams-office-service";
 
 export const TEAMS_MESSAGING_ENDPOINT = "/api/teams/messages" as const;
@@ -96,10 +97,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
       const userEmail = await resolveActivityUserEmail({ activity, api });
       const officeRequest = parseTeamsOfficeRequest(text);
       if (officeRequest) {
-        const startMessage =
-          officeRequest.action === "pdf_to_excel"
-            ? `「${officeRequest.fileQuery}」を検索し、Excelへの変換を開始します。完了までしばらくお待ちください。`
-            : `Excelの「${officeRequest.targetSheets.join(", ") || "指定シート"}」を再変換します。完了までしばらくお待ちください。`;
+        const startMessage = buildOfficeStartMessage(officeRequest);
         await send(startMessage);
         const officeReply = await executeTeamsOfficeRequest({
           request: officeRequest,
@@ -126,6 +124,53 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
   await app.initialize();
   return { app, adapter };
+}
+
+function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
+  if (request.action === "ppt_color_help") {
+    return "利用可能なPowerPointの色パターンを確認します。";
+  }
+  if (request.action === "edit_latest_ppt_color") {
+    return "直前に作成したPowerPointの色味を変更します。完了までしばらくお待ちください。";
+  }
+  if (request.action === "edit_latest_excel") {
+    return "直前に作成したExcelファイルを編集します。完了までしばらくお待ちください。";
+  }
+  if (request.action === "edit_latest_word") {
+    return "直前に作成したWordファイルを編集します。完了までしばらくお待ちください。";
+  }
+  if (request.action === "proofread_sp_word") {
+    return "SharePointのWordファイルを検索し、誤字・誤記を変更履歴付きで修正します。完了までしばらくお待ちください。";
+  }
+  if (request.action === "edit_latest_ppt") {
+    return `直前に作成したPowerPointの${request.targetPages
+      .map((page) => `P${page}`)
+      .join("、")}を編集します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "create_ppt_from_sharepoint") {
+    return `SharePoint資料を検索し、「${request.title}」のPowerPoint作成を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "create_excel") {
+    return `「${request.title}」のExcel作成を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "create_word") {
+    return `「${request.title}」のWord作成を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "create_ppt") {
+    return `「${request.title}」のPowerPoint作成を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "pdf_to_excel") {
+    return `「${request.fileQuery}」を検索し、Excelへの変換を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "pdf_to_word") {
+    return `「${request.fileQuery}」を検索し、Wordへの変換を開始します。完了までしばらくお待ちください。`;
+  }
+  if (request.action === "pdf_to_ppt") {
+    return `「${request.fileQuery}」を検索し、PowerPointへの変換を開始します。完了までしばらくお待ちください。`;
+  }
+  return `Excelの「${
+    request.targetSheets.join(", ") || "指定シート"
+  }」を再変換します。完了までしばらくお待ちください。`;
 }
 
 async function resolveActivityUserEmail(props: {

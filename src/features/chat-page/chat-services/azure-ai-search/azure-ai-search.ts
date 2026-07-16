@@ -147,12 +147,13 @@ export const SimpleSearch = async (
   searchText?: string,
   filter?: string,
   deptLower?: string | null,
-  top?: number
+  top?: number,
+  userHash?: string
 ): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
   try {
     const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
 
-    const scopeFilter = await buildSearchAclFilter(deptLower);
+    const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
     const finalFilter = combineFilters(filter, scopeFilter);
 
     const searchResults = await instance.search(searchText ?? "*", {

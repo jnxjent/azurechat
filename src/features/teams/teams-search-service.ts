@@ -2,6 +2,7 @@ import "server-only";
 
 import {
   ExtensionSimilaritySearch,
+  SimpleSearch,
   type DocumentSearchResponse,
 } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { hashValue } from "@/features/auth-page/helpers";
@@ -76,6 +77,78 @@ export async function searchTeamsKnowledge(props: {
   };
 }
 
+export async function searchTeamsKnowledgeByFileFamily(props: {
+  query: string;
+  searchQueries: string[];
+  fileFamily: string;
+  userEmail?: string | null;
+}): Promise<TeamsSearchResult> {
+  assertSearchConfiguration();
+
+  const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
+  if (!userEmail) {
+    return { context: "", sources: [], userEmail: "", dept: "" };
+  }
+
+  const access = resolveSlAccess(userEmail);
+  const queries = Array.from(
+    new Set(props.searchQueries.map((item) => item.trim()).filter(Boolean))
+  );
+  const responses = await Promise.all(
+    (queries.length ? queries : [props.query]).map((searchText) =>
+      ExtensionSimilaritySearch({
+        searchText,
+        vectors: ["embedding"],
+        apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
+        searchName: requiredEnv("AZURE_SEARCH_NAME"),
+        indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
+        filter: "isSlDoc eq true",
+        deptLower: access.dept,
+        userHash: hashValue(userEmail),
+        top: 20,
+      })
+    )
+  );
+
+  const failed = responses.find((response) => response.status !== "OK");
+  if (failed) {
+    const detail = failed.errors?.map((error) => error.message).join("; ");
+    throw new Error(
+      `Teams targeted AI Search failed${detail ? `: ${detail}` : "."}`
+    );
+  }
+
+  const normalizedFamily = normalizeFileSearchText(props.fileFamily);
+  const unique = new Map<string, DocumentSearchResponse>();
+  for (const response of responses) {
+    if (response.status !== "OK") continue;
+    for (const item of response.response) {
+      const name = item.document.metadata?.trim() ?? "";
+      if (
+        !normalizedFamily ||
+        !normalizeFileSearchText(name).includes(normalizedFamily)
+      ) {
+        continue;
+      }
+      const key = [
+        item.document.effectiveFileUrl ?? item.document.fileUrl ?? name,
+        item.document.pageContent ?? "",
+      ].join("\n");
+      if (!unique.has(key)) unique.set(key, item);
+    }
+  }
+
+  const formatted = formatSearchResults(Array.from(unique.values()));
+  console.log("[teams-search] targeted document search completed", {
+    dept: access.dept,
+    fileFamily: props.fileFamily,
+    queries: queries.length,
+    matchedChunks: unique.size,
+    sources: formatted.sources.length,
+  });
+  return { ...formatted, userEmail, dept: access.dept };
+}
+
 export async function findTeamsOfficeFileCandidates(props: {
   query: string;
   userEmail?: string | null;
@@ -94,7 +167,18 @@ export async function findTeamsOfficeFileCandidates(props: {
   }
 
   const access = resolveSlAccess(userEmail);
-  const response = await ExtensionSimilaritySearch({
+  const userHash = hashValue(userEmail);
+  const filenameList = await SimpleSearch(
+    "*",
+    "isSlDoc eq true",
+    access.dept,
+    1000,
+    userHash
+  );
+  const response =
+    filenameList.status === "OK" && filenameList.response.length > 0
+      ? filenameList
+      : await ExtensionSimilaritySearch({
     searchText: props.query,
     vectors: ["embedding"],
     apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
@@ -102,7 +186,7 @@ export async function findTeamsOfficeFileCandidates(props: {
     indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
     filter: "isSlDoc eq true",
     deptLower: access.dept,
-    userHash: hashValue(userEmail),
+    userHash,
     top: 20,
   });
 
@@ -139,10 +223,63 @@ export async function findTeamsOfficeFileCandidates(props: {
     );
   });
 
+  console.log("[teams-office-search] filename-first completed", {
+    dept: access.dept,
+    query: props.query,
+    scannedDocuments:
+      response.status === "OK" ? response.response.length : 0,
+    candidateFiles: suggestions.length,
+    exactMatches: exactMatches.length,
+  });
+
   return {
     exactMatches,
     suggestions: suggestions.slice(0, 5),
   };
+}
+
+export async function searchTeamsKnowledgeByOfficeFileName(props: {
+  fileName: string;
+  userEmail?: string | null;
+}): Promise<TeamsSearchResult> {
+  assertSearchConfiguration();
+
+  const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
+  if (!userEmail) {
+    throw new Error(
+      "Teams Office user is unresolved. Set TEAMS_TEST_USER_EMAIL for local Playground testing."
+    );
+  }
+
+  const access = resolveSlAccess(userEmail);
+  const response = await SimpleSearch(
+    "*",
+    "isSlDoc eq true",
+    access.dept,
+    1000,
+    hashValue(userEmail)
+  );
+  if (response.status !== "OK") {
+    const detail = response.errors?.map((error) => error.message).join("; ");
+    throw new Error(
+      `Teams Office document read failed${detail ? `: ${detail}` : "."}`
+    );
+  }
+
+  const expected = normalizeFileSearchText(props.fileName);
+  const matches = response.response.filter(({ document }) => {
+    const metadataName = document.metadata?.trim() ?? "";
+    return normalizeFileSearchText(metadataName) === expected;
+  });
+  const formatted = formatSearchResults(matches);
+  console.log("[teams-office-search] exact file content completed", {
+    dept: access.dept,
+    fileName: props.fileName,
+    chunks: matches.length,
+    contextCharacters: formatted.context.length,
+  });
+
+  return { ...formatted, userEmail, dept: access.dept };
 }
 
 export function isTeamsSearchConfigured(): boolean {
@@ -202,17 +339,14 @@ function formatSearchResults(results: DocumentSearchResponse[]): {
 function resolveTeamsSearchUserEmail(
   explicitEmail?: string | null
 ): string | null {
-  const explicit = normalizeEmail(explicitEmail);
-  if (explicit) return explicit;
-
   if (process.env.NODE_ENV !== "production") {
-    return (
+    const localTestEmail =
       normalizeEmail(process.env.TEAMS_TEST_USER_EMAIL) ??
-      normalizeEmail(process.env.SL_LOCAL_DEFAULT_EMAIL)
-    );
+      normalizeEmail(process.env.SL_LOCAL_DEFAULT_EMAIL);
+    if (localTestEmail) return localTestEmail;
   }
 
-  return null;
+  return normalizeEmail(explicitEmail);
 }
 
 function resolveSearchTop(): number {
