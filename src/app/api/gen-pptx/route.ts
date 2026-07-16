@@ -3866,7 +3866,16 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const rawCards: PptxCard[] = (slide.cards ?? []).length > 0
     ? slide.cards!
     : (slide.steps ?? []).map((st) => ({ iconKey: st.iconKey, heading: st.title, body: st.body }));
-  const cards = rawCards.filter((c) => c.heading?.trim()).slice(0, 6);
+  // DeckSpec上に項目が存在しても、見出しが空だと従来は描画対象から落ちていた。
+  // 本文しかない項目は本文先頭から見出しを補い、項目数を表示件数と一致させる。
+  const cards = rawCards
+    .map((c) => {
+      const body = String(c.body ?? "").trim();
+      const heading = String(c.heading ?? "").trim() || body.slice(0, 20).trim();
+      return { ...c, heading, body };
+    })
+    .filter((c) => c.heading || c.body)
+    .slice(0, 6);
 
   if (cards.length === 0) {
     // フォールバック: bullets で描画
@@ -3970,7 +3979,16 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const rawRows: PptxCard[] = (slide.cards ?? []).length > 0
     ? slide.cards!
     : (slide.steps ?? []).map((st) => ({ iconKey: st.iconKey, heading: st.title, body: st.body }));
-  const rows = rawRows.filter((r) => r.heading?.trim()).slice(0, 4);
+  // 見出しが空のDeckSpec項目も本文から見出しを補って描画する。
+  // これにより「内部は4件・PPT表示は1件」という不一致を防ぐ。
+  const rows = rawRows
+    .map((r) => {
+      const body = String(r.body ?? "").trim();
+      const heading = String(r.heading ?? "").trim() || body.slice(0, 20).trim();
+      return { ...r, heading, body };
+    })
+    .filter((r) => r.heading || r.body)
+    .slice(0, 4);
 
   if (rows.length === 0) {
     const bulletItems = (slide.bullets ?? []).slice(0, 5).map((b) => ({

@@ -1613,7 +1613,8 @@ export const GetDefaultExtensions = async (props: {
               (await resolveLatestPptxInfoFromThread(props.chatThread.id))?.url ||
               "",
           },
-          props.chatThread
+          props.chatThread,
+          props.userMessage
         ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
@@ -5124,13 +5125,19 @@ function buildEditLabel(instruction: string): string {
 // ---------------- 既存 PPTX 改良 ----------------
 async function executeEditPptx(
   args: { fileUrl?: string; instruction: string; imageUrl?: string; targetPages?: number[]; targetItemCount?: number },
-  chatThread: ChatThreadModel
+  chatThread: ChatThreadModel,
+  userMessage?: string
 ) {
   let { fileUrl, instruction, imageUrl: argImageUrl, targetPages: argTargetPages, targetItemCount: argTargetItemCount } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
+  // ツールLLMが「箇条書きに変更」を「箇条書きを追加」へ言い換える場合があるため、
+  // レイアウト意図と対象ページの判定にはユーザー原文も必ず含める。
+  const userIntentText = [userMessage?.trim(), instruction.trim()]
+    .filter(Boolean)
+    .join("\n");
 
   // 画像URL解決: LLMがimageUrlを省略した場合のフォールバック
   // ロゴ/画像/添付の指示 かつ instruction にURLがない場合、スレッド最新アップロード画像URLを自動注入
@@ -5195,7 +5202,7 @@ async function executeEditPptx(
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
   // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
   // 「箇条書き」「bullet」だけでは layout_regen に入れない（reference copy と混同するため）
-  const referenceCopyPages = extractReferenceCopyPages(instruction);
+  const referenceCopyPages = extractReferenceCopyPages(userIntentText);
   // 「カードをN枚に」「カードをN個に」はカード数調整（layout変換ではない）
   // hasLayoutIntent のカード + に パターンが誤マッチするため先にガードする
   const isCardCountAdjust =
@@ -5207,7 +5214,7 @@ async function executeEditPptx(
         /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|レイアウト.{0,6}(をカード|カード))/i.test(instruction);
   const hasSimpleBulletLayoutIntent =
     !referenceCopyPages &&
-    /箇条書き.{0,8}(?:デザイン|レイアウト|形式|型|にして|へ変更|に変更|へ変え|に変え)/i.test(instruction);
+    /箇条書き.{0,8}(?:デザイン|レイアウト|形式|型|にして|へ変更|に変更|へ変え|に変え)/i.test(userIntentText);
   const hasColorIntent =
     /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
   // 「色は不変で」「既存配色のまま」など色を変えないと明示された場合のみ true
@@ -5419,7 +5426,7 @@ async function executeEditPptx(
       }
 
       // 対象スライドを解決（ページ番号 → タイトル/本文マッチの優先順）
-      const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+      const rangeTargetPages = Array.from(extractPageRangeMentions(userIntentText).keys());
       const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
       const layoutTargetIndices =
         Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
@@ -5521,13 +5528,13 @@ async function executeEditPptx(
     }
 
     try {
-      const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+      const rangeTargetPages = Array.from(extractPageRangeMentions(userIntentText).keys());
       const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
       const targetIndices =
         Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
           ? new Set(effectiveTargetPages.map((page) => page - 1))
           : resolveTargetSlideIndices(
-              instruction,
+              userIntentText,
               deckSpec.slides.map((slide) => ({
                 slideIndex: slide.pptxSlideIndex,
                 title: slide.title,
@@ -5837,8 +5844,8 @@ async function executeEditPptx(
 
   // ── 箇条書き/項目の明示的追加は内容増量より優先（先に計算して両方で使う）────────
   // 「枚」単独では「画像を2枚」「スライドを3枚」等の誤マッチが起きるため「カード」のみ追加
-  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント|カード)/i.test(instruction);
-  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|減らし?|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|枚|項目|bullet|ブレット))/i.test(instruction);
+  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント|カード)/i.test(userIntentText);
+  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|減らし?|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|枚|項目|bullet|ブレット))/i.test(userIntentText);
   const isBulletAddRequest = hasBulletWord && hasBulletIncrease;
 
   // ── 内容増量・詳細化リクエストの制御（箇条書き追加の明示がない場合のみ）────────
@@ -5910,7 +5917,7 @@ async function executeEditPptx(
   // ── 箇条書き追加リクエストの制御（未対応判定より前）────────
   if (isBulletAddRequest) {
     // ツール引数 targetItemCount を優先し、なければ instruction から抽出
-    const targetItemCount = (typeof argTargetItemCount === "number" ? argTargetItemCount : null) ?? extractTargetItemCount(instruction);
+    const targetItemCount = (typeof argTargetItemCount === "number" ? argTargetItemCount : null) ?? extractTargetItemCount(userIntentText);
 
     // ── 項目数SET: 専用フロー ─────────────────────────────────────────────────────
     if (targetItemCount !== null) {
@@ -5937,9 +5944,12 @@ async function executeEditPptx(
             bullets: ds.items.map(i => i.body),
           }));
           // ツール引数 targetPages を優先し、なければ instruction から解析
-          const tsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
-            ? new Set(argTargetPages.map((p: number) => p - 1))
-            : resolveTargetSlideIndices(instruction, deckSpecSummary);
+          const originalPageMentions = extractPageMentions(userMessage ?? "");
+          const tsTargetIndices = originalPageMentions.size > 0
+            ? new Set(originalPageMentions.values())
+            : (Array.isArray(argTargetPages) && argTargetPages.length > 0)
+              ? new Set(argTargetPages.map((p: number) => p - 1))
+              : resolveTargetSlideIndices(userIntentText, deckSpecSummary);
 
           // 対象スライドを特定できなければエラー（Python へのサイレントフォールバック禁止）
           if (!tsTargetIndices || tsTargetIndices.size === 0) {
@@ -6134,13 +6144,19 @@ async function executeEditPptx(
         // ツール引数 targetPages を最優先。なければ instruction から解析。
         // ページ特定できない場合は全スライド処理を禁止してエラーにする。
         let pyTargetSlideIndices: Set<number>;
-        if (Array.isArray(argTargetPages) && argTargetPages.length > 0) {
+        const originalPageMentions = extractPageMentions(userMessage ?? "");
+        if (originalPageMentions.size > 0) {
+          pyTargetSlideIndices = new Set(originalPageMentions.values());
+          const pyPageNums = Array.from(originalPageMentions.keys()).sort((a,b)=>a-b).join(",");
+          const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
+          console.log(`[item_count_adjust] parsedPages(user) page=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
+        } else if (Array.isArray(argTargetPages) && argTargetPages.length > 0) {
           pyTargetSlideIndices = new Set(argTargetPages.map((p: number) => p - 1));
           const pyPageNums = argTargetPages.sort((a,b)=>a-b).join(",");
           const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
           console.log(`[item_count_adjust] targetPages(tool)=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
         } else {
-          const pyPageMentions = extractPageMentions(instruction);
+          const pyPageMentions = extractPageMentions(userIntentText);
           if (pyPageMentions.size === 0) {
             return { error: "対象ページを特定できませんでした。「P2,P4の項目数を4つに」のようにページ番号を明示してください。" };
           }
