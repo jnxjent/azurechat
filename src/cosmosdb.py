@@ -14,8 +14,8 @@ COSMOSDB_KEY = os.getenv("AZURE_COSMOSDB_KEY")
 DATABASE_NAME = "chat"
 CONTAINER_NAME ="history"
 
-print(f"URI: {COSMOSDB_URI}")
-print(f"KEY: {COSMOSDB_KEY[:8]}...")  # キーの先頭だけ確認用に
+if not COSMOSDB_URI or not COSMOSDB_KEY:
+    raise RuntimeError("AZURE_COSMOSDB_URI and AZURE_COSMOSDB_KEY are required")
 
 # Initialize Cosmos DB client
 client = CosmosClient(COSMOSDB_URI, COSMOSDB_KEY)
@@ -26,53 +26,87 @@ container = database.get_container_client(CONTAINER_NAME)
 start_date = datetime(2024, 10, 1)
 end_date = datetime.utcnow()
 
-# Query data excluding admin usage
-query = f'''
+# Query existing Web data. Records without a channel are legacy Web records.
+# The original counting method is intentionally preserved.
+web_query = f'''
 SELECT c.createdAt, c.userId
 FROM c
-WHERE NOT CONTAINS(c.userId, "j.nomoto@midac.jp") AND c.createdAt >= "{start_date.isoformat()}"
+WHERE NOT CONTAINS(c.userId, "j.nomoto@midac.jp")
+  AND c.createdAt >= "{start_date.isoformat()}"
+  AND (NOT IS_DEFINED(c.channel) OR c.channel != "teams")
 '''
 
-# Fetch data from Cosmos DB
-items = container.query_items(query=query, enable_cross_partition_query=True)
-data = [{"createdAt": item["createdAt"], "userId": item["userId"]} for item in items]
+# Query Teams thread records written by the Teams module.
+teams_query = f'''
+SELECT c.createdAt, c.userId
+FROM c
+WHERE c.channel = "teams"
+  AND c.type = "TEAMS_CHAT_THREAD"
+  AND c.createdAt >= "{start_date.isoformat()}"
+'''
 
-# Create a DataFrame
-df = pd.DataFrame(data)
 
-# Convert createdAt to datetime
-df["createdAt"] = pd.to_datetime(df["createdAt"])
+def fetch_dataframe(query):
+    items = container.query_items(
+        query=query,
+        enable_cross_partition_query=True,
+    )
+    data = [
+        {"createdAt": item["createdAt"], "userId": item["userId"]}
+        for item in items
+    ]
+    return pd.DataFrame(data, columns=["createdAt", "userId"])
 
-# Filter out admin user (additional safety net)
-df = df[~df["userId"].str.contains("j.nomoto@midac.jp", na=False)]
 
-# Add a "month" column for monthly aggregation
-df["month"] = df["createdAt"].dt.to_period("M").apply(lambda r: r.start_time)
+def aggregate(dataframe):
+    df = dataframe.copy()
+    if df.empty:
+        weekly = pd.DataFrame(columns=["week_start", "threads", "users"])
+        monthly = pd.DataFrame(columns=["month", "threads", "users"])
+        return weekly, monthly
 
-# Add a "week_start" column for weekly aggregation
-df["week_start"] = df["createdAt"].dt.to_period("W").apply(lambda r: r.start_time)
+    df["createdAt"] = pd.to_datetime(df["createdAt"])
+    df["month"] = df["createdAt"].dt.to_period("M").apply(
+        lambda period: period.start_time
+    )
+    df["week_start"] = df["createdAt"].dt.to_period("W").apply(
+        lambda period: period.start_time
+    )
 
-# Weekly aggregation
-weekly_summary = df.groupby("week_start").agg(
-    threads=("createdAt", "count"),
-    users=("userId", "nunique")
-).reset_index()
+    weekly = df.groupby("week_start").agg(
+        threads=("createdAt", "count"),
+        users=("userId", "nunique"),
+    ).reset_index()
 
-# Monthly aggregation
-monthly_summary = df.groupby("month").agg(
-    threads=("createdAt", "count"),
-    users=("userId", "nunique")
-).reset_index()
+    monthly = df.groupby("month").agg(
+        threads=("createdAt", "count"),
+        users=("userId", "nunique"),
+    ).reset_index()
+    monthly["month"] = pd.to_datetime(monthly["month"])
+    return weekly, monthly
 
-# Ensure 'month' is a datetime for proper display
-monthly_summary["month"] = pd.to_datetime(monthly_summary["month"])
+
+web_df = fetch_dataframe(web_query)
+teams_df = fetch_dataframe(teams_query)
+
+# Additional safety net retained for the existing Web statistics.
+web_df = web_df[~web_df["userId"].str.contains("j.nomoto@midac.jp", na=False)]
+
+web_weekly_summary, web_monthly_summary = aggregate(web_df)
+teams_weekly_summary, teams_monthly_summary = aggregate(teams_df)
 
 # Print the results
-print("Weekly Summary:")
-print(weekly_summary)
-print("\nMonthly Summary:")
-print(monthly_summary)
+print("Web Weekly Summary:")
+print(web_weekly_summary)
+print("\nWeb Monthly Summary:")
+print(web_monthly_summary)
+print("\nTeams Weekly Summary:")
+print(teams_weekly_summary)
+print("\nTeams Monthly Summary:")
+print(teams_monthly_summary)
 
-# Save the summaries to CSV
-weekly_summary.to_csv("weekly_summary.csv", index=False)
-monthly_summary.to_csv("monthly_summary.csv", index=False)
+# Keep the existing Web CSV names unchanged and write Teams separately.
+web_weekly_summary.to_csv("weekly_summary.csv", index=False)
+web_monthly_summary.to_csv("monthly_summary.csv", index=False)
+teams_weekly_summary.to_csv("teams_weekly_summary.csv", index=False)
+teams_monthly_summary.to_csv("teams_monthly_summary.csv", index=False)

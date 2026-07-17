@@ -11,6 +11,8 @@ export type SpFileItem = {
   webUrl: string;
   sourceSiteUrl: string;
   relativePath: string;
+  contentTag: string;
+  lastModifiedAt: string | null;
 };
 
 export type SlSyncDeptResult = {
@@ -21,6 +23,10 @@ export type SlSyncDeptResult = {
   urlUpdated?: number;
   newIndexed?: number;
   newSkipped?: number;
+  reindexCandidates?: number;
+  reindexCandidateNames?: string[];
+  reindexed?: number;
+  reindexFailed?: number;
   unindexedCount?: number;
   skipped?: string;
   error?: string;
@@ -37,6 +43,7 @@ export type RunSlSyncParams = {
   apply?: boolean;
   indexNew?: boolean;
   batchSize?: number;
+  reindexOnly?: boolean;
 };
 
 type IndexDoc = {
@@ -48,6 +55,8 @@ type IndexDoc = {
   relativePath: string | null;
   storedRelativePath: string | null;
   spItemId: string | null;
+  spContentTag: string | null;
+  spLastModifiedAt: string | null;
 };
 
 type NewIndexDoc = {
@@ -65,6 +74,30 @@ type NewIndexDoc = {
   slOwner: string | null;
   spItemId: string | null;
   relativePath?: string | null;
+  spContentTag?: string | null;
+  spLastModifiedAt?: string | null;
+};
+
+type MatchedIndexDoc = {
+  doc: IndexDoc;
+  spItem: SpFileItem | null;
+  lookupFailed?: boolean;
+};
+
+type ReindexCandidate = {
+  item: SpFileItem;
+  oldDocIds: string[];
+  reason: "content_changed" | "legacy_missing_tag";
+};
+
+type ReindexJob = {
+  resultKey: string;
+  candidate: ReindexCandidate;
+  dept: string;
+  siteUrl: string;
+  driveName: string;
+  baseFolder: string;
+  globalCommon?: GlobalCommonConfig | null;
 };
 
 type ScopeKind = "global_common" | "dept_common" | "personal";
@@ -295,7 +328,7 @@ async function lookupSpItemByIdInDrive(
 
     const res = await fetch(
       `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}` +
-        `?$select=name,file,id,webUrl,parentReference,deleted`,
+        `?$select=name,file,id,webUrl,parentReference,deleted,cTag,eTag,lastModifiedDateTime`,
       { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" }
     );
 
@@ -333,6 +366,10 @@ async function lookupSpItemByIdInDrive(
       webUrl: String(item.webUrl),
       sourceSiteUrl: siteUrl,
       relativePath,
+      contentTag: String(item.cTag ?? item.eTag ?? ""),
+      lastModifiedAt: item.lastModifiedDateTime
+        ? String(item.lastModifiedDateTime)
+        : null,
     };
   } catch (e) {
     console.warn(`[SL sync] lookupSpItemByIdInDrive error:`, e);
@@ -403,9 +440,11 @@ async function collectFileItemsRecursive(
   isRoot = false
 ): Promise<{ fetchFailed: boolean; rootMissing: boolean }> {
   const encoded = encodeGraphPath(currentFolderPath);
+  const select =
+    "name,file,folder,id,webUrl,parentReference,cTag,eTag,lastModifiedDateTime";
   let nextUrl: string | null = encoded
-    ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encoded}:/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`
-    : `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$select=name,file,folder,id,webUrl,parentReference&$top=200`;
+    ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encoded}:/children?$select=${select}&$top=200`
+    : `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$select=${select}&$top=200`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -433,6 +472,10 @@ async function collectFileItemsRecursive(
           webUrl: String(item.webUrl ?? ""),
           sourceSiteUrl,
           relativePath: normalizeFolderPath(`${currentFolderPath}/${item.name}`),
+          contentTag: String(item.cTag ?? item.eTag ?? ""),
+          lastModifiedAt: item.lastModifiedDateTime
+            ? String(item.lastModifiedDateTime)
+            : null,
         });
       } else if (item?.folder && item?.name) {
         const child = await collectFileItemsRecursive(
@@ -532,7 +575,8 @@ async function getIndexDocs(
   deptSiteUrl: string,
   deptBaseFolder: string,
   globalCommon?: GlobalCommonConfig | null,
-  hasRelativePath = false
+  hasRelativePath = false,
+  hasChangeTrackingFields = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -542,9 +586,19 @@ async function getIndexDocs(
     throw new Error("Missing Azure Search env vars");
   }
 
-  const selectFields = hasRelativePath
-    ? "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId,relativePath"
-    : "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId";
+  const selectFields = [
+    "id",
+    "metadata",
+    "fileUrl",
+    "effectiveFileUrl",
+    "dept",
+    "slScope",
+    "spItemId",
+    ...(hasRelativePath ? ["relativePath"] : []),
+    ...(hasChangeTrackingFields
+      ? ["spContentTag", "spLastModifiedAt"]
+      : []),
+  ].join(",");
 
   const docs: IndexDoc[] = [];
   let skip = 0;
@@ -589,6 +643,13 @@ async function getIndexDocs(
           relativePath: null,
           storedRelativePath,
           spItemId: item.spItemId ? String(item.spItemId) : null,
+          spContentTag: hasChangeTrackingFields && item.spContentTag
+            ? String(item.spContentTag)
+            : null,
+          spLastModifiedAt:
+            hasChangeTrackingFields && item.spLastModifiedAt
+              ? String(item.spLastModifiedAt)
+              : null,
         };
         doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
           doc,
@@ -609,7 +670,8 @@ async function getIndexDocs(
 
 async function getIndexDocsGlobalCommon(
   globalCommon: GlobalCommonConfig,
-  hasRelativePath = false
+  hasRelativePath = false,
+  hasChangeTrackingFields = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -619,9 +681,19 @@ async function getIndexDocsGlobalCommon(
     throw new Error("Missing Azure Search env vars");
   }
 
-  const selectFields = hasRelativePath
-    ? "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId,relativePath"
-    : "id,metadata,fileUrl,effectiveFileUrl,dept,slScope,spItemId";
+  const selectFields = [
+    "id",
+    "metadata",
+    "fileUrl",
+    "effectiveFileUrl",
+    "dept",
+    "slScope",
+    "spItemId",
+    ...(hasRelativePath ? ["relativePath"] : []),
+    ...(hasChangeTrackingFields
+      ? ["spContentTag", "spLastModifiedAt"]
+      : []),
+  ].join(",");
 
   const docs: IndexDoc[] = [];
   let skip = 0;
@@ -665,6 +737,13 @@ async function getIndexDocsGlobalCommon(
           relativePath: null,
           storedRelativePath,
           spItemId: item.spItemId ? String(item.spItemId) : null,
+          spContentTag: hasChangeTrackingFields && item.spContentTag
+            ? String(item.spContentTag)
+            : null,
+          spLastModifiedAt:
+            hasChangeTrackingFields && item.spLastModifiedAt
+              ? String(item.spLastModifiedAt)
+              : null,
         };
         doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
           doc,
@@ -694,21 +773,22 @@ async function deleteIndexDocs(ids: string[]): Promise<void> {
     throw new Error("Missing Azure Search env vars");
   }
 
-  const body = {
-    value: ids.map((id) => ({ "@search.action": "delete", id })),
-  };
+  for (let offset = 0; offset < ids.length; offset += 1000) {
+    const batchIds = ids.slice(offset, offset + 1000);
+    const res = await fetch(
+      `${endpoint}/indexes/${indexName}/docs/index?api-version=2024-07-01`,
+      {
+        method: "POST",
+        headers: { "api-key": apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          value: batchIds.map((id) => ({ "@search.action": "delete", id })),
+        }),
+        cache: "no-store",
+      }
+    );
 
-  const res = await fetch(
-    `${endpoint}/indexes/${indexName}/docs/index?api-version=2024-07-01`,
-    {
-      method: "POST",
-      headers: { "api-key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      cache: "no-store",
-    }
-  );
-
-  if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
+    await assertIndexActionSucceeded(res, "Delete");
+  }
   console.log(`[SL sync] Deleted ${ids.length} index docs`);
 }
 
@@ -771,6 +851,41 @@ async function ensureRelativePathField(): Promise<boolean> {
   return true;
 }
 
+async function hasSharePointChangeTrackingFields(): Promise<boolean> {
+  const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
+  const apiKey = process.env.AZURE_SEARCH_API_KEY;
+  const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
+  if (!endpoint || !apiKey || !indexName) return false;
+
+  const res = await fetch(
+    `${endpoint}/indexes/${indexName}?api-version=2024-07-01`,
+    { headers: { "api-key": apiKey }, cache: "no-store" }
+  );
+  if (!res.ok) {
+    console.warn(
+      "[SL sync] Failed to inspect index schema for SharePoint change tracking"
+    );
+    return false;
+  }
+
+  const index = await res.json();
+  const fieldNames = new Set<string>(
+    (index.fields ?? []).map((field: any) => String(field.name ?? ""))
+  );
+  const requiredFields = ["spContentTag", "spLastModifiedAt"];
+  const missingFields = requiredFields.filter(
+    (fieldName) => !fieldNames.has(fieldName)
+  );
+  const hasFields = missingFields.length === 0;
+
+  if (!hasFields) {
+    console.warn(
+      `[SL sync] Change reindexing disabled for ${indexName}: missing fields ${missingFields.join(", ")}`
+    );
+  }
+  return hasFields;
+}
+
 async function addNewIndexDocs(docs: NewIndexDoc[]): Promise<void> {
   if (docs.length === 0) return;
 
@@ -782,22 +897,51 @@ async function addNewIndexDocs(docs: NewIndexDoc[]): Promise<void> {
     throw new Error("Missing Azure Search env vars");
   }
 
-  const body = {
-    value: docs.map((doc) => ({ "@search.action": "upload", ...doc })),
-  };
+  for (let offset = 0; offset < docs.length; offset += 500) {
+    const batchDocs = docs.slice(offset, offset + 500);
+    const res = await fetch(
+      `${endpoint}/indexes/${indexName}/docs/index?api-version=2024-07-01`,
+      {
+        method: "POST",
+        headers: { "api-key": apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          value: batchDocs.map((doc) => ({
+            "@search.action": "upload",
+            ...doc,
+          })),
+        }),
+        cache: "no-store",
+      }
+    );
 
-  const res = await fetch(
-    `${endpoint}/indexes/${indexName}/docs/index?api-version=2024-07-01`,
-    {
-      method: "POST",
-      headers: { "api-key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      cache: "no-store",
-    }
-  );
-
-  if (!res.ok) throw new Error(`Index upload failed: ${await res.text()}`);
+    await assertIndexActionSucceeded(res, "Index upload");
+  }
   console.log(`[SL sync] Indexed ${docs.length} new docs`);
+}
+
+async function assertIndexActionSucceeded(
+  response: Response,
+  operation: string
+): Promise<void> {
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${operation} failed: ${text}`);
+  }
+
+  if (!text) return;
+  const payload = JSON.parse(text);
+  const failures = (payload.value ?? []).filter(
+    (result: any) => result.status === false
+  );
+  if (failures.length > 0) {
+    const details = failures
+      .slice(0, 5)
+      .map((result: any) => `${result.key}: ${result.errorMessage ?? "failed"}`)
+      .join("; ");
+    throw new Error(
+      `${operation} partially failed (${failures.length} documents): ${details}`
+    );
+  }
 }
 
 async function downloadSpFile(
@@ -894,6 +1038,7 @@ async function indexNewSpFiles(params: {
   batchSize: number;
   globalCommon?: GlobalCommonConfig | null;
   hasRelativePath?: boolean;
+  hasChangeTrackingFields?: boolean;
 }): Promise<{ indexed: number; skipped: number }> {
   const {
     accessToken,
@@ -905,6 +1050,7 @@ async function indexNewSpFiles(params: {
     batchSize,
     globalCommon,
     hasRelativePath = false,
+    hasChangeTrackingFields = false,
   } = params;
 
   const batch = unindexedItems.slice(0, batchSize);
@@ -988,6 +1134,12 @@ async function indexNewSpFiles(params: {
             slOwner: slOwner ?? null,
             spItemId: item.id,
             ...(hasRelativePath ? { relativePath: item.relativePath ?? null } : {}),
+            ...(hasChangeTrackingFields
+              ? {
+                  spContentTag: item.contentTag || null,
+                  spLastModifiedAt: item.lastModifiedAt,
+                }
+              : {}),
           });
         }
       }
@@ -1028,6 +1180,12 @@ async function indexNewSpFiles(params: {
           slOwner: null,
           spItemId: item.id,
           relativePath: item.relativePath ?? null,
+          ...(hasChangeTrackingFields
+            ? {
+                spContentTag: item.contentTag || null,
+                spLastModifiedAt: item.lastModifiedAt,
+              }
+            : {}),
         }]);
         console.warn(`[SL sync] Sentinel registered for ${item.name} to prevent re-queue`);
       } catch (sentinelErr) {
@@ -1038,6 +1196,104 @@ async function indexNewSpFiles(params: {
   }
 
   return { indexed, skipped };
+}
+
+function findReindexCandidates(
+  matchedDocs: MatchedIndexDoc[]
+): ReindexCandidate[] {
+  const groups = new Map<
+    string,
+    { item: SpFileItem; docs: IndexDoc[] }
+  >();
+
+  for (const entry of matchedDocs) {
+    if (!entry.spItem?.id || !entry.spItem.contentTag) continue;
+    const current = groups.get(entry.spItem.id) ?? {
+      item: entry.spItem,
+      docs: [],
+    };
+    current.docs.push(entry.doc);
+    groups.set(entry.spItem.id, current);
+  }
+
+  const changed: ReindexCandidate[] = [];
+  const legacy: ReindexCandidate[] = [];
+
+  for (const { item, docs } of Array.from(groups.values())) {
+    const storedTags = docs
+      .map((doc) => doc.spContentTag)
+      .filter((tag): tag is string => Boolean(tag));
+    const hasMissingTag = storedTags.length !== docs.length;
+    const contentChanged = storedTags.some((tag) => tag !== item.contentTag);
+
+    if (!hasMissingTag && !contentChanged) continue;
+
+    const candidate: ReindexCandidate = {
+      item,
+      oldDocIds: docs.map((doc) => doc.id),
+      reason: contentChanged ? "content_changed" : "legacy_missing_tag",
+    };
+    if (contentChanged) changed.push(candidate);
+    else legacy.push(candidate);
+  }
+
+  // Real SharePoint changes take priority over the gradual legacy migration.
+  const modifiedAt = (candidate: ReindexCandidate) => {
+    const value = Date.parse(candidate.item.lastModifiedAt ?? "");
+    return Number.isNaN(value) ? 0 : value;
+  };
+  const newestFirst = (a: ReindexCandidate, b: ReindexCandidate) =>
+    modifiedAt(b) - modifiedAt(a);
+  return [
+    ...changed.sort(newestFirst),
+    ...legacy.sort(newestFirst),
+  ];
+}
+
+async function reindexSpFiles(params: {
+  accessToken: string;
+  dept: string;
+  siteUrl: string;
+  driveName: string;
+  baseFolder: string;
+  candidates: ReindexCandidate[];
+  batchSize: number;
+  globalCommon?: GlobalCommonConfig | null;
+  hasRelativePath: boolean;
+  hasChangeTrackingFields: boolean;
+}): Promise<{ reindexed: number; failed: number }> {
+  const batch = params.candidates.slice(0, params.batchSize);
+  let reindexed = 0;
+  let failed = 0;
+
+  for (const candidate of batch) {
+    console.log(
+      `[SL sync] Reindexing ${candidate.item.name}: reason=${candidate.reason} oldChunks=${candidate.oldDocIds.length}`
+    );
+    const result = await indexNewSpFiles({
+      accessToken: params.accessToken,
+      dept: params.dept,
+      siteUrl: params.siteUrl,
+      driveName: params.driveName,
+      baseFolder: params.baseFolder,
+      unindexedItems: [candidate.item],
+      batchSize: 1,
+      globalCommon: params.globalCommon,
+      hasRelativePath: params.hasRelativePath,
+      hasChangeTrackingFields: params.hasChangeTrackingFields,
+    });
+
+    if (result.indexed !== 1) {
+      failed++;
+      continue;
+    }
+
+    // Keep the previous searchable chunks until the replacement is complete.
+    await deleteIndexDocs(candidate.oldDocIds);
+    reindexed++;
+  }
+
+  return { reindexed, failed };
 }
 
 async function updateIndexDocs(
@@ -1092,10 +1348,14 @@ export async function runSlSync({
   apply = false,
   indexNew = false,
   batchSize = 5,
+  reindexOnly = false,
 }: RunSlSyncParams): Promise<SlSyncResult> {
   const hasRelativePath = await ensureRelativePathField();
+  const hasChangeTrackingFields =
+    await hasSharePointChangeTrackingFields();
 
   const results: Record<string, SlSyncDeptResult> = {};
+  const reindexJobs: ReindexJob[] = [];
 
   for (const dept of getAllowedDepts()) {
     try {
@@ -1117,20 +1377,27 @@ export async function runSlSync({
         if (rootMissing) {
           // ベースフォルダ自体が存在しない → SP上にファイルは0件確定
           // インデックス上の孤立ドキュメントをすべて削除する
-          const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon, hasRelativePath);
+          const indexDocs = await getIndexDocs(
+            dept,
+            siteUrl,
+            baseFolder,
+            globalCommon,
+            hasRelativePath,
+            hasChangeTrackingFields
+          );
           const orphanIds = indexDocs
             .filter((doc) => doc.slScope !== "global_common")
             .map((doc) => doc.id);
           console.log(
             `[SL sync] dept=${dept} base folder missing, orphans=${orphanIds.length} apply=${apply}`
           );
-          if (apply && orphanIds.length > 0) {
+          if (apply && !reindexOnly && orphanIds.length > 0) {
             await deleteIndexDocs(orphanIds);
           }
           results[dept] = {
             spFileNames: 0,
             indexDocs: indexDocs.length,
-            deleted: apply ? orphanIds.length : 0,
+            deleted: apply && !reindexOnly ? orphanIds.length : 0,
             orphanIds,
           };
         } else {
@@ -1145,10 +1412,17 @@ export async function runSlSync({
         continue;
       }
 
-      const indexDocs = await getIndexDocs(dept, siteUrl, baseFolder, globalCommon, hasRelativePath);
+      const indexDocs = await getIndexDocs(
+        dept,
+        siteUrl,
+        baseFolder,
+        globalCommon,
+        hasRelativePath,
+        hasChangeTrackingFields
+      );
       console.log(`[SL sync] dept=${dept} indexed docs=${indexDocs.length}`);
 
-      const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = indexDocs.map((doc) => ({
+      const matchedDocs: MatchedIndexDoc[] = indexDocs.map((doc) => ({
         doc,
         spItem: findMatchingSpItem(doc, inventory),
       }));
@@ -1236,20 +1510,45 @@ export async function runSlSync({
           };
         });
 
-      if (apply) {
+      const reindexCandidates = hasChangeTrackingFields
+        ? findReindexCandidates(
+            matchedDocs.filter(({ doc }) => doc.slScope !== "global_common")
+          )
+        : [];
+
+      if (apply && !reindexOnly) {
         await deleteIndexDocs(orphanIds);
         await updateIndexDocs(docUpdates);
+      }
+      if (apply && indexNew) {
+        reindexJobs.push(
+          ...reindexCandidates.map((candidate) => ({
+            resultKey: dept,
+            candidate,
+            dept,
+            siteUrl,
+            driveName,
+            baseFolder,
+            globalCommon,
+          }))
+        );
       }
 
       const deptResult: SlSyncDeptResult = {
         spFileNames: inventory.allItems.length,
         indexDocs: indexDocs.length,
-        deleted: apply ? orphanIds.length : 0,
+        deleted: apply && !reindexOnly ? orphanIds.length : 0,
         urlUpdated: docUpdates.length,
+        reindexCandidates: reindexCandidates.length,
+        reindexCandidateNames: reindexCandidates
+          .slice(0, 5)
+          .map((candidate) => candidate.item.name),
+        reindexed: 0,
+        reindexFailed: 0,
         orphanIds,
       };
 
-      if (indexNew) {
+      if (indexNew && !reindexOnly) {
         const unindexed = findUnindexedSpItems(inventory, indexDocs);
         console.log(
           `[SL sync] dept=${dept} unindexedSPFiles=${unindexed.length} apply=${apply}`
@@ -1265,6 +1564,7 @@ export async function runSlSync({
             batchSize,
             globalCommon,
             hasRelativePath,
+            hasChangeTrackingFields,
           });
           deptResult.newIndexed = indexed;
           deptResult.newSkipped = skipped;
@@ -1296,9 +1596,13 @@ export async function runSlSync({
       );
 
       if (!globalScan.fetchFailed) {
-        const globalIndexDocs = await getIndexDocsGlobalCommon(globalCommon, hasRelativePath);
+        const globalIndexDocs = await getIndexDocsGlobalCommon(
+          globalCommon,
+          hasRelativePath,
+          hasChangeTrackingFields
+        );
         console.log(`[SL sync] global_common SP files=${globalScan.inventory.allItems.length} indexed docs=${globalIndexDocs.length}`);
-        const matchedDocs: Array<{ doc: IndexDoc; spItem: SpFileItem | null; lookupFailed?: boolean }> = globalIndexDocs.map((doc) => ({
+        const matchedDocs: MatchedIndexDoc[] = globalIndexDocs.map((doc) => ({
           doc,
           spItem: findMatchingSpItem(doc, globalScan.inventory),
         }));
@@ -1345,26 +1649,48 @@ export async function runSlSync({
             ...(hasRelativePath ? { relativePath: spItem.relativePath } : {}),
           }));
 
+        const reindexCandidates = hasChangeTrackingFields
+          ? findReindexCandidates(matchedDocs)
+          : [];
         if (globalOrphanIds.length > 0) {
           console.log(
             `[SL sync] global_common orphans=${globalOrphanIds.length} apply=${apply}`
           );
         }
 
-        if (apply) {
+        if (apply && !reindexOnly) {
           if (globalOrphanIds.length > 0) await deleteIndexDocs(globalOrphanIds);
           if (docUpdates.length > 0) await updateIndexDocs(docUpdates);
+        }
+        if (apply && indexNew) {
+          reindexJobs.push(
+            ...reindexCandidates.map((candidate) => ({
+              resultKey: "global_common",
+              candidate,
+              dept: "common",
+              siteUrl: globalCommon.siteUrl,
+              driveName: globalCommon.driveName,
+              baseFolder: globalCommon.folder,
+              globalCommon,
+            }))
+          );
         }
 
         const gcResult: SlSyncDeptResult = {
           spFileNames: globalScan.inventory.allItems.length,
           indexDocs: globalIndexDocs.length,
-          deleted: apply ? globalOrphanIds.length : 0,
+          deleted: apply && !reindexOnly ? globalOrphanIds.length : 0,
           urlUpdated: docUpdates.length,
+          reindexCandidates: reindexCandidates.length,
+          reindexCandidateNames: reindexCandidates
+            .slice(0, 5)
+            .map((candidate) => candidate.item.name),
+          reindexed: 0,
+          reindexFailed: 0,
           orphanIds: globalOrphanIds,
         };
 
-        if (indexNew) {
+        if (indexNew && !reindexOnly) {
           const gcUnindexed = findUnindexedSpItems(globalScan.inventory, globalIndexDocs);
           console.log(
             `[SL sync] global_common unindexedSPFiles=${gcUnindexed.length} apply=${apply}`
@@ -1380,6 +1706,7 @@ export async function runSlSync({
               batchSize,
               globalCommon,
               hasRelativePath,
+              hasChangeTrackingFields,
             });
             gcResult.newIndexed = indexed;
             gcResult.newSkipped = skipped;
@@ -1406,6 +1733,55 @@ export async function runSlSync({
       deleted: 0,
       error: String(globalErr?.message ?? globalErr),
     };
+  }
+
+  // Prioritize real content changes across every department, then spend any
+  // remaining budget on the gradual migration of legacy untagged documents.
+  const selectedReindexJobs = reindexJobs
+    .sort((a, b) => {
+      if (a.candidate.reason !== b.candidate.reason) {
+        return a.candidate.reason === "content_changed" ? -1 : 1;
+      }
+      const aModified = Date.parse(a.candidate.item.lastModifiedAt ?? "");
+      const bModified = Date.parse(b.candidate.item.lastModifiedAt ?? "");
+      return (
+        (Number.isNaN(bModified) ? 0 : bModified) -
+        (Number.isNaN(aModified) ? 0 : aModified)
+      );
+    })
+    .slice(0, batchSize);
+
+  for (const job of selectedReindexJobs) {
+    try {
+      const reindexResult = await reindexSpFiles({
+        accessToken,
+        dept: job.dept,
+        siteUrl: job.siteUrl,
+        driveName: job.driveName,
+        baseFolder: job.baseFolder,
+        candidates: [job.candidate],
+        batchSize: 1,
+        globalCommon: job.globalCommon,
+        hasRelativePath,
+        hasChangeTrackingFields,
+      });
+      const resultRow = results[job.resultKey];
+      if (resultRow) {
+        resultRow.reindexed =
+          (resultRow.reindexed ?? 0) + reindexResult.reindexed;
+        resultRow.reindexFailed =
+          (resultRow.reindexFailed ?? 0) + reindexResult.failed;
+      }
+    } catch (error) {
+      console.error(
+        `[SL sync] Reindex job failed for ${job.candidate.item.name}`,
+        error
+      );
+      const resultRow = results[job.resultKey];
+      if (resultRow) {
+        resultRow.reindexFailed = (resultRow.reindexFailed ?? 0) + 1;
+      }
+    }
   }
 
   return {
