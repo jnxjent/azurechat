@@ -399,6 +399,45 @@ sharePointReference: 'midac_logo.png'
 - `src/features/chat-page/message-content.tsx`
 - `src/scripts/test-image-upload-routing.cjs`
 
+## 2026-07-21 TestSiteのSharePointロゴ読込失敗への追加修正
+
+TestSiteではAI Searchによる `midac_logo.png` の特定、Graph経由のBlob保存、SAS URLのHEAD確認までは成功したが、GPT Image呼び出し前に「参照画像の一部をPNG/JPEGとして読み取れない」と返った。
+
+原因候補は、SharePoint画像を一時BlobのSAS URLから再取得する経路と、モデルが `referenceImageUrls` に `midac_logo.png` のようなURLではない値を追加する経路が、同じ参照配列に混在していたこと。1件でも読込失敗があると、正しいSharePoint画像を取得できていても処理全体が失敗する実装だった。
+
+追加修正:
+
+- SharePoint画像は一時BlobのSAS URLを再取得せず、Azure Storage SDKの `downloadToBuffer()` で直接読む。
+- SDK直接読込が利用できない場合だけ、SAS URLのHTTP取得へフォールバックする。
+- HTTP取得が非成功の場合、SASクエリを除外してHTTPステータス、Content-Type、ホストとパスを記録する。
+- GPT Image実行前の `input images.base` もSASクエリを除外し、ホストとパスだけを記録する。`sig`、`se` 等はログへ出さない。
+- モデル指定の `referenceImageUrls` はHTTP(S) URLまたは対応画像data URLだけを許可し、裸のファイル名を除外する。
+- SharePoint画像をコード側で解決した場合、モデル生成の参照URLは混在させず、SDKで取得した信頼済みバッファを参照画像として使用する。
+- 通常の紙クリップ添付画像と既存生成画像の編集経路は変更しない。
+
+期待ログ:
+
+```text
+[edit_existing_image] SP image loaded via Blob SDK: {
+  container: 'dl-link',
+  blobPath: '<thread-id>/midac_logo.png',
+  bytes: <positive number>,
+  format: 'png'
+}
+[edit_existing_image] input images: {
+  referencesLoaded: 1,
+  sharePointReference: 'midac_logo.png'
+}
+```
+
+検証結果:
+
+- `node scripts/test-image-upload-routing.cjs`: 71 assertions passed
+- `npx tsc --noEmit`: 成功
+- `npm run lint`: warnings/errorsなし
+- `git diff --check`: 問題なし
+- `npm run build`: コードエラーではなく、起動中のNext.js開発サーバーが `src/.next/trace` を使用していたため `EPERM`。ビルドを再確認する場合は開発サーバー停止後に実行する。
+
 ## 再開時の最短手順
 
 1. このメモと `git status --short` を確認。

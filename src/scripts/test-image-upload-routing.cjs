@@ -77,6 +77,29 @@ assert.equal(
   "midac_logo.png"
 );
 assert.equal(intent.extractSharePointImageQuery("添付ロゴを使って"), null);
+assert.equal(intent.isSupportedImageReferenceUrl("midac_logo.png"), false);
+assert.equal(
+  intent.isSupportedImageReferenceUrl("https://example.com/midac_logo.png"),
+  true
+);
+assert.equal(
+  intent.isSupportedImageReferenceUrl("data:image/png;base64,iVBORw0KGgo="),
+  true
+);
+assert.equal(
+  intent.sanitizeImageLocationForLog(
+    "https://account.blob.core.windows.net/dl-link/thread/logo.png?sv=1&sig=secret"
+  ),
+  "https://account.blob.core.windows.net/dl-link/thread/logo.png"
+);
+assert.equal(
+  intent.sanitizeImageLocationForLog("data:image/png;base64,secret"),
+  "chat-attachment:data-url"
+);
+assert.equal(
+  intent.sanitizeImageLocationForLog("thread:__latest__.png"),
+  "thread:__latest__.png"
+);
 assert.equal(
   intent.resolveRequiredImageToolName(
     "SPにあるLogoを使ってパッカー車をデザインして",
@@ -173,6 +196,34 @@ assert.ok(imageExtensions.includes("storedAttachment?.fileName"));
 assert.ok(imageExtensions.includes("ConsumeLatestImageAttachment(chatThread.id)"));
 assert.ok(imageExtensions.includes("extractSharePointImageQuery(userMessage)"));
 assert.ok(imageExtensions.includes("sharePointReference:"));
+assert.ok(imageExtensions.includes("readImageBufferFromConfiguredBlob"));
+assert.ok(imageExtensions.includes("SP image loaded via Blob SDK"));
+assert.ok(imageExtensions.includes("Image URL fetch failed"));
+assert.ok(imageExtensions.includes("sanitizeImageLocationForLog(resolvedBaseUrl)"));
+assert.ok(imageExtensions.includes("isSupportedImageReferenceUrl"));
+assert.ok(
+  imageExtensions.includes("Ignored invalid model referenceImageUrls")
+);
+assert.ok(
+  imageExtensions.includes(
+    "Ignored model referenceImageUrls because a SharePoint image was resolved"
+  )
+);
+assert.ok(
+  imageExtensions.includes("sharePointImageReference\n    ? []")
+);
+const candidateReferenceSelection = imageExtensions.slice(
+  imageExtensions.indexOf("const candidateReferenceUrls"),
+  imageExtensions.indexOf("const referenceUrls")
+);
+assert.ok(
+  !candidateReferenceSelection.includes("sharePointImageReference.resolvedUrl")
+);
+assert.ok(
+  imageExtensions.includes(
+    "if (sharePointImageBuffer && !sharePointImageUsedAsBase)"
+  )
+);
 assert.ok(imageExtensions.includes("[edit_existing_image] output saved:"));
 
 const openAiStream = fs.readFileSync(
@@ -203,4 +254,4 @@ assert.ok(
     baseSelection.indexOf("explicitBaseUrl")
 );
 
-console.log("Image upload/edit regression tests: 55 assertions passed");
+console.log("Image upload/edit regression tests: 71 assertions passed");

@@ -207,6 +207,38 @@ export function extractSharePointImageQuery(message: string): string | null {
 }
 
 /** gpt-image-2へ渡す複数画像の役割を明示し、参照素材の勝手な改変を抑える。 */
+/** Model-provided reference assets must be fetchable URLs or supported image data URLs. */
+export function isSupportedImageReferenceUrl(value: string): boolean {
+  const normalized = String(value ?? "").trim();
+  if (/^data:image\/(?:png|jpe?g|webp);base64,/i.test(normalized)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/** Removes query strings such as SAS signatures before an image location is logged. */
+export function sanitizeImageLocationForLog(value: string): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return "unknown";
+  if (/^data:image\//i.test(normalized)) return "chat-attachment:data-url";
+  if (/^thread:/i.test(normalized)) return normalized;
+
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return "non-http-reference";
+    }
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    return "non-url-reference";
+  }
+}
+
 export function buildMultiImageReferenceInstruction(
   referenceCount: number
 ): string {

@@ -32,7 +32,9 @@ import {
   extractSharePointImageQuery,
   isExplicitTextOverlayRequest,
   isNewImageReferenceCompositionRequest,
+  isSupportedImageReferenceUrl,
   normalizeGptImageSize,
+  sanitizeImageLocationForLog,
 } from "./image/image-intent";
 
 import {
@@ -7734,7 +7736,15 @@ async function fetchImageBuffer(imageUrl: string): Promise<Buffer | null> {
       cache: "no-store",
       redirect: "follow",
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      console.warn("[edit_existing_image] Image URL fetch failed:", {
+        status: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get("content-type"),
+        location: sanitizeImageLocationForLog(imageUrl),
+      });
+      return null;
+    }
     const buffer = Buffer.from(await response.arrayBuffer());
     if (!detectImageFormat(buffer)) {
       console.warn("[edit_existing_image] URL did not return a supported image:", {
@@ -7746,6 +7756,83 @@ async function fetchImageBuffer(imageUrl: string): Promise<Buffer | null> {
     return buffer;
   } catch (error) {
     console.warn("[edit_existing_image] Failed to fetch image URL:", error);
+    return null;
+  }
+}
+
+function parseConfiguredAzureBlobUrl(
+  imageUrl: string
+): { container: string; blobPath: string } | null {
+  const accountName = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  if (!accountName) return null;
+
+  try {
+    const parsed = new URL(imageUrl);
+    if (
+      parsed.hostname.toLowerCase() !==
+      `${accountName.toLowerCase()}.blob.core.windows.net`
+    ) {
+      return null;
+    }
+    const parts = parsed.pathname
+      .split("/")
+      .filter(Boolean)
+      .map((part) => decodeURIComponent(part));
+    if (parts.length < 2) return null;
+    return {
+      container: parts[0],
+      blobPath: parts.slice(1).join("/"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readImageBufferFromConfiguredBlob(
+  imageUrl: string
+): Promise<Buffer | null> {
+  const target = parseConfiguredAzureBlobUrl(imageUrl);
+  if (!target) return null;
+
+  const accountName = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const accountKey = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!accountName || !accountKey) return null;
+
+  try {
+    const connectionString =
+      `DefaultEndpointsProtocol=https;AccountName=${accountName};` +
+      `AccountKey=${accountKey};EndpointSuffix=core.windows.net`;
+    const buffer = await BlobServiceClient.fromConnectionString(connectionString)
+      .getContainerClient(target.container)
+      .getBlockBlobClient(target.blobPath)
+      .downloadToBuffer();
+    const format = detectImageFormat(buffer);
+    if (!format) {
+      console.warn(
+        "[edit_existing_image] Blob SDK download was not a supported image:",
+        {
+          container: target.container,
+          blobPath: target.blobPath,
+          bytes: buffer.length,
+        }
+      );
+      return null;
+    }
+    console.log("[edit_existing_image] SP image loaded via Blob SDK:", {
+      container: target.container,
+      blobPath: target.blobPath,
+      bytes: buffer.length,
+      format,
+    });
+    return buffer;
+  } catch (error: any) {
+    console.warn("[edit_existing_image] Blob SDK image download failed:", {
+      container: target.container,
+      blobPath: target.blobPath,
+      statusCode: error?.statusCode ?? null,
+      code: error?.code ?? null,
+      message: String(error?.message ?? error).slice(0, 200),
+    });
     return null;
   }
 }
@@ -7868,6 +7955,35 @@ async function executeEditExistingImage(
     }
     sharePointImageReference = spResult;
   }
+  let sharePointImageBuffer: Buffer | null = null;
+  if (sharePointImageReference) {
+    sharePointImageBuffer = await readImageBufferFromConfiguredBlob(
+      sharePointImageReference.resolvedUrl
+    );
+    if (!sharePointImageBuffer) {
+      console.warn(
+        "[edit_existing_image] Blob SDK read unavailable; falling back to the resolved SP image URL"
+      );
+      sharePointImageBuffer = await fetchImageBuffer(
+        sharePointImageReference.resolvedUrl
+      );
+    }
+    if (!sharePointImageBuffer) {
+      return {
+        error:
+          "SharePointの参照画像を取得できませんでした。ファイルは見つかりましたが、画像データの読み込みに失敗しました。",
+      };
+    }
+    sharePointImageBuffer = await normalizeAzureEditImage(
+      sharePointImageBuffer
+    );
+    if (!sharePointImageBuffer) {
+      return {
+        error:
+          "SharePointの参照画像をPNG/JPEGとして読み取れませんでした。",
+      };
+    }
+  }
   const explicitBaseUrl = String(args?.baseImageUrl ?? "").trim();
   const legacyImageUrl = String(args?.imageUrl ?? "").trim();
   const latestBuffer = await readStoredImageBuffer(
@@ -7929,9 +8045,11 @@ async function executeEditExistingImage(
     storedAttachmentUsedAsBase = true;
   }
 
-  if (!inputBuffer && sharePointImageReference) {
+  let sharePointImageUsedAsBase = false;
+  if (!inputBuffer && sharePointImageReference && sharePointImageBuffer) {
     resolvedBaseUrl = sharePointImageReference.resolvedUrl;
-    inputBuffer = await fetchImageBuffer(sharePointImageReference.resolvedUrl);
+    inputBuffer = sharePointImageBuffer;
+    sharePointImageUsedAsBase = true;
   }
 
   if (!inputBuffer) {
@@ -7941,9 +8059,32 @@ async function executeEditExistingImage(
     };
   }
 
-  const explicitReferenceUrls = Array.isArray(args?.referenceImageUrls)
+  const rawExplicitReferenceUrls = Array.isArray(args?.referenceImageUrls)
     ? args.referenceImageUrls.map((url) => String(url ?? "").trim())
     : [];
+  const validExplicitReferenceUrls = rawExplicitReferenceUrls.filter(
+    isSupportedImageReferenceUrl
+  );
+  const rejectedExplicitReferenceCount =
+    rawExplicitReferenceUrls.length - validExplicitReferenceUrls.length;
+  if (rejectedExplicitReferenceCount > 0) {
+    console.warn(
+      "[edit_existing_image] Ignored invalid model referenceImageUrls:",
+      { count: rejectedExplicitReferenceCount }
+    );
+  }
+  // The SharePoint asset is resolved from the user's request and loaded through
+  // the Storage SDK. Model-generated URLs are redundant and may be a bare file
+  // name or an authenticated SharePoint page, so do not mix them into this path.
+  const explicitReferenceUrls = sharePointImageReference
+    ? []
+    : validExplicitReferenceUrls;
+  if (sharePointImageReference && validExplicitReferenceUrls.length > 0) {
+    console.log(
+      "[edit_existing_image] Ignored model referenceImageUrls because a SharePoint image was resolved:",
+      { count: validExplicitReferenceUrls.length }
+    );
+  }
   // imageUrl is a legacy BASE-image pointer, never a reference asset.
   // Adding it here duplicated the generated base image as image 3.
   const inferredReferenceUrls = currentAttachmentUrls.filter(
@@ -7953,16 +8094,10 @@ async function executeEditExistingImage(
     currentAttachmentUrls.length > 0
       ? [
           ...inferredReferenceUrls,
-          ...(sharePointImageReference
-            ? [sharePointImageReference.resolvedUrl]
-            : []),
         ]
       : [
           ...explicitReferenceUrls,
           ...inferredReferenceUrls,
-          ...(sharePointImageReference
-            ? [sharePointImageReference.resolvedUrl]
-            : []),
         ];
 
   const referenceUrls = Array.from(
@@ -7992,6 +8127,10 @@ async function executeEditExistingImage(
       error:
         "添付された参照画像の一部をPNG/JPEGとして読み取れませんでした。画像を再添付してください。",
     };
+  }
+
+  if (sharePointImageBuffer && !sharePointImageUsedAsBase) {
+    loadedReferenceBuffers.push(sharePointImageBuffer);
   }
 
   if (storedAttachment && !storedAttachmentUsedAsBase) {
@@ -8050,9 +8189,7 @@ async function executeEditExistingImage(
 
     console.log("[edit_existing_image] input images:", {
       base: resolvedBaseUrl
-        ? resolvedBaseUrl.startsWith("data:image/")
-          ? "chat-attachment:data-url"
-          : resolvedBaseUrl
+        ? sanitizeImageLocationForLog(resolvedBaseUrl)
         : "thread:__latest__.png",
       referencesRequested:
         referenceUrls.length +
