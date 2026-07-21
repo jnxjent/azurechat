@@ -271,10 +271,19 @@ export const ChatApiExtensions = async (props: {
   userMessage: string;
   history: ChatCompletionMessageParam[];
   extensions: RunnableToolFunction<any>[];
+  requiredToolName?: string;
   signal: AbortSignal;
   mode?: "normal" | "thinking" | "fast";
 }): Promise<ChatCompletionStreamingRunner> => {
-  const { userMessage, history, signal, chatThread, extensions, mode } = props;
+  const {
+    userMessage,
+    history,
+    signal,
+    chatThread,
+    extensions,
+    mode,
+    requiredToolName,
+  } = props;
 
   const openAI = OpenAIInstance();
 
@@ -472,6 +481,14 @@ export const ChatApiExtensions = async (props: {
       model,
       reasoning_effort: modeOpts.reasoning_effort,
       stream: true,
+      ...(requiredToolName
+        ? {
+            tool_choice: {
+              type: "function",
+              function: { name: requiredToolName },
+            },
+          }
+        : {}),
       messages: [
         {
           role: "system",

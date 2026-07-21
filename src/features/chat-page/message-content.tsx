@@ -332,18 +332,16 @@ const MessageContent: React.FC<MessageContentProps> = ({ message }) => {
     const normalized = normalizeContent(message.content);
 
     const hasImage = !!message.multiModalImage;
-    const overlayText = hasImage ? extractOverlayText(message.content) : "";
-
     return (
       <>
         <Markdown content={normalized} onCitationClick={CitationAction} />
         {hasImage && (
           <ImageWithCanvasOverlay
-            key={`${message.multiModalImage}-${overlayText}`}
+            key={message.multiModalImage}
             src={message.multiModalImage!}
             alt=""
-            overlayText={overlayText}
-            styleHint={message.content}
+            overlayText=""
+            styleHint=""
           />
         )}
       </>

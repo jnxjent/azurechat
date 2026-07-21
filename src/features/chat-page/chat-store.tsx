@@ -166,6 +166,7 @@ class ChatState {
         signal: controller.signal,
       });
 
+      let assistantResponseId: string | undefined;
       const onParse = (event: ParsedEvent | ReconnectInterval) => {
         if (event.type === "event") {
           const responseType = JSON.parse(event.data) as AzureChatCompletion;
@@ -205,8 +206,9 @@ class ChatState {
               break;
             }
             case "content": {
+              assistantResponseId = responseType.response.id;
               const mappedContent: ChatMessageModel = {
-                id: responseType.response.id,
+                id: assistantResponseId,
                 content: responseType.response.choices[0].message.content || "",
                 name: AI_NAME,
                 role: "assistant",
@@ -231,11 +233,29 @@ class ChatState {
               showError(responseType.response);
               this.loading = "idle";
               break;
-            case "finalContent":
+            case "finalContent": {
+              const finalContent = responseType.response || "";
+              if (finalContent) {
+                const mappedFinalContent: ChatMessageModel = {
+                  id: assistantResponseId ?? uniqueId(),
+                  content: finalContent,
+                  name: AI_NAME,
+                  role: "assistant",
+                  createdAt: new Date(),
+                  isDeleted: false,
+                  threadId: this.chatThreadId,
+                  type: "CHAT_MESSAGE",
+                  userId: "",
+                  multiModalImage: "",
+                };
+                this.addToMessages(mappedFinalContent);
+                this.lastMessage = finalContent;
+              }
               this.loading = "idle";
               this.completed(this.lastMessage);
               this.updateTitle();
               break;
+            }
             default:
               break;
           }

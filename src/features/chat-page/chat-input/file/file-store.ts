@@ -9,6 +9,7 @@ import {
   CreateChatDocument,
   UploadDocument,
 } from "../../chat-services/chat-document-service";
+import { SaveLatestImageAttachment } from "../../chat-services/chat-image-service";
 import { chatStore } from "../../chat-store";
 
 // File -> base64（data:... を除いた純base64）
@@ -93,6 +94,120 @@ async function publishToSharePoint(file: File, uploadScope: UploadScope) {
 
 class FileStore {
   public uploadButtonLabel: string = "";
+
+  /**
+   * Image assets use the same Blob/SharePoint destinations as file uploads,
+   * but intentionally skip document cracking, RAG indexing, and chat-document
+   * registration. The caller stages the original File for GPT Image only after
+   * this storage step succeeds.
+   */
+  public async onImageFileChange(props: {
+    formData: FormData;
+    chatThreadId: string;
+    uploadScope?: string;
+  }): Promise<boolean> {
+    const { formData, chatThreadId, uploadScope: requestedScopeRaw } = props;
+
+    try {
+      chatStore.updateLoading("file upload");
+
+      const file = formData.get("file") as unknown as File | null;
+      if (!file) {
+        showError("No image selected.");
+        return false;
+      }
+
+      const requestedUploadScope = resolveRequestedUploadScope(
+        requestedScopeRaw
+      );
+      formData.append("id", chatThreadId);
+      formData.append("fileName", file.name);
+
+      this.uploadButtonLabel = "Uploading image";
+      const uploadResponse = await UploadDocument(formData);
+      if (uploadResponse.status !== "OK") {
+        showError(uploadResponse.errors.map((e) => e.message).join("\n"));
+        return false;
+      }
+
+      this.uploadButtonLabel = "Preparing image reference";
+      const attachmentResponse = await SaveLatestImageAttachment(formData);
+      if (attachmentResponse.status !== "OK") {
+        showError(attachmentResponse.errors.map((e) => e.message).join("\n"));
+        return false;
+      }
+
+      this.uploadButtonLabel = "Syncing image to SharePoint";
+      try {
+        const sp = await publishToSharePoint(file, requestedUploadScope);
+
+        if (sp.isSharePointEnabled === true) {
+          if (!sp.webUrl) {
+            throw new Error("SharePoint publish succeeded but webUrl was empty.");
+          }
+          this.uploadButtonLabel = "Indexing image metadata";
+          const imageIndexResponses = await IndexDocuments(
+            file.name,
+            sp.webUrl,
+            [
+              `SharePoint image asset. File name: ${file.name}. ` +
+                "This file can be used as a visual reference for image generation and editing.",
+            ],
+            chatThreadId,
+            String(sp.dept ?? "").toLowerCase().trim(),
+            true,
+            sp.uploadScope ?? requestedUploadScope,
+            sp.webUrl,
+            sp.spItemId ?? null
+          );
+          const imageIndexed = imageIndexResponses.every(
+            (response) => response.status === "OK"
+          );
+          if (!imageIndexed) {
+            const errors = imageIndexResponses
+              .filter((response) => response.status !== "OK")
+              .flatMap((response) => response.errors)
+              .map((error) => error.message)
+              .join("\n");
+            showError(
+              `The image was uploaded to SharePoint, but its search metadata could not be indexed: ${errors}`
+            );
+          }
+        }
+
+        showSuccess({
+          title: "SharePoint sync",
+          description: sp.webUrl
+            ? `Image synced to SharePoint: ${sp.webUrl}`
+            : `Image synced to SharePoint: ${sp.name || file.name}`,
+        });
+      } catch (error: any) {
+        const message = String(error?.message ?? error);
+        if (
+          message.includes("not SharePoint-enabled") ||
+          message.includes("Use Blob upload flow instead")
+        ) {
+          showSuccess({
+            title: "Blob upload",
+            description:
+              `${file.name} uploaded to Blob. ` +
+              "This department is not SharePoint-enabled, so SharePoint sync was skipped.",
+          });
+        } else {
+          showError(`SharePoint image sync failed: ${message}`);
+          return false;
+        }
+      }
+
+      return true;
+    } catch (error) {
+      showError(String(error));
+      return false;
+    } finally {
+      this.uploadButtonLabel = "";
+      chatStore.updateLoading("idle");
+    }
+  }
 
   public async onFileChange(props: {
     formData: FormData;

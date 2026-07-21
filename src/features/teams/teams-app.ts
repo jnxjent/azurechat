@@ -10,6 +10,7 @@ import {
   parseTeamsOfficeRequest,
   type TeamsOfficeRequest,
 } from "./teams-office-service";
+import { recordTeamsThreadUsage } from "./teams-usage-service";
 
 export const TEAMS_MESSAGING_ENDPOINT = "/api/teams/messages" as const;
 
@@ -95,6 +96,13 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
     try {
       const userEmail = await resolveActivityUserEmail({ activity, api });
+      const teamsUserId = activity.from?.id;
+      if (teamsUserId) {
+        await recordTeamsThreadUsage({ conversationId, teamsUserId });
+      } else {
+        console.warn("[teams] Usage statistics skipped: user ID is missing");
+      }
+
       const officeRequest = parseTeamsOfficeRequest(text);
       if (officeRequest) {
         const startMessage = buildOfficeStartMessage(officeRequest);

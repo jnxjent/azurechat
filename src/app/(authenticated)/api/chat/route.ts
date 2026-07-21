@@ -63,6 +63,10 @@ export async function POST(req: Request) {
     console.log("🚦 route.ts resolved (Body only):", {
       resolvedUI: uiThinkingMode ?? "standard",
       resolvedAPI: apiThinkingMode,
+      hasImageAttachment:
+        typeof multimodalImage === "string" && multimodalImage.length > 0,
+      imageAttachmentChars:
+        typeof multimodalImage === "string" ? multimodalImage.length : 0,
     });
   }
 

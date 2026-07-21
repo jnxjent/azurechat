@@ -7,6 +7,10 @@ import { GetBlob, UploadBlob } from "../../common/services/azure-storage";
 import { ChatThreadModel } from "./models";
 
 const IMAGE_CONTAINER_NAME = "images";
+const LATEST_ATTACHMENT_BLOB_NAME = "__latest_attachment__.img";
+const LATEST_ATTACHMENT_META_BLOB_NAME = "__latest_attachment__.json";
+const DEFAULT_ATTACHMENT_TTL_MS = 30 * 60 * 1000;
+const MAX_IMAGE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 // ★ まず NEXT_PUBLIC_IMAGE_URL を優先し、なければ NEXTAUTH_URL + /api/images
 const IMAGE_API_PATH =
   process.env.NEXT_PUBLIC_IMAGE_URL ||
@@ -34,6 +38,141 @@ export const GetImageFromStore = async (
 ): Promise<ServerActionResponse<ReadableStream>> => {
   const blobPath = GetBlobPath(threadId, fileName);
   return await GetBlob(IMAGE_CONTAINER_NAME, blobPath);
+};
+
+type LatestImageAttachmentMetadata = {
+  fileName: string;
+  contentType: string;
+  savedAt: string;
+  size: number;
+  consumedAt?: string;
+};
+
+export type LatestImageAttachment = LatestImageAttachmentMetadata & {
+  buffer: Buffer;
+};
+
+function resolveAttachmentTtlMs(): number {
+  const configured = Number(process.env.IMAGE_ATTACHMENT_TTL_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_ATTACHMENT_TTL_MS;
+}
+
+/**
+ * Keep a short-lived server-side copy of the paperclip image. The normal file
+ * upload remains unchanged; this copy is only a fallback reference for GPT
+ * Image when the chat message loses its in-memory data URL.
+ */
+export const SaveLatestImageAttachment = async (
+  formData: FormData
+): Promise<ServerActionResponse<LatestImageAttachmentMetadata>> => {
+  const threadId = String(formData.get("id") ?? "").trim();
+  const file = formData.get("file");
+  if (!threadId || !(file instanceof File)) {
+    return {
+      status: "ERROR",
+      errors: [{ message: "Image attachment or chat thread is missing." }],
+    };
+  }
+
+  if (!file.size || file.size >= MAX_IMAGE_ATTACHMENT_BYTES) {
+    return {
+      status: "ERROR",
+      errors: [{ message: "Image attachment must be smaller than 50 MB." }],
+    };
+  }
+
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const metadata: LatestImageAttachmentMetadata = {
+    fileName: file.name || "attachment.img",
+    contentType: file.type || "application/octet-stream",
+    savedAt: new Date().toISOString(),
+    size: buffer.length,
+  };
+
+  const imageResult = await UploadImageToStore(
+    threadId,
+    LATEST_ATTACHMENT_BLOB_NAME,
+    buffer
+  );
+  if (imageResult.status !== "OK") return imageResult;
+
+  const metaResult = await UploadImageToStore(
+    threadId,
+    LATEST_ATTACHMENT_META_BLOB_NAME,
+    Buffer.from(JSON.stringify(metadata), "utf-8")
+  );
+  if (metaResult.status !== "OK") return metaResult;
+
+  return { status: "OK", response: metadata };
+};
+
+export const LoadLatestImageAttachment = async (
+  threadId: string
+): Promise<LatestImageAttachment | null> => {
+  const metaResult = await GetImageFromStore(
+    threadId,
+    LATEST_ATTACHMENT_META_BLOB_NAME
+  );
+  if (metaResult.status !== "OK" || !metaResult.response) return null;
+
+  try {
+    const metadata = JSON.parse(
+      await new Response(metaResult.response as any).text()
+    ) as LatestImageAttachmentMetadata;
+    const savedAtMs = Date.parse(metadata.savedAt);
+    if (
+      metadata.consumedAt ||
+      !Number.isFinite(savedAtMs) ||
+      Date.now() - savedAtMs > resolveAttachmentTtlMs()
+    ) {
+      return null;
+    }
+
+    const imageResult = await GetImageFromStore(
+      threadId,
+      LATEST_ATTACHMENT_BLOB_NAME
+    );
+    if (imageResult.status !== "OK" || !imageResult.response) return null;
+    const buffer = Buffer.from(
+      await new Response(imageResult.response as any).arrayBuffer()
+    );
+    if (!buffer.length || buffer.length >= MAX_IMAGE_ATTACHMENT_BYTES) {
+      return null;
+    }
+    return { ...metadata, buffer };
+  } catch (error) {
+    console.warn("[image-attachment] Failed to load latest attachment:", error);
+    return null;
+  }
+};
+
+export const ConsumeLatestImageAttachment = async (
+  threadId: string
+): Promise<void> => {
+  const metaResult = await GetImageFromStore(
+    threadId,
+    LATEST_ATTACHMENT_META_BLOB_NAME
+  );
+  if (metaResult.status !== "OK" || !metaResult.response) return;
+
+  try {
+    const metadata = JSON.parse(
+      await new Response(metaResult.response as any).text()
+    ) as LatestImageAttachmentMetadata;
+    if (!metadata.savedAt || metadata.consumedAt) return;
+    metadata.consumedAt = new Date().toISOString();
+    await UploadImageToStore(
+      threadId,
+      LATEST_ATTACHMENT_META_BLOB_NAME,
+      Buffer.from(JSON.stringify(metadata), "utf-8")
+    );
+  } catch (error) {
+    // The image edit already succeeded. A cleanup failure must not hide its
+    // result; expiry remains the secondary protection against stale reuse.
+    console.warn("[image-attachment] Failed to consume attachment:", error);
+  }
 };
 
 export const GetImageUrl = (threadId: string, fileName: string): string => {

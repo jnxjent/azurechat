@@ -16,11 +16,16 @@ import {
 } from "@/features/ui/chat/chat-input-area/chat-input-area";
 import { ChatTextInput } from "@/features/ui/chat/chat-input-area/chat-text-input";
 import { ImageInput } from "@/features/ui/chat/chat-input-area/image-input";
+import {
+  InputImageStore,
+  isSupportedChatImageFile,
+} from "@/features/ui/chat/chat-input-area/input-image-store";
 import { Microphone } from "@/features/ui/chat/chat-input-area/microphone";
 import { StopChat } from "@/features/ui/chat/chat-input-area/stop-chat";
 import { SubmitChat } from "@/features/ui/chat/chat-input-area/submit-chat";
 import React, { useRef, useState } from "react";
 import { useSession } from "next-auth/react";
+import { showError } from "@/features/globals/global-message-store";
 import { chatStore, useChat } from "../chat-store";
 import { fileStore, useFileStore } from "./file/file-store";
 import { PromptSlider } from "./prompt/prompt-slider";
@@ -54,6 +59,7 @@ export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
   const [uploadScope, setUploadScope] = useState<UploadScope>("personal");
 
   const submit = () => {
+    if (loading !== "idle") return;
     if (formRef.current) {
       formRef.current.requestSubmit();
     }
@@ -64,6 +70,11 @@ export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
       ref={formRef}
       onSubmit={(e) => {
         e.preventDefault();
+        if (loading === "file upload") {
+          showError("画像のアップロード完了後に送信してください。");
+          return;
+        }
+        if (loading !== "idle") return;
         chatStore.submitChat(e);
       }}
       status={uploadButtonLabel}
@@ -92,13 +103,35 @@ export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
       <ChatInputActionArea>
         <ChatInputSecondaryActionArea>
           <AttachFile
-            onClick={(formData) =>
-              fileStore.onFileChange({
+            onClick={async (formData) => {
+              const selectedFile = formData.get("file");
+              if (
+                selectedFile instanceof File &&
+                isSupportedChatImageFile(selectedFile)
+              ) {
+                try {
+                  // Stage the image before the network upload begins so the
+                  // chat form can never observe an empty image-base64 value.
+                  await InputImageStore.SetFile(selectedFile);
+                  const uploaded = await fileStore.onImageFileChange({
+                    formData,
+                    chatThreadId,
+                    uploadScope: isAdmin ? uploadScope : undefined,
+                  });
+                  if (!uploaded) InputImageStore.Reset();
+                } catch (error) {
+                  InputImageStore.Reset();
+                  showError(String(error));
+                }
+                return;
+              }
+
+              await fileStore.onFileChange({
                 formData,
                 chatThreadId,
                 uploadScope: isAdmin ? uploadScope : undefined,
-              })
-            }
+              });
+            }}
           />
 
           <PromptSlider />
@@ -144,7 +177,10 @@ export const ChatInput = ({ isAdmin: isAdminProp }: { isAdmin?: boolean }) => {
           {loading === "loading" ? (
             <StopChat stop={() => chatStore.stopGeneratingMessages()} />
           ) : (
-            <SubmitChat ref={submitButton} />
+            <SubmitChat
+              ref={submitButton}
+              disabled={loading !== "idle"}
+            />
           )}
         </ChatInputPrimaryActionArea>
       </ChatInputActionArea>
