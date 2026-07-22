@@ -3,11 +3,17 @@ import "server-only";
 import type { TeamsSearchSource } from "./teams-search-service";
 import { requiresTeamsInternalSearch } from "./teams-search-intent";
 import { buildTeamsWebQuery } from "./teams-web-query";
+import {
+  extractWeatherPageText,
+  isTrustedWeatherUrl,
+} from "./teams-weather-page";
 
 const BRAVE_SEARCH_ENDPOINT =
   "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_RESULT_COUNT = 5;
 const MAX_WEB_CONTEXT_CHARACTERS = 10_000;
+const MAX_WEATHER_PAGES = 3;
+const WEATHER_PAGE_TIMEOUT_MS = 6_000;
 
 type BraveWebResult = {
   title?: string;
@@ -94,10 +100,15 @@ export async function searchBraveWeb(props: {
     const data = (await response.json()) as {
       web?: { results?: BraveWebResult[] };
     };
+    const results = data.web?.results ?? [];
+    const weatherPageText = effectiveQuery.enriched
+      ? await loadWeatherPageText(results)
+      : new Map<string, string>();
     return formatResults(
-      data.web?.results ?? [],
+      results,
       props.startIndex,
-      effectiveQuery.enriched
+      effectiveQuery.enriched,
+      weatherPageText
     );
   } finally {
     clearTimeout(timeout);
@@ -111,7 +122,8 @@ export function isTeamsBraveSearchConfigured(): boolean {
 function formatResults(
   results: BraveWebResult[],
   startIndex: number,
-  queryEnriched: boolean
+  queryEnriched: boolean,
+  weatherPageText: Map<string, string>
 ): TeamsBraveSearchResult {
   const sources: TeamsSearchSource[] = [];
   const sections: string[] = [];
@@ -131,9 +143,11 @@ function formatResults(
       .join(" ");
 
     sources.push({ index, name, url, kind: "web" });
-    if (!snippets) continue;
-
-    const section = `[${index}] ${name}\nURL: ${url}\n${snippets}`;
+    const pageText = weatherPageText.get(url);
+    if (!snippets && !pageText) continue;
+    const section = `[${index}] ${name}\nURL: ${url}\n${snippets}${
+      pageText ? `\nページ本文の気象情報:\n${pageText}` : ""
+    }`;
     const remaining = MAX_WEB_CONTEXT_CHARACTERS - totalCharacters;
     if (remaining <= 0) break;
     const clipped = section.slice(0, remaining);
@@ -148,6 +162,55 @@ function formatResults(
   });
 
   return { context: sections.join("\n\n---\n\n"), sources };
+}
+
+async function loadWeatherPageText(
+  results: BraveWebResult[]
+): Promise<Map<string, string>> {
+  const urls = Array.from(
+    new Set(
+      results
+        .map((result) => normalizeHttpsUrl(result.url))
+        .filter((url): url is string => Boolean(url && isTrustedWeatherUrl(url)))
+    )
+  ).slice(0, MAX_WEATHER_PAGES);
+
+  const loaded = await Promise.all(
+    urls.map(async (url) => [url, await fetchWeatherPageText(url)] as const)
+  );
+  const successful = loaded.filter((entry) => Boolean(entry[1]));
+  console.log("[teams-brave-search] weather pages loaded", {
+    requested: urls.length,
+    loaded: successful.length,
+  });
+  return new Map(successful);
+}
+
+async function fetchWeatherPageText(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), WEATHER_PAGE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent": "AzureChat-TeamsBot/1.0",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok || !isTrustedWeatherUrl(response.url)) return "";
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.toLowerCase().includes("text/html")) return "";
+    return extractWeatherPageText((await response.text()).slice(0, 750_000));
+  } catch (error) {
+    console.warn("[teams-brave-search] weather page fetch skipped", {
+      host: new URL(url).hostname,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function resolveResultCount(): number {

@@ -11,6 +11,7 @@ import {
   searchBraveWeb,
 } from "./teams-brave-search-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
+import { buildTeamsWebQuery } from "./teams-web-query";
 
 const MAX_HISTORY_MESSAGES = 20;
 const conversations = new Map<string, ChatCompletionMessageParam[]>();
@@ -114,6 +115,12 @@ function buildUserContent(
     );
   }
   if (webSearchPerformed) {
+    const weatherQuery = buildTeamsWebQuery(message);
+    if (weatherQuery.enriched) {
+      sections.push(
+        `天気回答要件:\n対象日時をJSTで確認してください。検索資料全体を突き合わせ、取得できた範囲で「天気」「最高気温」「最低気温」「降水確率」を簡潔に回答してください。一つの資料で値が「-」でも、他の資料に具体値があればそちらを採用してください。資料にない項目は推測せず「確認できません」としてください。\n検索条件: ${weatherQuery.query}`
+      );
+    }
     sections.push(
       `Web検索資料:\n${webContext || "Web検索結果は見つかりませんでした。"}`
     );
