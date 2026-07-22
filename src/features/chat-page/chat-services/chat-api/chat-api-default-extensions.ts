@@ -36,6 +36,7 @@ import {
   normalizeGptImageSize,
   sanitizeImageLocationForLog,
 } from "./image/image-intent";
+import { normalizeGptImageQuality } from "./image/image-quality";
 
 import {
   buildSendOptionsFromMode,
@@ -1243,6 +1244,13 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             enum: ["1024x1024", "1024x1792", "1792x1024"],
           },
+          quality: {
+            type: "string",
+            enum: ["low", "medium", "high", "auto"],
+            default: "auto",
+            description:
+              "Rendering quality. Use high only when the user explicitly requests high/best/final quality (for example 高画質, 高品質, 最高品質). Use medium for explicitly requested standard quality. Use low for an explicitly requested draft, low-quality, or speed-first result (for example 下書き, 低画質, 高速優先). Otherwise use auto. Do not infer high merely because the visual prompt is detailed.",
+          },
         },
         required: ["prompt"],
       },
@@ -1296,6 +1304,13 @@ export const GetDefaultExtensions = async (props: {
           size: {
             type: "string",
             enum: ["1024x1024", "1024x1536", "1536x1024", "auto"],
+          },
+          quality: {
+            type: "string",
+            enum: ["low", "medium", "high", "auto"],
+            default: "auto",
+            description:
+              "Rendering quality for the edited output. Use high only when the user explicitly requests high/best/final quality (for example 高画質, 高品質, 最高品質). Use medium for explicitly requested standard quality. Use low for an explicitly requested draft, low-quality, or speed-first result (for example 下書き, 低画質, 高速優先). Otherwise use auto.",
           },
         },
         required: ["prompt"],
@@ -1519,7 +1534,7 @@ export const GetDefaultExtensions = async (props: {
           },
           fontFace: {
             type: "string",
-            description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
+            description: "PowerPointで使うフォント名。ユーザーがフォントを明示した場合のみ指定する。未指定時は省略（既定: 'Meiryo'）。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
           },
           designInstruction: {
             type: "string",
@@ -3483,6 +3498,8 @@ async function executeCreatePptx(
   userMessage?: string
 ) {
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
+  const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
+  const effectiveFontFace = hasExplicitFontRequest && fontFace?.trim() ? fontFace.trim() : "Meiryo";
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
@@ -3607,7 +3624,7 @@ async function executeCreatePptx(
           ...(s.textTreatment ? { textTreatment: s.textTreatment } : {}),
         })),
         threadId: chatThread.id,
-        fontFace,
+        fontFace: effectiveFontFace,
         designInstruction: explicitInstruction,
         deckPreferences,
         fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
@@ -7649,7 +7666,7 @@ async function executeEditSpWord(
 
 // ---------------- 画像生成（NEW image 用） ----------------
 async function executeCreateImage(
-  args: { prompt: string; text?: string; size?: string },
+  args: { prompt: string; text?: string; size?: string; quality?: string },
   chatThread: ChatThreadModel,
   userMessage: string,
   signal?: AbortSignal,
@@ -7671,6 +7688,12 @@ async function executeCreateImage(
     return "Prompt is too long, it must be 32000 characters or fewer";
 
   const openAI = OpenAIDALLEInstance();
+  const quality = normalizeGptImageQuality(args?.quality);
+
+  console.log("createImage resolved options:", {
+    size: normalizeGptImageSize(args?.size),
+    quality,
+  });
 
   let response;
   try {
@@ -7679,6 +7702,7 @@ async function executeCreateImage(
         model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
         prompt,
         size: normalizeGptImageSize(args?.size),
+        quality,
       },
       { signal }
     );
@@ -7913,6 +7937,7 @@ async function executeEditExistingImage(
     baseImageUrl?: string;
     referenceImageUrls?: string[];
     size?: string;
+    quality?: string;
   },
   chatThread: ChatThreadModel,
   userMessage: string,
@@ -8012,6 +8037,7 @@ async function executeEditExistingImage(
   if (!basePrompt) {
     return { error: "prompt is required for edit_existing_image." };
   }
+  const quality = normalizeGptImageQuality(args?.quality);
 
   // The stored latest image is authoritative for an in-thread edit. A model-
   // supplied page URL can resolve to HTML (for example an authenticated UI
@@ -8201,6 +8227,7 @@ async function executeEditExistingImage(
       inputHashPrefixes: imageBuffers.map((buffer) =>
         imageContentHash(buffer).slice(0, 12)
       ),
+      quality,
       timeoutMs: requestTimeoutMs,
     });
 
@@ -8210,6 +8237,7 @@ async function executeEditExistingImage(
         image: imageFiles.length === 1 ? imageFiles[0] : imageFiles,
         prompt,
         size: normalizeGptImageSize(args?.size),
+        quality,
       },
       {
         signal,

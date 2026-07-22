@@ -10,6 +10,7 @@ import {
   resolveBraveSearchRequest,
   searchBraveWeb,
 } from "./teams-brave-search-service";
+import { resolveTeamsInstantReply } from "./teams-instant-reply";
 
 const MAX_HISTORY_MESSAGES = 20;
 const conversations = new Map<string, ChatCompletionMessageParam[]>();
@@ -33,6 +34,11 @@ export async function createTeamsChatReply(props: {
     return { type: "reset", text: "この会話の履歴をリセットしました。" };
   }
 
+  const instantReply = resolveTeamsInstantReply(message);
+  if (instantReply) {
+    return { type: "reply", text: instantReply };
+  }
+
   assertAzureOpenAIConfiguration();
 
   const history = conversations.get(props.conversationId) ?? [];
@@ -53,7 +59,9 @@ export async function createTeamsChatReply(props: {
   const userContent = buildUserContent(
     braveRequest.query,
     internalSearch.context,
-    webSearch.context
+    webSearch.context,
+    !braveRequest.skipInternalSearch,
+    braveRequest.enabled
   );
   const messages: ChatCompletionMessageParam[] = [
     {
@@ -93,13 +101,24 @@ export async function createTeamsChatReply(props: {
 function buildUserContent(
   message: string,
   internalContext: string,
-  webContext: string
+  webContext: string,
+  internalSearchPerformed: boolean,
+  webSearchPerformed: boolean
 ): string {
-  const internal =
-    internalContext || "該当する社内文書は見つかりませんでした。";
-  const web = webContext || "Web検索は未実行、または結果がありません。";
-
-  return `質問:\n${message}\n\n社内検索資料:\n${internal}\n\nWeb検索資料:\n${web}`;
+  const sections = [`質問:\n${message}`];
+  if (internalSearchPerformed) {
+    sections.push(
+      `社内検索資料:\n${
+        internalContext || "該当する社内文書は見つかりませんでした。"
+      }`
+    );
+  }
+  if (webSearchPerformed) {
+    sections.push(
+      `Web検索資料:\n${webContext || "Web検索結果は見つかりませんでした。"}`
+    );
+  }
+  return sections.join("\n\n");
 }
 
 function appendSources(answer: string, sources: TeamsSearchSource[]): string {

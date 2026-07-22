@@ -1,6 +1,8 @@
 import "server-only";
 
 import type { TeamsSearchSource } from "./teams-search-service";
+import { requiresTeamsInternalSearch } from "./teams-search-intent";
+import { buildTeamsWebQuery } from "./teams-web-query";
 
 const BRAVE_SEARCH_ENDPOINT =
   "https://api.search.brave.com/res/v1/web/search";
@@ -35,16 +37,10 @@ export function resolveBraveSearchRequest(message: string): {
   }
 
   const mode = process.env.TEAMS_BRAVE_SEARCH_MODE?.trim().toLowerCase();
+  const skipInternalSearch = !requiresTeamsInternalSearch(trimmed);
   if (mode === "off") {
-    return { enabled: false, query: trimmed, skipInternalSearch: false };
+    return { enabled: false, query: trimmed, skipInternalSearch };
   }
-
-  const internalKnowledgePattern =
-    /(社内|規程|規定|就業|人事|総務|申請|手順書|マニュアル|sharepoint|sl文書)/i;
-  const clearlyPublicPattern =
-    /(天気|天候|気温|降水|台風|ニュース|株価|為替|選挙結果|スポーツ結果)/i;
-  const skipInternalSearch =
-    clearlyPublicPattern.test(trimmed) && !internalKnowledgePattern.test(trimmed);
 
   if (mode === "always") {
     return { enabled: true, query: trimmed, skipInternalSearch };
@@ -72,9 +68,11 @@ export async function searchBraveWeb(props: {
   const timeout = setTimeout(() => controller.abort(), 10_000);
 
   try {
+    const effectiveQuery = buildTeamsWebQuery(props.query);
     const params = new URLSearchParams({
-      q: props.query,
+      q: effectiveQuery.query,
       count: String(resolveResultCount()),
+      extra_snippets: "true",
     });
     const response = await fetch(`${BRAVE_SEARCH_ENDPOINT}?${params}`, {
       headers: {
@@ -96,7 +94,11 @@ export async function searchBraveWeb(props: {
     const data = (await response.json()) as {
       web?: { results?: BraveWebResult[] };
     };
-    return formatResults(data.web?.results ?? [], props.startIndex);
+    return formatResults(
+      data.web?.results ?? [],
+      props.startIndex,
+      effectiveQuery.enriched
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -108,7 +110,8 @@ export function isTeamsBraveSearchConfigured(): boolean {
 
 function formatResults(
   results: BraveWebResult[],
-  startIndex: number
+  startIndex: number,
+  queryEnriched: boolean
 ): TeamsBraveSearchResult {
   const sources: TeamsSearchSource[] = [];
   const sections: string[] = [];
@@ -122,7 +125,7 @@ function formatResults(
     const name = result.title?.trim() || new URL(url).hostname;
     const snippets = [
       result.description?.trim(),
-      ...(result.extra_snippets ?? []).slice(0, 2).map((item) => item.trim()),
+      ...(result.extra_snippets ?? []).slice(0, 5).map((item) => item.trim()),
     ]
       .filter(Boolean)
       .join(" ");
@@ -141,6 +144,7 @@ function formatResults(
   console.log("[teams-brave-search] completed", {
     results: results.length,
     sources: sources.length,
+    queryEnriched,
   });
 
   return { context: sections.join("\n\n---\n\n"), sources };

@@ -438,6 +438,31 @@ TestSiteではAI Searchによる `midac_logo.png` の特定、Graph経由のBlob
 - `git diff --check`: 問題なし
 - `npm run build`: コードエラーではなく、起動中のNext.js開発サーバーが `src/.next/trace` を使用していたため `EPERM`。ビルドを再確認する場合は開発サーバー停止後に実行する。
 
+### Local確認とTestSiteデプロイ状況
+
+Localで次の動作を確認済み。
+
+- AI Searchで `midac_logo.png` が1件に一致。
+- SharePointから取得した画像を `dl-link/<thread-id>/midac_logo.png` に保存。
+- `SP image loaded via Blob SDK` が出力され、`bytes: 37378`、`format: 'png'`、既知のハッシュ接頭辞 `1d281ee36184` を確認。
+- GPT Image処理が完了し、生成画像が保存・画面表示された。
+- `input images.base` のログからSASクエリが除外され、`sv`、`se`、`sp`、`sig` が出力されないことを確認。
+
+デプロイ履歴:
+
+- Local OKコミット: `9d5d9c13300c2857ca02f861fc9a17b0ef6acc3d`
+- TestSite cherry-pickコミット: `9d7a4a5`
+- TestSite push先: `testsite/fix-toggle-selfscope-20260323`
+- push結果: `75ba748..9d7a4a5 HEAD -> testsite/fix-toggle-selfscope-20260323`
+- 現在はTestSite側のデプロイ処理中。Remoteでの最終動作確認は未実施。
+
+TestSite反映後の最終確認項目:
+
+1. `SharePointにあるロゴ(midac_logo.png)を入れて` の生成依頼が成功すること。
+2. `SP image loaded via Blob SDK`、`gpt-image edit completed`、`output saved` が出ること。
+3. `base:` ログに `?sv=`、`sig=` 等のSASクエリが含まれないこと。
+4. 既存画像へSPロゴを差し替える場合は、車両画像がbase、ロゴが参照画像となり `referencesLoaded: 1` になること。
+
 ## 再開時の最短手順
 
 1. このメモと `git status --short` を確認。

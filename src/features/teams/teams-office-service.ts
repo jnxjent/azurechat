@@ -102,14 +102,19 @@ export function parseTeamsOfficeRequest(
   message: string
 ): TeamsOfficeRequest | null {
   const normalized = message.trim().normalize("NFKC");
-  const asksForExcelRefinement =
-    /(excel|エクセル|xlsx)/i.test(normalized) &&
+  const targetExcelSheets = extractTargetSheetNames(normalized);
+  const hasExcelRefinementIntent =
     /(再変換|再抽出|精度|読み直|再読込|もう一度変換)/i.test(normalized);
+  const asksForExcelRefinement =
+    hasExcelRefinementIntent &&
+    (/(excel|エクセル|xlsx|シート)/i.test(normalized) ||
+      (targetExcelSheets.length > 0 &&
+        !/(ppt|pptx|powerpoint|パワーポイント)/i.test(normalized)));
 
   if (asksForExcelRefinement) {
     return {
       action: "refine_excel_sheets",
-      targetSheets: extractTargetSheetNames(normalized),
+      targetSheets: targetExcelSheets,
     };
   }
 

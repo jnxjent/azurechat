@@ -10,7 +10,12 @@ import {
   parseTeamsOfficeRequest,
   type TeamsOfficeRequest,
 } from "./teams-office-service";
-import { recordTeamsThreadUsage } from "./teams-usage-service";
+import {
+  recordTeamsChatTurn,
+  recordTeamsThreadUsage,
+} from "./teams-usage-service";
+import { resolveTeamsInstantReply } from "./teams-instant-reply";
+import { requiresTeamsInternalSearch } from "./teams-search-intent";
 
 export const TEAMS_MESSAGING_ENDPOINT = "/api/teams/messages" as const;
 
@@ -88,6 +93,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
   app.on("message", async ({ activity, send, api }) => {
     const text = activity.text?.trim() || "(empty message)";
     const conversationId = activity.conversation?.id;
+    const activityId = String(activity.id ?? "").trim();
 
     if (!conversationId) {
       await send("会話を識別できなかったため、回答を作成できませんでした。");
@@ -95,7 +101,23 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
     }
 
     try {
-      const userEmail = await resolveActivityUserEmail({ activity, api });
+      const instantReply = resolveTeamsInstantReply(text);
+      if (instantReply) {
+        // Send first so a greeting is not delayed by Graph, Cosmos DB,
+        // Azure AI Search, or Azure OpenAI.
+        await send(instantReply);
+        const teamsUserId = activity.from?.id;
+        if (teamsUserId) {
+          await recordTeamsThreadUsage({ conversationId, teamsUserId });
+          await recordCompletedTeamsTurn({
+            conversationId,
+            activityId,
+            teamsUserId,
+          });
+        }
+        return;
+      }
+
       const teamsUserId = activity.from?.id;
       if (teamsUserId) {
         await recordTeamsThreadUsage({ conversationId, teamsUserId });
@@ -104,6 +126,13 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
       }
 
       const officeRequest = parseTeamsOfficeRequest(text);
+
+      // Office operations and internal ACL-aware search require the Teams
+      // member's email. General chat and Web search do not.
+      const userEmail = officeRequest || requiresTeamsInternalSearch(text)
+        ? await resolveActivityUserEmail({ activity, api })
+        : null;
+
       if (officeRequest) {
         const startMessage = buildOfficeStartMessage(officeRequest);
         await send(startMessage);
@@ -113,6 +142,11 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
           userEmail,
         });
         await send(officeReply);
+        await recordCompletedTeamsTurn({
+          conversationId,
+          activityId,
+          teamsUserId,
+        });
         return;
       }
 
@@ -122,6 +156,13 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         userEmail,
       });
       await send(result.text);
+      if (result.type === "reply") {
+        await recordCompletedTeamsTurn({
+          conversationId,
+          activityId,
+          teamsUserId,
+        });
+      }
     } catch (error) {
       console.error("[teams] AzureChat reply failed", error);
       await send(
@@ -132,6 +173,26 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
   await app.initialize();
   return { app, adapter };
+}
+
+async function recordCompletedTeamsTurn(props: {
+  conversationId: string;
+  activityId: string;
+  teamsUserId: string | undefined;
+}): Promise<void> {
+  if (!props.teamsUserId) {
+    console.warn("[teams] Chat turn statistics skipped: user ID is missing");
+    return;
+  }
+  if (!props.activityId) {
+    console.warn("[teams] Chat turn statistics skipped: activity ID is missing");
+    return;
+  }
+  await recordTeamsChatTurn({
+    conversationId: props.conversationId,
+    activityId: props.activityId,
+    teamsUserId: props.teamsUserId,
+  });
 }
 
 function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
