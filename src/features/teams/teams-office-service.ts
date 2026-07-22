@@ -27,6 +27,7 @@ import {
   buildExplicitWordReplacementInstruction,
   findTeamsWordProofreadingReplacements,
 } from "./teams-word-proofread-service";
+import type { TeamsStoredFile } from "./teams-file-policy";
 
 export type TeamsOfficeRequest =
   | {
@@ -102,6 +103,8 @@ export function parseTeamsOfficeRequest(
   message: string
 ): TeamsOfficeRequest | null {
   const normalized = message.trim().normalize("NFKC");
+  const attachedFileQuery = extractAttachedFileQuery(normalized);
+  const hasAttachedFileMarker = Boolean(attachedFileQuery);
   const targetExcelSheets = extractTargetSheetNames(normalized);
   const hasExcelRefinementIntent =
     /(再変換|再抽出|精度|読み直|再読込|もう一度変換)/i.test(normalized);
@@ -186,6 +189,7 @@ export function parseTeamsOfficeRequest(
     asksForWord &&
     asksForProofreading &&
     !isExplicitConversion &&
+    !hasAttachedFileMarker &&
     !explicitlyReferencesLatestWord
   ) {
     return {
@@ -223,6 +227,7 @@ export function parseTeamsOfficeRequest(
 
   if (asksForPowerPoint && asksForConversion && hasPdfSource) {
     const fileQuery =
+      attachedFileQuery ||
       extractQuotedFileQuery(normalized) ||
       extractUnquotedFileQuery(normalized, "ppt");
     if (!fileQuery) return null;
@@ -238,6 +243,7 @@ export function parseTeamsOfficeRequest(
 
   if (asksForWord && asksForConversion && hasPdfSource) {
     const fileQuery =
+      attachedFileQuery ||
       extractQuotedFileQuery(normalized) ||
       extractUnquotedFileQuery(normalized, "word");
     if (!fileQuery) return null;
@@ -256,6 +262,7 @@ export function parseTeamsOfficeRequest(
 
   if (asksForExcel && asksForConversion && hasDocumentSource) {
     const fileQuery =
+      attachedFileQuery ||
       extractQuotedFileQuery(normalized) ||
       extractUnquotedFileQuery(normalized, "excel");
     if (!fileQuery) return null;
@@ -286,6 +293,7 @@ export function parseTeamsOfficeRequest(
 export async function executeTeamsOfficeRequest(props: {
   request: TeamsOfficeRequest;
   conversationId: string;
+  uploadedFiles?: TeamsStoredFile[];
   userEmail?: string | null;
 }): Promise<string> {
   const teamsThreadId = buildTeamsThreadId(props.conversationId);
@@ -439,6 +447,32 @@ export async function executeTeamsOfficeRequest(props: {
   }
 
   if (props.request.action === "pdf_to_word") {
+    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+    if (uploaded.error) return uploaded.error;
+    if (uploaded.file) {
+      const result = await convertPdfToWord({
+        fileUrl: uploaded.file.url,
+        fileName: uploaded.file.fileName,
+        threadId: teamsThreadId,
+        mode: props.request.mode,
+      });
+      if ("error" in result) {
+        return `Wordへの変換に失敗しました。\n\n${String(result.error)}`;
+      }
+      const outputName =
+        typeof result.fileName === "string"
+          ? result.fileName
+          : uploaded.file.fileName.replace(/\.pdf$/i, ".docx");
+      await saveWordPointer(teamsThreadId, {
+        url: String(result.downloadUrl),
+        fileName: outputName,
+        savedAt: Date.now(),
+      });
+      return `添付PDFをWordへ変換しました。\n\n📄 [${escapeMarkdownLinkText(
+        outputName
+      )}](${String(result.downloadUrl)})`;
+    }
+
     const search = await findTeamsOfficeFileCandidates({
       query: props.request.fileQuery,
       userEmail: props.userEmail,
@@ -482,6 +516,30 @@ export async function executeTeamsOfficeRequest(props: {
   }
 
   if (props.request.action === "pdf_to_ppt") {
+    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+    if (uploaded.error) return uploaded.error;
+    if (uploaded.file) {
+      const result = await convertPdfToPowerPoint({
+        fileUrl: uploaded.file.url,
+        fileName: uploaded.file.fileName,
+        threadId: teamsThreadId,
+        mode: props.request.mode,
+      });
+      if ("error" in result) {
+        return `PowerPointへの変換に失敗しました。\n\n${String(
+          result.error
+        )}`;
+      }
+      const outputName =
+        typeof result.fileName === "string"
+          ? result.fileName
+          : uploaded.file.fileName.replace(/\.pdf$/i, ".pptx");
+      await savePptxResult(teamsThreadId, result, outputName);
+      return `添付PDFをPowerPointへ変換しました。\n\n📊 [${escapeMarkdownLinkText(
+        outputName
+      )}](${String(result.downloadUrl)})`;
+    }
+
     const search = await findTeamsOfficeFileCandidates({
       query: props.request.fileQuery,
       userEmail: props.userEmail,
@@ -522,6 +580,26 @@ export async function executeTeamsOfficeRequest(props: {
     return `PowerPointへの変換が完了しました。${detail}\n\n📊 [${escapeMarkdownLinkText(
       outputName
     )}](${result.downloadUrl})`;
+  }
+
+  const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+  if (uploaded.error) return uploaded.error;
+  if (uploaded.file) {
+    const result = await convertDocumentToExcel({
+      fileUrl: uploaded.file.url,
+      fileName: uploaded.file.fileName,
+      threadId: teamsThreadId,
+    });
+    if ("error" in result) {
+      return `Excelへの変換に失敗しました。\n\n${String(result.error)}`;
+    }
+    const outputName =
+      typeof result.fileName === "string"
+        ? result.fileName
+        : uploaded.file.fileName.replace(/\.pdf$/i, ".xlsx");
+    return `添付PDFをExcelへ変換しました。\n\n📊 [${escapeMarkdownLinkText(
+      outputName
+    )}](${String(result.downloadUrl)})`;
   }
 
   const search = await findTeamsOfficeFileCandidates({
@@ -588,6 +666,55 @@ type TeamsWordPointer = {
   fileName: string;
   savedAt: number;
 };
+
+export async function registerTeamsUploadedOfficeFiles(
+  threadId: string,
+  files: TeamsStoredFile[]
+): Promise<void> {
+  for (const file of files) {
+    const sameTypeCount = files.filter(
+      (candidate) => candidate.extension === file.extension
+    ).length;
+    if (sameTypeCount !== 1) continue;
+
+    if (file.extension === "xlsx") {
+      await saveExcelPointer(threadId, {
+        url: file.url,
+        fileName: file.fileName,
+        savedAt: file.savedAt,
+      });
+    } else if (file.extension === "docx") {
+      await saveWordPointer(threadId, {
+        url: file.url,
+        fileName: file.fileName,
+        savedAt: file.savedAt,
+      });
+    } else if (file.extension === "pptx") {
+      await savePptxResult(
+        threadId,
+        { downloadUrl: file.url, fileName: file.fileName },
+        file.fileName
+      );
+    }
+  }
+}
+
+function selectUploadedOfficeFile(
+  files: TeamsStoredFile[] | undefined,
+  extensions: string[]
+): { error?: string; file?: TeamsStoredFile } {
+  const matches = (files ?? []).filter((file) =>
+    extensions.includes(file.extension.toLowerCase())
+  );
+  if (matches.length > 1) {
+    return {
+      error: `対象となる添付ファイルが複数あります。1件ずつ添付して実行してください。\n\n${matches
+        .map((file) => `- ${file.fileName}`)
+        .join("\n")}`,
+    };
+  }
+  return { file: matches[0] };
+}
 
 const wordPointerBlobName = (threadId: string) =>
   `thread-${threadId}-word-latest.json`;
@@ -1766,6 +1893,16 @@ function extractQuotedFileQuery(message: string): string | null {
   );
 }
 
+function extractAttachedFileQuery(message: string): string | null {
+  return (
+    message
+      .match(
+        /添付ファイル\s*[:：]\s*([^\n、]+?\.(?:pdf|docx|xlsx|pptx|png|jpe?g|webp))(?=\s|$|、)/i
+      )?.[1]
+      ?.trim() ?? null
+  );
+}
+
 function extractDirectOutputTitle(
   message: string,
   action: "create_excel" | "create_word" | "create_ppt"
@@ -1896,7 +2033,7 @@ function buildMultipleFilesMessage(files: TeamsOfficeFileCandidate[]): string {
   return `複数のファイルが見つかりました。変換するファイル名を「」で囲んで指定してください。\n\n${list}`;
 }
 
-function buildTeamsThreadId(conversationId: string): string {
+export function buildTeamsThreadId(conversationId: string): string {
   return `teams-${createHash("sha256")
     .update(conversationId)
     .digest("hex")

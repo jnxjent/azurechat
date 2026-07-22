@@ -6,8 +6,10 @@ import { createTeamsChatReply } from "./teams-chat-service";
 import { isTeamsSearchConfigured } from "./teams-search-service";
 import { isTeamsBraveSearchConfigured } from "./teams-brave-search-service";
 import {
+  buildTeamsThreadId,
   executeTeamsOfficeRequest,
   parseTeamsOfficeRequest,
+  registerTeamsUploadedOfficeFiles,
   type TeamsOfficeRequest,
 } from "./teams-office-service";
 import {
@@ -16,6 +18,12 @@ import {
 } from "./teams-usage-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
 import { requiresTeamsInternalSearch } from "./teams-search-intent";
+import { readLatestTeamsFiles, receiveTeamsFiles } from "./teams-file-service";
+import {
+  referencesTeamsUpload,
+  stripTeamsAttachmentMarkup,
+  type TeamsStoredFile,
+} from "./teams-file-policy";
 
 export const TEAMS_MESSAGING_ENDPOINT = "/api/teams/messages" as const;
 
@@ -91,7 +99,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
   });
 
   app.on("message", async ({ activity, send, api }) => {
-    const text = activity.text?.trim() || "(empty message)";
+    const text = stripTeamsAttachmentMarkup(activity.text?.trim() ?? "");
     const conversationId = activity.conversation?.id;
     const activityId = String(activity.id ?? "").trim();
 
@@ -101,12 +109,29 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
     }
 
     try {
-      const instantReply = resolveTeamsInstantReply(text);
-      if (instantReply) {
-        // Send first so a greeting is not delayed by Graph, Cosmos DB,
-        // Azure AI Search, or Azure OpenAI.
-        await send(instantReply);
-        const teamsUserId = activity.from?.id;
+      const teamsThreadId = buildTeamsThreadId(conversationId);
+      let uploadedFiles: TeamsStoredFile[] = [];
+      try {
+        uploadedFiles = await receiveTeamsFiles({
+          attachments: activity.attachments,
+          threadId: teamsThreadId,
+        });
+        if (uploadedFiles.length > 0) {
+          await registerTeamsUploadedOfficeFiles(teamsThreadId, uploadedFiles);
+          await send(buildTeamsFileReceivedMessage(uploadedFiles));
+        } else if (text && referencesTeamsUpload(text)) {
+          uploadedFiles = await readLatestTeamsFiles(teamsThreadId);
+        }
+      } catch (error) {
+        console.error("[teams-file] receive failed", error);
+        await send(
+          `ファイルを受信できませんでした。${safeTeamsFileErrorMessage(error)}`
+        );
+        return;
+      }
+
+      const teamsUserId = activity.from?.id;
+      if (!text && uploadedFiles.length > 0) {
         if (teamsUserId) {
           await recordTeamsThreadUsage({ conversationId, teamsUserId });
           await recordCompletedTeamsTurn({
@@ -118,14 +143,34 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         return;
       }
 
-      const teamsUserId = activity.from?.id;
+      const messageText = text || "(empty message)";
+      const instantReply = resolveTeamsInstantReply(messageText);
+      if (instantReply) {
+        // Send first so a greeting is not delayed by Graph, Cosmos DB,
+        // Azure AI Search, or Azure OpenAI.
+        await send(instantReply);
+        if (teamsUserId) {
+          await recordTeamsThreadUsage({ conversationId, teamsUserId });
+          await recordCompletedTeamsTurn({
+            conversationId,
+            activityId,
+            teamsUserId,
+          });
+        }
+        return;
+      }
+
       if (teamsUserId) {
         await recordTeamsThreadUsage({ conversationId, teamsUserId });
       } else {
         console.warn("[teams] Usage statistics skipped: user ID is missing");
       }
 
-      const officeRequest = parseTeamsOfficeRequest(text);
+      const routingText = appendTeamsFileNamesForRouting(
+        messageText,
+        uploadedFiles
+      );
+      const officeRequest = parseTeamsOfficeRequest(routingText);
 
       // Office operations and internal ACL-aware search require the Teams
       // member's email. General chat and Web search do not.
@@ -139,6 +184,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         const officeReply = await executeTeamsOfficeRequest({
           request: officeRequest,
           conversationId,
+          uploadedFiles,
           userEmail,
         });
         await send(officeReply);
@@ -152,7 +198,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
       const result = await createTeamsChatReply({
         conversationId,
-        message: text,
+        message: messageText,
         userEmail,
       });
       await send(result.text);
@@ -173,6 +219,39 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
   await app.initialize();
   return { app, adapter };
+}
+
+function buildTeamsFileReceivedMessage(files: TeamsStoredFile[]): string {
+  const list = files
+    .map(
+      (file) =>
+        `- ${file.fileName}（${Math.max(1, Math.ceil(file.size / 1024))} KB）`
+    )
+    .join("\n");
+  return [
+    "ファイルを受信しました。",
+    "",
+    list,
+    "",
+    "PDFはExcel・Word・PowerPoint変換、Excel・Word・PowerPointは既存の編集機能で利用できます。",
+  ].join("\n");
+}
+
+function appendTeamsFileNamesForRouting(
+  message: string,
+  files: TeamsStoredFile[]
+): string {
+  if (files.length === 0) return message;
+  return `${message}\n添付ファイル: ${files
+    .map((file) => file.fileName)
+    .join("、")}`;
+}
+
+function safeTeamsFileErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message.trim() : "";
+  return message && message.length <= 180
+    ? `\n\n${message}`
+    : "対応形式とファイルサイズを確認してください。";
 }
 
 async function recordCompletedTeamsTurn(props: {
