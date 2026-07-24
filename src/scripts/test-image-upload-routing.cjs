@@ -209,8 +209,9 @@ assert.ok(
     "Ignored model referenceImageUrls because a SharePoint image was resolved"
   )
 );
-assert.ok(
-  imageExtensions.includes("sharePointImageReference\n    ? []")
+assert.match(
+  imageExtensions,
+  /sharePointImageReference\r?\n    \? \[\]/
 );
 const candidateReferenceSelection = imageExtensions.slice(
   imageExtensions.indexOf("const candidateReferenceUrls"),
