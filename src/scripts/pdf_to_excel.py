@@ -715,6 +715,116 @@ def _find_libreoffice() -> str | None:
     return None
 
 
+def _render_excel_sheet_with_pillow(excel_path: str, sheet_name: str) -> list[bytes]:
+    """Render a worksheet to paginated PNGs without depending on LibreOffice."""
+    import io
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("[pdf_to_excel] Pillow not available for Excel render fallback", file=sys.stderr)
+        return []
+
+    font_candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\YuGothR.ttc",
+    ]
+
+    try:
+        font_path = next((p for p in font_candidates if os.path.isfile(p)), None)
+        body_font = ImageFont.truetype(font_path, 16) if font_path else ImageFont.load_default()
+        header_font = ImageFont.truetype(font_path, 16) if font_path else body_font
+
+        wb = openpyxl.load_workbook(excel_path, data_only=False)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            return []
+        ws = wb[sheet_name]
+        max_row = max(ws.max_row, 1)
+        max_col = max(ws.max_column, 1)
+
+        col_widths: list[int] = []
+        for col_idx in range(1, max_col + 1):
+            letter = get_column_letter(col_idx)
+            configured = ws.column_dimensions[letter].width
+            content_units = 0
+            for row_idx in range(1, min(max_row, 200) + 1):
+                value = ws.cell(row_idx, col_idx).value
+                if value is None:
+                    continue
+                content_units = max(
+                    content_units,
+                    min(sum(2 if ord(ch) > 127 else 1 for ch in str(value)), 36),
+                )
+            excel_units = float(configured) if configured is not None else 10.0
+            col_widths.append(max(80, min(360, int(max(excel_units, content_units) * 9 + 24))))
+
+        total_width = sum(col_widths)
+        if total_width > 6000:
+            scale = 6000 / total_width
+            col_widths = [max(60, int(width * scale)) for width in col_widths]
+
+        margin = 16
+        row_height = 34
+        rows_per_page = 40
+        pages: list[bytes] = []
+
+        for start_row in range(1, max_row + 1, rows_per_page):
+            page_rows = list(range(start_row, min(start_row + rows_per_page, max_row + 1)))
+            if start_row > 1 and max_row > 1:
+                page_rows = [1] + page_rows
+
+            image = Image.new(
+                "RGB",
+                (sum(col_widths) + margin * 2, len(page_rows) * row_height + margin * 2),
+                "white",
+            )
+            draw = ImageDraw.Draw(image)
+            y = margin
+            for row_idx in page_rows:
+                x = margin
+                for col_idx, cell_width in enumerate(col_widths, start=1):
+                    cell = ws.cell(row_idx, col_idx)
+                    fill = "#D9EAF7" if row_idx == 1 else "#FFFFFF"
+                    draw.rectangle(
+                        (x, y, x + cell_width, y + row_height),
+                        fill=fill,
+                        outline="#808080",
+                        width=1,
+                    )
+                    value = "" if cell.value is None else str(cell.value)
+                    max_chars = max(4, int((cell_width - 12) / 9))
+                    if len(value) > max_chars:
+                        value = value[: max_chars - 1] + "…"
+                    draw.text(
+                        (x + 6, y + 7),
+                        value,
+                        fill="#000000",
+                        font=header_font if row_idx == 1 else body_font,
+                    )
+                    x += cell_width
+                y += row_height
+
+            png = io.BytesIO()
+            image.save(png, format="PNG", optimize=True)
+            pages.append(png.getvalue())
+
+        wb.close()
+        total_bytes = sum(len(page) for page in pages)
+        print(
+            f"[pdf_to_excel] Pillow fallback rendered sheet '{sheet_name}' "
+            f"as {len(pages)} PNG(s) ({total_bytes} bytes total)",
+            file=sys.stderr,
+        )
+        return pages
+    except Exception as e:
+        print(f"[pdf_to_excel] Pillow Excel render fallback error: {e}", file=sys.stderr)
+        return []
+
+
 def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 200) -> list[bytes]:
     """指定シートだけの一時xlsxを作成→LibreOffice→PDF→ページごとにPNG化して返す。
     1シートが複数PDFページになる場合もページ単位のリストで返す（縦結合しない）。"""
@@ -723,15 +833,15 @@ def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 20
     import shutil
 
     if not HAS_PYMUPDF:
-        print("[pdf_to_excel] PyMuPDF not available, cannot render Excel sheet", file=sys.stderr)
-        return []
+        print("[pdf_to_excel] PyMuPDF not available, using Pillow render fallback", file=sys.stderr)
+        return _render_excel_sheet_with_pillow(excel_path, sheet_name)
 
     lo_exe = _find_libreoffice()
     if lo_exe is None:
-        print("[pdf_to_excel] LibreOffice not found, cannot render Excel sheet", file=sys.stderr)
-        return []
+        print("[pdf_to_excel] LibreOffice not found, using Pillow render fallback", file=sys.stderr)
+        return _render_excel_sheet_with_pillow(excel_path, sheet_name)
 
-    out_dir = tempfile.mkdtemp()
+    out_dir = tempfile.mkdtemp(prefix="azurechat-excel-render-")
     try:
         # 1. 指定シートだけを含む一時xlsxを作成
         wb_src = openpyxl.load_workbook(excel_path)
@@ -740,32 +850,55 @@ def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 20
             return []
         for sn in [s for s in wb_src.sheetnames if s != sheet_name]:
             del wb_src[sn]
-        single_xlsx = os.path.join(out_dir, "single_sheet.xlsx")
+        input_dir = os.path.join(out_dir, "input")
+        pdf_dir = os.path.join(out_dir, "pdf")
+        profile_dir = os.path.join(out_dir, "lo-profile")
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(pdf_dir, exist_ok=True)
+        os.makedirs(profile_dir, exist_ok=True)
+        single_xlsx = os.path.join(input_dir, "single_sheet.xlsx")
         wb_src.save(single_xlsx)
         wb_src.close()
 
         # 2. LibreOffice で1シートxlsx → PDF
-        import platform
-        lo_cmd = [lo_exe, "--headless"]
-        # Linuxコンテナではホームディレクトリが書き込めずサイレント失敗するため
-        # プロセス固有のtmpディレクトリをユーザープロファイルに指定する
-        if platform.system() != "Windows":
-            lo_profile = f"/tmp/lo_profile_{os.getpid()}"
-            lo_cmd += [f"-env:UserInstallation=file://{lo_profile}"]
-        lo_cmd += ["--convert-to", "pdf", "--outdir", out_dir, single_xlsx]
+        from pathlib import Path
+        lo_cmd = [
+            lo_exe,
+            f"-env:UserInstallation={Path(profile_dir).resolve().as_uri()}",
+            "--headless",
+            "--norestore",
+            "--nologo",
+            "--nodefault",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf:calc_pdf_Export",
+            "--outdir",
+            pdf_dir,
+            single_xlsx,
+        ]
 
-        result = subprocess.run(lo_cmd, capture_output=True, text=True, timeout=60)
-        print(f"[pdf_to_excel] LibreOffice returncode={result.returncode} stderr={result.stderr[:200]!r}", file=sys.stderr)
+        result = subprocess.run(
+            lo_cmd,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            cwd=input_dir,
+        )
+        print(
+            f"[pdf_to_excel] LibreOffice returncode={result.returncode} "
+            f"stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}",
+            file=sys.stderr,
+        )
         if result.returncode != 0:
             print(f"[pdf_to_excel] LibreOffice failed (rc={result.returncode})", file=sys.stderr)
-            return []
+            return _render_excel_sheet_with_pillow(excel_path, sheet_name)
 
-        pdf_path = os.path.join(out_dir, "single_sheet.pdf")
-        out_dir_files = os.listdir(out_dir)
-        print(f"[pdf_to_excel] out_dir contents after LibreOffice: {out_dir_files}", file=sys.stderr)
+        pdf_path = os.path.join(pdf_dir, "single_sheet.pdf")
+        out_dir_files = os.listdir(pdf_dir)
+        print(f"[pdf_to_excel] PDF output contents after LibreOffice: {out_dir_files}", file=sys.stderr)
         if not os.path.exists(pdf_path):
             print(f"[pdf_to_excel] LibreOffice output PDF not found (expected: {pdf_path})", file=sys.stderr)
-            return []
+            return _render_excel_sheet_with_pillow(excel_path, sheet_name)
 
         # 3. 各ページを個別PNGとして返す（縦結合しない）
         doc = fitz.open(pdf_path)
@@ -784,10 +917,10 @@ def _render_excel_sheet_as_pages(excel_path: str, sheet_name: str, dpi: int = 20
 
     except subprocess.TimeoutExpired:
         print("[pdf_to_excel] LibreOffice timeout when rendering Excel sheet", file=sys.stderr)
-        return []
+        return _render_excel_sheet_with_pillow(excel_path, sheet_name)
     except Exception as e:
         print(f"[pdf_to_excel] Excel sheet render error: {e}", file=sys.stderr)
-        return []
+        return _render_excel_sheet_with_pillow(excel_path, sheet_name)
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
