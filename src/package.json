@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:teams": "next dev",
+    "teams:playground": "teamsapptester start --app-endpoint http://localhost:3000/api/teams/messages --channel-id msteams --disable-telemetry",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
@@ -18,6 +20,7 @@
     "@codemirror/lang-javascript": "^6.2.1",
     "@kenjiuno/msgreader": "^1.28.0",
     "@markdoc/markdoc": "^0.4.0",
+    "@microsoft/teams.apps": "^2.0.13",
     "@napi-rs/canvas": "^0.1.83",
     "@radix-ui/react-accordion": "^1.1.2",
     "@radix-ui/react-avatar": "^1.0.4",
@@ -61,6 +64,7 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@microsoft/teams-app-test-tool": "^0.2.27",
     "@types/node": "20.19.39",
     "@types/react": "18.3.28",
     "@types/react-dom": "^18",

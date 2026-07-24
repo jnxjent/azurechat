@@ -32,6 +32,34 @@ function repairBrokenMarkdownUrls(text: string): string {
   );
 }
 
+function buildToolResultFallbackContent(toolResults: string[]): string {
+  const latest = toolResults.at(-1) ?? "";
+  if (!latest) return "処理が完了しました。";
+
+  try {
+    const parsed = JSON.parse(latest) as Record<string, unknown>;
+    const imageUrl = typeof parsed.url === "string" ? parsed.url : "";
+    if (imageUrl) {
+      return `画像の処理が完了しました。\n\n![生成画像](${imageUrl})`;
+    }
+    const downloadUrl =
+      typeof parsed.downloadUrl === "string" ? parsed.downloadUrl : "";
+    if (downloadUrl) {
+      return `ファイルの処理が完了しました。\n\n[ファイルを開く](${downloadUrl})`;
+    }
+    if (typeof parsed.error === "string" && parsed.error) {
+      return parsed.error;
+    }
+    if (typeof parsed.message === "string" && parsed.message) {
+      return parsed.message;
+    }
+  } catch {
+    // String tool results are already suitable as a fallback response.
+  }
+
+  return latest;
+}
+
 export const OpenAIStream = (props: {
   runner: ChatCompletionStreamingRunner;
   chatThread: ChatThreadModel;
@@ -65,9 +93,53 @@ export const OpenAIStream = (props: {
       };
 
       let lastMessage = "";
+      let finalized = false;
       // functionCallResult をまとめて収集し finalContent で DB 保存する
       // （revalidate 後の props.messages でも tool メッセージが残るようにするため）
       const pendingToolResults: string[] = [];
+
+      const finalizeStream = async (content: string) => {
+        if (finalized) return;
+        finalized = true;
+
+        const repairedContent = repairBrokenMarkdownUrls(content || "");
+        if (repairedContent !== content) {
+          console.warn(
+            "[open-ai-stream] repaired broken markdown URL in finalContent"
+          );
+        }
+
+        try {
+          // tool results を assistant より先に保存することで
+          // revalidate 後の props.messages でも messages[index-1] が tool になる
+          for (const result of pendingToolResults) {
+            await CreateChatMessage({
+              name: "tool",
+              content: result,
+              role: "tool",
+              chatThreadId: chatThread.id,
+            });
+          }
+
+          await CreateChatMessage({
+            name: AI_NAME,
+            content: repairedContent,
+            role: "assistant",
+            chatThreadId: chatThread.id,
+          });
+        } catch (error) {
+          // A persistence failure must not leave the browser stream open
+          // forever after an otherwise successful tool execution.
+          console.error("[open-ai-stream] final message persistence failed", error);
+        } finally {
+          const response: AzureChatCompletion = {
+            type: "finalContent",
+            response: repairedContent,
+          };
+          streamResponse(response.type, JSON.stringify(response));
+          closeController();
+        }
+      };
 
       // 🔹 ツール呼び出し（GPT-5 runTools → functionCall にマッピング）
       runner
@@ -127,6 +199,8 @@ export const OpenAIStream = (props: {
           }
         })
         .on("abort", () => {
+          if (finalized) return;
+          finalized = true;
           const response: AzureChatCompletionAbort = {
             type: "abort",
             response: "Chat aborted",
@@ -135,6 +209,8 @@ export const OpenAIStream = (props: {
           closeController();
         })
         .on("error", async (error: any) => {
+          if (finalized) return;
+          finalized = true;
           console.log("🔴 error", error);
           const response: AzureChatCompletion = {
             type: "error",
@@ -153,36 +229,18 @@ export const OpenAIStream = (props: {
           streamResponse(response.type, JSON.stringify(response));
           closeController();
         })
-        .on("finalContent", async (content: string) => {
-          const repairedContent = repairBrokenMarkdownUrls(content);
-          if (repairedContent !== content) {
-            console.warn("[open-ai-stream] repaired broken markdown URL in finalContent");
-          }
-
-          // tool results を assistant より先に保存することで
-          // revalidate 後の props.messages でも messages[index-1] が tool になる
-          for (const result of pendingToolResults) {
-            await CreateChatMessage({
-              name: "tool",
-              content: result,
-              role: "tool",
-              chatThreadId: chatThread.id,
-            });
-          }
-
-          await CreateChatMessage({
-            name: AI_NAME,
-            content: repairedContent,
-            role: "assistant",
-            chatThreadId: chatThread.id,
-          });
-
-          const response: AzureChatCompletion = {
-            type: "finalContent",
-            response: repairedContent,
-          };
-          streamResponse(response.type, JSON.stringify(response));
-          closeController();
+        .on("finalContent", (content: string) => {
+          void finalizeStream(content);
+        })
+        .on("end", () => {
+          if (finalized) return;
+          const fallbackContent = pendingToolResults.length
+            ? buildToolResultFallbackContent(pendingToolResults)
+            : lastMessage || "処理が完了しました。";
+          console.warn(
+            "[open-ai-stream] runner ended without finalContent; using fallback"
+          );
+          void finalizeStream(fallbackContent);
         });
     },
   });

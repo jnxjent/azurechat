@@ -15,12 +15,17 @@ import {
   FindTopChatMessagesForCurrentUser,
 } from "../chat-message-service";
 import { EnsureChatThreadOperation } from "../chat-thread-service";
+import { LoadLatestImageAttachment } from "../chat-image-service";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
 import { GetDynamicExtensions } from "./chat-api-dynamic-extensions";
 import { ChatApiExtensions } from "./chat-api-extension";
 import { ChatApiMultimodal } from "./chat-api-multimodal";
+import {
+  isSharePointImageRequest,
+  resolveRequiredImageToolName,
+} from "./image/image-intent";
 import { OpenAIStream } from "./open-ai-stream";
 
 type ChatTypes = "extensions" | "chat-with-file" | "multimodal";
@@ -37,6 +42,14 @@ function uiToApi(mode?: ThinkingModeUI): ThinkingModeAPI {
   if (mode === "thinking") return "thinking";
   if (mode === "fast") return "fast";
   return "normal";
+}
+
+function normalizeImageAttachments(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  }
+  const single = String(value ?? "").trim();
+  return single ? [single] : [];
 }
 
 /** ★最小ガード：直前 assistant.tool_calls に紐付かない tool を history から除外 */
@@ -85,6 +98,27 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   const currentChatThread = currentChatThreadResponse.response;
 
   const p = props as UserPromptWithMode;
+  const imageAttachmentUrls = normalizeImageAttachments(
+    (p as any).multimodalImage
+  );
+  const referencesAnAttachedImage =
+    /(?:添付|アップロード|ロゴ|画像ファイル|reference\s+image|attached\s+(?:logo|image))/i.test(
+      props.message
+    );
+  const referencesSharePointImage = isSharePointImageRequest(props.message);
+  const storedImageAttachment =
+    imageAttachmentUrls.length === 0 && referencesAnAttachedImage
+      ? await LoadLatestImageAttachment(currentChatThread.id)
+      : null;
+  const imageAttachmentCountForRouting =
+    imageAttachmentUrls.length +
+    (storedImageAttachment ? 1 : 0) +
+    (referencesSharePointImage ? 1 : 0);
+  const requiredImageToolName = resolveRequiredImageToolName(
+    props.message,
+    imageAttachmentCountForRouting
+  );
+  const shouldUseImageEditTools = Boolean(requiredImageToolName);
   const resolvedMode: ThinkingModeAPI =
     p.apiThinkingMode ?? uiToApi(p.thinkingMode) ?? "normal";
 
@@ -93,6 +127,10 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
       apiThinkingMode: p.apiThinkingMode,
       uiThinkingMode: p.thinkingMode,
       resolvedMode,
+      imageAttachmentCount: imageAttachmentUrls.length,
+      imageAttachmentCountForRouting,
+      storedImageAttachment: storedImageAttachment?.fileName ?? null,
+      requiredImageToolName: requiredImageToolName ?? null,
     });
   }
 
@@ -104,6 +142,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     _getExtensions({
       chatThread: currentChatThread,
       userMessage: props.message,
+      imageAttachmentUrls,
       signal,
       mode: resolvedMode,
     }),
@@ -112,7 +151,9 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   currentChatThread.personaMessage = `${CHAT_DEFAULT_SYSTEM_PROMPT} \n\n ${currentChatThread.personaMessage}`;
 
   let chatType: ChatTypes = "extensions";
-  if ((p as any).multimodalImage && (p as any).multimodalImage.length > 0) {
+  if (shouldUseImageEditTools) {
+    chatType = "extensions";
+  } else if (imageAttachmentUrls.length > 0) {
     chatType = "multimodal";
   } else if (docs.length > 0) {
     chatType = "chat-with-file";
@@ -153,6 +194,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
         userMessage: props.message,
         history,
         extensions: extension,
+        requiredToolName: requiredImageToolName,
         signal,
         mode: resolvedMode,
       });
@@ -191,6 +233,7 @@ const _getDocuments = async (chatThread: ChatThreadModel) => {
 const _getExtensions = async (props: {
   chatThread: ChatThreadModel;
   userMessage: string;
+  imageAttachmentUrls?: string[];
   signal: AbortSignal;
   mode: ThinkingModeAPI;
 }) => {
@@ -206,6 +249,7 @@ const _getExtensions = async (props: {
     const response = await GetDefaultExtensions({
       chatThread: props.chatThread,
       userMessage: props.userMessage,
+      imageAttachmentUrls: props.imageAttachmentUrls,
       signal: props.signal,
       mode: props.mode, // ← ここが“断絶”をつなぐ肝
     });

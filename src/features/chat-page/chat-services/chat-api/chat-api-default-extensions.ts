@@ -6,7 +6,13 @@ import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/commo
 import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
-import { GetImageUrl, UploadImageToStore } from "../chat-image-service";
+import {
+  ConsumeLatestImageAttachment,
+  GetImageFromStore,
+  GetImageUrl,
+  LoadLatestImageAttachment,
+  UploadImageToStore,
+} from "../chat-image-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
@@ -15,6 +21,22 @@ import { loadDeckSpecForUrl, checkPptxIsOurs } from "@/lib/deck-spec-storage";
 import type { DeckSpec, DeckSpecItem } from "@/types/deck-spec";
 import { SimpleSearch, SimilaritySearch, ExtensionSimilaritySearch, DocumentSearchResponse } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { userSession } from "@/features/auth-page/helpers";
+import { toFile } from "openai";
+import { createHash } from "crypto";
+import sharp from "sharp";
+import {
+  buildFaithfulImagePrompt,
+  buildMultiImageReferenceInstruction,
+  buildNewImageReferenceInstruction,
+  decodeChatImageDataUrl,
+  extractSharePointImageQuery,
+  isExplicitTextOverlayRequest,
+  isNewImageReferenceCompositionRequest,
+  isSupportedImageReferenceUrl,
+  normalizeGptImageSize,
+  sanitizeImageLocationForLog,
+} from "./image/image-intent";
+import { normalizeGptImageQuality } from "./image/image-quality";
 
 import {
   buildSendOptionsFromMode,
@@ -866,6 +888,17 @@ function extractLatestImageUrlFromMessages(messages: string[]): string | null {
   return null;
 }
 
+/** 現在のユーザーメッセージに添付された画像URLを出現順で全件取得する。 */
+function extractImageUrlsFromText(message: string): string[] {
+  const value = String(message ?? "");
+  if (!value) return [];
+
+  const imageUrlRe =
+    /https?:\/\/[^\s)\]]+\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s)\]]*)?/gi;
+  const matches = value.match(imageUrlRe) ?? [];
+  return Array.from(new Set(matches.map((url) => url.trim()).filter(Boolean)));
+}
+
 async function resolveLatestImageUrlFromThread(chatThreadId: string): Promise<string | null> {
   try {
     const historyResponse = await FindTopChatMessagesForCurrentUser(chatThreadId, 20);
@@ -1171,6 +1204,7 @@ function parseStyleHint(styleHint?: string): StyleParams {
 export const GetDefaultExtensions = async (props: {
   chatThread: ChatThreadModel;
   userMessage: string;
+  imageAttachmentUrls?: string[];
   signal: AbortSignal;
   mode?: ThinkingModeAPI;
 }): Promise<ServerActionResponse<Array<any>>> => {
@@ -1193,6 +1227,7 @@ export const GetDefaultExtensions = async (props: {
         await executeCreateImage(
           args,
           props.chatThread,
+          props.userMessage,
           props.signal,
           modeOpts
         ),
@@ -1200,26 +1235,94 @@ export const GetDefaultExtensions = async (props: {
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string" },
-          text: { type: "string" },
+          prompt: {
+            type: "string",
+            description:
+              "Complete image instruction. Preserve the user's original language, Japanese wording, quoted text, constraints, composition, and style details. Do not translate, summarize, sanitize, or replace it with a generic prompt.",
+          },
           size: {
             type: "string",
             enum: ["1024x1024", "1024x1792", "1792x1024"],
+          },
+          quality: {
+            type: "string",
+            enum: ["low", "medium", "high", "auto"],
+            default: "auto",
+            description:
+              "Rendering quality. Use high only when the user explicitly requests high/best/final quality (for example 高画質, 高品質, 最高品質). Use medium for explicitly requested standard quality. Use low for an explicitly requested draft, low-quality, or speed-first result (for example 下書き, 低画質, 高速優先). Otherwise use auto. Do not infer high merely because the visual prompt is detailed.",
           },
         },
         required: ["prompt"],
       },
       description:
-        "Use this tool ONLY when user clearly asks for a NEW image to be created. " +
-        "If user wants to MODIFY or add text to an ALREADY GENERATED image, you MUST NOT call this tool. " +
-        "Instead, call add_text_to_existing_image with the previous image URL." +
+        "Use this tool ONLY when the user clearly asks for a NEW image. Preserve every detail and the original language of the user's request in prompt; never translate, shorten, generalize, or add unrelated safety/style boilerplate. " +
+        "For a visual change to an existing image, use edit_existing_image. " +
+        "Only an explicit request to add literal text to an existing image may use add_text_to_existing_image. " +
         "After this tool returns a url, you MUST display the image using Markdown image syntax: ![image](url). Never output the URL as plain text.",
       name: "create_img",
     },
   });
 
-  // ★ 既存画像に文字だけ足すツール（Vision を使わないシンプル版）
+  // ★ gpt-image-2 による既存画像の通常編集（文字合成とは分離）
   defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeEditExistingImage(
+          args,
+          props.chatThread,
+          props.userMessage,
+          props.imageAttachmentUrls,
+          props.signal
+        ),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description:
+              "The complete requested visual edit. Keep the user's Japanese and all concrete details verbatim. Identify the smallest target that must change. Do not broaden the scope, redesign the whole image, or reinterpret the request as adding text. Everything not explicitly requested must remain unchanged.",
+          },
+          imageUrl: {
+            type: "string",
+            description:
+              "Legacy single-image URL. Prefer baseImageUrl and referenceImageUrls for multi-image composition.",
+          },
+          baseImageUrl: {
+            type: "string",
+            description:
+              "Optional URL of image 1, the base image to edit. Omit it to use the latest generated image in this thread.",
+          },
+          referenceImageUrls: {
+            type: "array",
+            items: { type: "string" },
+            maxItems: 15,
+            description:
+              "URLs of image 2 onward: attached logos, labels, products, people, or other source assets to insert into image 1. Preserve each reference asset's spelling, colors, geometry, and aspect ratio.",
+          },
+          size: {
+            type: "string",
+            enum: ["1024x1024", "1024x1536", "1536x1024", "auto"],
+          },
+          quality: {
+            type: "string",
+            enum: ["low", "medium", "high", "auto"],
+            default: "auto",
+            description:
+              "Rendering quality for the edited output. Use high only when the user explicitly requests high/best/final quality (for example 高画質, 高品質, 最高品質). Use medium for explicitly requested standard quality. Use low for an explicitly requested draft, low-quality, or speed-first result (for example 下書き, 低画質, 高速優先). Otherwise use auto.",
+          },
+        },
+        required: ["prompt"],
+      },
+      description:
+        "Use this tool for a visual edit to an EXISTING image, including multi-image composition such as adding an attached logo or a SharePoint image asset to a vehicle. For composition, image 1 is the base image and image 2 onward are reference assets. Pass attached asset URLs in referenceImageUrls; SharePoint image names are resolved securely from the user's original request. Pass the latest user request faithfully in its original language and limit the edit to the smallest explicitly requested area. Preserve all unmentioned content, identities, geometry, composition, and style. Do NOT use this for a request whose explicit purpose is merely to overlay literal text; that special case uses add_text_to_existing_image.",
+      name: "edit_existing_image",
+    },
+  });
+
+  // ★ 旧文字合成は、最新メッセージが明示的な文字追加の場合だけ公開する
+  if (isExplicitTextOverlayRequest(props.userMessage)) defaultExtensions.push({
     type: "function",
     function: {
       function: async (args: any) =>
@@ -1275,12 +1378,11 @@ export const GetDefaultExtensions = async (props: {
               "Vertical offset in pixels. Positive moves text downward, negative upward.",
           },
         },
-        required: ["imageUrl", "text"],
+        required: ["text"],
       },
       description:
-        "Use this tool when the user wants to add or adjust text on an EXISTING image, for example 'この絵に 2026 謹賀新年 と入れて' or 'もう少し下に', 'そこから➡で右に', 'もう少し大きく'. " +
-        "CRITICAL RULE: When the user is ONLY requesting position/size/color adjustments, " +
-        "you MUST preserve the EXACT text from the previous image without any modifications.",
+        "Use this legacy overlay tool ONLY because the CURRENT user message explicitly asks to add literal text to an existing image, for example '今の絵に、以下の文字を加えて' or 'この画像に「謹賀新年」と入れて'. " +
+        "Never use it for ordinary image edits or for later position/size/color-only follow-ups.",
       name: "add_text_to_existing_image",
     },
   });
@@ -1432,7 +1534,7 @@ export const GetDefaultExtensions = async (props: {
           },
           fontFace: {
             type: "string",
-            description: "PowerPointで使うフォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
+            description: "PowerPointで使うフォント名。ユーザーがフォントを明示した場合のみ指定する。未指定時は省略（既定: 'Meiryo'）。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'",
           },
           designInstruction: {
             type: "string",
@@ -1613,7 +1715,8 @@ export const GetDefaultExtensions = async (props: {
               (await resolveLatestPptxInfoFromThread(props.chatThread.id))?.url ||
               "",
           },
-          props.chatThread
+          props.chatThread,
+          props.userMessage
         ),
       parse: (input: string) => JSON.parse(input),
       parameters: {
@@ -3395,6 +3498,8 @@ async function executeCreatePptx(
   userMessage?: string
 ) {
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
+  const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
+  const effectiveFontFace = hasExplicitFontRequest && fontFace?.trim() ? fontFace.trim() : "Meiryo";
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
@@ -3519,7 +3624,7 @@ async function executeCreatePptx(
           ...(s.textTreatment ? { textTreatment: s.textTreatment } : {}),
         })),
         threadId: chatThread.id,
-        fontFace,
+        fontFace: effectiveFontFace,
         designInstruction: explicitInstruction,
         deckPreferences,
         fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
@@ -3822,13 +3927,34 @@ function nextRevisionBaseName(inputBaseName: string): string {
 }
 
 // ---------------- Page/P/ページ番号 → slideIndex 変換 ----------------
+function extractPageRangeMentions(instruction: string): Map<number, number> {
+  const result = new Map<number, number>();
+  const rangePatterns = [
+    /(?<![A-Za-z])P\s*(\d+)\s*(?:から|〜|～|~|[-–—])\s*P?\s*(\d+)/gi,
+    /(?:Page|ページ)\s*(\d+)\s*(?:から|〜|～|~|[-–—])\s*(?:(?:Page|ページ)\s*)?(\d+)/gi,
+  ];
+
+  for (const pattern of rangePatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(instruction)) !== null) {
+      const start = parseInt(match[1], 10);
+      const end = parseInt(match[2], 10);
+      if (start < 1 || end < start || end - start > 100) continue;
+      for (let page = start; page <= end; page++) {
+        result.set(page, page - 1);
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * instruction 内の "Page2,4,7" / "P5" / "ページ3" を抽出し、
  * Map<pageNumber(1-based), slideIndex(0-based)> を返す。
  * 「スライドN」表記は対象外（既存仕様を維持）。
  */
 function extractPageMentions(instruction: string): Map<number, number> {
-  const result = new Map<number, number>();
+  const result = extractPageRangeMentions(instruction);
   // マッチ直後の先頭が「助詞（は/が/を/も）+ 否定・除外語」のパターンのみスキップ。
   // 「以外」はここに含めない：「P5,6,7,8以外は変えないで」でP5-P8が誤スキップされるため。
   const NEGATION_RE = /^[はがをも]\s*(?:しない|除外|対象外|除く|除いて|含まない|変えない|やらない|変更しない|変更済み|前回|すでに)/;
@@ -5103,13 +5229,19 @@ function buildEditLabel(instruction: string): string {
 // ---------------- 既存 PPTX 改良 ----------------
 async function executeEditPptx(
   args: { fileUrl?: string; instruction: string; imageUrl?: string; targetPages?: number[]; targetItemCount?: number },
-  chatThread: ChatThreadModel
+  chatThread: ChatThreadModel,
+  userMessage?: string
 ) {
   let { fileUrl, instruction, imageUrl: argImageUrl, targetPages: argTargetPages, targetItemCount: argTargetItemCount } = args ?? {};
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
+  // ツールLLMが「箇条書きに変更」を「箇条書きを追加」へ言い換える場合があるため、
+  // レイアウト意図と対象ページの判定にはユーザー原文も必ず含める。
+  const userIntentText = [userMessage?.trim(), instruction.trim()]
+    .filter(Boolean)
+    .join("\n");
 
   // 画像URL解決: LLMがimageUrlを省略した場合のフォールバック
   // ロゴ/画像/添付の指示 かつ instruction にURLがない場合、スレッド最新アップロード画像URLを自動注入
@@ -5174,7 +5306,7 @@ async function executeEditPptx(
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
   // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
   // 「箇条書き」「bullet」だけでは layout_regen に入れない（reference copy と混同するため）
-  const referenceCopyPages = extractReferenceCopyPages(instruction);
+  const referenceCopyPages = extractReferenceCopyPages(userIntentText);
   // 「カードをN枚に」「カードをN個に」はカード数調整（layout変換ではない）
   // hasLayoutIntent のカード + に パターンが誤マッチするため先にガードする
   const isCardCountAdjust =
@@ -5184,6 +5316,9 @@ async function executeEditPptx(
       ? false  // reference copy はカード型変換ではないため layout_regen に流さない
       : !isCardCountAdjust &&
         /(Box|ボックス|card_grid|カード.{0,6}(型|に|へ|変え|変更|にして)|card.{0,6}(type|grid|layout|型|に変)|型.{0,4}(変え|変更|替え|に変)|レイアウト.{0,6}(をカード|カード))/i.test(instruction);
+  const hasSimpleBulletLayoutIntent =
+    !referenceCopyPages &&
+    /箇条書き.{0,8}(?:デザイン|レイアウト|形式|型|にして|へ変更|に変更|へ変え|に変え)/i.test(userIntentText);
   const hasColorIntent =
     /(色|色味|カラー|トーン|基調|tone|緑|青|紺|赤|黄|紫|オレンジ|ピンク|グレー|ネイビー|グリーン|ブルー|レッド|深緑|深赤|青緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|琥珀|サンゴ|煉瓦|炭|フォレスト|navy|orange|green|blue|red|yellow|purple|pink|gray|teal|coral|cyan|turquoise|ivory|beige|maroon|indigo|crimson|gold|amber|burgundy|charcoal|terra|forest)/i.test(instruction);
   // 「色は不変で」「既存配色のまま」など色を変えないと明示された場合のみ true
@@ -5218,8 +5353,11 @@ async function executeEditPptx(
       try {
         const t0 = Date.now();
         // 対象スライドを解決（ツール引数 targetPages 優先, なければ DeckSpec タイトル/items でマッチ）
-        const rawDsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
-          ? new Set(argTargetPages.map((p: number) => p - 1))
+        // instruction に範囲指定がある場合は、LLMが両端だけを targetPages に渡しても範囲全体を優先する。
+        const rangeTargetPages = Array.from(extractPageRangeMentions(instruction).keys());
+        const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+        const rawDsTargetIndices = (Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0)
+          ? new Set(effectiveTargetPages.map((p: number) => p - 1))
           : resolveTargetSlideIndices(instruction, deckSpec.slides.map(ds => ({
               slideIndex: ds.pptxSlideIndex,
               title: ds.title,
@@ -5392,7 +5530,12 @@ async function executeEditPptx(
       }
 
       // 対象スライドを解決（ページ番号 → タイトル/本文マッチの優先順）
-      const layoutTargetIndices = resolveTargetSlideIndices(instruction, extractJson.slides);
+      const rangeTargetPages = Array.from(extractPageRangeMentions(userIntentText).keys());
+      const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+      const layoutTargetIndices =
+        Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
+          ? new Set(effectiveTargetPages.map((p: number) => p - 1))
+          : resolveTargetSlideIndices(instruction, extractJson.slides);
       if (!layoutTargetIndices || layoutTargetIndices.size === 0) {
         return {
           error: "対象スライドを1つに絞れませんでした（キーワードが複数のスライドに同じ割合で一致しています）。スライドタイトル（例: 「AzureChatのコア機能」のスライドをカード型に）またはページ番号（例: Page3をカード型に）で一意に指定してください。",
@@ -5475,6 +5618,111 @@ async function executeEditPptx(
     } catch (e: any) {
       console.error("[edit_pptx] layout direct edit failed:", e);
       return { error: `カード型への直接編集に失敗しました: ${String(e?.message ?? e)}` };
+    }
+  }
+
+  // ── 単純な箇条書きレイアウトへの変換 ────────────────────────────────────
+  // 通常の文字編集へ流すと、既存テキストボックスへの追記になり重なるため、
+  // DeckSpec の項目を bullets として再構成してスライド全体を再描画する。
+  if (hasSimpleBulletLayoutIntent) {
+    if (!deckSpec) {
+      return {
+        error: "このPPTXの構造情報（DeckSpec）がないため、箇条書きデザインへ安全に変更できません。AzureChatで生成した元のPPTXから再度お試しください。",
+      };
+    }
+
+    try {
+      const rangeTargetPages = Array.from(extractPageRangeMentions(userIntentText).keys());
+      const effectiveTargetPages = rangeTargetPages.length > 0 ? rangeTargetPages : argTargetPages;
+      const targetIndices =
+        Array.isArray(effectiveTargetPages) && effectiveTargetPages.length > 0
+          ? new Set(effectiveTargetPages.map((page) => page - 1))
+          : resolveTargetSlideIndices(
+              userIntentText,
+              deckSpec.slides.map((slide) => ({
+                slideIndex: slide.pptxSlideIndex,
+                title: slide.title,
+                bullets: slide.items.map((item) => item.body),
+              }))
+            );
+
+      if (!targetIndices || targetIndices.size === 0) {
+        return {
+          error: "対象スライドを特定できませんでした。「P2を箇条書きデザインにして」のようにページ番号を指定してください。",
+        };
+      }
+      if (targetIndices.has(0)) {
+        return { error: "表紙スライド（P1）は箇条書きデザインに変更できません。" };
+      }
+
+      const validTargetIndices = new Set(
+        Array.from(targetIndices).filter((slideIndex) =>
+          deckSpec.slides.some((slide) => slide.pptxSlideIndex === slideIndex)
+        )
+      );
+      if (validTargetIndices.size === 0) {
+        return { error: "対象スライドがDeckSpecに見つかりませんでした。ページ番号を確認してください。" };
+      }
+
+      const updatedSlides: DeckSpec["slides"] = deckSpec.slides.map((slide) => {
+        if (!validTargetIndices.has(slide.pptxSlideIndex)) return slide;
+
+        const rawBullets = slide.items
+          .map((item) =>
+            [item.heading?.trim(), item.body.trim()].filter(Boolean).join("：")
+          )
+          .filter(Boolean);
+        const existingRawBullets = Array.isArray(slide.rawSlide.bullets)
+          ? slide.rawSlide.bullets.map((item) => String(item ?? "").trim()).filter(Boolean)
+          : [];
+        const bullets = rawBullets.length > 0 ? rawBullets : existingRawBullets;
+        if (bullets.length === 0) return slide;
+
+        const items: DeckSpecItem[] = bullets.map((body, index) => ({
+          id: `${deckSpec.deckId}-s${slide.pptxSlideIndex}-i${index}`,
+          body,
+        }));
+        return {
+          ...slide,
+          layoutType: "bullets",
+          items,
+          rawSlide: {
+            ...slide.rawSlide,
+            layoutType: "bullets",
+            bullets,
+            __forceSimpleBullets: true,
+          },
+        };
+      });
+
+      const outputName = cleanBaseName ? nextRevisionBaseName(inputBaseName ?? "") : "箇条書き変更";
+      const rerenderResponse = await fetch(`${baseUrl}/api/gen-pptx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "rerender_from_deckspec",
+          deckSpec: { ...deckSpec, slides: updatedSlides },
+          threadId: chatThread.id,
+          outputBaseName: outputName,
+        }),
+      });
+      const rerenderResult = await rerenderResponse.json().catch(() => ({}));
+      if (!rerenderResponse.ok || !rerenderResult?.ok || !rerenderResult?.downloadUrl) {
+        throw new Error(rerenderResult?.error ?? `HTTP ${rerenderResponse.status}`);
+      }
+
+      console.log(
+        `[simple_bullets_deckspec] done targets=[${Array.from(validTargetIndices).join(",")}]`
+      );
+      return {
+        downloadUrl: rerenderResult.downloadUrl,
+        fileName: rerenderResult.fileName ?? `${outputName}.pptx`,
+        displayName: `${outputName}.pptx`,
+        message: "指定スライドを箇条書きデザインに変更しました。",
+      };
+    } catch (error: any) {
+      console.error("[edit_pptx] simple bullet layout conversion failed:", error);
+      return { error: `箇条書きデザインへの変更に失敗しました: ${String(error?.message ?? error)}` };
     }
   }
 
@@ -5700,8 +5948,8 @@ async function executeEditPptx(
 
   // ── 箇条書き/項目の明示的追加は内容増量より優先（先に計算して両方で使う）────────
   // 「枚」単独では「画像を2枚」「スライドを3枚」等の誤マッチが起きるため「カード」のみ追加
-  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント|カード)/i.test(instruction);
-  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|減らし?|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|枚|項目|bullet|ブレット))/i.test(instruction);
+  const hasBulletWord = /(箇条書き|bullet|ブレット|項目|ポイント|カード)/i.test(userIntentText);
+  const hasBulletIncrease = /(追加|足し|足す|(増|ふ)や|減らし?|スカスカ|(\d|[２-９]|[二三四五六七八九]).{0,6}(つ|個|枚|項目|bullet|ブレット))/i.test(userIntentText);
   const isBulletAddRequest = hasBulletWord && hasBulletIncrease;
 
   // ── 内容増量・詳細化リクエストの制御（箇条書き追加の明示がない場合のみ）────────
@@ -5773,7 +6021,7 @@ async function executeEditPptx(
   // ── 箇条書き追加リクエストの制御（未対応判定より前）────────
   if (isBulletAddRequest) {
     // ツール引数 targetItemCount を優先し、なければ instruction から抽出
-    const targetItemCount = (typeof argTargetItemCount === "number" ? argTargetItemCount : null) ?? extractTargetItemCount(instruction);
+    const targetItemCount = (typeof argTargetItemCount === "number" ? argTargetItemCount : null) ?? extractTargetItemCount(userIntentText);
 
     // ── 項目数SET: 専用フロー ─────────────────────────────────────────────────────
     if (targetItemCount !== null) {
@@ -5800,9 +6048,12 @@ async function executeEditPptx(
             bullets: ds.items.map(i => i.body),
           }));
           // ツール引数 targetPages を優先し、なければ instruction から解析
-          const tsTargetIndices = (Array.isArray(argTargetPages) && argTargetPages.length > 0)
-            ? new Set(argTargetPages.map((p: number) => p - 1))
-            : resolveTargetSlideIndices(instruction, deckSpecSummary);
+          const originalPageMentions = extractPageMentions(userMessage ?? "");
+          const tsTargetIndices = originalPageMentions.size > 0
+            ? new Set(originalPageMentions.values())
+            : (Array.isArray(argTargetPages) && argTargetPages.length > 0)
+              ? new Set(argTargetPages.map((p: number) => p - 1))
+              : resolveTargetSlideIndices(userIntentText, deckSpecSummary);
 
           // 対象スライドを特定できなければエラー（Python へのサイレントフォールバック禁止）
           if (!tsTargetIndices || tsTargetIndices.size === 0) {
@@ -5997,13 +6248,19 @@ async function executeEditPptx(
         // ツール引数 targetPages を最優先。なければ instruction から解析。
         // ページ特定できない場合は全スライド処理を禁止してエラーにする。
         let pyTargetSlideIndices: Set<number>;
-        if (Array.isArray(argTargetPages) && argTargetPages.length > 0) {
+        const originalPageMentions = extractPageMentions(userMessage ?? "");
+        if (originalPageMentions.size > 0) {
+          pyTargetSlideIndices = new Set(originalPageMentions.values());
+          const pyPageNums = Array.from(originalPageMentions.keys()).sort((a,b)=>a-b).join(",");
+          const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
+          console.log(`[item_count_adjust] parsedPages(user) page=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
+        } else if (Array.isArray(argTargetPages) && argTargetPages.length > 0) {
           pyTargetSlideIndices = new Set(argTargetPages.map((p: number) => p - 1));
           const pyPageNums = argTargetPages.sort((a,b)=>a-b).join(",");
           const pySlideNums = Array.from(pyTargetSlideIndices).sort((a,b)=>a-b).join(",");
           console.log(`[item_count_adjust] targetPages(tool)=[${pyPageNums}] → slideIndices=[${pySlideNums}] targetCount=${targetItemCount}`);
         } else {
-          const pyPageMentions = extractPageMentions(instruction);
+          const pyPageMentions = extractPageMentions(userIntentText);
           if (pyPageMentions.size === 0) {
             return { error: "対象ページを特定できませんでした。「P2,P4の項目数を4つに」のようにページ番号を明示してください。" };
           }
@@ -7409,23 +7666,34 @@ async function executeEditSpWord(
 
 // ---------------- 画像生成（NEW image 用） ----------------
 async function executeCreateImage(
-  args: { prompt: string; text?: string; size?: string },
+  args: { prompt: string; text?: string; size?: string; quality?: string },
   chatThread: ChatThreadModel,
+  userMessage: string,
   signal?: AbortSignal,
   modeOpts?: {
     reasoning_effort?: "minimal" | "medium" | "high";
     temperature?: number;
   }
 ) {
-  const prompt = (args?.prompt || "").trim();
+  const prompt = buildFaithfulImagePrompt(
+    userMessage,
+    args?.prompt || "",
+    "generate"
+  );
 
   console.log("createImage called with prompt:", prompt);
 
   if (!prompt) return "No prompt provided";
-  if (prompt.length >= 4000)
-    return "Prompt is too long, it must be less than 4000 characters";
+  if (prompt.length > 32000)
+    return "Prompt is too long, it must be 32000 characters or fewer";
 
   const openAI = OpenAIDALLEInstance();
+  const quality = normalizeGptImageQuality(args?.quality);
+
+  console.log("createImage resolved options:", {
+    size: normalizeGptImageSize(args?.size),
+    quality,
+  });
 
   let response;
   try {
@@ -7433,6 +7701,8 @@ async function executeCreateImage(
       {
         model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
         prompt,
+        size: normalizeGptImageSize(args?.size),
+        quality,
       },
       { signal }
     );
@@ -7451,6 +7721,7 @@ async function executeCreateImage(
 
     await UploadImageToStore(chatThread.id, imageName, buffer);
     await UploadImageToStore(chatThread.id, "__base__.png", buffer);
+    await UploadImageToStore(chatThread.id, "__latest__.png", buffer);
 
     lastTextLayoutByThread.delete(chatThread.id);
     console.log("🗑️ Cleared text layout for thread:", chatThread.id);
@@ -7460,6 +7731,563 @@ async function executeCreateImage(
   } catch (error) {
     console.error("🔴 error while storing image:\n", error);
     return { error: "There was an error storing the image: " + error };
+  }
+}
+
+async function readStoredImageBuffer(
+  threadId: string,
+  fileName: string
+): Promise<Buffer | null> {
+  const stored = await GetImageFromStore(threadId, fileName);
+  if (stored.status !== "OK" || !stored.response) return null;
+
+  try {
+    return Buffer.from(await new Response(stored.response as any).arrayBuffer());
+  } catch (error) {
+    console.warn("[edit_existing_image] Failed to read stored image:", error);
+    return null;
+  }
+}
+
+async function fetchImageBuffer(imageUrl: string): Promise<Buffer | null> {
+  const dataUrlBuffer = decodeChatImageDataUrl(imageUrl);
+  if (dataUrlBuffer) return dataUrlBuffer;
+  if (/^data:/i.test(imageUrl)) return null;
+
+  if (!/^https?:\/\//i.test(imageUrl)) return null;
+  try {
+    const response = await fetch(imageUrl, {
+      cache: "no-store",
+      redirect: "follow",
+    });
+    if (!response.ok) {
+      console.warn("[edit_existing_image] Image URL fetch failed:", {
+        status: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get("content-type"),
+        location: sanitizeImageLocationForLog(imageUrl),
+      });
+      return null;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!detectImageFormat(buffer)) {
+      console.warn("[edit_existing_image] URL did not return a supported image:", {
+        contentType: response.headers.get("content-type"),
+        bytes: buffer.length,
+      });
+      return null;
+    }
+    return buffer;
+  } catch (error) {
+    console.warn("[edit_existing_image] Failed to fetch image URL:", error);
+    return null;
+  }
+}
+
+function parseConfiguredAzureBlobUrl(
+  imageUrl: string
+): { container: string; blobPath: string } | null {
+  const accountName = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  if (!accountName) return null;
+
+  try {
+    const parsed = new URL(imageUrl);
+    if (
+      parsed.hostname.toLowerCase() !==
+      `${accountName.toLowerCase()}.blob.core.windows.net`
+    ) {
+      return null;
+    }
+    const parts = parsed.pathname
+      .split("/")
+      .filter(Boolean)
+      .map((part) => decodeURIComponent(part));
+    if (parts.length < 2) return null;
+    return {
+      container: parts[0],
+      blobPath: parts.slice(1).join("/"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readImageBufferFromConfiguredBlob(
+  imageUrl: string
+): Promise<Buffer | null> {
+  const target = parseConfiguredAzureBlobUrl(imageUrl);
+  if (!target) return null;
+
+  const accountName = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
+  const accountKey = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
+  if (!accountName || !accountKey) return null;
+
+  try {
+    const connectionString =
+      `DefaultEndpointsProtocol=https;AccountName=${accountName};` +
+      `AccountKey=${accountKey};EndpointSuffix=core.windows.net`;
+    const buffer = await BlobServiceClient.fromConnectionString(connectionString)
+      .getContainerClient(target.container)
+      .getBlockBlobClient(target.blobPath)
+      .downloadToBuffer();
+    const format = detectImageFormat(buffer);
+    if (!format) {
+      console.warn(
+        "[edit_existing_image] Blob SDK download was not a supported image:",
+        {
+          container: target.container,
+          blobPath: target.blobPath,
+          bytes: buffer.length,
+        }
+      );
+      return null;
+    }
+    console.log("[edit_existing_image] SP image loaded via Blob SDK:", {
+      container: target.container,
+      blobPath: target.blobPath,
+      bytes: buffer.length,
+      format,
+    });
+    return buffer;
+  } catch (error: any) {
+    console.warn("[edit_existing_image] Blob SDK image download failed:", {
+      container: target.container,
+      blobPath: target.blobPath,
+      statusCode: error?.statusCode ?? null,
+      code: error?.code ?? null,
+      message: String(error?.message ?? error).slice(0, 200),
+    });
+    return null;
+  }
+}
+
+type ImageFormat = "png" | "jpeg" | "webp";
+
+function detectImageFormat(buffer: Buffer): ImageFormat | null {
+  if (
+    buffer.length >= 8 &&
+    buffer.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    )
+  ) {
+    return "png";
+  }
+  if (
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return "jpeg";
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "webp";
+  }
+  return null;
+}
+
+async function normalizeAzureEditImage(buffer: Buffer): Promise<Buffer | null> {
+  const format = detectImageFormat(buffer);
+  if (format === "png" || format === "jpeg") return buffer;
+  if (format !== "webp") return null;
+
+  try {
+    // Azure image edits currently accept PNG/JPEG inputs; retain WebP upload
+    // support in the UI by converting only the API-bound copy.
+    return await sharp(buffer).png().toBuffer();
+  } catch (error) {
+    console.warn("[edit_existing_image] Failed to convert WebP to PNG:", error);
+    return null;
+  }
+}
+
+function imageContentHash(buffer: Buffer): string {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function resolveImageEditTimeoutMs(): number {
+  const configured = Number(process.env.GPT_IMAGE_EDIT_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return 180_000;
+  return Math.min(600_000, Math.max(30_000, Math.floor(configured)));
+}
+
+function getImageUploadMetadata(
+  buffer: Buffer,
+  index: number
+): { name: string; type: string } | null {
+  const format = detectImageFormat(buffer);
+  if (format === "jpeg") {
+    return { name: `image-${index}.jpg`, type: "image/jpeg" };
+  }
+  if (format === "png") {
+    return { name: `image-${index}.png`, type: "image/png" };
+  }
+  return null;
+}
+
+// ---------------- gpt-image-2 による既存画像の通常編集 ----------------
+async function executeEditExistingImage(
+  args: {
+    prompt: string;
+    imageUrl?: string;
+    baseImageUrl?: string;
+    referenceImageUrls?: string[];
+    size?: string;
+    quality?: string;
+  },
+  chatThread: ChatThreadModel,
+  userMessage: string,
+  imageAttachmentUrls?: string[],
+  signal?: AbortSignal
+) {
+  if (isExplicitTextOverlayRequest(userMessage)) {
+    return {
+      error:
+        "Explicit text-overlay requests must use add_text_to_existing_image.",
+    };
+  }
+
+  const currentAttachmentUrls = Array.from(
+    new Set([
+      ...(Array.isArray(imageAttachmentUrls) ? imageAttachmentUrls : []),
+      ...extractImageUrlsFromText(userMessage),
+    ])
+  ).filter(Boolean);
+  const sharePointImageQuery = extractSharePointImageQuery(userMessage);
+  let sharePointImageReference:
+    | { resolvedUrl: string; fileName: string }
+    | null = null;
+  if (sharePointImageQuery) {
+    const spResult = await resolveSpFileToSasUrl(
+      sharePointImageQuery,
+      /\.(png|jpe?g|webp)$/i,
+      chatThread,
+      "edit_existing_image"
+    );
+    if ("error" in spResult) {
+      return {
+        error: `SharePointで「${sharePointImageQuery}」に一致する画像が見つかりませんでした。正確なファイル名（例: midac_logo.png）を指定してください。`,
+      };
+    }
+    if ("multipleFiles" in spResult) {
+      return {
+        error: `SharePointで「${sharePointImageQuery}」に一致する画像が複数見つかりました。拡張子を含む正確なファイル名を指定してください。`,
+      };
+    }
+    sharePointImageReference = spResult;
+  }
+  let sharePointImageBuffer: Buffer | null = null;
+  if (sharePointImageReference) {
+    sharePointImageBuffer = await readImageBufferFromConfiguredBlob(
+      sharePointImageReference.resolvedUrl
+    );
+    if (!sharePointImageBuffer) {
+      console.warn(
+        "[edit_existing_image] Blob SDK read unavailable; falling back to the resolved SP image URL"
+      );
+      sharePointImageBuffer = await fetchImageBuffer(
+        sharePointImageReference.resolvedUrl
+      );
+    }
+    if (!sharePointImageBuffer) {
+      return {
+        error:
+          "SharePointの参照画像を取得できませんでした。ファイルは見つかりましたが、画像データの読み込みに失敗しました。",
+      };
+    }
+    sharePointImageBuffer = await normalizeAzureEditImage(
+      sharePointImageBuffer
+    );
+    if (!sharePointImageBuffer) {
+      return {
+        error:
+          "SharePointの参照画像をPNG/JPEGとして読み取れませんでした。",
+      };
+    }
+  }
+  const explicitBaseUrl = String(args?.baseImageUrl ?? "").trim();
+  const legacyImageUrl = String(args?.imageUrl ?? "").trim();
+  const latestBuffer = await readStoredImageBuffer(
+    chatThread.id,
+    "__latest__.png"
+  );
+  const explicitlyNeedsAttachedImage =
+    /(?:添付|アップロード|ロゴ|画像ファイル|reference\s+image|attached\s+(?:logo|image))/i.test(
+      userMessage
+    );
+  const storedAttachment =
+    currentAttachmentUrls.length === 0 && explicitlyNeedsAttachedImage
+      ? await LoadLatestImageAttachment(chatThread.id)
+      : null;
+  const isNewReferenceComposition =
+    !latestBuffer &&
+    (currentAttachmentUrls.length > 0 ||
+      Boolean(storedAttachment) ||
+      Boolean(sharePointImageReference)) &&
+    isNewImageReferenceCompositionRequest(userMessage);
+  const basePrompt = buildFaithfulImagePrompt(
+    userMessage,
+    args?.prompt || "",
+    isNewReferenceComposition ? "generate" : "edit"
+  );
+  if (!basePrompt) {
+    return { error: "prompt is required for edit_existing_image." };
+  }
+  const quality = normalizeGptImageQuality(args?.quality);
+
+  // The stored latest image is authoritative for an in-thread edit. A model-
+  // supplied page URL can resolve to HTML (for example an authenticated UI
+  // route), so use URL inputs only when no stored image is available.
+  let resolvedBaseUrl = "";
+  let inputBuffer = latestBuffer;
+  if (!inputBuffer && explicitBaseUrl) {
+    resolvedBaseUrl = explicitBaseUrl;
+    inputBuffer = await fetchImageBuffer(explicitBaseUrl);
+  }
+
+  if (!inputBuffer) {
+    resolvedBaseUrl =
+      legacyImageUrl ||
+      currentAttachmentUrls[0] ||
+      (await resolveLatestImageUrlFromThread(chatThread.id)) ||
+      "";
+    if (resolvedBaseUrl) inputBuffer = await fetchImageBuffer(resolvedBaseUrl);
+  }
+
+  if (!inputBuffer) {
+    inputBuffer = await readStoredImageBuffer(chatThread.id, "__base__.png");
+  }
+
+  // For a first-turn "create using the attached logo" request, the attachment
+  // itself is the primary reference when the client-side data URL was lost.
+  let storedAttachmentUsedAsBase = false;
+  if (!inputBuffer && storedAttachment) {
+    inputBuffer = storedAttachment.buffer;
+    resolvedBaseUrl = `thread:${storedAttachment.fileName}`;
+    storedAttachmentUsedAsBase = true;
+  }
+
+  let sharePointImageUsedAsBase = false;
+  if (!inputBuffer && sharePointImageReference && sharePointImageBuffer) {
+    resolvedBaseUrl = sharePointImageReference.resolvedUrl;
+    inputBuffer = sharePointImageBuffer;
+    sharePointImageUsedAsBase = true;
+  }
+
+  if (!inputBuffer) {
+    return {
+      error:
+        "編集元画像を取得できませんでした。先に画像を生成するか、画像URLを指定してください。",
+    };
+  }
+
+  const rawExplicitReferenceUrls = Array.isArray(args?.referenceImageUrls)
+    ? args.referenceImageUrls.map((url) => String(url ?? "").trim())
+    : [];
+  const validExplicitReferenceUrls = rawExplicitReferenceUrls.filter(
+    isSupportedImageReferenceUrl
+  );
+  const rejectedExplicitReferenceCount =
+    rawExplicitReferenceUrls.length - validExplicitReferenceUrls.length;
+  if (rejectedExplicitReferenceCount > 0) {
+    console.warn(
+      "[edit_existing_image] Ignored invalid model referenceImageUrls:",
+      { count: rejectedExplicitReferenceCount }
+    );
+  }
+  // The SharePoint asset is resolved from the user's request and loaded through
+  // the Storage SDK. Model-generated URLs are redundant and may be a bare file
+  // name or an authenticated SharePoint page, so do not mix them into this path.
+  const explicitReferenceUrls = sharePointImageReference
+    ? []
+    : validExplicitReferenceUrls;
+  if (sharePointImageReference && validExplicitReferenceUrls.length > 0) {
+    console.log(
+      "[edit_existing_image] Ignored model referenceImageUrls because a SharePoint image was resolved:",
+      { count: validExplicitReferenceUrls.length }
+    );
+  }
+  // imageUrl is a legacy BASE-image pointer, never a reference asset.
+  // Adding it here duplicated the generated base image as image 3.
+  const inferredReferenceUrls = currentAttachmentUrls.filter(
+    (url) => url !== resolvedBaseUrl
+  );
+  const candidateReferenceUrls =
+    currentAttachmentUrls.length > 0
+      ? [
+          ...inferredReferenceUrls,
+        ]
+      : [
+          ...explicitReferenceUrls,
+          ...inferredReferenceUrls,
+        ];
+
+  const referenceUrls = Array.from(
+    new Set(
+      candidateReferenceUrls
+        .filter(Boolean)
+        .filter((url) => url !== resolvedBaseUrl && url !== explicitBaseUrl)
+    )
+  ).slice(0, 15);
+
+  const normalizedInputBuffer = await normalizeAzureEditImage(inputBuffer);
+  if (!normalizedInputBuffer) {
+    return {
+      error: "編集元画像がPNG/JPEGとして読み取れませんでした。",
+    };
+  }
+  inputBuffer = normalizedInputBuffer;
+
+  const loadedReferenceBuffers = await Promise.all(
+    referenceUrls.map(async (url) => {
+      const buffer = await fetchImageBuffer(url);
+      return buffer ? await normalizeAzureEditImage(buffer) : null;
+    })
+  );
+  if (loadedReferenceBuffers.some((buffer) => buffer === null)) {
+    return {
+      error:
+        "添付された参照画像の一部をPNG/JPEGとして読み取れませんでした。画像を再添付してください。",
+    };
+  }
+
+  if (sharePointImageBuffer && !sharePointImageUsedAsBase) {
+    loadedReferenceBuffers.push(sharePointImageBuffer);
+  }
+
+  if (storedAttachment && !storedAttachmentUsedAsBase) {
+    const normalizedStoredAttachment = await normalizeAzureEditImage(
+      storedAttachment.buffer
+    );
+    if (!normalizedStoredAttachment) {
+      return {
+        error:
+          "添付画像をPNG/JPEGとして読み取れませんでした。画像を再添付してください。",
+      };
+    }
+    loadedReferenceBuffers.push(normalizedStoredAttachment);
+  }
+
+  const seenHashes = new Set([imageContentHash(inputBuffer)]);
+  const referenceBuffers = (
+    loadedReferenceBuffers as Buffer[]
+  ).filter((buffer) => {
+    const hash = imageContentHash(buffer);
+    if (seenHashes.has(hash)) return false;
+    seenHashes.add(hash);
+    return true;
+  });
+
+  const referenceInstruction = isNewReferenceComposition
+    ? buildNewImageReferenceInstruction(1 + referenceBuffers.length)
+    : buildMultiImageReferenceInstruction(referenceBuffers.length);
+  const prompt = referenceInstruction
+    ? `${basePrompt}\n\n${referenceInstruction}`
+    : basePrompt;
+
+  if (prompt.length > 32000) {
+    return { error: "Prompt must be 32000 characters or fewer." };
+  }
+
+  try {
+    const openAI = OpenAIDALLEInstance();
+    const requestStartedAt = Date.now();
+    const requestTimeoutMs = resolveImageEditTimeoutMs();
+    const imageBuffers = [inputBuffer, ...referenceBuffers];
+    if (imageBuffers.some((buffer) => buffer.length >= 50 * 1024 * 1024)) {
+      return {
+        error: "入力画像は1枚あたり50MB未満にしてください。",
+      };
+    }
+    const imageFiles = await Promise.all(
+      imageBuffers.map((buffer, index) => {
+        const metadata = getImageUploadMetadata(buffer, index + 1);
+        if (!metadata) {
+          throw new Error(`Unsupported image format at input ${index + 1}.`);
+        }
+        return toFile(buffer, metadata.name, { type: metadata.type });
+      })
+    );
+
+    console.log("[edit_existing_image] input images:", {
+      base: resolvedBaseUrl
+        ? sanitizeImageLocationForLog(resolvedBaseUrl)
+        : "thread:__latest__.png",
+      referencesRequested:
+        referenceUrls.length +
+        (storedAttachment && !storedAttachmentUsedAsBase ? 1 : 0),
+      referencesLoaded: referenceBuffers.length,
+      storedAttachment: storedAttachment?.fileName ?? null,
+      sharePointReference: sharePointImageReference?.fileName ?? null,
+      inputBytes: imageBuffers.map((buffer) => buffer.length),
+      inputHashPrefixes: imageBuffers.map((buffer) =>
+        imageContentHash(buffer).slice(0, 12)
+      ),
+      quality,
+      timeoutMs: requestTimeoutMs,
+    });
+
+    const response = await openAI.images.edit(
+      {
+        model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
+        image: imageFiles.length === 1 ? imageFiles[0] : imageFiles,
+        prompt,
+        size: normalizeGptImageSize(args?.size),
+        quality,
+      },
+      {
+        signal,
+        timeout: requestTimeoutMs,
+        // A hidden SDK retry can multiply an already long image-generation wait.
+        // Return the first error so the user can retry deliberately.
+        maxRetries: 0,
+      }
+    );
+
+    console.log("[edit_existing_image] gpt-image edit completed:", {
+      elapsedMs: Date.now() - requestStartedAt,
+    });
+
+    const b64 = response.data?.[0]?.b64_json;
+    if (!b64) return { error: "Invalid image edit response: no b64_json." };
+
+    const buffer = Buffer.from(b64, "base64");
+    const imageName = `${uniqueId()}.png`;
+    await UploadImageToStore(chatThread.id, imageName, buffer);
+    await UploadImageToStore(chatThread.id, "__base__.png", buffer);
+    await UploadImageToStore(chatThread.id, "__latest__.png", buffer);
+    if (explicitlyNeedsAttachedImage) {
+      await ConsumeLatestImageAttachment(chatThread.id);
+    }
+    lastTextLayoutByThread.delete(chatThread.id);
+
+    console.log("[edit_existing_image] output saved:", {
+      imageName,
+      bytes: buffer.length,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
+
+    return {
+      revised_prompt: prompt,
+      url: buildExternalImageUrl(chatThread.id, imageName),
+    };
+  } catch (error) {
+    console.error("[edit_existing_image] gpt-image edit failed:", error);
+    if (signal?.aborted) {
+      return { error: "画像編集はキャンセルされました。" };
+    }
+    const errorText = String(error ?? "");
+    if (/timeout|timed out|APIConnectionTimeoutError/i.test(errorText)) {
+      return {
+        error:
+          "画像編集が3分以内に完了しなかったため終了しました。時間をおいて再実行してください。",
+      };
+    }
+    return { error: "There was an error editing the image: " + error };
   }
 }
 
@@ -7483,6 +8311,13 @@ async function executeAddTextToExistingImage(
     temperature?: number;
   }
 ) {
+  if (!isExplicitTextOverlayRequest(userMessage)) {
+    return {
+      error:
+        "add_text_to_existing_image is available only for an explicit request to add literal text to an existing image.",
+    };
+  }
+
   const explicitUrl = (args?.imageUrl || "").trim();
   let text = (args?.text || "").trim();
   const styleHint = (args?.styleHint || "").trim();
@@ -7778,6 +8613,7 @@ async function executeAddTextToExistingImage(
     const finalImageBuffer = fs.readFileSync(finalImagePath);
 
     await UploadImageToStore(chatThread.id, finalImageName, finalImageBuffer);
+    await UploadImageToStore(chatThread.id, "__latest__.png", finalImageBuffer);
 
     const finalImageUrl = buildExternalImageUrl(chatThread.id, finalImageName);
 

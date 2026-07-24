@@ -41,7 +41,7 @@ export const ImageInput: FC = () => {
       />
       <input
         type="file"
-        accept="image/*"
+        accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
         name="image"
         ref={fileInputRef}
         className="hidden"

@@ -109,6 +109,7 @@ export async function POST(req: NextRequest) {
     // SL_SYNC_DISABLED=true で新規インデックス化を完全停止できるキルスイッチ
     const syncDisabled = process.env.SL_SYNC_DISABLED === "true";
     const indexNew = !syncDisabled && url.searchParams.get("indexNew") === "true";
+    const reindexOnly = url.searchParams.get("reindexOnly") === "true";
     if (syncDisabled) {
       console.warn("[SL sync-check] SL_SYNC_DISABLED=true: indexNew forced to false");
     }
@@ -122,6 +123,7 @@ export async function POST(req: NextRequest) {
       apply,
       indexNew,
       batchSize,
+      reindexOnly,
     });
 
     return NextResponse.json(result);

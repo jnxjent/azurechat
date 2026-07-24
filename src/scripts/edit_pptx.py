@@ -1512,28 +1512,65 @@ def copy_slide_layout_from_reference(
         return False
 
     # 4. Replace text in copied body shapes with preserved target texts.
+    #    参照元が「見出し + 説明」の繰り返しレイアウトで、ターゲット側の文章数が
+    #    その項目数と一致する場合は、各文章を1項目ずつに整理して流し込む。
+    #    従来の単純な順次流し込みでは、4文章が最初の2項目にだけ入り、残り2項目が
+    #    空欄になるため、見出しは本文先頭から短く補完する。
     #    target_texts が尽きた後の残余シェイプは空にして参照元テキストを残さない。
     if preserve_target_text:
         body_shapes = [
             s for s in iter_shapes(target_slide.shapes)
             if not _is_title_like_shape(s, slide_height) and getattr(s, "has_text_frame", False)
         ]
-        text_idx = 0
-        for shape in body_shapes:
-            tf = shape.text_frame
-            for para in tf.paragraphs:
-                if not para.runs:
-                    continue
-                if text_idx < len(target_texts):
-                    # Keep run formatting; replace text content only
-                    para.runs[0].text = target_texts[text_idx]
-                    for run in para.runs[1:]:
-                        run.text = ""
-                    text_idx += 1
-                else:
-                    # target_texts 使い切り → 参照元テキストを残さないよう空にする
-                    for run in para.runs:
-                        run.text = ""
+        text_slots = [
+            para
+            for shape in body_shapes
+            for para in shape.text_frame.paragraphs
+            if para.runs and para.text.strip()
+        ]
+
+        def _heading_and_body(text: str) -> tuple[str, str]:
+            cleaned = text.strip()
+            for separator in ("：", ":", "。", "、"):
+                pos = cleaned.find(separator)
+                if 2 <= pos <= 24:
+                    heading = cleaned[:pos].strip()
+                    body = cleaned[pos + 1:].strip() or cleaned
+                    return heading, body
+            heading = cleaned[:20].strip()
+            if len(cleaned) > 20:
+                heading = heading.rstrip("、。・ ") + "…"
+            return heading or "要点", cleaned
+
+        # 見出し/説明の2枠 × N項目、かつターゲット文章がN件なら項目単位で配置する。
+        paired_layout = (
+            len(target_texts) >= 2
+            and len(text_slots) >= len(target_texts) * 2
+            and len(text_slots) % 2 == 0
+        )
+        replacement_texts: list[str]
+        if paired_layout:
+            replacement_texts = []
+            for target_text in target_texts:
+                heading, body = _heading_and_body(target_text)
+                replacement_texts.extend([heading, body])
+            print(
+                f"[copy_layout] organized {len(target_texts)} texts into heading/body pairs",
+                file=sys.stderr,
+            )
+        else:
+            replacement_texts = target_texts
+
+        for text_idx, para in enumerate(text_slots):
+            if text_idx < len(replacement_texts):
+                # Keep run formatting; replace text content only
+                para.runs[0].text = replacement_texts[text_idx]
+                for run in para.runs[1:]:
+                    run.text = ""
+            else:
+                # target_texts 使い切り → 参照元テキストを残さないよう空にする
+                for run in para.runs:
+                    run.text = ""
 
     return True
 

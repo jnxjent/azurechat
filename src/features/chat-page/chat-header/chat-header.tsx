@@ -21,6 +21,9 @@ type SyncRow = {
   error?: string;
   skipped?: string;
   urlUpdated?: number;
+  reindexCandidates?: number;
+  reindexed?: number;
+  reindexFailed?: number;
 };
 
 export const ChatHeader: FC<Props> = (props) => {
@@ -65,8 +68,28 @@ export const ChatHeader: FC<Props> = (props) => {
           (sum, row) => sum + (row.deleted ?? 0),
           0
         );
+        const reindexed = okRows.reduce(
+          (sum, row) => sum + (row.reindexed ?? 0),
+          0
+        );
+        const reindexCandidates = okRows.reduce(
+          (sum, row) => sum + (row.reindexCandidates ?? 0),
+          0
+        );
+        const reindexFailed = okRows.reduce(
+          (sum, row) => sum + (row.reindexFailed ?? 0),
+          0
+        );
 
-        const parts = [`更新:${updated}件`, `削除:${deleted}件`];
+        const parts = [
+          `更新:${updated}件`,
+          `削除:${deleted}件`,
+          `再Index:${reindexed}件`,
+          `再Index候補:${reindexCandidates}件`,
+        ];
+        if (reindexFailed > 0) {
+          parts.push(`再Index失敗:${reindexFailed}件`);
+        }
         if (errorDepts.length > 0) {
           parts.push(`エラー:${errorDepts.join(",")}`);
         }

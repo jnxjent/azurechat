@@ -43,27 +43,8 @@ function normalizeSpaces(input: string) {
 }
 
 function sanitizePrompt(raw: string) {
-  let s = normalizeSpaces(raw);
-
-  s = s
-    .replace(/プラカード/g, "無地のボード")
-    .replace(/サインボード|サイン・?ボード/g, "無地のボード")
-    .replace(/メッセージボード/g, "無地のボード")
-    .replace(/横断幕|バナー/g, "無地の布")
-    .replace(/ポスター/g, "無地のフレーム")
-    .replace(/持って|掲げ(る|て)/g, "そばにある")
-    .replace(/スローガン|抗議|デモ|プロテスト|政治|選挙/g, "ファミリー向け");
-
-  if (!/文字は入れない/.test(s)) s += "。文字は入れない。";
-  if (!/非政治的/.test(s)) s += " 非政治的。";
-  if (!/家族向け|ファミリー向け/.test(s)) s += " 家族向け。";
-  if (!/ロゴや商標は含まない/.test(s)) s += " ロゴや商標は含まない。";
-
-  return s;
-}
-
-function fallbackPrompt() {
-  return "可愛い三毛猫のイラスト。柔らかな水彩で、背景はシンプル。文字は入れない。非政治的。家族向け。ロゴや商標は含まない。";
+  // gpt-image-2へユーザーの日本語・改行・引用文字を意味変更せず渡す。
+  return String(raw ?? "").replace(/\r\n/g, "\n").trim();
 }
 
 function escapeXml(s: string) {
@@ -510,17 +491,6 @@ async function generateImageWithGuards({
   const first = await callOnce(safe);
 
   if (first.ok) return first.buf;
-
-  const policy =
-    first.status === 400 && /policy/i.test(first.text || "");
-
-  if (policy) {
-    const fb = fallbackPrompt();
-    const second = await callOnce(fb);
-    if (second.ok) return second.buf;
-
-    throw new Error(`Images API policy violation: ${second.text || ""}`);
-  }
 
   throw new Error(
     `Images API error ${first.status}: ${first.text || "unknown"}`
