@@ -1247,6 +1247,137 @@ async function runPythonPdfToWord(inputBuffer: Buffer, threadId: string, mode: "
   }
 }
 
+async function resolveTranslatePdfToPptxScriptPath(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "src", "scripts", "pdf_translate_to_pptx.py"),
+    path.join(process.cwd(), "scripts", "pdf_translate_to_pptx.py"),
+    "/home/site/wwwroot/src/scripts/pdf_translate_to_pptx.py",
+    "/home/site/wwwroot/scripts/pdf_translate_to_pptx.py",
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.R_OK);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(
+    `pdf_translate_to_pptx.py not found. Checked: ${candidates.join(", ")}`
+  );
+}
+
+const PDF_TRANSLATION_LANGUAGES = {
+  en: { japaneseName: "英語", outputSuffix: "_英訳版.pptx" },
+  pt: { japaneseName: "ポルトガル語", outputSuffix: "_ポルトガル語版.pptx" },
+  vi: { japaneseName: "ベトナム語", outputSuffix: "_ベトナム語版.pptx" },
+  id: { japaneseName: "インドネシア語", outputSuffix: "_インドネシア語版.pptx" },
+  "zh-CN": { japaneseName: "中国語（簡体字）", outputSuffix: "_中国語版.pptx" },
+  ko: { japaneseName: "韓国語", outputSuffix: "_韓国語版.pptx" },
+  es: { japaneseName: "スペイン語", outputSuffix: "_スペイン語版.pptx" },
+  fil: { japaneseName: "タガログ語", outputSuffix: "_タガログ語版.pptx" },
+} as const;
+
+type PdfTranslationLanguage = keyof typeof PDF_TRANSLATION_LANGUAGES;
+
+function resolvePdfTranslationLanguage(
+  value: unknown
+): PdfTranslationLanguage | null {
+  if (value === undefined || value === null || value === "") return "en";
+  if (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(PDF_TRANSLATION_LANGUAGES, value)
+  ) {
+    return value as PdfTranslationLanguage;
+  }
+  return null;
+}
+
+async function runPythonTranslatePdfToPptx(
+  inputBuffer: Buffer,
+  threadId: string,
+  targetLanguage: PdfTranslationLanguage,
+  sourceUrl?: string,
+  hintFileName?: string
+) {
+  const tempDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "azurechat-pdf-translate-")
+  );
+  const inputPath = path.join(tempDir, "input.pdf");
+  const outputPath = path.join(tempDir, "output.pptx");
+  const scriptPath = await resolveTranslatePdfToPptxScriptPath();
+  const pyEnv =
+    process.platform !== "win32"
+      ? {
+          ...process.env,
+          PYTHONPATH: `/home/site/python-packages${
+            process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""
+          }`,
+          LD_LIBRARY_PATH: `/home/site/python-packages${
+            process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""
+          }`,
+        }
+      : process.env;
+
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(
+      pythonBin,
+      [
+        scriptPath,
+        "--input",
+        inputPath,
+        "--output",
+        outputPath,
+        "--target-language",
+        targetLanguage,
+      ],
+      {
+        env: pyEnv,
+        timeout: 10 * 60 * 1000,
+        maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+    if (stderr?.trim()) {
+      console.warn("[pdf-translate] python stderr:", stderr.trim());
+    }
+
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const outputBuffer = await fs.readFile(outputPath);
+    const language = PDF_TRANSLATION_LANGUAGES[targetLanguage];
+    const displayName = hintFileName
+      ? buildOutputFileName(hintFileName, language.outputSuffix)
+      : buildOutputFileName(sourceUrl, language.outputSuffix);
+    // Content-Dispositionを採用しないブラウザーでも翻訳元・翻訳先を判別できるよう、
+    // この機能だけはBlob物理名にも表示名を含める。末尾IDで重複を防止する。
+    const readableBlobStem = displayName
+      .replace(/\.pptx$/i, "")
+      .replace(/[\\/#?%*:|"<>]/g, "_")
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
+    const blobName = `${readableBlobStem || `pdf_translation_${targetLanguage}`}_${uniqueId()}.pptx`;
+    const downloadUrl = await uploadToBlob(
+      outputBuffer,
+      blobName,
+      displayName
+    );
+    await savePptxPointer(threadId, blobName, displayName);
+
+    return {
+      downloadUrl,
+      fileName: displayName,
+      pages: Number(pythonResult.pages ?? 0),
+      translatedLines: Number(pythonResult.translatedLines ?? 0),
+      targetLanguage,
+      targetLanguageName: language.japaneseName,
+      engine: String(pythonResult.engine ?? ""),
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function resolveConvertPdfScriptPath(): Promise<string> {
   const candidates = [
     path.join(process.cwd(), "src", "scripts", "pdf_to_excel.py"),
@@ -2215,7 +2346,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName, targetLanguage } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -2232,6 +2363,7 @@ export async function POST(req: NextRequest) {
       /** 項目数SET検証モード: Python結果を全件検証しポインターを手動保存する */
       targetItemCount?: number;
       originalFileName?: string;
+      targetLanguage?: string;
     };
     const isInternalPptxBatch = req.headers.get("x-azurechat-internal-pptx-batch") === "1";
 
@@ -2246,7 +2378,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, ...result });
     }
 
-    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
+    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "translate_pdf_to_pptx" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
       return NextResponse.json(
         { ok: false, error: "fileUrl and instruction are required" },
         { status: 400 }
@@ -2272,6 +2404,38 @@ export async function POST(req: NextRequest) {
       const wordMode = mode === "editable" ? "editable" : "layout";
       const result = await runPythonPdfToWord(pdfBuffer, threadId, wordMode, outputBaseName);
       console.log("[pdf-to-word] result:", JSON.stringify(result));
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    // PDF内の日本語だけを指定言語へ翻訳し、編集可能なテキストを持つPPTXへ変換
+    if (action === "translate_pdf_to_pptx") {
+      if (ext !== ".pdf") {
+        return NextResponse.json(
+          { ok: false, error: "翻訳対象はPDFファイルを指定してください。" },
+          { status: 400 }
+        );
+      }
+      const resolvedTargetLanguage =
+        resolvePdfTranslationLanguage(targetLanguage);
+      if (!resolvedTargetLanguage) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error:
+              "対応していない翻訳先言語です。en, pt, vi, id, zh-CN, ko, es, fil のいずれかを指定してください。",
+          },
+          { status: 400 }
+        );
+      }
+      const pdfBuffer = await downloadBlob(fileUrl, threadId);
+      const result = await runPythonTranslatePdfToPptx(
+        pdfBuffer,
+        threadId,
+        resolvedTargetLanguage,
+        fileUrl,
+        outputBaseName
+      );
+      console.log("[pdf-translate] result:", JSON.stringify(result));
       return NextResponse.json({ ok: true, ...result });
     }
 

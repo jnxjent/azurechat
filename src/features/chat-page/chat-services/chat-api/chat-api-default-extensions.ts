@@ -1590,6 +1590,7 @@ export const GetDefaultExtensions = async (props: {
         "  ③ スライドタイトルに「Q1」「Q2」「Q3」「Q4」「第1四半期」などの時系列ラベルを含めないこと。\n" +
         "【重要】会話中にすでにPPTXが生成・編集された実績がある場合、色・デザイン・テキスト変更・ロゴ追加・画像追加・添付画像挿入はすべて edit_pptx を使うこと。このツールは完全新規作成専用。\n" +
         "【絶対禁止】このスレッドにPPTXが既に存在する状態で、文字数増やす・詳しくする・元資料から補足・内容増量・説明追加・修正・変更などの依頼の場合、このツール（create_pptx）は絶対に使用禁止。必ず edit_pptx を使うこと。\n" +
+        "【PDF翻訳の絶対禁止】PDFの日本語を翻訳したPPTXがあるスレッドで「次はポルトガル語に」「添付を韓国語に変換」「同じものを別の言語で」など翻訳先だけを変更する依頼には、このツールを絶対に使わないこと。元PDFを使う translate_pdf_to_pptx を呼ぶこと。\n" +
         "【禁止】会話中にPPTXリンクが存在する状態で「ロゴを追加して」「画像を入れて」「添付を表紙に」などと言われた場合、絶対にこのツールを使わないこと。\n" +
         "【palette 選択】ユーザーの業種・用途・ターゲット層を読み取り、必ず palette を設定すること。\n" +
         "  IT/AI/DX/経営/役員向け → navy_orange（ネイビー×オレンジ）\n" +
@@ -1756,6 +1757,7 @@ export const GetDefaultExtensions = async (props: {
       description:
         "このスレッドで生成・編集した既存PPTXを自然言語の指示に従って改良するツール。\n" +
         "【絶対ルール】会話中にPPTXが生成・編集された実績がある場合は、必ずこのツールを使うこと。create_pptx / convert_doc_to_pptx は使わないこと。\n" +
+        "【例外・PDF翻訳先変更】既存PPTXがPDF日本語翻訳の出力で、ユーザーが英語・ポルトガル語・ベトナム語・インドネシア語・中国語・韓国語・スペイン語・タガログ語の別言語版を求めた場合、このツールは使わないこと。translate_pdf_to_pptxで元PDFから再生成すること。\n" +
         "【即時実行ルール・確認禁止】色変更・色パレット変更・基調色変更・再実行・繰り返し要求はユーザーへの確認なしに即このツールを呼ぶこと。\n" +
         "以下のような『確認待ち』返答は厳禁：「問題なければ実行します」「実行してよいですか」「よろしいですか」。\n" +
         "「再実行して」「もう一度やって」「もう1回」と言われたら、直近PPTXを対象に同じ instruction でこのツールを即時呼ぶこと。\n" +
@@ -2075,6 +2077,47 @@ export const GetDefaultExtensions = async (props: {
         "mode=layout: 見た目・レイアウト再現優先。mode=editable: テキスト・表の編集を優先。\n" +
         "ツールが返した downloadUrl はUIが自動的にダウンロードボタンとして表示するため、アシスタントの返答にURLをMarkdownリンクとして再出力することは不要。完了を一言で伝えるだけでよい。",
       name: "convert_pdf_to_word",
+    },
+  });
+
+  // ★ PDF内の日本語だけを指定言語へ翻訳し、編集可能なPPTXに変換するツール
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeTranslatePdfToPptx(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description:
+              "翻訳対象のPDFファイルURL。このスレッドでアップロードされた.pdfのURL。省略時はスレッド内の最新PDFを自動使用。SharePoint/SLのファイルはfileQueryを使うこと。",
+          },
+          fileQuery: {
+            type: "string",
+            description:
+              "SharePoint/SLにあるPDFのファイル名またはキーワード。fileUrlとは排他。",
+          },
+          targetLanguage: {
+            type: "string",
+            enum: ["en", "pt", "vi", "id", "zh-CN", "ko", "es", "fil"],
+            default: "en",
+            description:
+              "翻訳先言語。en=英語、pt=ポルトガル語、vi=ベトナム語、id=インドネシア語、zh-CN=中国語（簡体字）、ko=韓国語、es=スペイン語、fil=タガログ語。ユーザーが指定した言語を設定し、省略時はen。",
+          },
+        },
+        required: [],
+      },
+      description:
+        "PDF内の日本語部分だけを指定言語へ翻訳し、元の絵・写真・レイアウトを維持した編集可能なPowerPoint（.pptx）を作成するツール。\n" +
+        "各PDFページを1スライドにし、翻訳文はPowerPoint上で手修正できるテキストボックスとして配置する。\n" +
+        "英語、ポルトガル語、ベトナム語、インドネシア語、中国語（簡体字）、韓国語、スペイン語、タガログ語に対応する。\n" +
+        "「日本語部分のみ英訳」「日本語をベトナム語に差し替え」「絵はそのまま」「翻訳後を手で修正したい」「PPTで出力」のような依頼に使用する。\n" +
+        "同じスレッドで一度翻訳版を作成した後の「次はポルトガル語に変換」「同じ添付を韓国語で」「中国語ではなく英語にして」のような翻訳先変更にも必ず使用する。直前のPPTXを翻訳・編集せず、スレッド内の元PDFから新しい言語版を再生成する。\n" +
+        "ツールが返したdownloadUrlはUIがダウンロードボタンとして表示するため、返答内にURLを再掲しないこと。",
+      name: "translate_pdf_to_pptx",
     },
   });
 
@@ -3475,6 +3518,96 @@ async function executeCreatePptxPython(
 
 // ---------------- PowerPoint 生成 ----------------
 
+const PDF_TRANSLATION_LANGUAGE_NAMES = {
+  en: "英語",
+  pt: "ポルトガル語",
+  vi: "ベトナム語",
+  id: "インドネシア語",
+  "zh-CN": "中国語（簡体字）",
+  ko: "韓国語",
+  es: "スペイン語",
+  fil: "タガログ語",
+} as const;
+
+type PdfTranslationLanguage =
+  keyof typeof PDF_TRANSLATION_LANGUAGE_NAMES;
+
+const PDF_TRANSLATION_LANGUAGE_PATTERNS: Array<
+  [PdfTranslationLanguage, RegExp]
+> = [
+  ["en", /英語|英訳|English/i],
+  ["pt", /ポルトガル語|Portuguese/i],
+  ["vi", /ベトナム語|Vietnamese/i],
+  ["id", /インドネシア語|Indonesian/i],
+  ["zh-CN", /中国語|簡体字|Chinese/i],
+  ["ko", /韓国語|ハングル|Korean/i],
+  ["es", /スペイン語|Spanish/i],
+  ["fil", /タガログ語|フィリピノ語?|Tagalog|Filipino/i],
+];
+
+function detectPdfTranslationLanguage(
+  text: string
+): PdfTranslationLanguage | null {
+  const match = PDF_TRANSLATION_LANGUAGE_PATTERNS.find(([, pattern]) =>
+    pattern.test(text)
+  );
+  return match?.[0] ?? null;
+}
+
+function isPdfTranslationOutputName(displayName: string | null): boolean {
+  return /(?:英訳|ポルトガル語|ベトナム語|インドネシア語|中国語|韓国語|スペイン語|タガログ語)版$/i.test(
+    displayName ?? ""
+  );
+}
+
+async function tryExecutePdfTranslationFollowup(
+  userText: string,
+  chatThread: ChatThreadModel
+): Promise<any | null> {
+  const targetLanguage = detectPdfTranslationLanguage(userText);
+  if (!targetLanguage) return null;
+
+  const followupTranslationIntent =
+    /翻訳|英訳|訳して?|変換|差し替|置き換|別言語|多言語|添付|PDF|同じ(?:もの|添付|PDF)?|元(?:の|PDF)|先ほど|さっき|今度|次(?:は)?|もう一度|再度|全体|全部|版(?:に|を|で|へ)|(?:英語|ポルトガル語|ベトナム語|インドネシア語|中国語|簡体字|韓国語|スペイン語|タガログ語|フィリピノ語?)にして/i.test(
+      userText
+    );
+  if (!followupTranslationIntent) return null;
+
+  const explicitlyNewPresentation =
+    /新規|一から|ゼロから|新しい(?:PPT|PowerPoint|プレゼン)|別テーマ|テーマで/i.test(
+      userText
+    );
+  if (explicitlyNewPresentation) return null;
+
+  const requestsPartialPptEdit =
+    /(?:タイトル|見出し|本文|文言|テキスト|文字|箇所|ページ|スライド|P\d+).{0,12}(?:英語|ポルトガル語|ベトナム語|インドネシア語|中国語|簡体字|韓国語|スペイン語|タガログ語|フィリピノ語?)/i.test(
+      userText
+    );
+  const requestsWholeDocument =
+    /全体|全部|全ページ|添付|PDF|同じ(?:もの|添付|PDF)?|元(?:の|PDF)|版(?:に|を|で|へ)/i.test(
+      userText
+    );
+  if (requestsPartialPptEdit && !requestsWholeDocument) return null;
+
+  const latestPptx = await resolveLatestPptxInfoFromThread(chatThread.id);
+  const followsTranslationOutput = isPdfTranslationOutputName(
+    latestPptx?.displayName ?? null
+  );
+  if (!followsTranslationOutput) return null;
+
+  const sourceUrl =
+    (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
+  if (!/\.pdf($|\?)/i.test(sourceUrl)) return null;
+
+  console.log(
+    `[pdf-translate-followup] rerouting to translate_pdf_to_pptx target=${targetLanguage} source=${sourceUrl.slice(0, 80)}`
+  );
+  return executeTranslatePdfToPptx(
+    { fileUrl: sourceUrl, targetLanguage },
+    chatThread
+  );
+}
+
 function generatePptxDisplayName(title: string): string {
   const clean = title
     .replace(/（[^）]*）|\([^)]*\)/g, "")
@@ -3500,6 +3633,14 @@ async function executeCreatePptx(
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
   const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
   const effectiveFontFace = hasExplicitFontRequest && fontFace?.trim() ? fontFace.trim() : "Meiryo";
+
+  if (userMessage?.trim()) {
+    const translated = await tryExecutePdfTranslationFollowup(
+      userMessage,
+      chatThread
+    );
+    if (translated) return translated;
+  }
 
   if (!title || !slides?.length) {
     return { error: "title and slides are required." };
@@ -5242,6 +5383,12 @@ async function executeEditPptx(
   const userIntentText = [userMessage?.trim(), instruction.trim()]
     .filter(Boolean)
     .join("\n");
+
+  const translated = await tryExecutePdfTranslationFollowup(
+    userIntentText,
+    chatThread
+  );
+  if (translated) return translated;
 
   // 画像URL解決: LLMがimageUrlを省略した場合のフォールバック
   // ロゴ/画像/添付の指示 かつ instruction にURLがない場合、スレッド最新アップロード画像URLを自動注入
@@ -7101,6 +7248,121 @@ async function executeConvertPdfToWord(
   } catch (e: any) {
     console.error("[convert_pdf_to_word] error:", e);
     return { error: "PDF→Word変換中にエラーが発生しました: " + String(e?.message ?? e) };
+  }
+}
+
+// ---------------- PDF 日本語翻訳 → 編集可能PPTX ----------------
+async function executeTranslatePdfToPptx(
+  args: {
+    fileUrl?: string;
+    fileQuery?: string;
+    targetLanguage?: PdfTranslationLanguage;
+  },
+  chatThread: ChatThreadModel
+) {
+  let { fileUrl, fileQuery, targetLanguage = "en" } = args ?? {};
+  let sourceFileName: string | undefined;
+
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      PDF_TRANSLATION_LANGUAGE_NAMES,
+      targetLanguage
+    )
+  ) {
+    return {
+      error:
+        "対応していない翻訳先言語です。英語、ポルトガル語、ベトナム語、インドネシア語、中国語（簡体字）、韓国語、スペイン語、タガログ語から指定してください。",
+    };
+  }
+  const targetLanguageName =
+    PDF_TRANSLATION_LANGUAGE_NAMES[targetLanguage];
+
+  if (fileQuery?.trim() && !fileUrl?.trim()) {
+    const spResult = await resolveSpFileToSasUrl(
+      fileQuery,
+      /\.pdf$/i,
+      chatThread,
+      "translate_pdf_to_pptx"
+    );
+    if ("error" in spResult) return spResult;
+    if ("multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+    sourceFileName = spResult.fileName;
+  }
+
+  if (!fileUrl?.trim()) {
+    const latest =
+      (await resolveLatestPdfOrDocxUrlFromThread(chatThread.id)) ?? "";
+    if (/\.pdf($|\?)/i.test(latest)) fileUrl = latest;
+  }
+
+  if (!fileUrl?.trim()) {
+    return {
+      error:
+        "翻訳対象のPDFが見つかりませんでした。このスレッドでPDFをアップロードするか、fileQueryでSharePoint/SLのPDFを指定してください。",
+    };
+  }
+  if (!/^https?:\/\//i.test(fileUrl)) {
+    return {
+      error: `fileUrlにはPDFのURLが必要です（「${fileUrl}」はURLではありません）。`,
+    };
+  }
+  if (!/\.pdf($|\?)/i.test(fileUrl)) {
+    return { error: "翻訳対象にはPDFファイルを指定してください。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME
+      ? `https://${process.env.WEBSITE_HOSTNAME}`
+      : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileUrl,
+        instruction: "",
+        threadId: chatThread.id,
+        action: "translate_pdf_to_pptx",
+        outputBaseName: sourceFileName,
+        targetLanguage,
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      console.error(
+        "[translate_pdf_to_pptx] route failed:",
+        res.status,
+        detail
+      );
+      return {
+        error: `PDF翻訳PPTXの作成に失敗しました: HTTP ${res.status}`,
+      };
+    }
+
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "翻訳版PPTXのダウンロードURLを取得できませんでした。" };
+    }
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      pages: result.pages,
+      translatedLines: result.translatedLines,
+      targetLanguage: result.targetLanguage ?? targetLanguage,
+      targetLanguageName: result.targetLanguageName ?? targetLanguageName,
+      message: `PDF ${result.pages}ページの日本語を${targetLanguageName}へ翻訳し、編集可能なPowerPointを作成しました。`,
+    };
+  } catch (error: any) {
+    console.error("[translate_pdf_to_pptx] error:", error);
+    return {
+      error:
+        "PDF翻訳PPTXの作成中にエラーが発生しました: " +
+        String(error?.message ?? error),
+    };
   }
 }
 
