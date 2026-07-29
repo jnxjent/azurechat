@@ -29,6 +29,78 @@ import {
 } from "./teams-word-proofread-service";
 import type { TeamsStoredFile } from "./teams-file-policy";
 
+const PDF_TRANSLATION_LANGUAGE_NAMES = {
+  en: "英語",
+  pt: "ポルトガル語",
+  vi: "ベトナム語",
+  id: "インドネシア語",
+  "zh-CN": "中国語（簡体字）",
+  ko: "韓国語",
+  es: "スペイン語",
+  fil: "タガログ語",
+} as const;
+
+type PdfTranslationLanguage = keyof typeof PDF_TRANSLATION_LANGUAGE_NAMES;
+
+const PDF_TRANSLATION_LANGUAGE_PATTERNS: Array<
+  [PdfTranslationLanguage, RegExp]
+> = [
+  ["en", /英語|英訳|English/i],
+  ["pt", /ポルトガル語|Portuguese/i],
+  ["vi", /ベトナム語|Vietnamese/i],
+  ["id", /インドネシア語|Indonesian/i],
+  ["zh-CN", /中国語|簡体字|Chinese/i],
+  ["ko", /韓国語|ハングル|Korean/i],
+  ["es", /スペイン語|Spanish/i],
+  ["fil", /タガログ語|フィリピノ語?|Tagalog|Filipino/i],
+];
+
+function parsePdfTranslationRequest(
+  message: string,
+  attachedFileQuery: string | null
+): Extract<TeamsOfficeRequest, { action: "translate_pdf_to_pptx" }> | null {
+  const targetLanguage =
+    PDF_TRANSLATION_LANGUAGE_PATTERNS.find(([, pattern]) =>
+      pattern.test(message)
+    )?.[0] ?? null;
+  if (!targetLanguage) return null;
+
+  const hasTranslationIntent =
+    /翻訳|英訳|訳して?|変換|差し替|置き換|別言語|多言語|(?:英語|ポルトガル語|ベトナム語|インドネシア語|中国語|簡体字|韓国語|スペイン語|タガログ語|フィリピノ語?)にして/i.test(
+      message
+    );
+  if (!hasTranslationIntent) return null;
+
+  const hasAttachedPdf = /\.pdf$/i.test(attachedFileQuery ?? "");
+  const explicitlyReferencesPdf =
+    /(?:添付|アップロード|このファイル|今のファイル|先ほどのファイル|さっきのファイル|元(?:の)?PDF|PDF)/i.test(
+      message
+    );
+  const isTranslationFollowup =
+    /(?:次(?:は)?|今度|もう一度|再度|同じ(?:もの|添付|PDF)?|別の言語|別言語|先ほど|さっき|元(?:の|PDF)|版(?:に|を|で|へ))/i.test(
+      message
+    );
+  if (!hasAttachedPdf && !explicitlyReferencesPdf && !isTranslationFollowup) {
+    return null;
+  }
+
+  const requestsPartialPptEdit =
+    /(?:タイトル|見出し|本文|文言|テキスト|文字|箇所|ページ|スライド|P\d+).{0,12}(?:英語|ポルトガル語|ベトナム語|インドネシア語|中国語|簡体字|韓国語|スペイン語|タガログ語|フィリピノ語?)/i.test(
+      message
+    );
+  const requestsWholeDocument =
+    /全体|全部|全ページ|添付|PDF|同じ(?:もの|添付|PDF)?|元(?:の|PDF)|版(?:に|を|で|へ)/i.test(
+      message
+    );
+  if (requestsPartialPptEdit && !requestsWholeDocument) return null;
+
+  return {
+    action: "translate_pdf_to_pptx",
+    fileQuery: hasAttachedPdf ? attachedFileQuery ?? undefined : undefined,
+    targetLanguage,
+  };
+}
+
 export type TeamsOfficeRequest =
   | {
       action: "pdf_to_excel";
@@ -43,6 +115,11 @@ export type TeamsOfficeRequest =
       action: "pdf_to_ppt";
       fileQuery: string;
       mode: "faithful" | "redesign";
+    }
+  | {
+      action: "translate_pdf_to_pptx";
+      fileQuery?: string;
+      targetLanguage: PdfTranslationLanguage;
     }
   | {
       action: "refine_excel_sheets";
@@ -105,6 +182,12 @@ export function parseTeamsOfficeRequest(
   const normalized = message.trim().normalize("NFKC");
   const attachedFileQuery = extractAttachedFileQuery(normalized);
   const hasAttachedFileMarker = Boolean(attachedFileQuery);
+  const pdfTranslationRequest = parsePdfTranslationRequest(
+    normalized,
+    attachedFileQuery
+  );
+  if (pdfTranslationRequest) return pdfTranslationRequest;
+
   const targetExcelSheets = extractTargetSheetNames(normalized);
   const hasExcelRefinementIntent =
     /(再変換|再抽出|精度|読み直|再読込|もう一度変換)/i.test(normalized);
@@ -297,6 +380,14 @@ export async function executeTeamsOfficeRequest(props: {
   userEmail?: string | null;
 }): Promise<string> {
   const teamsThreadId = buildTeamsThreadId(props.conversationId);
+
+  if (props.request.action === "translate_pdf_to_pptx") {
+    return translateTeamsPdfToPowerPoint({
+      request: props.request,
+      threadId: teamsThreadId,
+      uploadedFiles: props.uploadedFiles,
+    });
+  }
 
   if (props.request.action === "edit_latest_ppt") {
     return editLatestTeamsPowerPoint({
@@ -667,6 +758,12 @@ type TeamsWordPointer = {
   savedAt: number;
 };
 
+type TeamsPdfTranslationSourcePointer = {
+  url: string;
+  fileName: string;
+  savedAt: number;
+};
+
 export async function registerTeamsUploadedOfficeFiles(
   threadId: string,
   files: TeamsStoredFile[]
@@ -695,6 +792,12 @@ export async function registerTeamsUploadedOfficeFiles(
         { downloadUrl: file.url, fileName: file.fileName },
         file.fileName
       );
+    } else if (file.extension === "pdf") {
+      await savePdfTranslationSourcePointer(threadId, {
+        url: file.url,
+        fileName: file.fileName,
+        savedAt: file.savedAt,
+      });
     }
   }
 }
@@ -721,6 +824,84 @@ const wordPointerBlobName = (threadId: string) =>
 
 const pptxPointerBlobName = (threadId: string) =>
   `thread-${threadId}-pptx-latest.json`;
+
+const pdfTranslationSourcePointerBlobName = (threadId: string) =>
+  `thread-${threadId}-pdf-translation-source.json`;
+
+async function translateTeamsPdfToPowerPoint(props: {
+  request: Extract<
+    TeamsOfficeRequest,
+    { action: "translate_pdf_to_pptx" }
+  >;
+  threadId: string;
+  uploadedFiles?: TeamsStoredFile[];
+}): Promise<string> {
+  const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+  if (uploaded.error) return uploaded.error;
+
+  const source =
+    uploaded.file ??
+    (await readPdfTranslationSourcePointer(props.threadId));
+  if (!source?.url) {
+    return "翻訳対象のPDFが見つかりません。このTeams会話でPDFを添付してから、翻訳先の言語を指定してください。";
+  }
+
+  const languageName =
+    PDF_TRANSLATION_LANGUAGE_NAMES[props.request.targetLanguage];
+  console.log("[teams-pdf-translate] start", {
+    fileName: source.fileName,
+    targetLanguage: props.request.targetLanguage,
+    threadId: props.threadId,
+  });
+
+  const response = await fetch(`${getOfficeApiBaseUrl()}/api/edit-pptx`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileUrl: source.url,
+      instruction: "",
+      threadId: props.threadId,
+      action: "translate_pdf_to_pptx",
+      outputBaseName: source.fileName,
+      targetLanguage: props.request.targetLanguage,
+    }),
+  });
+  const result = (await response.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  if (
+    !response.ok ||
+    result.ok === false ||
+    typeof result.downloadUrl !== "string"
+  ) {
+    console.error("[teams-pdf-translate] failed", {
+      error: result.error,
+      status: response.status,
+      targetLanguage: props.request.targetLanguage,
+      threadId: props.threadId,
+    });
+    return `PDFの${languageName}翻訳に失敗しました。\n\n${String(
+      result.error ?? `HTTP ${response.status}`
+    )}`;
+  }
+
+  const outputName =
+    typeof result.fileName === "string"
+      ? result.fileName
+      : `${source.fileName.replace(/\.pdf$/i, "")}_${languageName}版.pptx`;
+  await savePptxResult(props.threadId, result, outputName);
+  console.log("[teams-pdf-translate] completed", {
+    fileName: outputName,
+    targetLanguage: props.request.targetLanguage,
+    threadId: props.threadId,
+  });
+  const pages = Number(result.pages ?? 0);
+  const detail = pages > 0 ? `（${pages}ページ）` : "";
+  return `PDFの日本語を${languageName}へ翻訳し、編集可能なPowerPointを作成しました。${detail}\n\n📊 [${escapeMarkdownLinkText(
+    outputName
+  )}](${result.downloadUrl})`;
+}
 
 async function editLatestTeamsOfficeFile(props: {
   action: "edit_latest_excel" | "edit_latest_word";
@@ -1747,6 +1928,45 @@ async function saveWordPointer(
   );
   if (response.status !== "OK") {
     throw new Error("Failed to save Teams Word pointer.");
+  }
+}
+
+async function savePdfTranslationSourcePointer(
+  threadId: string,
+  pointer: TeamsPdfTranslationSourcePointer
+): Promise<void> {
+  const response = await UploadBlob(
+    "dl-link",
+    pdfTranslationSourcePointerBlobName(threadId),
+    Buffer.from(JSON.stringify(pointer))
+  );
+  if (response.status !== "OK") {
+    throw new Error("Failed to save Teams PDF translation source pointer.");
+  }
+}
+
+async function readPdfTranslationSourcePointer(
+  threadId: string
+): Promise<TeamsPdfTranslationSourcePointer | null> {
+  const response = await DownloadBlobAsText(
+    "dl-link",
+    pdfTranslationSourcePointerBlobName(threadId)
+  );
+  if (response.status !== "OK") return null;
+  try {
+    const pointer = JSON.parse(
+      response.response
+    ) as Partial<TeamsPdfTranslationSourcePointer>;
+    if (
+      typeof pointer.url !== "string" ||
+      typeof pointer.fileName !== "string" ||
+      typeof pointer.savedAt !== "number"
+    ) {
+      return null;
+    }
+    return pointer as TeamsPdfTranslationSourcePointer;
+  } catch {
+    return null;
   }
 }
 

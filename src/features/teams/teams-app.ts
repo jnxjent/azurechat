@@ -316,6 +316,19 @@ function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
   if (request.action === "pdf_to_ppt") {
     return `「${request.fileQuery}」を検索し、PowerPointへの変換を開始します。完了までしばらくお待ちください。`;
   }
+  if (request.action === "translate_pdf_to_pptx") {
+    const languageNames = {
+      en: "英語",
+      pt: "ポルトガル語",
+      vi: "ベトナム語",
+      id: "インドネシア語",
+      "zh-CN": "中国語（簡体字）",
+      ko: "韓国語",
+      es: "スペイン語",
+      fil: "タガログ語",
+    } as const;
+    return `PDFの日本語を${languageNames[request.targetLanguage]}へ翻訳し、編集可能なPowerPointを作成します。完了までしばらくお待ちください。`;
+  }
   return `Excelの「${
     request.targetSheets.join(", ") || "指定シート"
   }」を再変換します。完了までしばらくお待ちください。`;
