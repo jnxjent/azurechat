@@ -10,6 +10,7 @@ import {
 } from "../ui/accordion";
 import { RecursiveUI } from "../ui/recursive-ui";
 import { CitationAction } from "./citation/citation-action";
+import { chatStore, useChat } from "./chat-store";
 
 interface MessageContentProps {
   message: {
@@ -107,6 +108,20 @@ const linkifyPhoneInTableRow = (line: string): string => {
 const normalizeContent = (src: string): string => {
   if (!src) return "";
 
+  // 一覧の冒頭でページ件数（20等）が総件数として誤表示された場合、
+  // 同じ回答内のページ情報「全109件中…」を正として補正する。
+  const paginationTotal = src.match(/全\s*(\d+)\s*件中/);
+  if (
+    paginationTotal &&
+    /(運搬事業者|処分業者)/.test(src)
+  ) {
+    const total = paginationTotal[1];
+    src = src.replace(
+      /(以下の全)\s*\d+\s*(社あります)/,
+      `$1${total}$2`
+    );
+  }
+
   // 【1】citation タグに blob URL が含まれる行を URL 除去より先に消す
   //     （先に URL を消すと sig= チェックが効かなくなるため順序が重要）
   src = src.replace(
@@ -132,6 +147,9 @@ const normalizeContent = (src: string): string => {
     }
 
     if (inCodeBlock) return line;
+    if (/続きは.*[『「]?\d+\s*ページ目[』」]?.*入力してください/.test(trimmed)) {
+      return "";
+    }
     if (line.includes("{% citation")) {
       // blob SAS URL を含む citation タグは除去（ファイル変換ツールの誤出力）
       if (line.includes("blob.core.windows.net") || line.includes("sig=")) return "";
@@ -165,6 +183,89 @@ const normalizeContent = (src: string): string => {
   });
 
   return lines.join("\n");
+};
+
+type SfPagination = {
+  page: number;
+  totalPages: number;
+};
+
+const extractSfPagination = (content: string): SfPagination | null => {
+  const fullMatch = (content || "").match(
+    /全\s*\d+\s*件中\s*\d+\s*[〜～~-]\s*\d+\s*件(?:を表示)?.*?[（(]?\s*(\d+)\s*[\/／]\s*(\d+)\s*ページ/
+  );
+  const ratioMatch = fullMatch
+    ? null
+    : (content || "").match(
+        /(?:ページ\s*)?(\d+)\s*[\/／]\s*(\d+)\s*ページ/
+      );
+  if (!fullMatch && !ratioMatch) return null;
+
+  const page = Number(fullMatch?.[1] ?? ratioMatch?.[1]);
+  const totalPages = Number(fullMatch?.[2] ?? ratioMatch?.[2]);
+  if (
+    !Number.isInteger(page) ||
+    !Number.isInteger(totalPages) ||
+    page < 1 ||
+    totalPages < 2 ||
+    page > totalPages
+  ) {
+    return null;
+  }
+  return { page, totalPages };
+};
+
+const pageNumbers = (page: number, totalPages: number): number[] => {
+  if (totalPages <= 9) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+
+  const pages = new Set([1, totalPages]);
+  for (let value = page - 2; value <= page + 2; value += 1) {
+    if (value >= 1 && value <= totalPages) pages.add(value);
+  }
+  return Array.from(pages).sort((a, b) => a - b);
+};
+
+const SfPaginationControls: React.FC<{ pagination: SfPagination }> = ({
+  pagination,
+}) => {
+  const { loading } = useChat();
+  const pages = pageNumbers(pagination.page, pagination.totalPages);
+
+  return (
+    <nav
+      className="not-prose mt-3 flex flex-wrap items-center gap-1"
+      aria-label="Salesforce一覧のページ"
+    >
+      {pages.map((page, index) => {
+        const previous = pages[index - 1];
+        const showEllipsis = previous !== undefined && page - previous > 1;
+        const isCurrent = page === pagination.page;
+        return (
+          <React.Fragment key={page}>
+            {showEllipsis && (
+              <span className="px-1 text-sm text-muted-foreground">…</span>
+            )}
+            <button
+              type="button"
+              aria-current={isCurrent ? "page" : undefined}
+              aria-label={`${page}ページ目を表示`}
+              disabled={isCurrent || loading !== "idle"}
+              onClick={() => void chatStore.submitText(`${page}ページ目`)}
+              className={`min-w-8 rounded-md border px-2.5 py-1 text-sm transition-colors ${
+                isCurrent
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "hover:bg-accent"
+              } disabled:cursor-default disabled:opacity-70`}
+            >
+              {page}
+            </button>
+          </React.Fragment>
+        );
+      })}
+    </nav>
+  );
 };
 
 /* ------------------------------------------------------------------ */
@@ -330,11 +431,14 @@ const ImageWithCanvasOverlay: React.FC<ImageWithCanvasOverlayProps> = ({
 const MessageContent: React.FC<MessageContentProps> = ({ message }) => {
   if (message.role === "assistant" || message.role === "user") {
     const normalized = normalizeContent(message.content);
+    const pagination =
+      message.role === "assistant" ? extractSfPagination(normalized) : null;
 
     const hasImage = !!message.multiModalImage;
     return (
       <>
         <Markdown content={normalized} onCitationClick={CitationAction} />
+        {pagination && <SfPaginationControls pagination={pagination} />}
         {hasImage && (
           <ImageWithCanvasOverlay
             key={message.multiModalImage}
