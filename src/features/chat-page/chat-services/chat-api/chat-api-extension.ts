@@ -59,6 +59,14 @@ function isAnalysisFollowupOnly(userMessage: string): boolean {
   const s = (userMessage || "").trim();
   if (!s) return false;
 
+  // 期間を明示した日報分析は、直前回答の深掘りではなく再検索する。
+  if (
+    /(日報|活動報告)/.test(s) &&
+    /(?:(?:\d{4})\s*年\s*)?\d{1,2}\s*月|今月|先月|今週|先週|昨日|今日/.test(s)
+  ) {
+    return false;
+  }
+
   if (
     /(もっと|詳細|詳しく|いいところ|良いところ|強み|弱み|課題|アドバイス|育成|評価|フィードバック|改善点|成長|伸ばす|褒める|叱る|指導|コーチング)/.test(
       s
