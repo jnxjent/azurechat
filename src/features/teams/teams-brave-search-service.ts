@@ -1,7 +1,6 @@
 import "server-only";
 
 import type { TeamsSearchSource } from "./teams-search-service";
-import { requiresTeamsInternalSearch } from "./teams-search-intent";
 import { buildTeamsWebQuery } from "./teams-web-query";
 import {
   extractWeatherPageText,
@@ -43,13 +42,12 @@ export function resolveBraveSearchRequest(message: string): {
   }
 
   const mode = process.env.TEAMS_BRAVE_SEARCH_MODE?.trim().toLowerCase();
-  const skipInternalSearch = !requiresTeamsInternalSearch(trimmed);
   if (mode === "off") {
-    return { enabled: false, query: trimmed, skipInternalSearch };
+    return { enabled: false, query: trimmed, skipInternalSearch: false };
   }
 
   if (mode === "always") {
-    return { enabled: true, query: trimmed, skipInternalSearch };
+    return { enabled: true, query: trimmed, skipInternalSearch: false };
   }
 
   const autoSearchPattern =
@@ -57,7 +55,10 @@ export function resolveBraveSearchRequest(message: string): {
   return {
     enabled: autoSearchPattern.test(trimmed),
     query: trimmed,
-    skipInternalSearch,
+    // Only an explicit /web or /brave command forbids internal tool use.
+    // For every other message, the Teams LLM decides whether internal search
+    // is appropriate instead of relying on a Japanese regular expression.
+    skipInternalSearch: false,
   };
 }
 

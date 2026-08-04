@@ -17,7 +17,6 @@ import {
   recordTeamsThreadUsage,
 } from "./teams-usage-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
-import { requiresTeamsInternalSearch } from "./teams-search-intent";
 import { readLatestTeamsFiles, receiveTeamsFiles } from "./teams-file-service";
 import {
   referencesTeamsUpload,
@@ -172,11 +171,9 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
       );
       const officeRequest = parseTeamsOfficeRequest(routingText);
 
-      // Office operations and internal ACL-aware search require the Teams
-      // member's email. General chat and Web search do not.
-      const userEmail = officeRequest || requiresTeamsInternalSearch(text)
-        ? await resolveActivityUserEmail({ activity, api })
-        : null;
+      // The LLM may decide to use ACL-aware internal search after this routing
+      // step, so resolve the Teams member before entering the chat service.
+      const userEmail = await resolveActivityUserEmail({ activity, api });
 
       if (officeRequest) {
         const startMessage = buildOfficeStartMessage(officeRequest);

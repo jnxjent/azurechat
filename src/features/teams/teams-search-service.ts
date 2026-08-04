@@ -11,6 +11,7 @@ import {
   buildSlSearchTargetFilter,
   inferSlSearchTarget,
   stripSlSearchTargetTerms,
+  type SlSearchScope,
 } from "@/lib/sl-search-target";
 
 const DEFAULT_SEARCH_TOP = 8;
@@ -35,10 +36,51 @@ export type TeamsOfficeFileCandidate = {
   url: string;
 };
 
+export type TeamsKnowledgeSearchTarget = {
+  query: string;
+  userEmail?: string | null;
+  scope?: SlSearchScope;
+  folder?: string;
+};
+
 export async function searchTeamsKnowledge(props: {
   query: string;
   userEmail?: string | null;
 }): Promise<TeamsSearchResult> {
+  const targetQuery = normalizeTeamsSearchTargetQuery(props.query);
+  const target = inferSlSearchTarget(targetQuery);
+
+  if (target.folderUncertain) {
+    const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
+    const dept = userEmail ? resolveSlAccess(userEmail).dept : "";
+    console.log("[teams-search] folder clarification required", {
+      dept,
+      query: props.query,
+    });
+    return {
+      context:
+        "検索対象のフォルダー名を一意に判断できません。ユーザーにフォルダー名を確認してください。",
+      sources: [],
+      userEmail: userEmail ?? "",
+      dept,
+    };
+  }
+
+  return searchTeamsKnowledgeWithTarget({
+    query: targetQuery,
+    userEmail: props.userEmail,
+    scope: target.scope,
+    folder: target.folder,
+  });
+}
+
+/**
+ * Executes Teams internal search from LLM-produced structured target fields.
+ * ACL resolution remains deterministic and is never delegated to the model.
+ */
+export async function searchTeamsKnowledgeWithTarget(
+  props: TeamsKnowledgeSearchTarget
+): Promise<TeamsSearchResult> {
   assertSearchConfiguration();
 
   const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
@@ -51,28 +93,16 @@ export async function searchTeamsKnowledge(props: {
 
   const access = resolveSlAccess(userEmail);
   const userHash = hashValue(userEmail);
-  const targetQuery = normalizeTeamsSearchTargetQuery(props.query);
-  const target = inferSlSearchTarget(targetQuery);
+  const target = {
+    scope: props.scope,
+    folder: props.folder?.trim() || undefined,
+  };
   const targetFilter = buildSlSearchTargetFilter(target);
   const searchFilter = targetFilter
     ? `(isSlDoc eq true) and (${targetFilter})`
     : "isSlDoc eq true";
-  const effectiveQuery = stripSlSearchTargetTerms(targetQuery, target);
+  const effectiveQuery = stripSlSearchTargetTerms(props.query, target);
   const top = resolveSearchTop();
-
-  if (target.folderUncertain) {
-    console.log("[teams-search] folder clarification required", {
-      dept: access.dept,
-      query: props.query,
-    });
-    return {
-      context:
-        "検索対象のフォルダー名を一意に判断できません。ユーザーにフォルダー名を確認してください。",
-      sources: [],
-      userEmail,
-      dept: access.dept,
-    };
-  }
 
   let filenameMatchedDocs: DocumentSearchResponse[] = [];
   const filenameList = await SimpleSearch(
@@ -121,8 +151,8 @@ export async function searchTeamsKnowledge(props: {
   console.log("[teams-search] completed", {
     dept: access.dept,
     role: access.role,
-    scope: target.scope ?? "all",
-    folder: target.folder ?? "(none)",
+    scope: props.scope ?? "all",
+    folder: props.folder ?? "(none)",
     effectiveQuery,
     filenameMatches: filenameMatchedDocs.length,
     results: response.response.length,

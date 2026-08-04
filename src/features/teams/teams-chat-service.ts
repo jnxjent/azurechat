@@ -1,9 +1,12 @@
 import "server-only";
 
 import { OpenAIInstance } from "@/features/common/services/openai";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+} from "openai/resources/chat/completions";
 import {
-  searchTeamsKnowledge,
+  searchTeamsKnowledgeWithTarget,
   type TeamsSearchSource,
 } from "./teams-search-service";
 import {
@@ -12,8 +15,15 @@ import {
 } from "./teams-brave-search-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
 import { buildTeamsWebQuery } from "./teams-web-query";
+import {
+  parseTeamsInternalSearchToolArguments,
+  TEAMS_INTERNAL_SEARCH_INSTRUCTIONS,
+  TEAMS_INTERNAL_SEARCH_TOOL,
+  TEAMS_INTERNAL_SEARCH_TOOL_NAME,
+} from "./teams-search-tool";
 
 const MAX_HISTORY_MESSAGES = 20;
+const MAX_INTERNAL_SEARCH_CALLS = 3;
 const conversations = new Map<string, ChatCompletionMessageParam[]>();
 
 export type TeamsChatResult =
@@ -44,43 +54,86 @@ export async function createTeamsChatReply(props: {
 
   const history = conversations.get(props.conversationId) ?? [];
   const braveRequest = resolveBraveSearchRequest(message);
-  const internalSearch = braveRequest.skipInternalSearch
-    ? { context: "", sources: [] as TeamsSearchSource[] }
-    : await searchTeamsKnowledge({
-        query: braveRequest.query,
-        userEmail: props.userEmail,
-      });
   const webSearch = braveRequest.enabled
     ? await searchBraveWeb({
         query: braveRequest.query,
-        startIndex: internalSearch.sources.length + 1,
+        startIndex: 1,
       })
     : { context: "", sources: [] };
-  const allSources = [...internalSearch.sources, ...webSearch.sources];
+  const allSources = [...webSearch.sources];
   const userContent = buildUserContent(
     braveRequest.query,
-    internalSearch.context,
+    "",
     webSearch.context,
-    !braveRequest.skipInternalSearch,
+    false,
     braveRequest.enabled
   );
+  const baseSystemPrompt =
+    process.env.TEAMS_SYSTEM_PROMPT?.trim() ||
+    "あなたはAzureChatのAIアシスタントです。ユーザーと同じ言語で、正確かつ簡潔に回答してください。Teamsで読みやすいMarkdownを使用してください。社内情報については提供された検索資料だけを根拠に回答し、根拠がない場合は分からないと回答してください。検索資料を使用した文には必ず [1] の形式で出典番号を付けてください。";
   const messages: ChatCompletionMessageParam[] = [
     {
       role: "system",
-      content:
-        process.env.TEAMS_SYSTEM_PROMPT?.trim() ||
-        "あなたはAzureChatのAIアシスタントです。ユーザーと同じ言語で、正確かつ簡潔に回答してください。Teamsで読みやすいMarkdownを使用してください。社内情報については提供された検索資料だけを根拠に回答し、根拠がない場合は分からないと回答してください。検索資料を使用した文には必ず [1] の形式で出典番号を付けてください。",
+      content: `${baseSystemPrompt}\n\n${TEAMS_INTERNAL_SEARCH_INSTRUCTIONS}`,
     },
     ...history,
     { role: "user", content: userContent },
   ];
 
-  const completion = await OpenAIInstance().chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
-    messages,
-  });
+  const openai = OpenAIInstance();
+  let answer = "";
+  let internalSearchCalls = 0;
+  let forceFinalAnswer = false;
 
-  const answer = completion.choices[0]?.message?.content?.trim();
+  while (!answer) {
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
+      messages,
+      ...(!braveRequest.skipInternalSearch && !forceFinalAnswer
+        ? { tools: [TEAMS_INTERNAL_SEARCH_TOOL], tool_choice: "auto" as const }
+        : {}),
+    });
+    const assistantMessage = completion.choices[0]?.message;
+    if (!assistantMessage) {
+      throw new Error("Azure OpenAI returned no assistant message.");
+    }
+
+    const toolCalls = forceFinalAnswer
+      ? []
+      : assistantMessage.tool_calls?.filter(
+          (toolCall) => toolCall.type === "function"
+        ) ?? [];
+    if (toolCalls.length === 0) {
+      answer = assistantMessage.content?.trim() ?? "";
+      break;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: assistantMessage.content,
+      tool_calls: toolCalls,
+    });
+
+    for (const toolCall of toolCalls) {
+      const toolContent = await executeInternalSearchTool({
+        toolCall,
+        userEmail: props.userEmail,
+        allSources,
+        searchCallAllowed: internalSearchCalls < MAX_INTERNAL_SEARCH_CALLS,
+      });
+      if (toolCall.function.name === TEAMS_INTERNAL_SEARCH_TOOL_NAME) {
+        internalSearchCalls++;
+      }
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: toolContent,
+      });
+    }
+
+    forceFinalAnswer = internalSearchCalls >= MAX_INTERNAL_SEARCH_CALLS;
+  }
+
   if (!answer) {
     throw new Error("Azure OpenAI returned an empty response.");
   }
@@ -97,6 +150,76 @@ export async function createTeamsChatReply(props: {
   );
 
   return { type: "reply", text: answerWithSources };
+}
+
+async function executeInternalSearchTool(props: {
+  toolCall: ChatCompletionMessageToolCall;
+  userEmail?: string | null;
+  allSources: TeamsSearchSource[];
+  searchCallAllowed: boolean;
+}): Promise<string> {
+  if (props.toolCall.function.name !== TEAMS_INTERNAL_SEARCH_TOOL_NAME) {
+    return "未対応のツールです。別のツールを呼ばず、回答を作成してください。";
+  }
+  if (!props.searchCallAllowed) {
+    return "社内検索回数の上限に達しました。取得済みの資料だけで回答してください。";
+  }
+
+  try {
+    const args = parseTeamsInternalSearchToolArguments(
+      props.toolCall.function.arguments
+    );
+    const result = await searchTeamsKnowledgeWithTarget({
+      ...args,
+      userEmail: props.userEmail,
+    });
+    if (!result.userEmail) {
+      return "Teamsユーザーのメールアドレスを解決できないため、アクセス権付き社内検索を実行できませんでした。";
+    }
+
+    const context = mergeSearchSources(
+      result.context,
+      result.sources,
+      props.allSources
+    );
+    return `社内検索資料:\n${
+      context || "該当する社内文書は見つかりませんでした。"
+    }`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[teams-search-tool] execution failed", message);
+    return `社内検索を実行できませんでした: ${message.slice(0, 300)}`;
+  }
+}
+
+function mergeSearchSources(
+  context: string,
+  incoming: TeamsSearchSource[],
+  allSources: TeamsSearchSource[]
+): string {
+  const indexMap = new Map<number, number>();
+  for (const source of incoming) {
+    const existing = allSources.find(
+      (item) =>
+        item.kind === source.kind &&
+        item.name === source.name &&
+        (item.url ?? "") === (source.url ?? "")
+    );
+    if (existing) {
+      indexMap.set(source.index, existing.index);
+      continue;
+    }
+
+    const nextIndex =
+      allSources.reduce((max, item) => Math.max(max, item.index), 0) + 1;
+    indexMap.set(source.index, nextIndex);
+    allSources.push({ ...source, index: nextIndex });
+  }
+
+  return context.replace(/\[(\d+)\]/g, (match, rawIndex: string) => {
+    const mapped = indexMap.get(Number(rawIndex));
+    return mapped ? `[${mapped}]` : match;
+  });
 }
 
 function buildUserContent(
