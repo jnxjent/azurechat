@@ -51,12 +51,13 @@ export async function searchTeamsKnowledge(props: {
 
   const access = resolveSlAccess(userEmail);
   const userHash = hashValue(userEmail);
-  const target = inferSlSearchTarget(props.query);
+  const targetQuery = normalizeTeamsSearchTargetQuery(props.query);
+  const target = inferSlSearchTarget(targetQuery);
   const targetFilter = buildSlSearchTargetFilter(target);
   const searchFilter = targetFilter
     ? `(isSlDoc eq true) and (${targetFilter})`
     : "isSlDoc eq true";
-  const effectiveQuery = stripSlSearchTargetTerms(props.query, target);
+  const effectiveQuery = stripSlSearchTargetTerms(targetQuery, target);
   const top = resolveSearchTop();
 
   if (target.folderUncertain) {
@@ -430,6 +431,13 @@ function normalizeFileSearchText(value: string): string {
     .toLowerCase()
     .replace(/\.(pdf|docx|xlsx)$/i, "")
     .replace(/[\s\u3000「」『』【】()（）・_\-]/g, "");
+}
+
+function normalizeTeamsSearchTargetQuery(value: string): string {
+  return value.replace(
+    /[、,]\s*(?=(?:という|と呼ばれる)\s*フォルダ(?:ー)?)/g,
+    ""
+  );
 }
 
 function findFilenameMatches(
