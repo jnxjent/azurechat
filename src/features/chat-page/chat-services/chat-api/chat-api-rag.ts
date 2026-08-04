@@ -5,6 +5,12 @@ import { OpenAIInstance } from "@/features/common/services/openai";
 import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/completions";
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ExtensionSimilaritySearch } from "../azure-ai-search/azure-ai-search";
+import {
+  buildSlSearchTargetFilter,
+  inferSlSearchTarget,
+  stripSlSearchTargetTerms,
+} from "@/lib/sl-search-target";
+import type { SlSearchScope } from "@/lib/sl-search-target";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { ChatCitationModel, ChatThreadModel } from "../models";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -133,28 +139,39 @@ export const ChatApiRAG = async (props: {
   console.log("[RAG-EXT] deptLower =", deptLower);
   console.log("[RAG-EXT] userHash =", userHash ? "***" : "(none)");
 
-  const filter = `(chatThreadId eq '${odataEscape(chatThread.id)}' or isSlDoc eq true)`;
-  console.log("[RAG-EXT] base filter =", filter);
+  const baseFilter = `(chatThreadId eq '${odataEscape(chatThread.id)}' or isSlDoc eq true)`;
+  const inferredTarget = inferSlSearchTarget(userMessage);
+  const initialTargetFilter = buildSlSearchTargetFilter(inferredTarget);
+  const initialSearchText = stripSlSearchTargetTerms(userMessage, inferredTarget);
+  const filter = initialTargetFilter
+    ? `(${baseFilter}) and (${initialTargetFilter})`
+    : baseFilter;
+  console.log("[RAG-EXT] base filter =", baseFilter);
+  console.log("[RAG-EXT] inferred search target =", inferredTarget);
+  console.log("[RAG-EXT] effective search text =", initialSearchText);
+  console.log("[RAG-EXT] effective filter =", filter);
 
   const apiKey = getRequiredEnv("AZURE_SEARCH_API_KEY");
   const searchName = getRequiredEnv("AZURE_SEARCH_NAME");
   const indexName = getRequiredEnv("AZURE_SEARCH_INDEX_NAME");
 
-  const documentResponse = await ExtensionSimilaritySearch({
-    searchText: userMessage,
-    vectors: ["embedding"],
-    apiKey,
-    searchName,
-    indexName,
-    filter,
-    deptLower,
-    userHash: userHash ?? undefined,
-  });
+  const documentResponse = inferredTarget.folderUncertain
+    ? null
+    : await ExtensionSimilaritySearch({
+        searchText: initialSearchText,
+        vectors: ["embedding"],
+        apiKey,
+        searchName,
+        indexName,
+        filter,
+        deptLower,
+        userHash: userHash ?? undefined,
+      });
 
   const documents: ChatCitationModel[] = [];
   const uploadedBlobUrls = await resolveThreadDocumentBlobUrls(chatThread.id);
 
-  if (documentResponse.status === "OK") {
+  if (documentResponse?.status === "OK") {
     const withoutEmbedding = FormatCitations(documentResponse.response);
     const citationResponse = await CreateCitations(withoutEmbedding);
     citationResponse.forEach((c) => {
@@ -162,7 +179,7 @@ export const ChatApiRAG = async (props: {
         documents.push(c.response);
       }
     });
-  } else {
+  } else if (documentResponse) {
     console.error("[RAG-EXT] ExtensionSimilaritySearch error:", documentResponse.errors);
   }
 
@@ -201,6 +218,7 @@ ${page}`;
 - If you don't know the answer, just say that you don't know. Don't try to make up an answer.
 - You must always include a citation at the end of your answer and don't include full stop after the citations.
 - IMPORTANT: If the user asks to compare multiple documents or find contradictions across files: (1) First call sl_doc_search with a broad query (e.g. "IR議事録") to discover available document names. (2) Then call sl_doc_search once per discovered document using "company name + document type + keyword" queries. (3) Only answer after collecting content from all documents. Never answer based solely on the initial context when multi-document comparison is requested.
+${inferredTarget.folderUncertain ? "- IMPORTANT: The user referred to a SharePoint folder, but its name could not be determined with confidence. Ask the user which folder name to search. Do not search broadly and do not answer from unrelated documents until the folder is clarified." : ""}
 - PowerPoint生成のツール選択ルール（厳守）：
   ① ユーザーがPDF/文書を「そのままPPTに変換して」「スライド化して」と言った場合 → convert_doc_to_pptx を使うこと。
   ② 会話の中でスライド構成（タイトル・箇条書き）が既に議論・提示されており、「PDFを参考に内容を拡充して」「追記して」「厚くして」とPDFはあくまで参考資料として扱う場合 → create_pptx を使うこと。この場合、前の会話のスライド構成を slides パラメータのベースとし、文書コンテキストや sl_doc_search の結果で各スライドの bullets を肉付けした上で呼び出すこと。convert_doc_to_pptx は使わないこと。${fileUrlHint}
@@ -229,6 +247,8 @@ ${userMessage}
       name: "sl_doc_search",
       description:
         "SharePointの個人・部署・全社共通ドキュメントを検索します。\n" +
+        "ユーザーが検索先を指定した場合はscopeとfolderへ必ず反映してください。\n" +
+        "例：「個人ファイルから」「個人フォルダーから」→scope=personal（folderは設定しない）、「部署共通から」→scope=dept_common、「全社共通から」→scope=global_common、「〇〇フォルダーから」→folder=〇〇。「部署共通フォルダー内の可能性調査というフォルダー」→scope=dept_common, folder=可能性調査。引用符は不要です。フォルダー名を一意に判断できない場合は検索せずユーザーに確認してください。\n" +
         "【2段階で使うこと】\n" +
         "① 比較対象の文書名が不明な場合: mode=\"discover\" で広いクエリ（例:「IR議事録」）を1回呼び出し、返ってくる file name から文書名・会社名を把握する。\n" +
         "② 文書名が判明したら: mode=\"content\" で「会社名 + 文書種別 + キーワード」の形式で文書ごとに個別呼び出しする（複数回）。\n" +
@@ -247,19 +267,43 @@ ${userMessage}
             description:
               "discover: 文書名の一覧取得（広いクエリ向け、上位32件）。content: 個社別の本文取得（絞ったクエリ向け、上位8件）。省略時はcontent扱い。",
           },
+          scope: {
+            type: "string",
+            enum: ["all", "personal", "dept_common", "global_common"],
+            description:
+              "検索範囲。指定なし/allは閲覧可能な全資料、personalは自分の個人資料、dept_commonは部署共通、global_commonは全社共通。",
+          },
+          folder: {
+            type: "string",
+            description:
+              "検索対象のSharePointフォルダー名。ユーザーが『〇〇フォルダーから』などと指定した場合だけ設定します。",
+          },
         },
         required: ["query"],
       },
-      function: async (args: { query: string; mode?: string }) => {
+      function: async (args: {
+        query: string;
+        mode?: string;
+        scope?: SlSearchScope;
+        folder?: string;
+      }) => {
+        if (inferredTarget.folderUncertain && !args.folder?.trim()) {
+          return "【要確認】検索対象のフォルダー名を一意に判断できません。ユーザーにフォルダー名を確認してから、folderを指定して再検索してください。";
+        }
         const effectiveTop = args.mode === "discover" ? 32 : 8;
-        console.log("[sl_doc_search] query =", args.query, "mode =", args.mode ?? "content", "top =", effectiveTop);
+        const targetFilter = buildSlSearchTargetFilter(args);
+        const searchQuery = stripSlSearchTargetTerms(args.query, args);
+        const scopedFilter = targetFilter
+          ? `(${filter}) and (${targetFilter})`
+          : filter;
+        console.log("[sl_doc_search] query =", args.query, "effectiveQuery =", searchQuery, "mode =", args.mode ?? "content", "scope =", args.scope ?? "all", "folder =", args.folder ?? "(none)", "top =", effectiveTop);
         const searchResult = await ExtensionSimilaritySearch({
-          searchText: args.query,
+          searchText: searchQuery,
           vectors: ["embedding"],
           apiKey,
           searchName,
           indexName,
-          filter,
+          filter: scopedFilter,
           deptLower,
           userHash: userHash ?? undefined,
           top: effectiveTop,
