@@ -314,6 +314,25 @@ class ChatState {
 
     this.chat(formData);
   }
+
+  public async submitText(message: string) {
+    const text = (message || "").trim();
+    if (!text || this.loading !== "idle") {
+      return;
+    }
+
+    this.input = text;
+    const formData = new FormData();
+    formData.append("thinkingMode", "standard");
+    formData.append(
+      "content",
+      JSON.stringify({
+        id: this.chatThreadId,
+        message: text,
+      })
+    );
+    await this.chat(formData);
+  }
 }
 
 export const chatStore = proxy(new ChatState());
