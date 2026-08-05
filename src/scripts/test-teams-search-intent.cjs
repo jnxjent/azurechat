@@ -29,6 +29,14 @@ assert.equal(requiresTeamsInternalSearch("社内規程によれば申請期限�
 assert.equal(requiresTeamsInternalSearch("SharePointの資料を調べて"), true);
 assert.equal(requiresTeamsInternalSearch("SPにある規程を確認して"), true);
 assert.equal(requiresTeamsInternalSearch("AI Searchで検索して"), true);
+assert.equal(
+  requiresTeamsInternalSearch(
+    "部署共通フォルダーにある、可能性調査、というフォルダーから、処分場の候補地を調べて"
+  ),
+  true
+);
+assert.equal(requiresTeamsInternalSearch("個人フォルダーの財務資料を調べて"), true);
+assert.equal(requiresTeamsInternalSearch("全社共通から就業規則を調べて"), true);
 
 assert.equal(requiresTeamsInternalSearch("浜松の明日の天気は？"), false);
 assert.equal(requiresTeamsInternalSearch("一般的な有給休暇の制度を教えて"), false);

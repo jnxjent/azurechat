@@ -7,6 +7,12 @@ import {
 } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
 import { hashValue } from "@/features/auth-page/helpers";
 import { resolveSlAccess } from "@/lib/sl-dept";
+import {
+  buildSlSearchTargetFilter,
+  inferSlSearchTarget,
+  stripSlSearchTargetTerms,
+  type SlSearchScope,
+} from "@/lib/sl-search-target";
 
 const DEFAULT_SEARCH_TOP = 8;
 const MAX_CONTEXT_CHARACTERS = 24_000;
@@ -30,10 +36,51 @@ export type TeamsOfficeFileCandidate = {
   url: string;
 };
 
+export type TeamsKnowledgeSearchTarget = {
+  query: string;
+  userEmail?: string | null;
+  scope?: SlSearchScope;
+  folder?: string;
+};
+
 export async function searchTeamsKnowledge(props: {
   query: string;
   userEmail?: string | null;
 }): Promise<TeamsSearchResult> {
+  const targetQuery = normalizeTeamsSearchTargetQuery(props.query);
+  const target = inferSlSearchTarget(targetQuery);
+
+  if (target.folderUncertain) {
+    const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
+    const dept = userEmail ? resolveSlAccess(userEmail).dept : "";
+    console.log("[teams-search] folder clarification required", {
+      dept,
+      query: props.query,
+    });
+    return {
+      context:
+        "検索対象のフォルダー名を一意に判断できません。ユーザーにフォルダー名を確認してください。",
+      sources: [],
+      userEmail: userEmail ?? "",
+      dept,
+    };
+  }
+
+  return searchTeamsKnowledgeWithTarget({
+    query: targetQuery,
+    userEmail: props.userEmail,
+    scope: target.scope,
+    folder: target.folder,
+  });
+}
+
+/**
+ * Executes Teams internal search from LLM-produced structured target fields.
+ * ACL resolution remains deterministic and is never delegated to the model.
+ */
+export async function searchTeamsKnowledgeWithTarget(
+  props: TeamsKnowledgeSearchTarget
+): Promise<TeamsSearchResult> {
   assertSearchConfiguration();
 
   const userEmail = resolveTeamsSearchUserEmail(props.userEmail);
@@ -45,17 +92,55 @@ export async function searchTeamsKnowledge(props: {
   }
 
   const access = resolveSlAccess(userEmail);
-  const response = await ExtensionSimilaritySearch({
-    searchText: props.query,
-    vectors: ["embedding"],
-    apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
-    searchName: requiredEnv("AZURE_SEARCH_NAME"),
-    indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
-    filter: "isSlDoc eq true",
-    deptLower: access.dept,
-    userHash: hashValue(userEmail),
-    top: resolveSearchTop(),
-  });
+  const userHash = hashValue(userEmail);
+  const target = {
+    scope: props.scope,
+    folder: props.folder?.trim() || undefined,
+  };
+  const targetFilter = buildSlSearchTargetFilter(target);
+  const searchFilter = targetFilter
+    ? `(isSlDoc eq true) and (${targetFilter})`
+    : "isSlDoc eq true";
+  const effectiveQuery = stripSlSearchTargetTerms(props.query, target);
+  const top = resolveSearchTop();
+
+  let filenameMatchedDocs: DocumentSearchResponse[] = [];
+  const filenameList = await SimpleSearch(
+    "*",
+    searchFilter,
+    access.dept,
+    1000,
+    userHash
+  );
+  if (filenameList.status === "OK") {
+    filenameMatchedDocs = findFilenameMatches(
+      filenameList.response,
+      effectiveQuery
+    );
+  } else {
+    console.warn(
+      "[teams-search] filename-first search failed; using vector fallback",
+      filenameList.errors
+    );
+  }
+
+  const response =
+    filenameMatchedDocs.length > 0
+      ? {
+          status: "OK" as const,
+          response: filenameMatchedDocs.slice(0, Math.max(top, 20)),
+        }
+      : await ExtensionSimilaritySearch({
+          searchText: effectiveQuery,
+          vectors: ["embedding"],
+          apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
+          searchName: requiredEnv("AZURE_SEARCH_NAME"),
+          indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
+          filter: searchFilter,
+          deptLower: access.dept,
+          userHash,
+          top,
+        });
 
   if (response.status !== "OK") {
     const detail = response.errors?.map((error) => error.message).join("; ");
@@ -66,6 +151,10 @@ export async function searchTeamsKnowledge(props: {
   console.log("[teams-search] completed", {
     dept: access.dept,
     role: access.role,
+    scope: props.scope ?? "all",
+    folder: props.folder ?? "(none)",
+    effectiveQuery,
+    filenameMatches: filenameMatchedDocs.length,
     results: response.response.length,
     sources: formatted.sources.length,
   });
@@ -372,6 +461,44 @@ function normalizeFileSearchText(value: string): string {
     .toLowerCase()
     .replace(/\.(pdf|docx|xlsx)$/i, "")
     .replace(/[\s\u3000「」『』【】()（）・_\-]/g, "");
+}
+
+function normalizeTeamsSearchTargetQuery(value: string): string {
+  return value.replace(
+    /[、,]\s*(?=(?:という|と呼ばれる)\s*フォルダ(?:ー)?)/g,
+    ""
+  );
+}
+
+function findFilenameMatches(
+  results: DocumentSearchResponse[],
+  query: string
+): DocumentSearchResponse[] {
+  const normalizedQuery = normalizeFileSearchText(query);
+  if (!normalizedQuery) return [];
+
+  return results.filter(({ document }) => {
+    const candidates = [
+      document.metadata ?? "",
+      getFileNameFromUrl(document.effectiveFileUrl ?? document.fileUrl),
+    ];
+
+    return candidates.some((candidate) => {
+      const normalizedName = normalizeFileSearchText(candidate);
+      return (
+        normalizedName.length >= 4 && normalizedQuery.includes(normalizedName)
+      );
+    });
+  });
+}
+
+function getFileNameFromUrl(value?: string | null): string {
+  const rawName = (value ?? "").split("/").pop() ?? "";
+  try {
+    return decodeURIComponent(rawName);
+  } catch {
+    return rawName;
+  }
 }
 
 function requiredEnv(name: string): string {
