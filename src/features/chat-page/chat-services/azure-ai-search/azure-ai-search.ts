@@ -32,6 +32,12 @@ export interface AzureSearchDocumentIndex {
   spItemId?: string | null;
   /** SP内の相対パス。例: j.nomoto/議事録サンプル/IR議事録20260220.docx */
   relativePath?: string | null;
+  indexingVersion?: number | null;
+  chunkIndex?: number | null;
+  documentChunkCount?: number | null;
+  pageStart?: number | null;
+  pageEnd?: number | null;
+  documentPageCount?: number | null;
 }
 
 export type DocumentSearchResponse = {
@@ -170,6 +176,50 @@ export const SimpleSearch = async (
       });
     }
 
+    return { status: "OK", response: results };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
+  }
+};
+
+/**
+ * Fetches every page-aware chunk for one SharePoint drive item in source order.
+ * ACL filtering is applied here as well, so callers cannot bypass document scope.
+ */
+export const SearchAllSharePointDocumentChunks = async (props: {
+  spItemId: string;
+  filter?: string;
+  deptLower?: string | null;
+  userHash?: string;
+}): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
+  try {
+    const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
+    const scopeFilter = await buildSearchAclFilter(
+      props.deptLower,
+      props.userHash
+    );
+    const documentFilter = [
+      `isSlDoc eq true`,
+      `spItemId eq '${escapeODataValue(props.spItemId)}'`,
+      `indexingVersion eq 2`,
+    ].join(" and ");
+    const finalFilter = combineFilters(
+      combineFilters(documentFilter, props.filter),
+      scopeFilter
+    );
+    const searchResults = await instance.search("*", {
+      filter: finalFilter,
+      orderBy: ["chunkIndex asc"],
+    });
+
+    const results: Array<DocumentSearchResponse> = [];
+    for await (const result of searchResults.results) {
+      const { embedding: _embedding, ...document } = result.document;
+      results.push({
+        score: result.score,
+        document: document as AzureSearchDocumentIndex,
+      });
+    }
     return { status: "OK", response: results };
   } catch (e) {
     return { status: "ERROR", errors: [{ message: `${e}` }] };
