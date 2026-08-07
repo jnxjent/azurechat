@@ -48,9 +48,69 @@ export type GenWordRequest = {
   content: string;
   instruction?: string;
   title?: string;
+  fileName?: string;
   threadId: string;
   fontFace?: string;
 };
+
+function countPlanContentCharacters(plan: WordDocPlan): number {
+  return plan.sections.reduce((total, section) => {
+    const tableChars = section.table
+      ? [...section.table.headers, ...section.table.rows.flat()].join("").length
+      : 0;
+    return (
+      total +
+      (section.heading?.length ?? 0) +
+      (section.paragraphs ?? []).join("").length +
+      (section.bullets ?? []).join("").length +
+      tableChars
+    );
+  }, 0);
+}
+
+function buildLosslessMarkdownPlan(
+  content: string,
+  title: string,
+  style: WordDocStyle
+): WordDocPlan {
+  const sections: WordSection[] = [];
+  let current: WordSection = {};
+  const pushCurrent = () => {
+    if (
+      current.heading ||
+      (current.paragraphs?.length ?? 0) > 0 ||
+      (current.bullets?.length ?? 0) > 0
+    ) {
+      sections.push(current);
+    }
+    current = {};
+  };
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      pushCurrent();
+      current = {
+        heading: heading[2].trim(),
+        level: Math.min(3, heading[1].length),
+      };
+      continue;
+    }
+    const bullet = line.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      current.bullets = [...(current.bullets ?? []), bullet[1].trim()];
+    } else {
+      current.paragraphs = [...(current.paragraphs ?? []), line];
+    }
+  }
+  pushCurrent();
+  if (sections.length === 0 && content.trim()) {
+    sections.push({ paragraphs: [content.trim()] });
+  }
+  return { title, sections, style };
+}
 
 // ── LLM で WordDocPlan を生成 ─────────────────────────────────────────────
 
@@ -99,7 +159,9 @@ async function generateWordPlan(
       },
     ],
     response_format: { type: "json_object" },
-    max_completion_tokens: 8000,
+    // A roughly 10-page Japanese summary plus JSON structure can exceed 8k
+    // output tokens even though the source text itself is shorter.
+    max_completion_tokens: 16000,
   });
 
   const raw = res.choices[0]?.message?.content ?? "{}";
@@ -119,6 +181,15 @@ async function generateWordPlan(
     fontSize: Number(parsed?.style?.fontSize ?? 11),
     titleFontSize: Number(parsed?.style?.titleFontSize ?? 16),
   };
+
+  const sourceCharacters = content.replace(/\s/g, "").length;
+  const planCharacters = countPlanContentCharacters({ title, sections, style });
+  if (sourceCharacters > 0 && planCharacters < sourceCharacters * 0.92) {
+    console.warn(
+      `[gen-word] formatter dropped content: sourceChars=${sourceCharacters} planChars=${planCharacters}; using lossless Markdown plan`
+    );
+    return buildLosslessMarkdownPlan(content, title, style);
+  }
 
   return { title, sections, style };
 }
@@ -145,7 +216,27 @@ async function resolveCreateWordScriptPath(): Promise<string> {
 
 // ── Blob アップロード ─────────────────────────────────────────────────────
 
-async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<string> {
+function encodeRFC5987ValueChars(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+function normalizeWordFileName(value: string | undefined, fallbackTitle: string): string {
+  const requested = (value ?? "").trim().replace(/\.docx$/i, "");
+  const fallback = fallbackTitle || "文書";
+  const base = (requested || fallback)
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 120) || "文書_要約";
+  return `${base}.docx`;
+}
+
+async function uploadWordToBlob(
+  buffer: Buffer,
+  blobName: string,
+  displayFileName: string
+): Promise<string> {
   const acc = process.env.AZURE_STORAGE_ACCOUNT_NAME!;
   const key = process.env.AZURE_STORAGE_ACCOUNT_KEY!;
   const containerName = "docx";
@@ -157,19 +248,19 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
   const cc = svc.getContainerClient(containerName);
   await cc.createIfNotExists({ access: "blob" });
 
-  const bbc = cc.getBlockBlobClient(fileName);
+  const bbc = cc.getBlockBlobClient(blobName);
   await bbc.uploadData(buffer, {
     blobHTTPHeaders: {
       blobContentType:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      blobContentDisposition: `attachment; filename="${fileName}"`,
+      blobContentDisposition: `attachment; filename="summary.docx"; filename*=UTF-8''${encodeRFC5987ValueChars(displayFileName)}`,
     },
   });
 
   const sas = generateBlobSASQueryParameters(
     {
       containerName,
-      blobName: fileName,
+      blobName,
       expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
     },
@@ -180,7 +271,11 @@ async function uploadWordToBlob(buffer: Buffer, fileName: string): Promise<strin
 
 // ── Python 実行 ───────────────────────────────────────────────────────────
 
-async function runPythonCreateWord(plan: WordDocPlan, threadId: string) {
+async function runPythonCreateWord(
+  plan: WordDocPlan,
+  threadId: string,
+  requestedFileName?: string
+) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-docx-"));
   const outputPath = path.join(tempDir, "output.docx");
   const planPath = path.join(tempDir, "plan.json");
@@ -230,8 +325,9 @@ async function runPythonCreateWord(plan: WordDocPlan, threadId: string) {
       .replace(/_+/g, "_")
       .replace(/^_|_$/g, "")
       .slice(0, 40) || "document";
-    const fileName = `${threadId || uniqueId()}_${safeTitle}_${uniqueId()}.docx`;
-    const downloadUrl = await uploadWordToBlob(outputBuffer, fileName);
+    const blobName = `${threadId || uniqueId()}_${safeTitle}_${uniqueId()}.docx`;
+    const fileName = normalizeWordFileName(requestedFileName, plan.title);
+    const downloadUrl = await uploadWordToBlob(outputBuffer, blobName, fileName);
 
     return {
       downloadUrl,
@@ -249,7 +345,7 @@ async function runPythonCreateWord(plan: WordDocPlan, threadId: string) {
 export async function POST(req: NextRequest) {
   try {
     const body: GenWordRequest = await req.json();
-    const { content, instruction, title, threadId, fontFace } = body;
+    const { content, instruction, title, fileName, threadId, fontFace } = body;
 
     if (!content?.trim() && !title?.trim()) {
       return NextResponse.json(
@@ -269,7 +365,11 @@ export async function POST(req: NextRequest) {
       resolvedFont
     );
 
-    const result = await runPythonCreateWord(plan, threadId ?? uniqueId());
+    const result = await runPythonCreateWord(
+      plan,
+      threadId ?? uniqueId(),
+      fileName
+    );
 
     return NextResponse.json(result);
   } catch (error: any) {
