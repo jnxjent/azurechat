@@ -19,6 +19,7 @@ import type { SlSearchScope } from "@/lib/sl-search-target";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { resolveUserContext } from "./chat-api-rag";
 import { buildSendOptionsFromMode } from "./reasoning-utils";
+import { createSharePointPdfSummaryTool } from "../sharepoint-summary-tool";
 
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
@@ -365,6 +366,15 @@ export const ChatApiExtensions = async (props: {
     const slFilter = `(chatThreadId eq '${(chatThread.id ?? "").replace(/'/g, "''")}' or isSlDoc eq true)`;
     let slSearchCallCount = 0;
     const SL_SEARCH_MAX_CALLS = 5;
+
+    extensions.push(
+      createSharePointPdfSummaryTool({
+        deptLower: slDeptLower,
+        userHash: slUserHash ?? undefined,
+        signal,
+        userMessage,
+      })
+    );
 
     extensions.push({
       type: "function",

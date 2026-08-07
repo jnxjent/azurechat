@@ -16,6 +16,7 @@ import { ChatCitationModel, ChatThreadModel } from "../models";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { GenerateSasUrl } from "@/features/common/services/azure-storage";
+import { createSharePointPdfSummaryTool } from "../sharepoint-summary-tool";
 
 // dept判定ユーティリティ
 import { decideDept, getEffectiveSlUserEmail, getUserEmailFromJwtToken, resolveSlAccess } from "@/lib/sl-dept";
@@ -239,6 +240,15 @@ ${userMessage}
     signal,
   });
   const tools = extensionsResponse.status === "OK" ? extensionsResponse.response : [];
+
+  tools.push(
+    createSharePointPdfSummaryTool({
+      deptLower,
+      userHash: userHash ?? undefined,
+      signal,
+      userMessage,
+    })
+  );
 
   // ★ sl_doc_search ツール：LLMが複数文書を横断検索するために複数回呼び出し可能
   tools.push({
