@@ -1976,6 +1976,22 @@ export const GetDefaultExtensions = async (props: {
             description:
               "ドキュメントのタイトル。省略時はcontentから自動推定する。",
           },
+          fileName: {
+            type: "string",
+            description:
+              "ダウンロード時のWordファイル名（.docx）。summarize_sp_pdfから要約をWord化する場合は、同ツールが推奨した『元ファイル名_要約.docx』を正確に指定する。",
+          },
+          formatMode: {
+            type: "string",
+            enum: ["auto", "markdown"],
+            description:
+              "通常はauto。summarize_sp_pdfが返したMarkdown要約をWord化する場合だけmarkdownを指定する。",
+          },
+          summaryRef: {
+            type: "string",
+            description:
+              "summarize_sp_pdfが返したWord出力用summaryRef。全文要約Wordの場合のみ、その値を一字一句変えずに渡す。",
+          },
           instruction: {
             type: "string",
             description:
@@ -1992,6 +2008,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーが会話中で直接提供したテキスト・内容からWordファイル（.docx）を新規作成するツール。\n" +
         "使用タイミング：ユーザーが会話中で直接テキストを渡して「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合のみ。\n" +
         "【禁止】SharePoint/SL の文書検索（sl_doc_search）で取得したコンテンツや、既存PDFや既存docxを変換・編集する目的には絶対に使わないこと。\n" +
+        "【唯一の例外】summarize_sp_pdf が返した全文要約を新規Word文書にする場合は create_word を使う。content='[summaryRef]'、summaryRef=ツールが返した値、formatMode=markdownを指定する。長い要約本文やPDF原文をcontentへコピーしない。\n" +
         "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
         "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
@@ -6752,10 +6769,10 @@ async function executeCreateExcel(
 
 // ---------------- Word 新規作成 ----------------
 async function executeCreateWord(
-  args: { content: string; title?: string; instruction?: string; fontFace?: string },
+  args: { content: string; title?: string; fileName?: string; formatMode?: "auto" | "markdown"; summaryRef?: string; instruction?: string; fontFace?: string },
   chatThread: ChatThreadModel
 ) {
-  const { content, title, instruction, fontFace } = args ?? {};
+  const { content, title, fileName, formatMode, summaryRef, instruction, fontFace } = args ?? {};
 
   if (!content?.trim() && !title?.trim()) {
     return { error: "content を指定してください。作成する内容を入力してください。" };
@@ -6773,6 +6790,9 @@ async function executeCreateWord(
       body: JSON.stringify({
         content: content ?? "",
         title: title ?? "",
+        fileName: fileName ?? "",
+        formatMode: formatMode ?? "auto",
+        summaryRef: summaryRef ?? "",
         instruction: instruction ?? "",
         fontFace: fontFace ?? "Meiryo",
         threadId: chatThread.id,

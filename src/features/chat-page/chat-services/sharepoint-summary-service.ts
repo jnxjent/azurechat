@@ -12,7 +12,7 @@ import {
 const DEFAULT_MAX_PAGES = 300;
 const MAP_MAX_CHARS = 18_000;
 const MAP_MAX_CHUNKS = 10;
-const MAP_CONCURRENCY = 3;
+const MAP_CONCURRENCY = 4;
 
 type SummaryBatch = {
   text: string;
@@ -234,7 +234,10 @@ export async function summarizeSharePointPdf(props: {
   userHash?: string;
   signal?: AbortSignal;
   targetPages?: number;
+  targetCharsLow?: number;
+  targetCharsHigh?: number;
 }): Promise<SharePointPdfSummaryResult> {
+  const summaryStartedAt = Date.now();
   const maxPages = Math.max(
     1,
     Number.parseInt(process.env.SL_FULL_SUMMARY_MAX_PAGES ?? "", 10) || DEFAULT_MAX_PAGES
@@ -269,12 +272,27 @@ export async function summarizeSharePointPdf(props: {
   const targetPages = Number.isFinite(props.targetPages)
     ? Math.max(3, Math.min(20, Math.round(props.targetPages as number)))
     : 10;
-  const targetCharsLow = Math.round(targetPages * 750 * 0.85);
-  const targetCharsHigh = Math.round(targetPages * 750 * 1.15);
+  const requestedCharsLow = Number.isFinite(props.targetCharsLow)
+    ? Math.max(1_000, Math.round(props.targetCharsLow as number))
+    : null;
+  const requestedCharsHigh = Number.isFinite(props.targetCharsHigh)
+    ? Math.max(1_000, Math.round(props.targetCharsHigh as number))
+    : null;
+  const hasValidRequestedRange =
+    requestedCharsLow !== null &&
+    requestedCharsHigh !== null &&
+    requestedCharsLow <= requestedCharsHigh;
+  const targetCharsLow = hasValidRequestedRange
+    ? requestedCharsLow
+    : Math.round(targetPages * 750 * 0.85);
+  const targetCharsHigh = hasValidRequestedRange
+    ? requestedCharsHigh
+    : Math.round(targetPages * 750 * 1.15);
   console.log(
     `[SP PDF summary] file=${fileNameFromDocument(candidate.document)} pages=${validated.pageCount} chunks=${validated.chunkCount} mapBatches=${batches.length}`
   );
   const openai = OpenAIInstance();
+  const mapStartedAt = Date.now();
   const partials = await mapWithConcurrency(batches, MAP_CONCURRENCY, async (batch) =>
     withRetry(async () => {
       const completion = await openai.chat.completions.create(
@@ -298,66 +316,103 @@ export async function summarizeSharePointPdf(props: {
       return `## p.${batch.pageStart}-${batch.pageEnd}\n${responseText(completion.choices[0]?.message?.content ?? null)}`;
     })
   );
+  console.log(`[SP PDF summary] map elapsedMs=${Date.now() - mapStartedAt}`);
 
   const reduceInput = partials.join("\n\n");
-  const finalCompletion = await withRetry(() =>
-    openai.chat.completions.create(
-      {
-        model: "",
-        temperature: 0,
-        max_completion_tokens: 16000,
-        messages: [
-          {
-            role: "system",
-            content:
-              `あなたは長文PDFの最終要約者です。部分要約だけを根拠に、重複を統合して日本語Markdownの全体要約を作ってください。構成は「概要」「主要ポイント」「重要な数値・決定事項」「章・論点別要約」「結論・留意点」とします。入力の先頭から末尾まで全ページ範囲を均等にカバーし、後半ページ・終盤の内容も必ず含めてください。すべての実質的な箇条書きに、入力に存在する [p.N] または [p.N-M] のページ参照を最低1つ残してください。ページ番号を推測・変更しないでください。Wordで約${targetPages}ページになる情報量を想定し、約${targetCharsLow}〜${targetCharsHigh}文字を目安に、根拠のある詳細・背景・数値を十分に残してください。水増しや同じ内容の繰り返しは禁止です。`,
-          },
-          { role: "user", content: reduceInput },
-        ],
-      },
-      { signal: props.signal }
-    )
-  );
-  let summary = removeInvalidPageReferences(
-    responseText(finalCompletion.choices[0]?.message?.content ?? null),
-    validated.pageCount
-  );
-  // Always inspect and cite the physical final page explicitly. This proves
-  // terminal-page coverage independently of the Reduce model's selection.
   const finalPageText = validated.documents
     .filter((document) => document.pageStart === validated.pageCount)
     .map((document) => document.pageContent)
     .filter((content) => content.trim() && content.trim() !== "[PAGE_EMPTY]")
     .join("\n\n")
     .trim();
-  let finalPageSummary: string;
-  if (!finalPageText) {
-    finalPageSummary = `PDFの最終ページは確認済みですが、抽出可能な本文はありませんでした。[p.${validated.pageCount}]`;
-  } else {
-    const finalPageCompletion = await withRetry(() =>
+  const reduceStartedAt = Date.now();
+  const [finalCompletion, finalPageSummary] = await Promise.all([
+    withRetry(() =>
       openai.chat.completions.create(
         {
           model: "",
           temperature: 0,
+          max_completion_tokens: 16000,
           messages: [
             {
               role: "system",
               content:
-                "与えられたPDF最終ページだけを根拠に、記載内容を1〜3項目の簡潔な日本語で要約してください。推測は禁止です。ページ参照は出力しないでください。",
+                `あなたは長文PDFの最終要約者です。部分要約だけを根拠に、重複を統合して日本語Markdownの全体要約を作ってください。構成は「概要」「主要ポイント」「重要な数値・決定事項」「章・論点別要約」「結論・留意点」とします。入力の先頭から末尾まで全ページ範囲を均等にカバーし、後半ページ・終盤の内容も必ず含めてください。すべての実質的な箇条書きに、入力に存在する [p.N] または [p.N-M] のページ参照を最低1つ残してください。ページ番号を推測・変更しないでください。Wordで約${targetPages}ページになる情報量を想定し、約${targetCharsLow}〜${targetCharsHigh}文字にしてください。${targetCharsLow}文字未満で終了してはいけません。最終出力前に情報量を確認し、不足する場合は根拠のある背景・数値・決定事項・章別論点を補ってください。水増しや同じ内容の繰り返しは禁止です。`,
             },
-            { role: "user", content: finalPageText },
+            { role: "user", content: reduceInput },
+          ],
+        },
+        { signal: props.signal }
+      )
+    ),
+    !finalPageText
+      ? Promise.resolve(
+          `PDFの最終ページは確認済みですが、抽出可能な本文はありませんでした。[p.${validated.pageCount}]`
+        )
+      : withRetry(() =>
+          openai.chat.completions.create(
+            {
+              model: "",
+              temperature: 0,
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "与えられたPDF最終ページだけを根拠に、記載内容を1〜3項目の簡潔な日本語で要約してください。推測は禁止です。ページ参照は出力しないでください。",
+                },
+                { role: "user", content: finalPageText },
+              ],
+            },
+            { signal: props.signal }
+          )
+        ).then(
+          (completion) =>
+            `${responseText(completion.choices[0]?.message?.content ?? null)
+              .replace(/\[p\.\d+(?:\s*[-–]\s*\d+)?\]/gi, "")
+              .trim()} [p.${validated.pageCount}]`
+        ),
+  ]);
+  console.log(`[SP PDF summary] reduce+finalPage elapsedMs=${Date.now() - reduceStartedAt}`);
+  let summary = removeInvalidPageReferences(
+    responseText(finalCompletion.choices[0]?.message?.content ?? null),
+    validated.pageCount
+  );
+  if (summary.length < targetCharsLow) {
+    const refineStartedAt = Date.now();
+    console.log(
+      `[SP PDF summary] draft below target: chars=${summary.length} target=${targetCharsLow}-${targetCharsHigh}; refining once`
+    );
+    const refinedCompletion = await withRetry(() =>
+      openai.chat.completions.create(
+        {
+          model: "",
+          temperature: 0,
+          max_completion_tokens: 16000,
+          messages: [
+            {
+              role: "system",
+              content:
+                `あなたは長文PDF要約の編集者です。部分要約だけを根拠に、下書きを約${targetCharsLow}〜${targetCharsHigh}文字へ具体化してください。構成と [p.N] / [p.N-M] の参照を維持し、重要な背景・数値・決定事項・章別論点を補ってください。入力にない事実やページ番号の追加、同じ内容の水増しは禁止です。完成した要約本文だけを返してください。`,
+            },
+            {
+              role: "user",
+              content: `# 部分要約\n\n${reduceInput}\n\n# 現在の下書き\n\n${summary}`,
+            },
           ],
         },
         { signal: props.signal }
       )
     );
-    finalPageSummary = responseText(
-      finalPageCompletion.choices[0]?.message?.content ?? null
-    )
-      .replace(/\[p\.\d+(?:\s*[-–]\s*\d+)?\]/gi, "")
-      .trim();
-    finalPageSummary += ` [p.${validated.pageCount}]`;
+    summary = removeInvalidPageReferences(
+      responseText(refinedCompletion.choices[0]?.message?.content ?? null),
+      validated.pageCount
+    );
+    console.log(
+      `[SP PDF summary] refined chars=${summary.length} elapsedMs=${Date.now() - refineStartedAt}`
+    );
   }
+  // Always inspect and cite the physical final page explicitly. This proves
+  // terminal-page coverage independently of the Reduce model's selection.
   summary += `\n\n# 最終ページの確認\n\n${finalPageSummary}`;
   console.log(
     `[SP PDF summary] final page explicitly summarized page=${validated.pageCount}`
@@ -367,7 +422,7 @@ export async function summarizeSharePointPdf(props: {
     summary += `\n\n参照範囲: [p.1-${validated.pageCount}]`;
   }
   console.log(
-    `[SP PDF summary] reduce completed file=${fileNameFromDocument(candidate.document)}`
+    `[SP PDF summary] reduce completed file=${fileNameFromDocument(candidate.document)} totalElapsedMs=${Date.now() - summaryStartedAt}`
   );
 
   return {

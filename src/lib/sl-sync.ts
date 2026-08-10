@@ -3,7 +3,7 @@
 import { createHash, randomUUID } from "crypto";
 import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
 import { OpenAIEmbeddingInstance } from "@/features/common/services/openai";
-import { extractTextFromBuffer, chunkWithOverlap } from "./document-extract";
+import { extractIndexDocumentFromBuffer } from "./document-extract";
 
 export type SpFileItem = {
   id: string;
@@ -57,6 +57,7 @@ type IndexDoc = {
   spItemId: string | null;
   spContentTag: string | null;
   spLastModifiedAt: string | null;
+  indexingVersion: number | null;
 };
 
 type NewIndexDoc = {
@@ -76,6 +77,12 @@ type NewIndexDoc = {
   relativePath?: string | null;
   spContentTag?: string | null;
   spLastModifiedAt?: string | null;
+  indexingVersion?: number;
+  chunkIndex?: number;
+  documentChunkCount?: number;
+  pageStart?: number;
+  pageEnd?: number;
+  documentPageCount?: number;
 };
 
 type MatchedIndexDoc = {
@@ -87,7 +94,7 @@ type MatchedIndexDoc = {
 type ReindexCandidate = {
   item: SpFileItem;
   oldDocIds: string[];
-  reason: "content_changed" | "legacy_missing_tag";
+  reason: "content_changed" | "legacy_missing_tag" | "page_metadata_missing";
 };
 
 type ReindexJob = {
@@ -576,7 +583,8 @@ async function getIndexDocs(
   deptBaseFolder: string,
   globalCommon?: GlobalCommonConfig | null,
   hasRelativePath = false,
-  hasChangeTrackingFields = false
+  hasChangeTrackingFields = false,
+  hasPageMetadataFields = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -598,6 +606,7 @@ async function getIndexDocs(
     ...(hasChangeTrackingFields
       ? ["spContentTag", "spLastModifiedAt"]
       : []),
+    ...(hasPageMetadataFields ? ["indexingVersion"] : []),
   ].join(",");
 
   const docs: IndexDoc[] = [];
@@ -650,6 +659,10 @@ async function getIndexDocs(
             hasChangeTrackingFields && item.spLastModifiedAt
               ? String(item.spLastModifiedAt)
               : null,
+          indexingVersion:
+            hasPageMetadataFields && Number.isInteger(item.indexingVersion)
+              ? Number(item.indexingVersion)
+              : null,
         };
         doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
           doc,
@@ -671,7 +684,8 @@ async function getIndexDocs(
 async function getIndexDocsGlobalCommon(
   globalCommon: GlobalCommonConfig,
   hasRelativePath = false,
-  hasChangeTrackingFields = false
+  hasChangeTrackingFields = false,
+  hasPageMetadataFields = false
 ): Promise<IndexDoc[]> {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
@@ -693,6 +707,7 @@ async function getIndexDocsGlobalCommon(
     ...(hasChangeTrackingFields
       ? ["spContentTag", "spLastModifiedAt"]
       : []),
+    ...(hasPageMetadataFields ? ["indexingVersion"] : []),
   ].join(",");
 
   const docs: IndexDoc[] = [];
@@ -743,6 +758,10 @@ async function getIndexDocsGlobalCommon(
           spLastModifiedAt:
             hasChangeTrackingFields && item.spLastModifiedAt
               ? String(item.spLastModifiedAt)
+              : null,
+          indexingVersion:
+            hasPageMetadataFields && Number.isInteger(item.indexingVersion)
+              ? Number(item.indexingVersion)
               : null,
         };
         doc.relativePath = storedRelativePath ?? resolveIndexRelativePath(
@@ -884,6 +903,43 @@ async function hasSharePointChangeTrackingFields(): Promise<boolean> {
     );
   }
   return hasFields;
+}
+
+async function hasSharePointPageMetadataFields(): Promise<boolean> {
+  const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
+  const apiKey = process.env.AZURE_SEARCH_API_KEY;
+  const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
+  if (!endpoint || !apiKey || !indexName) return false;
+
+  const res = await fetch(
+    `${endpoint}/indexes/${indexName}?api-version=2024-07-01`,
+    { headers: { "api-key": apiKey }, cache: "no-store" }
+  );
+  if (!res.ok) {
+    console.warn("[SL sync] Failed to inspect page metadata index fields");
+    return false;
+  }
+
+  const index = await res.json();
+  const fieldNames = new Set<string>(
+    (index.fields ?? []).map((field: any) => String(field.name ?? ""))
+  );
+  const requiredFields = [
+    "indexingVersion",
+    "chunkIndex",
+    "documentChunkCount",
+    "pageStart",
+    "pageEnd",
+    "documentPageCount",
+  ];
+  const missingFields = requiredFields.filter((fieldName) => !fieldNames.has(fieldName));
+  if (missingFields.length > 0) {
+    console.warn(
+      `[SL sync] Page-aware indexing disabled for ${indexName}: missing fields ${missingFields.join(", ")}`
+    );
+    return false;
+  }
+  return true;
 }
 
 async function addNewIndexDocs(docs: NewIndexDoc[]): Promise<void> {
@@ -1039,6 +1095,7 @@ async function indexNewSpFiles(params: {
   globalCommon?: GlobalCommonConfig | null;
   hasRelativePath?: boolean;
   hasChangeTrackingFields?: boolean;
+  hasPageMetadataFields?: boolean;
 }): Promise<{ indexed: number; skipped: number }> {
   const {
     accessToken,
@@ -1051,6 +1108,7 @@ async function indexNewSpFiles(params: {
     globalCommon,
     hasRelativePath = false,
     hasChangeTrackingFields = false,
+    hasPageMetadataFields = false,
   } = params;
 
   const batch = unindexedItems.slice(0, batchSize);
@@ -1069,14 +1127,13 @@ async function indexNewSpFiles(params: {
 
       const buffer = await downloadSpFile(accessToken, driveId, item.id);
 
-      const textChunks = await extractTextFromBuffer(buffer, item.name);
-      if (textChunks.length === 0) {
+      const extractedDocument = await extractIndexDocumentFromBuffer(buffer, item.name);
+      const allChunks = extractedDocument.chunks;
+      if (allChunks.length === 0) {
         console.warn(`[SL sync] No text extracted from ${item.name}, skipping`);
         skipped++;
         continue;
       }
-
-      const allChunks: string[] = chunkWithOverlap(textChunks.join("\n"));
 
       const scope = resolveScopeFromLocation({
         webUrl: item.webUrl,
@@ -1107,7 +1164,7 @@ async function indexNewSpFiles(params: {
       for (let b = 0; b < allChunks.length; b += EMBED_BATCH) {
         const batchChunks = allChunks.slice(b, b + EMBED_BATCH);
         const embeddingRes = await openai.embeddings.create({
-          input: batchChunks,
+          input: batchChunks.map((chunk) => chunk.content),
           model: "",
         });
 
@@ -1121,7 +1178,7 @@ async function indexNewSpFiles(params: {
         for (let j = 0; j < batchChunks.length; j++) {
           docsToIndex.push({
             id: randomUUID(),
-            pageContent: batchChunks[j],
+            pageContent: batchChunks[j].content,
             embedding: embeddingRes.data[j]?.embedding ?? [],
             metadata: item.name,
             fileUrl: item.webUrl,
@@ -1133,6 +1190,16 @@ async function indexNewSpFiles(params: {
             slScope: effectiveScope,
             slOwner: slOwner ?? null,
             spItemId: item.id,
+            ...(hasPageMetadataFields && extractedDocument.hasPageMetadata
+              ? {
+                  indexingVersion: 2,
+                  chunkIndex: batchChunks[j].chunkIndex,
+                  documentChunkCount: allChunks.length,
+                  pageStart: batchChunks[j].pageStart ?? undefined,
+                  pageEnd: batchChunks[j].pageEnd ?? undefined,
+                  documentPageCount: extractedDocument.pageCount ?? undefined,
+                }
+              : {}),
             ...(hasRelativePath ? { relativePath: item.relativePath ?? null } : {}),
             ...(hasChangeTrackingFields
               ? {
@@ -1199,7 +1266,8 @@ async function indexNewSpFiles(params: {
 }
 
 function findReindexCandidates(
-  matchedDocs: MatchedIndexDoc[]
+  matchedDocs: MatchedIndexDoc[],
+  hasPageMetadataFields: boolean
 ): ReindexCandidate[] {
   const groups = new Map<
     string,
@@ -1225,13 +1293,21 @@ function findReindexCandidates(
       .filter((tag): tag is string => Boolean(tag));
     const hasMissingTag = storedTags.length !== docs.length;
     const contentChanged = storedTags.some((tag) => tag !== item.contentTag);
+    const pageMetadataMissing =
+      hasPageMetadataFields &&
+      item.name.toLowerCase().endsWith(".pdf") &&
+      docs.some((doc) => doc.indexingVersion !== 2);
 
-    if (!hasMissingTag && !contentChanged) continue;
+    if (!hasMissingTag && !contentChanged && !pageMetadataMissing) continue;
 
     const candidate: ReindexCandidate = {
       item,
       oldDocIds: docs.map((doc) => doc.id),
-      reason: contentChanged ? "content_changed" : "legacy_missing_tag",
+      reason: contentChanged
+        ? "content_changed"
+        : pageMetadataMissing
+          ? "page_metadata_missing"
+          : "legacy_missing_tag",
     };
     if (contentChanged) changed.push(candidate);
     else legacy.push(candidate);
@@ -1261,6 +1337,7 @@ async function reindexSpFiles(params: {
   globalCommon?: GlobalCommonConfig | null;
   hasRelativePath: boolean;
   hasChangeTrackingFields: boolean;
+  hasPageMetadataFields: boolean;
 }): Promise<{ reindexed: number; failed: number }> {
   const batch = params.candidates.slice(0, params.batchSize);
   let reindexed = 0;
@@ -1281,6 +1358,7 @@ async function reindexSpFiles(params: {
       globalCommon: params.globalCommon,
       hasRelativePath: params.hasRelativePath,
       hasChangeTrackingFields: params.hasChangeTrackingFields,
+      hasPageMetadataFields: params.hasPageMetadataFields,
     });
 
     if (result.indexed !== 1) {
@@ -1353,6 +1431,8 @@ export async function runSlSync({
   const hasRelativePath = await ensureRelativePathField();
   const hasChangeTrackingFields =
     await hasSharePointChangeTrackingFields();
+  const hasPageMetadataFields =
+    await hasSharePointPageMetadataFields();
 
   const results: Record<string, SlSyncDeptResult> = {};
   const reindexJobs: ReindexJob[] = [];
@@ -1383,7 +1463,8 @@ export async function runSlSync({
             baseFolder,
             globalCommon,
             hasRelativePath,
-            hasChangeTrackingFields
+            hasChangeTrackingFields,
+            hasPageMetadataFields
           );
           const orphanIds = indexDocs
             .filter((doc) => doc.slScope !== "global_common")
@@ -1418,7 +1499,8 @@ export async function runSlSync({
         baseFolder,
         globalCommon,
         hasRelativePath,
-        hasChangeTrackingFields
+        hasChangeTrackingFields,
+        hasPageMetadataFields
       );
       console.log(`[SL sync] dept=${dept} indexed docs=${indexDocs.length}`);
 
@@ -1510,9 +1592,10 @@ export async function runSlSync({
           };
         });
 
-      const reindexCandidates = hasChangeTrackingFields
+      const reindexCandidates = hasChangeTrackingFields || hasPageMetadataFields
         ? findReindexCandidates(
-            matchedDocs.filter(({ doc }) => doc.slScope !== "global_common")
+            matchedDocs.filter(({ doc }) => doc.slScope !== "global_common"),
+            hasPageMetadataFields
           )
         : [];
 
@@ -1565,6 +1648,7 @@ export async function runSlSync({
             globalCommon,
             hasRelativePath,
             hasChangeTrackingFields,
+            hasPageMetadataFields,
           });
           deptResult.newIndexed = indexed;
           deptResult.newSkipped = skipped;
@@ -1599,7 +1683,8 @@ export async function runSlSync({
         const globalIndexDocs = await getIndexDocsGlobalCommon(
           globalCommon,
           hasRelativePath,
-          hasChangeTrackingFields
+          hasChangeTrackingFields,
+          hasPageMetadataFields
         );
         console.log(`[SL sync] global_common SP files=${globalScan.inventory.allItems.length} indexed docs=${globalIndexDocs.length}`);
         const matchedDocs: MatchedIndexDoc[] = globalIndexDocs.map((doc) => ({
@@ -1649,8 +1734,8 @@ export async function runSlSync({
             ...(hasRelativePath ? { relativePath: spItem.relativePath } : {}),
           }));
 
-        const reindexCandidates = hasChangeTrackingFields
-          ? findReindexCandidates(matchedDocs)
+        const reindexCandidates = hasChangeTrackingFields || hasPageMetadataFields
+          ? findReindexCandidates(matchedDocs, hasPageMetadataFields)
           : [];
         if (globalOrphanIds.length > 0) {
           console.log(
@@ -1707,6 +1792,7 @@ export async function runSlSync({
               globalCommon,
               hasRelativePath,
               hasChangeTrackingFields,
+              hasPageMetadataFields,
             });
             gcResult.newIndexed = indexed;
             gcResult.newSkipped = skipped;
@@ -1764,6 +1850,7 @@ export async function runSlSync({
         globalCommon: job.globalCommon,
         hasRelativePath,
         hasChangeTrackingFields,
+        hasPageMetadataFields,
       });
       const resultRow = results[job.resultKey];
       if (resultRow) {
