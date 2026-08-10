@@ -6905,6 +6905,16 @@ async function executeEditWord(
 }
 
 // ---------------- SP ファイル → SAS URL 解決（Word/Excel共用） ----------------
+function normalizeSpFileLookupName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .trim()
+    .toLocaleLowerCase("ja-JP")
+    .replace(/\.(pdf|docx)$/i, "")
+    .replace(/\(株\)|株式会社/g, "株式会社")
+    .replace(/[\s\u3000'"「」『』]/g, "");
+}
+
 async function resolveSpFileToSasUrl(
   fileQuery: string,
   allowedExts: RegExp,
@@ -6932,14 +6942,42 @@ async function resolveSpFileToSasUrl(
     return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
   }
 
-  const queryLower = fileQuery.trim().toLowerCase();
-  const matched = allDocs.filter(({ document: doc }) => {
-    const metaName = (doc.metadata ?? "").trim().toLowerCase();
-    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
-    const name = allowedExts.test(metaName) ? metaName : (urlName || metaName);
-    if (!allowedExts.test(name)) return false;
-    return name.includes(queryLower) || queryLower.includes(name.replace(/\.[^.]+$/i, ""));
-  });
+  const queryName = normalizeSpFileLookupName(fileQuery);
+  const matchByFileName = (docs: Array<{ document: any }>) =>
+    docs.filter(({ document: doc }) => {
+      const metaName = String(doc.metadata ?? "").trim();
+      const urlName =
+        extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "";
+      const name = allowedExts.test(metaName) ? metaName : urlName || metaName;
+      if (!allowedExts.test(name)) return false;
+      const normalizedName = normalizeSpFileLookupName(name);
+      return normalizedName.includes(queryName) || queryName.includes(normalizedName);
+    });
+
+  let matched = matchByFileName(allDocs);
+
+  // The wildcard result is capped by chunks, not unique files. Large PDFs can
+  // occupy most of the first 1,000 results, so retry with the requested name
+  // whenever the filename-first scan itself produced no match.
+  if (matched.length === 0) {
+    const normalizedSearchQuery = fileQuery
+      .normalize("NFKC")
+      .replace(/\(株\)/g, "株式会社")
+      .trim();
+    const fallback = await SimpleSearch(
+      normalizedSearchQuery || fileQuery,
+      "isSlDoc eq true",
+      deptLower,
+      200
+    );
+    if (fallback.status === "OK" && fallback.response.length > 0) {
+      allDocs = [...allDocs, ...fallback.response];
+      matched = matchByFileName(fallback.response);
+    }
+    console.log(
+      `[${logTag}] SP filename fallback results=${fallback.status === "OK" ? fallback.response.length : 0} normalizedQuery="${normalizedSearchQuery}"`
+    );
+  }
 
   console.log(`[${logTag}] SP name-matched count=${matched.length} (query="${fileQuery}")`);
 
