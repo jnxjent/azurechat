@@ -1,5 +1,7 @@
 import "server-only";
 
+import { randomUUID } from "crypto";
+import { UploadBlob } from "@/features/common/services/azure-storage";
 import { buildSlSearchTargetFilter } from "@/lib/sl-search-target";
 import type { SlSearchScope } from "@/lib/sl-search-target";
 import { RunnableToolFunction } from "openai/lib/RunnableFunction";
@@ -10,6 +12,7 @@ export function createSharePointPdfSummaryTool(props: {
   userHash?: string;
   signal?: AbortSignal;
   userMessage?: string;
+  chatThreadId: string;
 }): RunnableToolFunction<any> {
   return {
     type: "function",
@@ -58,6 +61,16 @@ export function createSharePointPdfSummaryTool(props: {
           const inferredTargetPages = requestedPagesMatch
             ? Number.parseInt(requestedPagesMatch[1], 10)
             : undefined;
+          const normalizedLengthMessage = normalizedUserMessage.replace(/[,，]/g, "");
+          const requestedCharsMatch = normalizedLengthMessage.match(
+            /(\d{3,6})\s*(?:[～〜~\-–—]|から)\s*(\d{3,6})\s*(?:文字|字)/i
+          );
+          const inferredTargetCharsLow = requestedCharsMatch
+            ? Number.parseInt(requestedCharsMatch[1], 10)
+            : undefined;
+          const inferredTargetCharsHigh = requestedCharsMatch
+            ? Number.parseInt(requestedCharsMatch[2], 10)
+            : undefined;
           const result = await summarizeSharePointPdf({
             fileQuery: args.fileQuery,
             filter: targetFilter,
@@ -65,13 +78,43 @@ export function createSharePointPdfSummaryTool(props: {
             userHash: props.userHash,
             signal: props.signal,
             targetPages: args.targetPages ?? inferredTargetPages,
+            targetCharsLow: inferredTargetCharsLow,
+            targetCharsHigh: inferredTargetCharsHigh,
           });
+          const wantsWord = /(?:Word|ワード|docx)/i.test(props.userMessage ?? "");
+          let summaryRef = "";
+          if (wantsWord) {
+            summaryRef = `sp-summary-cache/${props.chatThreadId}/${randomUUID()}.json`;
+            const cached = await UploadBlob(
+              "dl-link",
+              summaryRef,
+              Buffer.from(
+                JSON.stringify({
+                  summary: result.summary,
+                  characters: result.summary.length,
+                  createdAt: new Date().toISOString(),
+                }),
+                "utf8"
+              )
+            );
+            if (cached.status !== "OK") {
+              throw new Error(
+                `Word用要約の一時保存に失敗しました: ${cached.errors[0]?.message ?? "unknown"}`
+              );
+            }
+            console.log(
+              `[SP PDF summary] cached for Word chars=${result.summary.length} ref=${summaryRef}`
+            );
+          }
           const summaryFileName = `${result.fileName.replace(/\.pdf$/i, "")}_要約.docx`;
           return [
             `全文要約完了: ${result.fileName}（${result.pageCount}ページ、${result.chunkCount}チャンク）`,
             result.fileUrl ? `原文: ${result.fileUrl}` : "",
             `Word出力時のファイル名: ${summaryFileName}`,
-            "以下の要約をページ参照を削らずにユーザーへ提示してください。ユーザーがWord/docx出力も要求している場合は、ここで止まらず、要約本文だけをcontentにしてcreate_wordを続けて呼び出してください。",
+            summaryRef ? `Word出力用summaryRef: ${summaryRef}` : "",
+            summaryRef
+              ? "Word/docx出力では本文をコピーせず、create_word.content=\"[summaryRef]\"、create_word.summaryRef=上記の値、create_word.formatMode=\"markdown\"を指定してください。"
+              : "以下の要約をページ参照を削らずにユーザーへ提示してください。",
             "",
             result.summary,
           ]

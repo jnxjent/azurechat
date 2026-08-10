@@ -13,6 +13,7 @@ import {
   generateBlobSASQueryParameters,
 } from "@azure/storage-blob";
 import { OpenAIInstance } from "@/features/common/services/openai";
+import { DeleteBlob, DownloadBlobAsText } from "@/features/common/services/azure-storage";
 import { uniqueId } from "@/features/common/util";
 
 const execFileAsync = promisify(execFile);
@@ -49,6 +50,8 @@ export type GenWordRequest = {
   instruction?: string;
   title?: string;
   fileName?: string;
+  formatMode?: "auto" | "markdown";
+  summaryRef?: string;
   threadId: string;
   fontFace?: string;
 };
@@ -344,10 +347,33 @@ async function runPythonCreateWord(
 
 export async function POST(req: NextRequest) {
   try {
+    const startedAt = Date.now();
     const body: GenWordRequest = await req.json();
-    const { content, instruction, title, fileName, threadId, fontFace } = body;
+    const { content, instruction, title, fileName, formatMode, summaryRef, threadId, fontFace } = body;
 
-    if (!content?.trim() && !title?.trim()) {
+    let resolvedContent = content ?? "";
+    let resolvedFormatMode = formatMode;
+    if (summaryRef?.trim()) {
+      const expectedPrefix = `sp-summary-cache/${threadId}/`;
+      if (!threadId || !summaryRef.startsWith(expectedPrefix) || !summaryRef.endsWith(".json")) {
+        return NextResponse.json({ error: "Invalid summaryRef." }, { status: 400 });
+      }
+      const cached = await DownloadBlobAsText("dl-link", summaryRef);
+      if (cached.status !== "OK") {
+        return NextResponse.json(
+          { error: `Word用要約を取得できませんでした: ${cached.errors[0]?.message ?? "unknown"}` },
+          { status: 400 }
+        );
+      }
+      const payload = JSON.parse(cached.response);
+      resolvedContent = String(payload?.summary ?? "");
+      resolvedFormatMode = "markdown";
+      console.log(
+        `[gen-word] loaded summaryRef chars=${resolvedContent.length} ref=${summaryRef}`
+      );
+    }
+
+    if (!resolvedContent.trim() && !title?.trim()) {
       return NextResponse.json(
         { error: "content または title を指定してください。" },
         { status: 400 }
@@ -358,18 +384,40 @@ export async function POST(req: NextRequest) {
     const resolvedTitle = title?.trim() || "";
     const resolvedInstruction = instruction?.trim() || "";
 
-    const plan = await generateWordPlan(
-      content ?? "",
-      resolvedInstruction,
-      resolvedTitle,
-      resolvedFont
+    const planStartedAt = Date.now();
+    const plan = resolvedFormatMode === "markdown"
+      ? buildLosslessMarkdownPlan(
+          resolvedContent,
+          resolvedTitle || "文書",
+          { fontFace: resolvedFont, fontSize: 11, titleFontSize: 16 }
+        )
+      : await generateWordPlan(
+          resolvedContent,
+          resolvedInstruction,
+          resolvedTitle,
+          resolvedFont
+        );
+    console.log(
+      `[gen-word] plan mode=${resolvedFormatMode === "markdown" ? "markdown" : "auto"} elapsedMs=${Date.now() - planStartedAt}`
     );
 
+    const renderStartedAt = Date.now();
     const result = await runPythonCreateWord(
       plan,
       threadId ?? uniqueId(),
       fileName
     );
+    console.log(
+      `[gen-word] render+upload elapsedMs=${Date.now() - renderStartedAt} totalElapsedMs=${Date.now() - startedAt}`
+    );
+    if (summaryRef) {
+      const deleted = await DeleteBlob("dl-link", summaryRef);
+      if (deleted.status !== "OK") {
+        console.warn(
+          `[gen-word] failed to delete summaryRef: ${deleted.errors[0]?.message ?? "unknown"}`
+        );
+      }
+    }
 
     return NextResponse.json(result);
   } catch (error: any) {

@@ -219,7 +219,7 @@ ${page}`;
 - If you don't know the answer, just say that you don't know. Don't try to make up an answer.
 - You must always include a citation at the end of your answer and don't include full stop after the citations.
 - OVERRIDE FOR PDF SUMMARY: If the user asks to summarize one named SharePoint PDF (including 要約, 全文要約, 全体要約, or 全ページ要約), call summarize_sp_pdf instead of sl_doc_search unless they explicitly request only a specific topic or page range. Preserve every [p.N] page reference returned by the tool and do not claim full-document coverage from ordinary search results.
-- PDF SUMMARY TO WORD: If the request also asks for Word/docx output, complete both calls in order: summarize_sp_pdf, then create_word. Pass an explicitly requested approximate Word page count to summarize_sp_pdf.targetPages. Pass only the returned summary body with all [p.N] references to create_word.content. Set create_word.title to '元ファイル名 要約' and create_word.fileName to the exact '元ファイル名_要約.docx' recommended by summarize_sp_pdf. Do not use convert_pdf_to_word for this summary-output case.
+- PDF SUMMARY TO WORD: If the request also asks for Word/docx output, complete both calls in order: summarize_sp_pdf, then create_word. Pass an explicitly requested page count to summarize_sp_pdf.targetPages. Copy the short Word出力用summaryRef returned by summarize_sp_pdf into create_word.summaryRef, set create_word.content='[summaryRef]', create_word.formatMode='markdown', create_word.title='元ファイル名 要約', and create_word.fileName to the exact recommended '元ファイル名_要約.docx'. Never copy or rewrite the long summary into create_word.content and do not use convert_pdf_to_word for this case.
 - IMPORTANT: If the user asks to compare multiple documents or find contradictions across files: (1) First call sl_doc_search with a broad query (e.g. "IR議事録") to discover available document names. (2) Then call sl_doc_search once per discovered document using "company name + document type + keyword" queries. (3) Only answer after collecting content from all documents. Never answer based solely on the initial context when multi-document comparison is requested.
 ${inferredTarget.folderUncertain ? "- IMPORTANT: The user referred to a SharePoint folder, but its name could not be determined with confidence. Ask the user which folder name to search. Do not search broadly and do not answer from unrelated documents until the folder is clarified." : ""}
 - PowerPoint生成のツール選択ルール（厳守）：
@@ -242,13 +242,13 @@ ${userMessage}
     signal,
   });
   const tools = extensionsResponse.status === "OK" ? extensionsResponse.response : [];
-
   tools.push(
     createSharePointPdfSummaryTool({
       deptLower,
       userHash: userHash ?? undefined,
       signal,
       userMessage,
+      chatThreadId: chatThread.id,
     })
   );
 
