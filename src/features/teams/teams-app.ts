@@ -304,6 +304,9 @@ function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
   if (request.action === "create_ppt") {
     return `「${request.title}」のPowerPoint作成を開始します。完了までしばらくお待ちください。`;
   }
+  if (request.action === "summarize_sp_pdf") {
+    return `「${request.fileQuery}」のPDF全文要約を開始します。完了までしばらくお待ちください。`;
+  }
   if (request.action === "pdf_to_excel") {
     return `「${request.fileQuery}」を検索し、Excelへの変換を開始します。完了までしばらくお待ちください。`;
   }

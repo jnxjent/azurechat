@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
   DownloadBlobAsText,
   GenerateSasUrl,
@@ -28,6 +28,9 @@ import {
   findTeamsWordProofreadingReplacements,
 } from "./teams-word-proofread-service";
 import type { TeamsStoredFile } from "./teams-file-policy";
+import { summarizeSharePointPdf } from "@/features/chat-page/chat-services/sharepoint-summary-service";
+import { hashValue } from "@/features/auth-page/helpers";
+import { resolveSlAccess } from "@/lib/sl-dept";
 
 const PDF_TRANSLATION_LANGUAGE_NAMES = {
   en: "英語",
@@ -102,6 +105,10 @@ function parsePdfTranslationRequest(
 }
 
 export type TeamsOfficeRequest =
+  | {
+      action: "summarize_sp_pdf";
+      fileQuery: string;
+    }
   | {
       action: "pdf_to_excel";
       fileQuery: string;
@@ -187,6 +194,17 @@ export function parseTeamsOfficeRequest(
     attachedFileQuery
   );
   if (pdfTranslationRequest) return pdfTranslationRequest;
+
+  // A PDF summary is not a PDF-to-Word conversion.  Route it before the
+  // generic Office conversion rules so requests such as "PDFを要約して、Word
+  // でも出して" do not accidentally select pdf_to_word.
+  const summaryFileQuery = extractPdfSummaryFileQuery(
+    normalized,
+    attachedFileQuery
+  );
+  if (summaryFileQuery) {
+    return { action: "summarize_sp_pdf", fileQuery: summaryFileQuery };
+  }
 
   const targetExcelSheets = extractTargetSheetNames(normalized);
   const hasExcelRefinementIntent =
@@ -380,6 +398,80 @@ export async function executeTeamsOfficeRequest(props: {
   userEmail?: string | null;
 }): Promise<string> {
   const teamsThreadId = buildTeamsThreadId(props.conversationId);
+
+  if (props.request.action === "summarize_sp_pdf") {
+    const userEmail = props.userEmail?.trim().toLowerCase();
+    if (!userEmail) {
+      return "PDF全文要約を実行するためのTeamsユーザー情報を取得できませんでした。もう一度お試しください。";
+    }
+
+    try {
+      const access = resolveSlAccess(userEmail);
+      const result = await summarizeSharePointPdf({
+        fileQuery: props.request.fileQuery,
+        deptLower: access.dept,
+        userHash: hashValue(userEmail),
+      });
+      const summaryRef = `sp-summary-cache/${teamsThreadId}/${randomUUID()}.json`;
+      const cached = await UploadBlob(
+        "dl-link",
+        summaryRef,
+        Buffer.from(
+          JSON.stringify({
+            summary: result.summary,
+            characters: result.summary.length,
+            createdAt: new Date().toISOString(),
+          }),
+          "utf8"
+        )
+      );
+      if (cached.status !== "OK") {
+        throw new Error(
+          `Word出力用の要約保存に失敗しました: ${cached.errors[0]?.message ?? "unknown"}`
+        );
+      }
+      const outputBaseName = result.fileName.replace(/\.pdf$/i, "") || "PDF要約";
+      const wordResult = await postOfficeGenerationApi("/api/gen-word", {
+        content: "[summaryRef]",
+        title: `${outputBaseName} 要約`,
+        fileName: `${outputBaseName}_要約.docx`,
+        formatMode: "markdown",
+        summaryRef,
+        threadId: teamsThreadId,
+        fontFace: "Meiryo",
+      });
+      if (typeof wordResult.downloadUrl !== "string") {
+        throw new Error(String(wordResult.error ?? "Word出力URLを取得できませんでした。"));
+      }
+      const outputName =
+        typeof wordResult.fileName === "string"
+          ? wordResult.fileName
+          : `${outputBaseName}_要約.docx`;
+      await saveWordPointer(teamsThreadId, {
+        url: wordResult.downloadUrl,
+        fileName: outputName,
+        savedAt: Date.now(),
+      });
+      console.log("[teams-pdf-summary] completed", {
+        fileName: result.fileName,
+        pageCount: result.pageCount,
+        chunkCount: result.chunkCount,
+        outputName,
+      });
+      return [
+        `PDF全文要約をWordで作成しました（${result.fileName}、${result.pageCount}ページ、${result.chunkCount}チャンク）。`,
+        "",
+        `📄 [${escapeMarkdownLinkText(outputName)}](${wordResult.downloadUrl})`,
+      ].join("\n");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("[teams-pdf-summary] failed", {
+        fileQuery: props.request.fileQuery,
+        message,
+      });
+      return `PDF全文要約に失敗しました。\n\n${message}`;
+    }
+  }
 
   if (props.request.action === "translate_pdf_to_pptx") {
     return translateTeamsPdfToPowerPoint({
@@ -2111,6 +2203,24 @@ function extractQuotedFileQuery(message: string): string | null {
     message.match(/["“]([^"”]+)["”]/)?.[1]?.trim() ??
     null
   );
+}
+
+function extractPdfSummaryFileQuery(
+  message: string,
+  attachedFileQuery: string | null
+): string | null {
+  if (!/(?:要約|まとめ|サマリー|summary)/i.test(message)) return null;
+
+  if (/\.pdf$/i.test(attachedFileQuery ?? "")) return attachedFileQuery;
+
+  const quoted = extractQuotedFileQuery(message);
+  // The PDF extension is often omitted in natural Teams requests. The
+  // summary service resolves this quoted file stem against indexed PDFs.
+  if (quoted && !/(?:word|docx|excel|xlsx|powerpoint|pptx)/i.test(quoted)) {
+    return quoted;
+  }
+
+  return message.match(/([^\s「」"']+\.pdf)(?=\s|$|を|の|に|、|,)/i)?.[1] ?? null;
 }
 
 function extractAttachedFileQuery(message: string): string | null {
