@@ -5,6 +5,20 @@ import { DocumentIntelligenceInstance } from "@/features/common/services/documen
 
 const CHUNK_SIZE = 2300;
 const CHUNK_OVERLAP = Math.floor(CHUNK_SIZE * 0.25);
+const EMPTY_PDF_PAGE_TEXT = "[PAGE_EMPTY]";
+
+export type ExtractedIndexChunk = {
+  content: string;
+  chunkIndex: number;
+  pageStart: number | null;
+  pageEnd: number | null;
+};
+
+export type ExtractedIndexDocument = {
+  chunks: ExtractedIndexChunk[];
+  pageCount: number | null;
+  hasPageMetadata: boolean;
+};
 
 export async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
   const XLSX = require("xlsx");
@@ -92,6 +106,81 @@ async function getPdfPageCount(buffer: ArrayBuffer): Promise<number> {
   }
 }
 
+function normalizeReportedPageNumber(
+  reportedPage: number,
+  requestedStart: number,
+  requestedEnd: number
+): number {
+  if (reportedPage >= requestedStart && reportedPage <= requestedEnd) {
+    return reportedPage;
+  }
+  const requestedCount = requestedEnd - requestedStart + 1;
+  if (reportedPage >= 1 && reportedPage <= requestedCount) {
+    return requestedStart + reportedPage - 1;
+  }
+  return reportedPage;
+}
+
+async function extractPdfPagesWithDocumentIntelligence(
+  buffer: ArrayBuffer
+): Promise<{ pageCount: number; pages: Array<{ pageNumber: number; content: string }> }> {
+  const totalPages = await getPdfPageCount(buffer);
+  if (totalPages === 0) {
+    throw new Error("PDF page count could not be determined");
+  }
+
+  console.log(`[doc-extract] totalPages=${totalPages} chunkSize=${DOC_INTELLIGENCE_PAGE_CHUNK}`);
+  const client = DocumentIntelligenceInstance();
+  const pageText = new Map<number, string[]>();
+
+  for (let pageStart = 1; pageStart <= totalPages; pageStart += DOC_INTELLIGENCE_PAGE_CHUNK) {
+    const pageEnd = Math.min(pageStart + DOC_INTELLIGENCE_PAGE_CHUNK - 1, totalPages);
+    const pages = `${pageStart}-${pageEnd}`;
+    console.log(`[doc-extract] beginAnalyzeDocument pages=${pages}`);
+
+    const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer, { pages });
+    const result = await poller.pollUntilDone();
+    const pagesWithLines = (result.pages ?? []).filter((page) => (page.lines?.length ?? 0) > 0);
+
+    if (pagesWithLines.length > 0) {
+      for (const page of pagesWithLines) {
+        const pageNumber = normalizeReportedPageNumber(page.pageNumber, pageStart, pageEnd);
+        if (pageNumber < 1 || pageNumber > totalPages) continue;
+        const lines = (page.lines ?? []).map((line) => line.content).filter(Boolean);
+        const current = pageText.get(pageNumber) ?? [];
+        current.push(...lines);
+        pageText.set(pageNumber, current);
+      }
+      continue;
+    }
+
+    // Defensive fallback for service responses that omit page lines.
+    for (const paragraph of result.paragraphs ?? []) {
+      const reportedPage = paragraph.boundingRegions?.[0]?.pageNumber;
+      if (!reportedPage || !paragraph.content) continue;
+      const pageNumber = normalizeReportedPageNumber(reportedPage, pageStart, pageEnd);
+      if (pageNumber < 1 || pageNumber > totalPages) continue;
+      const current = pageText.get(pageNumber) ?? [];
+      current.push(paragraph.content);
+      pageText.set(pageNumber, current);
+    }
+  }
+
+  const extractedPages = Array.from({ length: totalPages }, (_, index) => {
+    const pageNumber = index + 1;
+    const content = (pageText.get(pageNumber) ?? []).join("\n").trim();
+    return {
+      pageNumber,
+      content: content || EMPTY_PDF_PAGE_TEXT,
+    };
+  });
+
+  console.log(
+    `[doc-extract] PDF pages extracted: total=${totalPages} empty=${extractedPages.filter((page) => page.content === EMPTY_PDF_PAGE_TEXT).length}`
+  );
+  return { pageCount: totalPages, pages: extractedPages };
+}
+
 export async function extractWithDocumentIntelligence(
   buffer: ArrayBuffer
 ): Promise<string[]> {
@@ -169,6 +258,42 @@ export async function extractTextFromBuffer(
     return extractMsgText(buffer);
   }
   return extractWithDocumentIntelligence(buffer);
+}
+
+export async function extractIndexDocumentFromBuffer(
+  buffer: ArrayBuffer,
+  fileName: string
+): Promise<ExtractedIndexDocument> {
+  if (fileName.toLowerCase().endsWith(".pdf")) {
+    const extracted = await extractPdfPagesWithDocumentIntelligence(buffer);
+    const chunks: ExtractedIndexChunk[] = [];
+
+    for (const page of extracted.pages) {
+      for (const content of chunkWithOverlap(page.content)) {
+        chunks.push({
+          content,
+          chunkIndex: chunks.length,
+          pageStart: page.pageNumber,
+          pageEnd: page.pageNumber,
+        });
+      }
+    }
+
+    return {
+      chunks,
+      pageCount: extracted.pageCount,
+      hasPageMetadata: true,
+    };
+  }
+
+  const textParts = await extractTextFromBuffer(buffer, fileName);
+  const chunks = chunkWithOverlap(textParts.join("\n")).map((content, chunkIndex) => ({
+    content,
+    chunkIndex,
+    pageStart: null,
+    pageEnd: null,
+  }));
+  return { chunks, pageCount: null, hasPageMetadata: false };
 }
 
 export function chunkWithOverlap(text: string): string[] {

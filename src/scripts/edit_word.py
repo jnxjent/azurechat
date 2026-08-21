@@ -176,6 +176,8 @@ def apply_format_runs(doc, formats: list) -> int:
         bold = fmt.get("bold")
         italic = fmt.get("italic")
         font_size = fmt.get("fontSize")
+        if isinstance(font_size, str) and not font_size.strip():
+            font_size = None
         font_color = parse_hex_color(fmt.get("fontColor"))
         font_face = str(fmt.get("fontFace") or "").strip() or None
 
@@ -224,6 +226,8 @@ def apply_add_paragraphs(doc, paragraphs: list) -> int:
         bold = para_def.get("bold")
         italic = para_def.get("italic")
         font_size = para_def.get("fontSize")
+        if isinstance(font_size, str) and not font_size.strip():
+            font_size = None
         font_color = parse_hex_color(para_def.get("fontColor"))
 
         try:
@@ -585,6 +589,8 @@ def apply_format_runs_tracked(
         bold = fmt.get("bold")
         italic = fmt.get("italic")
         font_size = fmt.get("fontSize")
+        if isinstance(font_size, str) and not font_size.strip():
+            font_size = None
         font_color = parse_hex_color(fmt.get("fontColor"))
         font_face = str(fmt.get("fontFace") or "").strip() or None
 

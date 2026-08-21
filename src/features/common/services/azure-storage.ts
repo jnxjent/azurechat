@@ -91,6 +91,21 @@ export const DownloadBlobAsText = async (
   }
 };
 
+export const DeleteBlob = async (
+  containerName: string,
+  blobPath: string
+): Promise<ServerActionResponse<boolean>> => {
+  try {
+    const deleted = await InitBlobServiceClient()
+      .getContainerClient(containerName)
+      .getBlockBlobClient(blobPath)
+      .deleteIfExists();
+    return { status: "OK", response: deleted.succeeded };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `DeleteBlob failed: ${String(e)}` }] };
+  }
+};
+
 export const GetBlob = async (
   containerName: string,
   blobPath: string

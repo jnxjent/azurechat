@@ -3,6 +3,9 @@ import { ChatAPIEntry } from "@/features/chat-page/chat-services/chat-api/chat-a
 import { UserPrompt } from "@/features/chat-page/chat-services/models";
 
 export const runtime = "nodejs";
+// Synchronous SharePoint PDF Map/Reduce PoC. The hosting/front-door timeout
+// must still be configured separately; this only declares the route budget.
+export const maxDuration = 300;
 
 // 🚀 キャッシュ禁止（既存）
 export const dynamic = "force-dynamic";

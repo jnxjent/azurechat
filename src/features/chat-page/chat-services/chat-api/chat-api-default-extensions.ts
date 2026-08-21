@@ -1976,6 +1976,22 @@ export const GetDefaultExtensions = async (props: {
             description:
               "ドキュメントのタイトル。省略時はcontentから自動推定する。",
           },
+          fileName: {
+            type: "string",
+            description:
+              "ダウンロード時のWordファイル名（.docx）。summarize_sp_pdfから要約をWord化する場合は、同ツールが推奨した『元ファイル名_要約.docx』を正確に指定する。",
+          },
+          formatMode: {
+            type: "string",
+            enum: ["auto", "markdown"],
+            description:
+              "通常はauto。summarize_sp_pdfが返したMarkdown要約をWord化する場合だけmarkdownを指定する。",
+          },
+          summaryRef: {
+            type: "string",
+            description:
+              "summarize_sp_pdfが返したWord出力用summaryRef。全文要約Wordの場合のみ、その値を一字一句変えずに渡す。",
+          },
           instruction: {
             type: "string",
             description:
@@ -1992,6 +2008,7 @@ export const GetDefaultExtensions = async (props: {
         "ユーザーが会話中で直接提供したテキスト・内容からWordファイル（.docx）を新規作成するツール。\n" +
         "使用タイミング：ユーザーが会話中で直接テキストを渡して「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合のみ。\n" +
         "【禁止】SharePoint/SL の文書検索（sl_doc_search）で取得したコンテンツや、既存PDFや既存docxを変換・編集する目的には絶対に使わないこと。\n" +
+        "【唯一の例外】summarize_sp_pdf が返した全文要約を新規Word文書にする場合は create_word を使う。content='[summaryRef]'、summaryRef=ツールが返した値、formatMode=markdownを指定する。長い要約本文やPDF原文をcontentへコピーしない。\n" +
         "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
         "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
@@ -6752,10 +6769,10 @@ async function executeCreateExcel(
 
 // ---------------- Word 新規作成 ----------------
 async function executeCreateWord(
-  args: { content: string; title?: string; instruction?: string; fontFace?: string },
+  args: { content: string; title?: string; fileName?: string; formatMode?: "auto" | "markdown"; summaryRef?: string; instruction?: string; fontFace?: string },
   chatThread: ChatThreadModel
 ) {
-  const { content, title, instruction, fontFace } = args ?? {};
+  const { content, title, fileName, formatMode, summaryRef, instruction, fontFace } = args ?? {};
 
   if (!content?.trim() && !title?.trim()) {
     return { error: "content を指定してください。作成する内容を入力してください。" };
@@ -6773,6 +6790,9 @@ async function executeCreateWord(
       body: JSON.stringify({
         content: content ?? "",
         title: title ?? "",
+        fileName: fileName ?? "",
+        formatMode: formatMode ?? "auto",
+        summaryRef: summaryRef ?? "",
         instruction: instruction ?? "",
         fontFace: fontFace ?? "Meiryo",
         threadId: chatThread.id,
@@ -6885,6 +6905,16 @@ async function executeEditWord(
 }
 
 // ---------------- SP ファイル → SAS URL 解決（Word/Excel共用） ----------------
+function normalizeSpFileLookupName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .trim()
+    .toLocaleLowerCase("ja-JP")
+    .replace(/\.(pdf|docx)$/i, "")
+    .replace(/\(株\)|株式会社/g, "株式会社")
+    .replace(/[\s\u3000'"「」『』]/g, "");
+}
+
 async function resolveSpFileToSasUrl(
   fileQuery: string,
   allowedExts: RegExp,
@@ -6912,14 +6942,42 @@ async function resolveSpFileToSasUrl(
     return { error: "アクセス可能なSharePointファイルが見つかりませんでした。" };
   }
 
-  const queryLower = fileQuery.trim().toLowerCase();
-  const matched = allDocs.filter(({ document: doc }) => {
-    const metaName = (doc.metadata ?? "").trim().toLowerCase();
-    const urlName = (extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "").toLowerCase();
-    const name = allowedExts.test(metaName) ? metaName : (urlName || metaName);
-    if (!allowedExts.test(name)) return false;
-    return name.includes(queryLower) || queryLower.includes(name.replace(/\.[^.]+$/i, ""));
-  });
+  const queryName = normalizeSpFileLookupName(fileQuery);
+  const matchByFileName = (docs: Array<{ document: any }>) =>
+    docs.filter(({ document: doc }) => {
+      const metaName = String(doc.metadata ?? "").trim();
+      const urlName =
+        extractFileNameFromDocumentUrl(doc.effectiveFileUrl || doc.fileUrl) ?? "";
+      const name = allowedExts.test(metaName) ? metaName : urlName || metaName;
+      if (!allowedExts.test(name)) return false;
+      const normalizedName = normalizeSpFileLookupName(name);
+      return normalizedName.includes(queryName) || queryName.includes(normalizedName);
+    });
+
+  let matched = matchByFileName(allDocs);
+
+  // The wildcard result is capped by chunks, not unique files. Large PDFs can
+  // occupy most of the first 1,000 results, so retry with the requested name
+  // whenever the filename-first scan itself produced no match.
+  if (matched.length === 0) {
+    const normalizedSearchQuery = fileQuery
+      .normalize("NFKC")
+      .replace(/\(株\)/g, "株式会社")
+      .trim();
+    const fallback = await SimpleSearch(
+      normalizedSearchQuery || fileQuery,
+      "isSlDoc eq true",
+      deptLower,
+      200
+    );
+    if (fallback.status === "OK" && fallback.response.length > 0) {
+      allDocs = [...allDocs, ...fallback.response];
+      matched = matchByFileName(fallback.response);
+    }
+    console.log(
+      `[${logTag}] SP filename fallback results=${fallback.status === "OK" ? fallback.response.length : 0} normalizedQuery="${normalizedSearchQuery}"`
+    );
+  }
 
   console.log(`[${logTag}] SP name-matched count=${matched.length} (query="${fileQuery}")`);
 
