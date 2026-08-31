@@ -10,6 +10,20 @@ export const OpenAIInstance = () => {
   return openai;
 };
 
+export const OpenAIPptInstance = () => {
+  const deploymentName =
+    process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME?.trim() ||
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME;
+
+  const openai = new OpenAI({
+    apiKey: process.env.AZURE_OPENAI_API_KEY,
+    baseURL: `https://${process.env.AZURE_OPENAI_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${deploymentName}`,
+    defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
+    defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+  });
+  return openai;
+};
+
 export const OpenAIEmbeddingInstance = () => {
   if (
     !process.env.AZURE_OPENAI_API_KEY ||
@@ -90,4 +104,30 @@ export const OpenAIVisionInstance = () => {
     defaultHeaders: { "api-key": process.env.AZURE_OPENAI_VISION_API_KEY },
   });
   return openai;
+};
+
+export const OpenAIPptVisionInstance = () => {
+  const deploymentName =
+    process.env.AZURE_OPENAI_PPT_VISION_DEPLOYMENT_NAME?.trim() ||
+    process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME?.trim();
+
+  if (
+    !process.env.AZURE_OPENAI_VISION_API_KEY ||
+    !deploymentName ||
+    !process.env.AZURE_OPENAI_VISION_API_INSTANCE_NAME ||
+    !process.env.AZURE_OPENAI_VISION_API_VERSION
+  ) {
+    throw new Error(
+      "Azure OpenAI PPT Vision environment config is not set, check environment variables."
+    );
+  }
+
+  return new OpenAI({
+    apiKey: process.env.AZURE_OPENAI_VISION_API_KEY,
+    baseURL: `https://${process.env.AZURE_OPENAI_VISION_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${deploymentName}`,
+    defaultQuery: {
+      "api-version": process.env.AZURE_OPENAI_VISION_API_VERSION,
+    },
+    defaultHeaders: { "api-key": process.env.AZURE_OPENAI_VISION_API_KEY },
+  });
 };

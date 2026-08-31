@@ -9,15 +9,16 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as XLSX from "xlsx";
+import sharp from "sharp";
 import {
   BlobSASPermissions,
   BlobServiceClient,
   StorageSharedKeyCredential,
   generateBlobSASQueryParameters,
 } from "@azure/storage-blob";
-import { OpenAIInstance, OpenAIDALLEInstance } from "@/features/common/services/openai";
+import { OpenAIInstance, OpenAIDALLEInstance, OpenAIPptInstance } from "@/features/common/services/openai";
 import { uniqueId } from "@/features/common/util";
-import { resolvePptxPaletteInstruction, buildPaletteFromKey, PPTX_NAMED_PALETTES, PptxPalette } from "@/features/pptx/palette";
+import { resolvePptxPaletteInstruction, isPptxWhiteBaseRequest, buildPaletteFromKey, PPTX_NAMED_PALETTES, PptxPalette } from "@/features/pptx/palette";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,16 +31,21 @@ type ImageInsert = {
   nearText?: string;   // このテキストを含む Shape の隣に配置（指定時は position より優先）
   anchorSide?: "left" | "right" | "above" | "below"; // nearText Shape のどちら側か（default: "right"）
   widthPct?: number;
+  role?: "logo" | "image";
+  removeWhiteBackground?: boolean;
   imagePath?: string; // set after download/generation, before Python call
 };
 
 type EditPlan = {
   deckEdits?: {
     accentColor?: string | null;
+    backgroundColor?: string | null;
+    whiteBase?: boolean;
     paletteKey?: string | null;
     palette?: Record<string, string> | null;
     fontFace?: string | null;
     preserveTextColors?: boolean;
+    harmonizeWithLogo?: boolean;
   };
   slideEdits?: Array<{
     slideIndex: number;
@@ -227,10 +233,95 @@ function tryBuildDirectPlan(instruction: string, _slides: unknown[]): EditPlan |
   else if (/右上|top[\s-]?right/i.test(instruction)) position = "top-right";
   else if (/中央|center/i.test(instruction)) position = "center";
 
+  const naturalLogoIntegration =
+    isLogo && /自然|なじ|馴染|背景.{0,8}白|配色|色.{0,8}調整|ブランド/i.test(instruction);
+  const coverAndBodyLogo =
+    isLogo &&
+    /表紙|フロント|front/i.test(instruction) &&
+    /各スライド|全スライド|各ページ|全ページ|右肩/i.test(instruction);
+  const imageInserts: ImageInsert[] = coverAndBodyLogo
+    ? [
+        {
+          slideIndex: 0,
+          imageUrl,
+          position: "top-right",
+          widthPct: 24,
+          role: "logo",
+          removeWhiteBackground: true,
+        },
+        {
+          slideIndex: -2,
+          imageUrl,
+          position: "top-right",
+          widthPct: 8,
+          role: "logo",
+          removeWhiteBackground: true,
+        },
+      ]
+    : [
+        {
+          slideIndex,
+          imageUrl,
+          position,
+          widthPct,
+          ...(isLogo
+            ? { role: "logo" as const, removeWhiteBackground: true }
+            : {}),
+        },
+      ];
+
   return {
-    deckEdits: { accentColor: null, fontFace: null, preserveTextColors: true },
+    deckEdits: {
+      accentColor: null,
+      fontFace: null,
+      preserveTextColors: true,
+      ...(naturalLogoIntegration ? { harmonizeWithLogo: true } : {}),
+    },
     slideEdits: [],
-    imageInserts: [{ slideIndex, imageUrl, position, widthPct }],
+    imageInserts,
+  };
+}
+
+function normalizeLogoEditPlan(
+  plan: EditPlan,
+  instruction: string,
+  attachedImageUrl = ""
+): EditPlan {
+  if (!/ロゴ|logo/i.test(instruction)) return plan;
+
+  const existingUrl =
+    attachedImageUrl ||
+    plan.imageInserts?.find((item) => item.imageUrl)?.imageUrl ||
+    "";
+  const naturalLogoIntegration =
+    /自然|なじ|馴染|背景.{0,8}白|配色|色.{0,8}調整|ブランド/i.test(instruction);
+  const coverAndBodyLogo =
+    /表紙|フロント|front/i.test(instruction) &&
+    /各スライド|全スライド|各ページ|全ページ|右肩/i.test(instruction);
+
+  const logoDefaults = (item: ImageInsert): ImageInsert => ({
+    ...item,
+    ...(existingUrl ? { imageUrl: existingUrl, imagePrompt: undefined } : {}),
+    role: "logo",
+    removeWhiteBackground: true,
+    position: item.position ?? "top-right",
+  });
+
+  const imageInserts = coverAndBodyLogo && existingUrl
+    ? [
+        logoDefaults({ slideIndex: 0, widthPct: 24, position: "top-right" }),
+        logoDefaults({ slideIndex: -2, widthPct: 8, position: "top-right" }),
+      ]
+    : (plan.imageInserts ?? []).map(logoDefaults);
+
+  return {
+    ...plan,
+    deckEdits: {
+      ...(plan.deckEdits ?? {}),
+      preserveTextColors: plan.deckEdits?.preserveTextColors !== false,
+      ...(naturalLogoIntegration ? { harmonizeWithLogo: true } : {}),
+    },
+    imageInserts,
   };
 }
 
@@ -251,7 +342,7 @@ async function buildEditPlan(
     }
   }
 
-  const openai = OpenAIInstance();
+  const openai = OpenAIPptInstance();
   const pptModel = process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!;
 
   const systemPrompt = `You convert a natural-language PowerPoint editing request into a safe JSON edit plan.
@@ -276,7 +367,9 @@ Return JSON only in this shape:
       "nearText": string,
       "anchorSide": "left" | "right" | "above" | "below",
       "position": "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center",
-      "widthPct": number
+      "widthPct": number,
+      "role": "logo" | "image",
+      "removeWhiteBackground": boolean
     }
   ]
 }
@@ -291,11 +384,13 @@ Rules:
 - If the user asks to add an icon, illustration, image, or mark to a slide, populate imageInserts[].
   - imagePrompt: concise English DALL-E prompt describing the image (e.g. "robot icon, flat design, simple, white background"). Use this when NO existing URL is provided.
   - imageUrl: if the user provides an existing image URL (logo, photo, etc.), set imageUrl to that URL and omit imagePrompt. Do NOT generate a DALL-E prompt when a URL is given.
-  - slideIndex: use -1 to apply the image to ALL slides (useful for logos/watermarks). Use a specific index for a single slide.
+  - slideIndex: use -1 to apply the image to ALL slides, or -2 for every slide EXCEPT the cover. Use a specific index for one slide.
   - nearText: if the user says "next to X", "beside X", "横に", "〇〇の横" etc., set nearText to the shortest unique text string found in the slide (e.g. "ボット" not the full sentence). The image will be placed adjacent to the shape containing that text.
   - anchorSide: which side of the nearText shape to place the image. Use "right" for "横に/右に", "left" for "左に", "above" for "上に", "below" for "下に". Default "right".
   - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons and logos. Never use "top-left" as it may overlap slide content.
   - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons, 10-15 for logos, 30-50 for large illustrations. Default 12 for logos (imageUrl), 8 when nearText is set, 13 otherwise.
+  - For an existing logo asset, set role="logo" and removeWhiteBackground=true. Never redraw or regenerate a supplied logo.
+  - If the cover needs a larger logo and every other slide needs a small top-right logo, emit two inserts: slideIndex=0 at widthPct 20-26 and slideIndex=-2 at widthPct 6-9.
 - Only emit imageInserts when the user explicitly requests an image or visual element.
 - Keep the JSON minimal. Use null or [] when not needed.`;
 
@@ -373,7 +468,7 @@ Return JSON only.`;
     }
   }
 
-  return parsed;
+  return normalizeLogoEditPlan(parsed, instruction);
 }
 
 function parseAzureBlobUrl(fileUrl: string): {
@@ -1163,18 +1258,6 @@ async function runPythonEditExcel(
     }
 
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
-    const changedParagraphs = Number(pythonResult.changedParagraphs ?? 0);
-    const requestedReplacementCount = (plan.replaceText ?? []).filter(
-      (replacement) => String(replacement?.find ?? "").length > 0
-    ).length;
-    if (requestedReplacementCount > 0 && changedParagraphs === 0) {
-      const noChangeError = new Error(
-        "指定された置換元の文字列が最新Word内に見つからなかったため、修正版は作成しませんでした。既に修正済みか、表記が異なる可能性があります。"
-      ) as Error & { statusCode?: number };
-      noChangeError.statusCode = 422;
-      throw noChangeError;
-    }
-
     const outputBuffer = await fs.readFile(outputPath);
     const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.xlsx`;
     const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
@@ -2060,8 +2143,20 @@ async function runPythonEditWord(
       console.warn("[edit-word] python stderr:", stderr.trim());
     }
 
-    const outputBuffer = await fs.readFile(outputPath);
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const changedParagraphs = Number(pythonResult.changedParagraphs ?? 0);
+    const requestedReplacementCount = (plan.replaceText ?? []).filter(
+      (replacement) => String(replacement?.find ?? "").length > 0
+    ).length;
+    if (requestedReplacementCount > 0 && changedParagraphs === 0) {
+      const noChangeError = new Error(
+        "指定された置換元の文字列が最新Word内に見つからなかったため、修正版は作成しませんでした。既に修正済みか、表記が異なる可能性があります。"
+      ) as Error & { statusCode?: number };
+      noChangeError.statusCode = 422;
+      throw noChangeError;
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
     const blobKey = `${threadId || uniqueId()}_edited_${uniqueId()}.docx`;
     const displayName = originalFileName
       ? (() => {
@@ -2145,6 +2240,143 @@ async function resolveEditPptxScriptPath(): Promise<string> {
   throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
 }
 
+function decodeImageDataUrl(value: string): Buffer | null {
+  const match = value.match(
+    /^data:image\/(?:png|jpe?g|webp);base64,([a-z0-9+/=\s]+)$/i
+  );
+  if (!match) return null;
+  try {
+    return Buffer.from(match[1].replace(/\s/g, ""), "base64");
+  } catch {
+    return null;
+  }
+}
+
+function isSupportedEditImageSource(value: unknown): boolean {
+  const candidate = String(value ?? "").trim();
+  if (/^data:image\/(?:png|jpe?g|webp);base64,/i.test(candidate)) return true;
+  try {
+    const parsed = new URL(candidate);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+type PreparedLogo = { buffer: Buffer; brandColors: string[] };
+
+async function prepareLogoImage(input: Buffer): Promise<PreparedLogo> {
+  const { data, info } = await sharp(input)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const histogram = new Map<string, number>();
+
+  for (let i = 0; i < data.length; i += 4) {
+    const originalAlpha = data[i + 3] / 255;
+    if (originalAlpha <= 0) continue;
+
+    const minChannel = Math.min(data[i], data[i + 1], data[i + 2]);
+    const coverage = Math.max(0, Math.min(1, 1 - minChannel / 255));
+    if (coverage <= 0.015) {
+      data[i + 3] = 0;
+      continue;
+    }
+
+    // Undo white-background antialiasing so the edge stays crisp on dark slides.
+    for (let channel = 0; channel < 3; channel++) {
+      const reconstructed =
+        (data[i + channel] - (1 - coverage) * 255) / coverage;
+      data[i + channel] = Math.max(0, Math.min(255, Math.round(reconstructed)));
+    }
+    data[i + 3] = Math.max(
+      0,
+      Math.min(255, Math.round(255 * originalAlpha * coverage))
+    );
+
+    const maxChannel = Math.max(data[i], data[i + 1], data[i + 2]);
+    const newMinChannel = Math.min(data[i], data[i + 1], data[i + 2]);
+    if (data[i + 3] < 96 || maxChannel - newMinChannel < 45) continue;
+    const r = Math.round(data[i] / 24) * 24;
+    const g = Math.round(data[i + 1] / 24) * 24;
+    const b = Math.round(data[i + 2] / 24) * 24;
+    const key = [r, g, b]
+      .map((component) => Math.min(255, component).toString(16).padStart(2, "0"))
+      .join("")
+      .toUpperCase();
+    histogram.set(key, (histogram.get(key) ?? 0) + data[i + 3] / 255);
+  }
+
+  const rankedColors = Array.from(histogram.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([hex]) => hex);
+  const brandColors: string[] = [];
+  for (const candidate of rankedColors) {
+    const rgb = [0, 2, 4].map((offset) =>
+      parseInt(candidate.slice(offset, offset + 2), 16)
+    );
+    const sufficientlyDifferent = brandColors.every((selected) => {
+      const selectedRgb = [0, 2, 4].map((offset) =>
+        parseInt(selected.slice(offset, offset + 2), 16)
+      );
+      return Math.sqrt(
+        rgb.reduce(
+          (sum, component, index) =>
+            sum + Math.pow(component - selectedRgb[index], 2),
+          0
+        )
+      ) >= 85;
+    });
+    if (sufficientlyDifferent) brandColors.push(candidate);
+    if (brandColors.length >= 2) break;
+  }
+
+  const buffer = await sharp(data, {
+    raw: {
+      width: info.width,
+      height: info.height,
+      channels: 4,
+    },
+  })
+    .png()
+    .toBuffer();
+  return { buffer, brandColors };
+}
+
+function blendHexWithWhite(hex: string, whiteRatio: number): string {
+  return [0, 2, 4]
+    .map((offset) => {
+      const value = parseInt(hex.slice(offset, offset + 2), 16);
+      return Math.round(value + (255 - value) * whiteRatio)
+        .toString(16)
+        .padStart(2, "0");
+    })
+    .join("")
+    .toUpperCase();
+}
+
+function buildLogoBrandPalette(colors: string[]): PptxPalette | null {
+  const primary = normalizeHexColor(colors[0]);
+  if (!primary) return null;
+  const secondary = normalizeHexColor(colors[1]) ?? primary;
+  return {
+    canvas: "FFFFFF",
+    surface: "FFFFFF",
+    titleBg: primary,
+    headerBg: primary,
+    accentA: primary,
+    accentB: secondary,
+    headerText: "FFFFFF",
+    bodyText: primary,
+    mutedText: "5F6B76",
+    sectionBg: blendHexWithWhite(primary, 0.9),
+    tableHeaderBg: primary,
+    tableHeaderText: "FFFFFF",
+    tableAltBg: blendHexWithWhite(primary, 0.86),
+    border: blendHexWithWhite(primary, 0.72),
+  };
+}
+
 async function runPythonEdit(
   inputBuffer: Buffer,
   plan: EditPlan,
@@ -2176,11 +2408,13 @@ async function runPythonEdit(
       void totalSlideCount; // 現在は Python 側で処理
 
       const urlCache = new Map<string, Buffer>();
+      let extractedBrandColors: string[] = [];
       for (let i = 0; i < plan.imageInserts!.length; i++) {
         const insert = plan.imageInserts![i];
         if (insert.imageUrl) {
-          // 既存画像URL（ロゴ等）をダウンロード — 同じURLは1回のみ
-          const cached = urlCache.get(insert.imageUrl);
+          // 既存画像URL（ロゴ等）をダウンロード — 同じURL・処理条件は1回のみ
+          const cacheKey = `${insert.role ?? "image"}:${insert.removeWhiteBackground === true}:${insert.imageUrl}`;
+          const cached = urlCache.get(cacheKey);
           if (cached) {
             const imagePath = path.join(tempDir, `image_${i}.png`);
             await fs.writeFile(imagePath, cached);
@@ -2189,11 +2423,30 @@ async function runPythonEdit(
             console.log(`[edit-pptx] image ${i} reused from cache`);
           } else {
             try {
-              console.log(`[edit-pptx] downloading image ${i}: ${insert.imageUrl.slice(0, 80)}`);
-              const resp = await fetch(insert.imageUrl);
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-              const buf = Buffer.from(await resp.arrayBuffer());
-              urlCache.set(insert.imageUrl, buf);
+              const dataUrlBuffer = decodeImageDataUrl(insert.imageUrl);
+              let buf: Buffer;
+              if (dataUrlBuffer) {
+                buf = dataUrlBuffer;
+                console.log(`[edit-pptx] using attached image data for image ${i}`);
+              } else {
+                if (!/^https?:\/\//i.test(insert.imageUrl)) {
+                  throw new Error(
+                    `Unsupported image URL scheme: ${insert.imageUrl.slice(0, 40)}`
+                  );
+                }
+                console.log(`[edit-pptx] downloading image ${i}: ${insert.imageUrl.slice(0, 80)}`);
+                const resp = await fetch(insert.imageUrl);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                buf = Buffer.from(await resp.arrayBuffer());
+              }
+              if (insert.role === "logo" || insert.removeWhiteBackground) {
+                const prepared = await prepareLogoImage(buf);
+                buf = prepared.buffer;
+                if (extractedBrandColors.length === 0) {
+                  extractedBrandColors = prepared.brandColors;
+                }
+              }
+              urlCache.set(cacheKey, buf);
               const imagePath = path.join(tempDir, `image_${i}.png`);
               await fs.writeFile(imagePath, buf);
               insert.imagePath = imagePath;
@@ -2215,6 +2468,19 @@ async function runPythonEdit(
           } else {
             console.warn(`[edit-pptx] image ${i} skipped: DALL-E failed`);
           }
+        }
+      }
+
+      if (plan.deckEdits?.harmonizeWithLogo && extractedBrandColors.length > 0) {
+        const logoPalette = buildLogoBrandPalette(extractedBrandColors);
+        if (logoPalette) {
+          plan.deckEdits.accentColor = logoPalette.accentA;
+          plan.deckEdits.palette = logoPalette as unknown as Record<string, string>;
+          plan.deckEdits.preserveTextColors = true;
+          console.log("[edit-pptx] harmonizing deck with logo colors", {
+            primary: logoPalette.accentA,
+            secondary: logoPalette.accentB,
+          });
         }
       }
     }
@@ -2363,7 +2629,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName, targetLanguage } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName, targetLanguage, imageDataUrl } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -2381,6 +2647,7 @@ export async function POST(req: NextRequest) {
       targetItemCount?: number;
       originalFileName?: string;
       targetLanguage?: string;
+      imageDataUrl?: string;
     };
     const isInternalPptxBatch = req.headers.get("x-azurechat-internal-pptx-batch") === "1";
 
@@ -2473,6 +2740,8 @@ export async function POST(req: NextRequest) {
       // accentColor / paletteKey が明示された場合はデッキ色変更として safeplan に含める
       const incomingDeck = (incomingPlan as any).deckEdits ?? {};
       const incomingDeckAccent = normalizeHexColor(String(incomingDeck.accentColor ?? ""));
+      const incomingDeckBackground = normalizeHexColor(String(incomingDeck.backgroundColor ?? ""));
+      const incomingWhiteBase = incomingDeck.whiteBase === true;
       const incomingPaletteKey = typeof incomingDeck.paletteKey === "string" && incomingDeck.paletteKey in PPTX_NAMED_PALETTES
         ? incomingDeck.paletteKey : undefined;
       const incomingPalette: PptxPalette | undefined = incomingPaletteKey ? buildPaletteFromKey(incomingPaletteKey) : undefined;
@@ -2572,9 +2841,13 @@ export async function POST(req: NextRequest) {
             };
           })
           .filter((se): se is NonNullable<typeof se> => se !== null),
-        ...(incomingDeckAccent || incomingPaletteKey ? {
+        ...(incomingDeckAccent || incomingPaletteKey || incomingDeckBackground || incomingWhiteBase ? {
           deckEdits: {
-            accentColor: incomingDeckAccent || incomingPalette?.accentA,
+            ...(incomingDeckAccent || incomingPalette?.accentA
+              ? { accentColor: incomingDeckAccent || incomingPalette?.accentA }
+              : {}),
+            ...(incomingDeckBackground ? { backgroundColor: incomingDeckBackground } : {}),
+            ...(incomingWhiteBase ? { whiteBase: true } : {}),
             ...(incomingPaletteKey ? { paletteKey: incomingPaletteKey, palette: incomingPalette as Record<string, string> } : {}),
             preserveTextColors: incomingDeck.preserveTextColors !== false,
           },
@@ -2713,14 +2986,104 @@ export async function POST(req: NextRequest) {
     const pptxBuffer = await downloadBlob(fileUrl, threadId);
     const slides = await extractSlidesStructured(pptxBuffer);
     let plan = await buildEditPlan(slides, instruction);
+    const safeImageDataUrl =
+      typeof imageDataUrl === "string" &&
+      imageDataUrl.length <= 20 * 1024 * 1024 &&
+      /^data:image\/(?:png|jpe?g|webp);base64,/i.test(imageDataUrl)
+        ? imageDataUrl
+        : "";
+    if (safeImageDataUrl) {
+      plan = normalizeLogoEditPlan(plan, instruction, safeImageDataUrl);
+    }
+    const invalidLogoSource = (plan.imageInserts ?? []).find(
+      (item) =>
+        item.role === "logo" &&
+        !isSupportedEditImageSource(item.imageUrl)
+    );
+    if (invalidLogoSource) {
+      console.error("[edit-pptx] rejected unresolved logo image source", {
+        value: String(invalidLogoSource.imageUrl ?? "").slice(0, 80),
+      });
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "添付ロゴの画像データを解決できませんでした。PPTXは変更していません。ロゴ画像を添付して再度お試しください。",
+        },
+        { status: 400 }
+      );
+    }
 
     // deckEdits はユーザーが明示的にスライド追加・削除を要求した場合のみ許可
     // (それ以外の編集指示で accentColor/fontFace が混入すると別物化する)
     const deckEditAllowed =
-      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更|かえ|にして|替え)|フォント.{0,8}(変え|変更|かえ)|アクセント|(緑|青|紺|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|深緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|サンゴ|フォレスト|green|blue|red|yellow|purple|orange|pink|navy|gray|teal|coral|amber|burgundy|forest|charcoal|terra).{0,12}(にして|にかえ|に変え|に変更)|ネイビー.{0,2}オレンジ|深緑.{0,2}アンバー|バーガンディ.{0,2}ゴールド|ティール.{0,2}コーラル|チャコール.{0,2}テラコッタ|navy.orange|forest.amber|burgundy.gold|teal.coral|charcoal.terra/.test(instruction);
+      /スライド.{0,8}(追加|挿入|削除)|ページ.{0,8}(追加|削除)|デザイン.{0,8}変更|カラー.{0,8}変更|色.{0,8}(変え|変更|かえ|にして|替え|調整)|フォント.{0,8}(変え|変更|かえ)|アクセント|(緑|青|紺|赤|黄|紫|オレンジ|ピンク|ネイビー|グレー|グリーン|ブルー|レッド|深緑|バーガンディ|ゴールド|ティール|コーラル|チャコール|テラコッタ|アンバー|ワインレッド|サンゴ|フォレスト|green|blue|red|yellow|purple|orange|pink|navy|gray|teal|coral|amber|burgundy|forest|charcoal|terra).{0,12}(にして|にかえ|に変え|に変更)|ネイビー.{0,2}オレンジ|深緑.{0,2}アンバー|バーガンディ.{0,2}ゴールド|ティール.{0,2}コーラル|チャコール.{0,2}テラコッタ|navy.orange|forest.amber|burgundy.gold|teal.coral|charcoal.terra/.test(instruction) ||
+      (/ロゴ|logo/i.test(instruction) &&
+        /自然|なじ|馴染|背景.{0,8}白|配色|ブランド/i.test(instruction));
     if (!deckEditAllowed && plan.deckEdits) {
       console.log("[edit-pptx] stripping deckEdits (not explicitly requested)");
       plan = { ...plan, deckEdits: undefined };
+    }
+
+    // An explicit user color always wins over logo-derived brand harmonization.
+    // Otherwise a request such as "green accent, keep the logo" is silently
+    // overwritten with the logo's blue during image preparation.
+    const explicitlyRequestedPalette = resolvePptxPaletteInstruction(instruction);
+    if (explicitlyRequestedPalette && plan.deckEdits?.harmonizeWithLogo) {
+      plan.deckEdits = {
+        ...plan.deckEdits,
+        accentColor: explicitlyRequestedPalette.accentColor,
+        ...(explicitlyRequestedPalette.paletteKey
+          ? {
+              paletteKey: explicitlyRequestedPalette.paletteKey,
+              palette: explicitlyRequestedPalette.palette as unknown as Record<string, string>,
+            }
+          : {}),
+        harmonizeWithLogo: false,
+      };
+      console.log("[edit-pptx] explicit color overrides logo harmonization", {
+        accentColor: explicitlyRequestedPalette.accentColor,
+      });
+    }
+
+    // White-base is a deterministic surface requirement, not a palette suggestion.
+    // Apply it after logo normalization so logo-derived colors cannot turn the cover
+    // or decorative panels into a brand-colored full surface. If the user did not
+    // name an accent color, also discard any color invented by the planning model.
+    if (isPptxWhiteBaseRequest(instruction)) {
+      const currentDeckEdits = plan.deckEdits ?? {};
+      const {
+        accentColor: plannedAccentColor,
+        paletteKey: plannedPaletteKey,
+        palette: plannedPalette,
+        ...nonPaletteDeckEdits
+      } = currentDeckEdits;
+      plan.deckEdits = {
+        ...nonPaletteDeckEdits,
+        ...(explicitlyRequestedPalette
+          ? {
+              accentColor: explicitlyRequestedPalette.accentColor,
+              ...(explicitlyRequestedPalette.paletteKey
+                ? {
+                    paletteKey: explicitlyRequestedPalette.paletteKey,
+                    palette: explicitlyRequestedPalette.palette as unknown as Record<string, string>,
+                  }
+                : {}),
+            }
+          : {}),
+        backgroundColor: "FFFFFF",
+        whiteBase: true,
+        preserveTextColors: explicitlyRequestedPalette
+          ? false
+          : currentDeckEdits.preserveTextColors ?? true,
+        harmonizeWithLogo: false,
+      };
+      console.log("[edit-pptx] enforcing white-base surfaces", {
+        explicitAccentColor: explicitlyRequestedPalette?.accentColor ?? null,
+        discardedPlannedAccentColor: explicitlyRequestedPalette ? null : plannedAccentColor ?? null,
+        discardedPlannedPaletteKey: explicitlyRequestedPalette ? null : plannedPaletteKey ?? null,
+        discardedPlannedPalette: explicitlyRequestedPalette ? null : !!plannedPalette,
+      });
     }
 
     console.log("[edit-pptx] plan:", JSON.stringify(plan));
@@ -2730,7 +3093,12 @@ export async function POST(req: NextRequest) {
 
     // 変更なし検証: 0件置換は無言成功ではなくエラーとして返す
     // deckEdits（テーマ色・フォント変更）はchangedSlides=0でもtheme XMLが更新されるため除外
-    const hasDeckChange = !!(plan.deckEdits?.accentColor || plan.deckEdits?.fontFace);
+    const hasDeckChange = !!(
+      plan.deckEdits?.accentColor ||
+      plan.deckEdits?.backgroundColor ||
+      plan.deckEdits?.whiteBase ||
+      plan.deckEdits?.fontFace
+    );
     if ((result.changedSlides ?? 0) <= 0 && (plan.imageInserts?.length ?? 0) === 0 && !hasDeckChange) {
       return NextResponse.json({
         ok: false,

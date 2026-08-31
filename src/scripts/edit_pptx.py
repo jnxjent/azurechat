@@ -1,4 +1,5 @@
 import argparse
+from io import BytesIO
 import json
 import math
 import sys
@@ -15,6 +16,11 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml import parse_xml
 from pptx.util import Emu, Pt
 from lxml import etree
+from PIL import Image as PILImage
+
+
+LOGO_SHAPE_NAME_PREFIX = "AzureChat Logo"
+LOGO_PLATE_NAME_PREFIX = "AzureChat Logo Contrast Plate"
 
 
 def normalize_hex(value: str | None) -> str | None:
@@ -389,6 +395,338 @@ def find_shape_by_text(slide, near_text: str):
     return None
 
 
+def _shape_solid_rgb(shape) -> tuple[int, int, int] | None:
+    try:
+        fill = shape.fill
+        if fill.type != MSO_FILL_TYPE.SOLID:
+            return None
+        return try_get_rgb(fill.fore_color)
+    except Exception:
+        return None
+
+
+def _background_rgb_at(slide, x: int, y: int) -> tuple[int, int, int]:
+    """Estimate the visible solid-fill color below a newly inserted asset."""
+    result: tuple[int, int, int] | None = None
+    try:
+        background_fill = slide.background.fill
+        if background_fill.type == MSO_FILL_TYPE.SOLID:
+            result = try_get_rgb(background_fill.fore_color)
+    except Exception:
+        pass
+
+    # Shape order is back-to-front. Keep the last solid shape covering the point.
+    for shape in slide.shapes:
+        try:
+            if (
+                int(shape.left) <= x <= int(shape.left + shape.width)
+                and int(shape.top) <= y <= int(shape.top + shape.height)
+            ):
+                shape_rgb = _shape_solid_rgb(shape)
+                if shape_rgb:
+                    result = shape_rgb
+        except Exception:
+            continue
+    return result or (255, 255, 255)
+
+
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
+    def linearize(channel: int) -> float:
+        value = channel / 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = [linearize(channel) for channel in rgb]
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _add_logo_contrast_plate(
+    slide,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    slide_width: int,
+    slide_height: int,
+    before_shape=None,
+) -> bool:
+    center_x = left + width // 2
+    center_y = top + height // 2
+    background_rgb = _background_rgb_at(slide, center_x, center_y)
+    if _relative_luminance(background_rgb) >= 0.58:
+        return False
+
+    pad_x = max(int(slide_width * 0.008), int(width * 0.035))
+    pad_y = max(int(slide_height * 0.008), int(height * 0.12))
+    plate_left = max(0, left - pad_x)
+    plate_top = max(0, top - pad_y)
+    plate_right = min(slide_width, left + width + pad_x)
+    plate_bottom = min(slide_height, top + height + pad_y)
+    plate = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        plate_left,
+        plate_top,
+        max(1, plate_right - plate_left),
+        max(1, plate_bottom - plate_top),
+    )
+    plate.fill.solid()
+    plate.fill.fore_color.rgb = RGBColor(255, 255, 255)
+    plate.line.fill.background()
+    try:
+        plate.name = LOGO_PLATE_NAME_PREFIX
+        if before_shape is not None:
+            before_shape._element.addprevious(plate._element)
+    except Exception:
+        pass
+    return True
+
+
+def _add_picture_with_logo_contrast(
+    slide,
+    image_path: str,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    slide_width: int,
+    slide_height: int,
+    role: str,
+) -> None:
+    if role == "logo":
+        _add_logo_contrast_plate(
+            slide,
+            left,
+            top,
+            width,
+            height,
+            slide_width,
+            slide_height,
+        )
+    picture = slide.shapes.add_picture(image_path, left, top, width, height)
+    if role == "logo":
+        try:
+            picture.name = LOGO_SHAPE_NAME_PREFIX
+        except Exception:
+            pass
+
+
+def _picture_has_transparency(shape) -> bool:
+    try:
+        with PILImage.open(BytesIO(shape.image.blob)) as image:
+            if "A" not in image.getbands():
+                return False
+            alpha = image.getchannel("A")
+            return alpha.getextrema()[0] < 245
+    except Exception:
+        return False
+
+
+def force_slide_base_background(
+    slide,
+    background_hex: str,
+    slide_width: int,
+    slide_height: int,
+) -> int:
+    """Set the canvas and full-slide background shapes to an explicit color."""
+    changed = 0
+    try:
+        fill = slide.background.fill
+        current = try_get_rgb(fill.fore_color) if fill.type == MSO_FILL_TYPE.SOLID else None
+        target = tuple(int(background_hex[i : i + 2], 16) for i in range(0, 6, 2))
+        if current != target:
+            fill.solid()
+            fill.fore_color.rgb = RGBColor.from_string(background_hex)
+            changed += 1
+    except Exception:
+        pass
+
+    for shape in slide.shapes:
+        try:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                continue
+            covers_width = int(shape.width) >= int(slide_width * 0.90)
+            covers_height = int(shape.height) >= int(slide_height * 0.90)
+            near_origin = (
+                int(shape.left) <= int(slide_width * 0.05)
+                and int(shape.top) <= int(slide_height * 0.05)
+            )
+            if not (covers_width and covers_height and near_origin):
+                continue
+            fill = shape.fill
+            if fill.type != MSO_FILL_TYPE.SOLID:
+                continue
+            rgb = try_get_rgb(fill.fore_color)
+            target = tuple(int(background_hex[i : i + 2], 16) for i in range(0, 6, 2))
+            if rgb == target:
+                continue
+            fill.fore_color.rgb = RGBColor.from_string(background_hex)
+            changed += 1
+        except Exception:
+            continue
+    return changed
+
+
+def force_white_base_surfaces(slide) -> int:
+    """Make slide surfaces white while preserving text, lines, and pictures.
+
+    A white-base request means more than replacing the canvas: colored title bars,
+    cards, circles, and table cells are surfaces too. Leaving those fills intact can
+    make a slide (especially the cover) still look red or otherwise color-based.
+    """
+    changed = 0
+    white = (255, 255, 255)
+    surface_fill_types = {
+        MSO_FILL_TYPE.SOLID,
+        MSO_FILL_TYPE.GRADIENT,
+        MSO_FILL_TYPE.PATTERNED,
+    }
+    for shape in iter_shapes(slide.shapes):
+        try:
+            if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                fill = shape.fill
+                if fill.type in surface_fill_types:
+                    current = try_get_rgb(fill.fore_color) if fill.type == MSO_FILL_TYPE.SOLID else None
+                    if current != white:
+                        fill.solid()
+                        fill.fore_color.rgb = RGBColor(255, 255, 255)
+                        changed += 1
+        except Exception:
+            pass
+
+        if not getattr(shape, "has_table", False):
+            continue
+        for row in shape.table.rows:
+            for cell in row.cells:
+                try:
+                    fill = cell.fill
+                    if fill.type in surface_fill_types:
+                        current = try_get_rgb(fill.fore_color) if fill.type == MSO_FILL_TYPE.SOLID else None
+                        if current != white:
+                            fill.solid()
+                            fill.fore_color.rgb = RGBColor(255, 255, 255)
+                            changed += 1
+                except Exception:
+                    pass
+    return changed
+
+
+def ensure_text_contrast_for_white_base(
+    slide,
+    slide_width: int,
+    slide_height: int,
+    dark_hex: str,
+) -> int:
+    """Turn light text dark only when it now sits on a light background."""
+    changed = 0
+    for shape in iter_shapes(slide.shapes):
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        try:
+            center_x = int(shape.left + shape.width // 2)
+            center_y = int(shape.top + shape.height // 2)
+            background_rgb = _background_rgb_at(slide, center_x, center_y)
+            if _relative_luminance(background_rgb) < 0.72:
+                continue
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    rgb = try_get_rgb(run.font.color)
+                    if not rgb or _relative_luminance(rgb) < 0.72:
+                        continue
+                    run.font.color.rgb = RGBColor.from_string(dark_hex)
+                    changed += 1
+        except Exception:
+            continue
+    return changed
+
+
+def _is_likely_logo_picture(
+    shape,
+    slide_width: int,
+    slide_height: int,
+) -> bool:
+    if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+        return False
+    if str(getattr(shape, "name", "")).startswith(LOGO_SHAPE_NAME_PREFIX):
+        return True
+
+    # Compatibility for logos inserted before semantic shape names were added.
+    # Keep this deliberately narrow: transparent, wide, small, top-right assets.
+    try:
+        aspect_ratio = float(shape.width) / max(1.0, float(shape.height))
+        is_top_right = (
+            int(shape.left) >= int(slide_width * 0.52)
+            and int(shape.top) <= int(slide_height * 0.12)
+        )
+        is_logo_sized = (
+            int(shape.width) <= int(slide_width * 0.36)
+            and int(shape.height) <= int(slide_height * 0.28)
+            and aspect_ratio >= 1.45
+        )
+        return is_top_right and is_logo_sized and _picture_has_transparency(shape)
+    except Exception:
+        return False
+
+
+def _find_logo_plate(slide, logo_shape):
+    try:
+        logo_center_x = int(logo_shape.left + logo_shape.width // 2)
+        logo_center_y = int(logo_shape.top + logo_shape.height // 2)
+        for shape in slide.shapes:
+            if not str(getattr(shape, "name", "")).startswith(LOGO_PLATE_NAME_PREFIX):
+                continue
+            if (
+                int(shape.left) <= logo_center_x <= int(shape.left + shape.width)
+                and int(shape.top) <= logo_center_y <= int(shape.top + shape.height)
+            ):
+                return shape
+    except Exception:
+        pass
+    return None
+
+
+def ensure_logo_contrast_after_recolor(
+    slide,
+    slide_width: int,
+    slide_height: int,
+) -> int:
+    """Protect existing transparent logos after a later deck color change."""
+    repaired = 0
+    for shape in list(slide.shapes):
+        if not _is_likely_logo_picture(shape, slide_width, slide_height):
+            continue
+        try:
+            if not str(getattr(shape, "name", "")).startswith(LOGO_SHAPE_NAME_PREFIX):
+                shape.name = LOGO_SHAPE_NAME_PREFIX
+        except Exception:
+            pass
+
+        existing_plate = _find_logo_plate(slide, shape)
+        if existing_plate is not None:
+            try:
+                existing_plate.fill.solid()
+                existing_plate.fill.fore_color.rgb = RGBColor(255, 255, 255)
+                existing_plate.line.fill.background()
+            except Exception:
+                pass
+            continue
+
+        center_x = int(shape.left + shape.width // 2)
+        center_y = int(shape.top + shape.height // 2)
+        if _relative_luminance(_background_rgb_at(slide, center_x, center_y)) >= 0.58:
+            continue
+        if _add_logo_contrast_plate(
+            slide,
+            int(shape.left),
+            int(shape.top),
+            int(shape.width),
+            int(shape.height),
+            slide_width,
+            slide_height,
+            before_shape=shape,
+        ):
+            repaired += 1
+    return repaired
+
+
 def insert_image(
     slide,
     image_path: str,
@@ -398,6 +736,7 @@ def insert_image(
     slide_height: int,
     near_text: str = "",
     anchor_side: str = "right",
+    role: str = "image",
 ) -> bool:
     """DALL-E で生成した画像をスライドに挿入する。
     near_text が指定されていればその Shape の隣に配置し、見つからなければ固定 position を使う。
@@ -406,7 +745,12 @@ def insert_image(
         # widthPct をクランプ（5〜50%）
         width_pct = max(5.0, min(50.0, width_pct))
         width = int(slide_width * width_pct / 100)
-        height = width  # アイコンは正方形
+        try:
+            with PILImage.open(image_path) as source_image:
+                source_width, source_height = source_image.size
+            height = int(width * source_height / max(1, source_width))
+        except Exception:
+            height = width
         margin = int(slide_width * 0.015)
 
         # anchorSide バリデーション
@@ -415,7 +759,7 @@ def insert_image(
             anchor_side = "right"
 
         # ヘッダー下限：スライド高さの20%以上に強制（タイトルバーへの被りを防ぐ）
-        header_bottom = int(slide_height * 0.20)
+        header_bottom = margin if role == "logo" else int(slide_height * 0.20)
 
         # nearText が指定されていれば Shape 相対配置を試みる
         if near_text:
@@ -443,7 +787,17 @@ def insert_image(
                 # ヘッダー回避 + スライド範囲内クランプ
                 left = max(0, min(slide_width - width, left))
                 top = max(header_bottom, min(slide_height - height, top))
-                slide.shapes.add_picture(image_path, left, top, width, height)
+                _add_picture_with_logo_contrast(
+                    slide,
+                    image_path,
+                    left,
+                    top,
+                    width,
+                    height,
+                    slide_width,
+                    slide_height,
+                    role,
+                )
                 return True
             else:
                 print(f"[edit_pptx] nearText '{near_text}' not found, falling back to position", file=sys.stderr)
@@ -461,7 +815,17 @@ def insert_image(
             "center":       ((slide_width - width) // 2, (slide_height - height) // 2),
         }
         left, top = pos_map[position]
-        slide.shapes.add_picture(image_path, left, top, width, height)
+        _add_picture_with_logo_contrast(
+            slide,
+            image_path,
+            left,
+            top,
+            width,
+            height,
+            slide_width,
+            slide_height,
+            role,
+        )
         return True
     except Exception as e:
         print(f"[edit_pptx] insert_image failed: {e}", file=sys.stderr)
@@ -1591,6 +1955,10 @@ def main() -> None:
 
     deck_edits = plan.get("deckEdits") or {}
     target_hex = normalize_hex(deck_edits.get("accentColor"))
+    background_hex = normalize_hex(deck_edits.get("backgroundColor"))
+    white_base = bool(deck_edits.get("whiteBase", False))
+    if white_base and not background_hex:
+        background_hex = "FFFFFF"
     palette: dict | None = deck_edits.get("palette") if isinstance(deck_edits.get("palette"), dict) else None
     palette_key: str | None = deck_edits.get("paletteKey") or None
     effective_hex = target_hex or (palette.get("accentA") if palette else None)
@@ -1603,20 +1971,24 @@ def main() -> None:
         if item.get("slideIndex") is not None
     }
 
-    # imageInserts: slideIndex → list of inserts (-1 = 全スライドに適用)
+    # imageInserts: -1 = all slides, -2 = all slides except cover.
     image_insert_map: dict[int, list[dict]] = {}
     all_slides_inserts: list[dict] = []
+    body_slides_inserts: list[dict] = []
     for item in (plan.get("imageInserts") or []):
         si = item.get("slideIndex")
         if si is not None:
             if int(si) == -1:
                 all_slides_inserts.append(item)
+            elif int(si) == -2:
+                body_slides_inserts.append(item)
             else:
                 image_insert_map.setdefault(int(si), []).append(item)
 
     chars_before = count_all_run_chars(prs)
     changed_slides: set[int] = set()
     inserted_images: int = 0
+    repaired_logo_plates: int = 0
     layout_warnings: list[str] = []
     changed_fills: int = 0
     changed_texts: int = 0
@@ -1639,6 +2011,23 @@ def main() -> None:
         slide_changed = False
         slide_edit = slide_edit_map.get(slide_index) or {}
         replacements = slide_edit.get("replaceText") or []
+
+        if background_hex:
+            background_changes = force_slide_base_background(
+                slide,
+                background_hex,
+                int(prs.slide_width),
+                int(prs.slide_height),
+            )
+            if background_changes > 0:
+                slide_changed = True
+                changed_fills += background_changes
+
+        if white_base:
+            surface_changes = force_white_base_surfaces(slide)
+            if surface_changes > 0:
+                slide_changed = True
+                changed_fills += surface_changes
 
         if effective_hex or palette:
             if recolor_slide_background(slide, effective_hex, palette):
@@ -1725,7 +2114,33 @@ def main() -> None:
         ):
             slide_changed = True
 
-        for img_item in image_insert_map.get(slide_index, []) + all_slides_inserts:
+        if white_base:
+            contrast_text_changes = ensure_text_contrast_for_white_base(
+                slide,
+                int(prs.slide_width),
+                int(prs.slide_height),
+                effective_hex or (palette.get("bodyText") if palette else None) or "1D2435",
+            )
+            if contrast_text_changes > 0:
+                changed_texts += contrast_text_changes
+                slide_changed = True
+
+        if effective_hex or palette:
+            repaired_on_slide = ensure_logo_contrast_after_recolor(
+                slide,
+                int(prs.slide_width),
+                int(prs.slide_height),
+            )
+            if repaired_on_slide > 0:
+                repaired_logo_plates += repaired_on_slide
+                slide_changed = True
+
+        effective_image_inserts = (
+            image_insert_map.get(slide_index, [])
+            + all_slides_inserts
+            + (body_slides_inserts if slide_index > 0 else [])
+        )
+        for img_item in effective_image_inserts:
             image_path = img_item.get("imagePath")
             if image_path and Path(image_path).exists():
                 try:
@@ -1741,6 +2156,7 @@ def main() -> None:
                     prs.slide_height,
                     near_text=img_item.get("nearText", ""),
                     anchor_side=img_item.get("anchorSide", "right"),
+                    role=img_item.get("role", "image"),
                 ):
                     slide_changed = True
                     inserted_images += 1
@@ -1771,11 +2187,12 @@ def main() -> None:
       "changedSlideIndices": sorted(changed_slides),
       "totalSlides": len(prs.slides),
       "insertedImages": inserted_images,
+      "repairedLogoPlates": repaired_logo_plates,
       "charsBefore": chars_before,
       "charsAfter": chars_after,
       **({"paletteKey": palette_key} if palette_key else {}),
       **({"changedFills": changed_fills, "changedLines": changed_lines, "changedTexts": changed_texts}
-         if (effective_hex or palette) else {}),
+         if (effective_hex or palette or background_hex) else {}),
     }
     if out_of_range_indices:
         result["outOfRangeSlides"] = out_of_range_indices

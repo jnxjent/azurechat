@@ -7,7 +7,10 @@ import { promisify } from "util";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { OpenAIVisionInstance } from "@/features/common/services/openai";
+import {
+  OpenAIPptVisionInstance,
+  OpenAIVisionInstance,
+} from "@/features/common/services/openai";
 
 const execFileAsync = promisify(execFile);
 
@@ -87,6 +90,8 @@ export type VisionFix =
       reason?: string;
     };
 
+type SlideIndexMode = "rendered-zero-based" | "cover-separated";
+
 export type VisionReviewResult = {
   deckScore: number;
   fixes: VisionFix[];
@@ -165,10 +170,18 @@ async function pptxToPngs(pptxBuffer: Buffer, maxSlides = 12): Promise<string[]>
 async function reviewWithVision(
   pngPaths: string[],
   title: string,
-  promptIntent?: Record<string, unknown>
+  promptIntent?: Record<string, unknown>,
+  slideIndexMode: SlideIndexMode = "rendered-zero-based",
+  b3mode = false,
+  b3pass = 1,
+  b4mode = false
 ): Promise<VisionReviewResult> {
-  const openai = OpenAIVisionInstance();
-  const model = process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME!;
+  const primaryModel =
+    process.env.AZURE_OPENAI_PPT_VISION_DEPLOYMENT_NAME?.trim() ||
+    process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME?.trim() ||
+    "";
+  const fallbackModel =
+    process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME?.trim() || "";
 
   // 全スライドをレビュー対象にする（上限 12枚 — 10枚資料は全ページカバー）
   const reviewPaths = pngPaths.slice(0, 12);
@@ -181,10 +194,25 @@ async function reviewWithVision(
     },
   }));
 
+  const slideIndexRule = slideIndexMode === "cover-separated"
+    ? "- slideIndex is the zero-based RENDERED PAGE index: 0 = cover, 1 = first content page, 2 = second content page, etc. The server normalizes it after review."
+    : "- slideIndex is the zero-based RENDERED PAGE index: 0 = first page, 1 = second page, etc.";
+
+  const targetScore = b3mode
+    ? Math.max(72, parseInt(process.env.PPTX_VISION_TARGET_SCORE ?? "90", 10) || 90)
+    : 72;
+  const maxFixesNote = b3mode
+    ? "- Each slide can receive at most 2 fixes. Prioritize the highest-impact improvement."
+    : "- NEVER suggest fixes for slides that look acceptable — fewer fixes is better.";
+
   const systemPrompt = [
     "You are a QA reviewer for B2B Japanese corporate presentations rendered with Meiryo font.",
-    "Your ONLY job is to detect VISIBLE DEFECTS that users would complain about.",
-    "Do NOT suggest micro-adjustments to slides that look acceptable.",
+    b3mode && b3pass === 1
+      ? "Your job is to detect VISIBLE DEFECTS and suggest HIGH-IMPACT quality improvements. Each improvement should have a clear expected benefit."
+      : "Your ONLY job is to detect VISIBLE DEFECTS that users would complain about.",
+    b3mode && b3pass === 1
+      ? "Evaluate in this order: (1) text overflow/overlap/poor fit, (2) information priority and executive readability, (3) layout-content fit, (4) data visualization opportunities, (5) slide monotony and design consistency, (6) cover-to-conclusion story arc."
+      : "Do NOT suggest micro-adjustments to slides that look acceptable.",
     "",
     "DEFECT CHECKLIST — check in priority order:",
     "== TIER 1: OVERFLOW / OVERLAP (highest priority — always fix) ==",
@@ -234,8 +262,19 @@ async function reviewWithVision(
     "",
     "When you detect a layout-type defect (items 7, 8, 9), output a layoutType fix:",
     "- Bullet-only with numbers → layoutType='stat_callouts' (provide statCallouts data in bullets as 'value|unit|label' triplets)",
-    "- 3-6 parallel items without visuals → layoutType='card_grid'",
+    b4mode
+      ? "- 2-6 narrative or parallel items without essential metrics/process structure → layoutType='asymmetric_list'"
+      : "- 3-6 parallel items without visuals → layoutType='card_grid'",
+    ...(b4mode ? [
+      "- 1-3 strong narrative points → layoutType='editorial_statement'",
+      "- Card-heavy slides should not exceed 40% of the deck or appear more than twice consecutively.",
+      "- editorial_statement and asymmetric_list are intentionally decorated non-card layouts; do not mark them as text-only defects.",
+      "- Do not propose card_grid/icon_rows merely to fill whitespace. Preserve meaningful whitespace and hierarchy.",
+    ] : []),
     "- Process/capability list → layoutType='icon_rows'",
+    "- Balanced text plus an existing visual/data panel → layoutType='split_visual'",
+    "- Existing 2-3 option comparison grid → layoutType='comparison_matrix'",
+    "- Explicit conclusion + evidence + next actions → layoutType='decision_summary'",
     "",
     "Return ONLY valid JSON in this exact shape:",
     '{"deckScore": <0-100>, "fixes": [<fix>, ...]}',
@@ -248,7 +287,9 @@ async function reviewWithVision(
     '{"slideIndex":<n>, "field":"syncItemDecorations", "value":"true", "reason":"..."}',
     '{"slideIndex":<n>, "field":"copyItemDecoration", "value":"true", "reason":"..."}',
     '{"slideIndex":<n>, "field":"alignItemGroup", "value":"true", "reason":"..."}',
-    '{"slideIndex":<n>, "field":"layoutType", "value":"stat_callouts"|"card_grid"|"icon_rows"|"bullets"|"process-cards"|"table"|"multi-column", "reason":"..."}',
+    b4mode
+      ? '{"slideIndex":<n>, "field":"layoutType", "value":"stat_callouts"|"card_grid"|"icon_rows"|"bullets"|"process-cards"|"table"|"multi-column"|"split_visual"|"comparison_matrix"|"decision_summary"|"editorial_statement"|"asymmetric_list", "reason":"..."}'
+      : '{"slideIndex":<n>, "field":"layoutType", "value":"stat_callouts"|"card_grid"|"icon_rows"|"bullets"|"process-cards"|"table"|"multi-column"|"split_visual"|"comparison_matrix"|"decision_summary", "reason":"..."}',
     '{"slideIndex":<n>, "field":"bullets", "value":"bullet1|bullet2|bullet3", "reason":"..."}',
     '{"slideIndex":<n>, "field":"steps", "value":"タイトル1:説明1|タイトル2:説明2", "reason":"..."}',
     '{"slideIndex":<n>, "field":"deleteSlide", "value":"true", "reason":"..."}',
@@ -258,38 +299,74 @@ async function reviewWithVision(
     "",
     ...(promptIntent ? buildIntentChecks(promptIntent) : []),
     "RULES:",
-    "- slideIndex -1 = cover slide. slideIndex 0 = first content slide.",
+    slideIndexRule,
+    "- slideIndex -1 is reserved for the deck-wide regenerateStyle action only.",
     "- Use regenerateStyle ONLY when overall color scheme fundamentally mismatches deck purpose.",
     "- Use deleteSlide ONLY for genuinely empty slides.",
-    "- NEVER suggest fixes for slides that look acceptable — fewer fixes is better.",
-    "- If deckScore >= 72 and no critical defects, return empty fixes array.",
+    maxFixesNote,
+    b3mode
+      ? `- If deckScore >= ${targetScore} and no critical defects, return empty fixes array.`
+      : "- If deckScore >= 72 and no critical defects, return empty fixes array.",
+    b3mode && b3pass === 2 ? "- PASS 2 RESTRICTION: Do NOT suggest regenerateStyle or layoutType changes. Only suggest fitTextToShape, fontScaleDown, or trimText for remaining overflow/overlap defects." : "",
     "Return no other text — JSON only.",
   ].join("\n");
 
-  console.log(`[vision-review] model=${model} slides=${reviewPaths.length}`);
+  const requestReview = (
+    client: ReturnType<typeof OpenAIVisionInstance>,
+    deploymentName: string
+  ) =>
+    client.chat.completions.create({
+      model: deploymentName,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Presentation title: "${title}"\nReview the first ${reviewPaths.length} slides:`,
+            },
+            ...imageContents,
+          ],
+        },
+      ],
+      max_completion_tokens: 16000,
+    });
 
-  const res = await openai.chat.completions.create({
-    model,
-    messages: [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Presentation title: "${title}"\nReview the first ${reviewPaths.length} slides:`,
-          },
-          ...imageContents,
-        ],
-      },
-    ],
-    max_completion_tokens: 16000,
-  });
+  let model = primaryModel;
+  let res: Awaited<ReturnType<typeof requestReview>>;
+  console.log(
+    `[vision-review] model=${model} fallback=${fallbackModel || "none"} slides=${reviewPaths.length}`
+  );
+  try {
+    res = await requestReview(OpenAIPptVisionInstance(), model);
+  } catch (error) {
+    if (!fallbackModel || fallbackModel === model) throw error;
+    console.warn(
+      `[vision-review] primary model failed; retrying with ${fallbackModel}: ${
+        error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
+      }`
+    );
+    model = fallbackModel;
+    res = await requestReview(OpenAIVisionInstance(), model);
+  }
 
-  const choice = res.choices[0];
+  let choice = res.choices[0];
   console.log(`[vision-review] finish_reason=${choice?.finish_reason} usage=${JSON.stringify(res.usage)}`);
 
-  const raw = choice?.message?.content ?? "";
+  let raw = choice?.message?.content ?? "";
+  if (!raw.trim() && fallbackModel && fallbackModel !== model) {
+    console.warn(
+      `[vision-review] empty response from ${model}; retrying with ${fallbackModel}`
+    );
+    model = fallbackModel;
+    res = await requestReview(OpenAIVisionInstance(), model);
+    choice = res.choices[0];
+    raw = choice?.message?.content ?? "";
+    console.log(
+      `[vision-review] fallback finish_reason=${choice?.finish_reason} usage=${JSON.stringify(res.usage)}`
+    );
+  }
   console.log(`[vision-review] raw response: ${raw.slice(0, 300)}`);
 
   if (!raw.trim()) {
@@ -297,15 +374,37 @@ async function reviewWithVision(
     return { deckScore: 0, fixes: [] };
   }
 
-  const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/) ?? raw.match(/(\{[\s\S]*\})/);
-  const jsonStr = jsonMatch ? (jsonMatch[1] ?? jsonMatch[0]).trim() : raw.trim();
+  const parseReviewJson = (text: string): any => {
+    const jsonMatch =
+      text.match(/```json\s*([\s\S]*?)```/) ?? text.match(/(\{[\s\S]*\})/);
+    const jsonStr = jsonMatch
+      ? (jsonMatch[1] ?? jsonMatch[0]).trim()
+      : text.trim();
+    return JSON.parse(jsonStr);
+  };
 
   let parsed: any;
   try {
-    parsed = JSON.parse(jsonStr);
+    parsed = parseReviewJson(raw);
   } catch {
-    console.warn(`[vision-review] JSON parse failed, raw: ${raw.slice(0, 200)}`);
-    return { deckScore: 0, fixes: [] };
+    if (!fallbackModel || fallbackModel === model) {
+      console.warn(`[vision-review] JSON parse failed, raw: ${raw.slice(0, 200)}`);
+      return { deckScore: 0, fixes: [] };
+    }
+    console.warn(
+      `[vision-review] JSON parse failed for ${model}; retrying with ${fallbackModel}`
+    );
+    model = fallbackModel;
+    res = await requestReview(OpenAIVisionInstance(), model);
+    raw = res.choices[0]?.message?.content ?? "";
+    try {
+      parsed = parseReviewJson(raw);
+    } catch {
+      console.warn(
+        `[vision-review] fallback JSON parse failed, raw: ${raw.slice(0, 200)}`
+      );
+      return { deckScore: 0, fixes: [] };
+    }
   }
 
   const rawFixes: any[] = Array.isArray(parsed.fixes) ? parsed.fixes : [];
@@ -336,11 +435,29 @@ async function reviewWithVision(
     return ALLOWED_SLIDE_FIELDS.has(f.field) && typeof f.value === "string";
   });
 
-  console.log(`[vision-review] fixes accepted=${validFixes.length} / raw=${rawFixes.length}`);
+  const normalizedFixes = validFixes.flatMap((fix): VisionFix[] => {
+    // -1 is a deck-wide action (regenerateStyle), not a rendered page number.
+    if (fix.slideIndex === -1) return [fix];
+    if (fix.slideIndex < 0 || fix.slideIndex >= reviewPaths.length) {
+      console.warn(
+        `[vision-review] ignored out-of-range rendered page index=${fix.slideIndex} pages=${reviewPaths.length}`
+      );
+      return [];
+    }
+    if (slideIndexMode !== "cover-separated") return [fix];
+
+    const contentSlideIndex = fix.slideIndex - 1;
+    console.log(
+      `[vision-review] normalized rendered page[${fix.slideIndex}] -> content slide[${contentSlideIndex}]`
+    );
+    return [{ ...fix, slideIndex: contentSlideIndex } as VisionFix];
+  });
+
+  console.log(`[vision-review] fixes accepted=${normalizedFixes.length} / raw=${rawFixes.length}`);
 
   return {
     deckScore: typeof parsed.deckScore === "number" ? parsed.deckScore : 0,
-    fixes: validFixes,
+    fixes: normalizedFixes,
   };
 }
 
@@ -349,6 +466,10 @@ export async function POST(req: NextRequest) {
     const formData = await req.formData();
     const pptxBlob = formData.get("pptx") as Blob | null;
     const title = String(formData.get("title") ?? "");
+    const slideIndexMode: SlideIndexMode =
+      formData.get("slideIndexMode") === "cover-separated"
+        ? "cover-separated"
+        : "rendered-zero-based";
 
     if (!pptxBlob) {
       return NextResponse.json({ error: "pptx is required" }, { status: 400 });
@@ -367,13 +488,25 @@ export async function POST(req: NextRequest) {
       console.log(`[vision-review] intentCheck purpose=${promptIntent.documentPurpose} freedom=${promptIntent.designFreedom}`);
     }
 
+    const b3mode = formData.get("b3mode") === "true";
+    const b3pass = parseInt(String(formData.get("b3pass") ?? "1"), 10) || 1;
+    const b4mode = formData.get("b4mode") === "true";
+    if (b3mode) {
+      console.log(`[vision-review] b3mode=true pass=${b3pass}`);
+    }
+    if (b4mode) {
+      console.log("[vision-review] b4mode=true composition-review=enabled");
+    }
+
     const pngPaths = await pptxToPngs(pptxBuffer, 12);
     if (pngPaths.length === 0) {
       return NextResponse.json({ deckScore: 0, fixes: [] });
     }
 
-    console.log(`[vision-review] Reviewing ${pngPaths.length} slides with Vision LLM`);
-    const result = await reviewWithVision(pngPaths, title, promptIntent);
+    console.log(
+      `[vision-review] Reviewing ${pngPaths.length} slides with Vision LLM indexMode=${slideIndexMode}`
+    );
+    const result = await reviewWithVision(pngPaths, title, promptIntent, slideIndexMode, b3mode, b3pass, b4mode);
     console.log(`[vision-review] deckScore=${result.deckScore} fixes=${result.fixes.length}`);
 
     pngPaths.forEach((p) => { try { fs.unlinkSync(p); } catch {} });

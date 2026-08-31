@@ -52,6 +52,20 @@ export type PaletteResolution = {
   palette?: PptxPalette;
 };
 
+/** True when the user explicitly wants the slide canvas/background to be white. */
+export function isPptxWhiteBaseRequest(s: string): boolean {
+  const text = String(s ?? "");
+  // 「白基調に色味を変えて」のように、白基調そのものが編集先として
+  // 明示されていれば十分。後続語を限定すると複合編集で判定漏れになる。
+  if (/(?:白基調|白ベース|白を基調|ホワイト基調|ホワイトベース)/i.test(text)) {
+    return true;
+  }
+  return (
+    /(?:背景(?:色)?|スライド|表紙|全体).{0,16}(?:白基調|白ベース|白を基調|白色|白に|ホワイト基調|ホワイトベース)/i.test(text) ||
+    /(?:背景(?:色)?|スライド|表紙|全体).{0,16}(?:白色|白に)/i.test(text)
+  );
+}
+
 // 判定順: ①複合パレット名明示 → ②基本色明示 → ③日本語複合名 → ④英語ID → ⑤個別KW → ⑥数字参照(1〜6) → ⑦基本色
 export function resolvePptxPaletteInstruction(s: string): PaletteResolution | null {
   const t = s.toLowerCase();

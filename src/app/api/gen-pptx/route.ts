@@ -7,10 +7,15 @@ import {
   BlobServiceClient,
 } from "@azure/storage-blob";
 import { uniqueId } from "@/features/common/util";
-import { OpenAIDALLEInstance, OpenAIInstance } from "@/features/common/services/openai";
+import { OpenAIDALLEInstance, OpenAIPptInstance } from "@/features/common/services/openai";
 import { PptxPalette as Palette, PPTX_NAMED_PALETTES, buildPaletteFromKey } from "@/features/pptx/palette";
 import { saveDeckSpec, saveIllustrationBlob, loadIllustrationBlob, markPptxAsOurs } from "@/lib/deck-spec-storage";
 import type { DeckSpec, DeckSpecSlide, DeckSpecItem } from "@/types/deck-spec";
+import { getArtDirectorMode, generateDeckArtDirection, isArtDirectorActive } from "@/features/pptx/art-director";
+import type { ArtDirectedSlide, DeckArtDirection } from "@/features/pptx/art-director";
+import { runPreflight } from "@/features/pptx/pptx-preflight";
+import type { PreflightResult } from "@/features/pptx/pptx-preflight";
+import { validateGeneratedPptx } from "@/features/pptx/pptx-package-validator";
 // PptxCard は同ファイル内で定義済み（import不要）
 
 // ── SVGアイコン（process-cards用） ────────────────────────────────────────────
@@ -82,6 +87,11 @@ function resolveStepIconKey(hintOrTitle: string): keyof typeof STEP_ICON_URIS | 
 }
 
 export type PptxColumn = { header: string; bullets: string[] };
+
+// ── B3（Guarded Creative）モード判定 ──────────────────────────────────────────
+function isB3Mode(): boolean {
+  return (process.env.PPTX_AI_DESIGN_MODE ?? "legacy") === "guarded-creative";
+}
 
 function resolveMetricIconKey(label: string, hint?: string): keyof typeof STEP_ICON_URIS | null {
   const src = hint ?? label;
@@ -159,8 +169,10 @@ export type PptxSlide = {
   bullets: string[];
   layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation"
              | "company-overview" | "process-cards" | "closing"
-             | "metric-cards" | "timeline"
-             | "stat_callouts" | "card_grid" | "icon_rows" | "roadmap";
+              | "metric-cards" | "timeline"
+              | "stat_callouts" | "card_grid" | "icon_rows" | "roadmap"
+              | "split_visual" | "comparison_matrix" | "decision_summary"
+              | "editorial_statement" | "asymmetric_list";
   tableRows?: string[][];
   columns?: PptxColumn[];
   visualBlocks?: PptxVisualBlock[];
@@ -179,6 +191,25 @@ export type PptxSlide = {
   statCallouts?: PptxStatCallout[];
   // card_grid / icon_rows — アイコン+見出し+本文カード
   cards?: PptxCard[];
+  // decision_summary — 明示ラベル付きbulletからのみ決定的に派生
+  decisionConclusion?: string;
+  decisionEvidence?: string[];
+  decisionActions?: string[];
+  // B4 apply時だけ設定。B3/off/audit/faithfulでは未設定のため既存描画は不変。
+  artDirectionMotif?: DeckArtDirection["motif"];
+  artDirectionTone?: DeckArtDirection["dominantTone"];
+  artDirectionRole?: ArtDirectedSlide["visualRole"];
+  artDirectionIndex?: number;
+  // Upstream deck-level Narrative Review metadata. These fields guide B4 only;
+  // they do not alter body content or the B3/off rendering path.
+  narrativeRole?: "opening" | "context" | "problem" | "value" | "evidence"
+                  | "comparison" | "process" | "risk" | "decision" | "closing";
+  narrativeImportance?: "hero" | "primary" | "support";
+  keyTakeaway?: string;
+  narrativeTransition?: string;
+  storyClaim?: string;
+  storyEvidenceQuotes?: string[];
+  storyPlanApplied?: boolean;
   // LLMデザイン判断フィールド
   visualIntent?: string;
   density?: "low" | "medium" | "high";
@@ -227,6 +258,8 @@ export type GenPptxRequest = {
   title: string;
   slides: PptxSlide[];
   threadId: string;
+  /** Story Plannerが決定した表紙込みの期待ページ数。指定時は黙った枚数減少を許可しない。 */
+  targetTotalSlides?: number;
   fontFace?: string;
   designInstruction?: string;
   deckPreferences?: DeckPreferencesInput;
@@ -408,7 +441,9 @@ function selectStrictPaletteKey(
       containsAny(h, ["キャンペーン","予算確保","投資判断","決断","campaign","緊急","今すぐ","即決","強い訴求"])) return "passionate";
 
   // 4. calm: 役員 / IT・AI・導入系（「社内向け」でも calm 優先）
-  if (audience === "executive" ||
+  // B3モードでは company-intro の executive を calm に固定しない
+  const execForceCalm = isB3Mode() && purpose === "company-intro" ? false : audience === "executive";
+  if (execForceCalm ||
       purpose === "proposal" || purpose === "ir" ||
       CALM_KEYWORDS.some((kw) => h.includes(kw))) return "calm";
 
@@ -703,11 +738,10 @@ function normalizeStyleSpecFromIntent(
   let { visualStyle, cardStyle } = styleSpec;
   const { documentPurpose, audience, designFreedom, styleGuardrails } = intent;
 
-  const isConservativePurpose =
-    documentPurpose === "proposal" ||
-    documentPurpose === "company-intro" ||
-    documentPurpose === "ir" ||
-    audience === "executive";
+  // B3モードでは company-intro・executive を理由に conservative に固定しない
+  const isConservativePurpose = isB3Mode()
+    ? (documentPurpose === "proposal" || documentPurpose === "ir")
+    : (documentPurpose === "proposal" || documentPurpose === "company-intro" || documentPurpose === "ir" || audience === "executive");
 
   const isExpressivePurpose =
     documentPurpose === "recruitment" ||
@@ -740,6 +774,135 @@ function hasUsableTableRows(rows?: string[][]): boolean {
   if (!rows || rows.length < 2) return false;
   const nonEmptyRows = rows.filter((row) => row.some((cell) => Boolean(cell?.trim())));
   return nonEmptyRows.length >= 2;
+}
+
+type DecisionSummaryData = {
+  conclusion: string;
+  evidence: string[];
+  actions: string[];
+};
+
+function deriveDecisionSummary(slide: PptxSlide): DecisionSummaryData | null {
+  const explicitConclusion = slide.decisionConclusion?.trim() ?? "";
+  const explicitEvidence = (slide.decisionEvidence ?? []).map((v) => v.trim()).filter(Boolean);
+  const explicitActions = (slide.decisionActions ?? []).map((v) => v.trim()).filter(Boolean);
+  if (
+    (slide.bullets ?? []).filter((v) => v?.trim()).length === 0 &&
+    explicitConclusion &&
+    explicitEvidence.length > 0 && explicitEvidence.length <= 3 &&
+    explicitActions.length > 0 && explicitActions.length <= 3
+  ) {
+    return {
+      conclusion: explicitConclusion,
+      evidence: explicitEvidence,
+      actions: explicitActions,
+    };
+  }
+
+  let conclusion = "";
+  let conclusionCount = 0;
+  const evidence: string[] = [];
+  const actions: string[] = [];
+  for (const rawBullet of slide.bullets ?? []) {
+    const bullet = rawBullet.trim();
+    if (!bullet) continue;
+    const match = bullet.match(/^(結論|判断|推奨|根拠|理由|次のアクション|アクション|対応|conclusion|decision|evidence|reason|next action|action)\s*[：:]\s*(.+)$/i);
+    // decision_summaryでは全bulletが明示的な役割を持つ場合だけ採用する。
+    if (!match) return null;
+    const label = match[1].toLowerCase();
+    const value = match[2].trim();
+    if (!value) continue;
+    if (/^(結論|判断|推奨|conclusion|decision)$/i.test(label)) {
+      conclusionCount += 1;
+      if (!conclusion) conclusion = value;
+    }
+    else if (/^(根拠|理由|evidence|reason)$/i.test(label)) evidence.push(value);
+    else if (/^(次のアクション|アクション|対応|next action|action)$/i.test(label)) actions.push(value);
+  }
+  if (
+    !conclusion || conclusionCount !== 1 ||
+    evidence.length === 0 || evidence.length > 3 ||
+    actions.length === 0 || actions.length > 3
+  ) return null;
+  return { conclusion, evidence, actions };
+}
+
+/**
+ * 構造化レイアウトを描画できない場合に、入力済みの情報だけから表示本文を救済する。
+ * Story Planner/Narrative Reviewのメタデータは上流で元資料との照合を通過しているため、
+ * ページ削除よりも安全なフォールバック本文として利用する。
+ */
+function deriveContentPreservingFallbackBullets(slide: PptxSlide): string[] {
+  const candidates: unknown[] = [
+    ...(slide.bullets ?? []),
+    slide.decisionConclusion,
+    ...(slide.decisionEvidence ?? []),
+    ...(slide.decisionActions ?? []),
+    slide.storyClaim,
+    slide.keyTakeaway,
+    slide.subtitle,
+    slide.leadText,
+    slide.callout?.title,
+    slide.callout?.body,
+    ...(slide.benefits ?? []),
+    ...(slide.storyEvidenceQuotes ?? []),
+  ];
+
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const value of candidates) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (!text) continue;
+    const key = text.normalize("NFKC").replace(/\s+/g, " ").toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+  }
+  // 最後の安全策として、Story Plannerで検証済みのメッセージタイトルを本文にも使う。
+  if (result.length === 0 && slide.storyPlanApplied && slide.title?.trim()) {
+    result.push(slide.title.trim());
+  }
+  return result;
+}
+
+function hasSplitVisualData(slide: PptxSlide): boolean {
+  const bullets = (slide.bullets ?? []).filter((b) => b?.trim());
+  const visualCount = Math.max(
+    (slide.metrics ?? []).filter((m) => m.label?.trim() || m.value?.trim()).length,
+    (slide.statCallouts ?? []).filter((c) => c.value?.trim() || c.label?.trim()).length,
+    (slide.cards ?? []).filter((c) => c.heading?.trim() || c.body?.trim()).length,
+    (slide.visualBlocks ?? []).filter((b) => b.text?.trim()).length
+  );
+  return bullets.length >= 1 && bullets.length <= 5 && visualCount >= 1 && visualCount <= 4;
+}
+
+function hasComparisonMatrixData(slide: PptxSlide): boolean {
+  const sourceBullets = (slide.bullets ?? []).map((b) => b.trim()).filter(Boolean);
+  const usableColumns = (slide.columns ?? []).filter((column) =>
+    Boolean(column.header?.trim()) || (column.bullets ?? []).some((b) => Boolean(b?.trim()))
+  );
+  if (usableColumns.length >= 2 && usableColumns.length <= 3) {
+    const represented = usableColumns.flatMap((column) => column.bullets.map((b) => b.trim()));
+    const itemCountsAreSafe = usableColumns.every((column) =>
+      column.bullets.filter((bullet) => bullet?.trim()).length <= 6
+    );
+    return itemCountsAreSafe && sourceBullets.every((bullet) => represented.includes(bullet));
+  }
+  if (!hasUsableTableRows(slide.tableRows)) return false;
+  const columnCount = Math.max(...(slide.tableRows ?? []).map((row) => row.length), 0);
+  if (columnCount < 2 || columnCount > 3 || (slide.tableRows?.length ?? 0) > 7) return false;
+  return sourceBullets.every((bullet) => {
+    const colonIndex = bullet.search(/[：:]/);
+    return (slide.tableRows ?? []).some((row) => {
+      const cells = row.map((cell) => cell.trim());
+      if (cells.includes(bullet)) return true;
+      if (colonIndex <= 0) return false;
+      const key = bullet.slice(0, colonIndex).trim();
+      const value = bullet.slice(colonIndex + 1).trim();
+      return cells.includes(key) && cells.includes(value);
+    });
+  });
 }
 
 function resolveLayoutType(slide: PptxSlide): NonNullable<PptxSlide["layoutType"]> {
@@ -798,7 +961,48 @@ function resolveLayoutType(slide: PptxSlide): NonNullable<PptxSlide["layoutType"
       return "bullets";
     }
   }
+  if (lt === "split_visual" && !hasSplitVisualData(slide)) {
+    console.log(`[gen-pptx] split_visual→bullets fallback (missing bounded visual data): "${slide.title}"`);
+    return "bullets";
+  }
+  if (lt === "comparison_matrix" && !hasComparisonMatrixData(slide)) {
+    console.log(`[gen-pptx] comparison_matrix→bullets fallback (no 2-3 column structure): "${slide.title}"`);
+    return "bullets";
+  }
+  if (lt === "decision_summary" && !deriveDecisionSummary(slide)) {
+    console.log(`[gen-pptx] decision_summary→bullets fallback (explicit decision structure missing): "${slide.title}"`);
+    return "bullets";
+  }
+  if (lt === "editorial_statement") {
+    const bulletCount = (slide.bullets ?? []).filter((bullet) => bullet?.trim()).length;
+    if (bulletCount < 1 || bulletCount > 3) {
+      console.log(`[gen-pptx] editorial_statement→bullets fallback (requires 1-3 bullets): "${slide.title}"`);
+      return "bullets";
+    }
+  }
+  if (lt === "asymmetric_list") {
+    const bulletCount = (slide.bullets ?? []).filter((bullet) => bullet?.trim()).length;
+    if (bulletCount < 2 || bulletCount > 6) {
+      console.log(`[gen-pptx] asymmetric_list→bullets fallback (requires 2-6 bullets): "${slide.title}"`);
+      return "bullets";
+    }
+  }
   return lt;
+}
+
+function resolveVisualTypeForLayout(
+  layoutType: NonNullable<PptxSlide["layoutType"]>
+): SlideVisualType {
+  if (layoutType === "table") return "table";
+  if (layoutType === "multi-column" || layoutType === "comparison_matrix") return "comparison";
+  if (layoutType === "diagram" || layoutType === "process-cards") return "process";
+  if (layoutType === "timeline" || layoutType === "roadmap") return "timeline";
+  if (
+    layoutType === "company-overview" || layoutType === "metric-cards" ||
+    layoutType === "card_grid" || layoutType === "icon_rows" || layoutType === "split_visual"
+  ) return "cards";
+  if (layoutType === "closing" || layoutType === "decision_summary") return "spotlight";
+  return "editorial";
 }
 
 // レイアウト変換のキーワードパターン
@@ -900,6 +1104,10 @@ function normalizeSlidesForPptx(slides: PptxSlide[]): PptxSlide[] {
     leadText:    slide.leadText    != null ? s(slide.leadText)    : undefined,
     subtitle:    slide.subtitle    != null ? s(slide.subtitle)    : undefined,
     visualIntent:slide.visualIntent!= null ? s(slide.visualIntent): undefined,
+    keyTakeaway: slide.keyTakeaway != null ? s(slide.keyTakeaway) : undefined,
+    narrativeTransition: slide.narrativeTransition != null ? s(slide.narrativeTransition) : undefined,
+    storyClaim: slide.storyClaim != null ? s(slide.storyClaim) : undefined,
+    storyEvidenceQuotes: slide.storyEvidenceQuotes ? sa(slide.storyEvidenceQuotes) : undefined,
     callout: slide.callout
       ? { title: s(slide.callout.title), body: s(slide.callout.body) }
       : undefined,
@@ -918,6 +1126,9 @@ function normalizeSlidesForPptx(slides: PptxSlide[]): PptxSlide[] {
       iconKey: st.iconKey != null ? s(st.iconKey) : undefined,
     })),
     benefits: slide.benefits ? sa(slide.benefits) : undefined,
+    decisionConclusion: slide.decisionConclusion != null ? s(slide.decisionConclusion) : undefined,
+    decisionEvidence: slide.decisionEvidence ? sa(slide.decisionEvidence) : undefined,
+    decisionActions: slide.decisionActions ? sa(slide.decisionActions) : undefined,
     columns:  slide.columns?.map((col) => ({
       ...col,
       header:  s(col.header),
@@ -1003,14 +1214,62 @@ function validateAndRepairSlides(slides: PptxSlide[]): PptxSlide[] {
         }
         break;
       }
+
+      case "split_visual":
+        if (!hasSplitVisualData(slide)) {
+          repairTo = "bullets";
+          reason = "本文と右側ビジュアル構造が不足または表示上限超過";
+        }
+        break;
+
+      case "comparison_matrix":
+        if (!hasComparisonMatrixData(slide)) {
+          repairTo = "bullets";
+          reason = "2〜3列のcolumns/tableRowsが不足";
+        }
+        break;
+
+      case "decision_summary":
+        if (!deriveDecisionSummary(slide)) {
+          repairTo = "bullets";
+          reason = "明示された結論・根拠・アクションが不足";
+        }
+        break;
+
+      case "editorial_statement": {
+        const bulletCount = (slide.bullets ?? []).filter((bullet) => bullet?.trim()).length;
+        if (bulletCount < 1 || bulletCount > 3) {
+          repairTo = "bullets";
+          reason = "editorial_statementは1〜3件の本文が必要";
+        }
+        break;
+      }
+
+      case "asymmetric_list": {
+        const bulletCount = (slide.bullets ?? []).filter((bullet) => bullet?.trim()).length;
+        if (bulletCount < 2 || bulletCount > 6) {
+          repairTo = "bullets";
+          reason = "asymmetric_listは2〜6件の本文が必要";
+        }
+        break;
+      }
     }
 
-    // bullets 化後または元から bullets で、bullet 本文もすべて空 → 削除
-    if (repairTo === "bullets" || lt === "bullets") {
-      const validBullets = (slide.bullets ?? []).filter((b) => b?.trim());
-      if (validBullets.length === 0) {
+    // 構造不足時は、入力済みの本文・Storyメタデータから表示可能な本文を救済する。
+    const hasOriginalBullets = (slide.bullets ?? []).some((bullet) => Boolean(bullet?.trim()));
+    if (repairTo === "bullets" || (lt === "bullets" && !hasOriginalBullets)) {
+      const fallbackBullets = deriveContentPreservingFallbackBullets(slide);
+      if (fallbackBullets.length === 0) {
         repairTo = "delete";
-        reason = reason ? `${reason} + bullets も空` : "bullets が空";
+        reason = reason ? `${reason} + 救済可能な本文も空` : "救済可能な本文が空";
+      } else {
+        const fallbackLayout = fallbackBullets.length <= 3 ? "editorial_statement" : "bullets";
+        console.log(
+          `[gen-pptx] repair: rescued "${slide.title}" as ${fallbackLayout} ` +
+          `using ${fallbackBullets.length} source-bound text item(s)`
+        );
+        result.push({ ...slide, bullets: fallbackBullets, layoutType: fallbackLayout });
+        continue;
       }
     }
 
@@ -1268,7 +1527,12 @@ async function generateDesignBrief(
   const fallback = createFallbackBrief(title, slides, instructionText, prefs);
 
   try {
-    const openai = OpenAIInstance();
+    const openai = OpenAIPptInstance();
+    const pptModel =
+      process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME?.trim() ||
+      process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() ||
+      "";
+    console.log(`[ppt-ai] stage=design-brief model=${pptModel}`);
 
     // ── PromptIntent に基づくカラー・スタイル制約を構築 ──
     const intentConstraints: string[] = [];
@@ -1280,9 +1544,11 @@ async function generateDesignBrief(
       if (colorDirectives?.primary) intentConstraints.push(`PRIMARY COLOR: #${colorDirectives.primary} — use this as titleBg or accentA`);
       if (colorDirectives?.accent)  intentConstraints.push(`ACCENT COLOR: #${colorDirectives.accent} — use as accentB or accentA`);
       if (colorDirectives?.background) intentConstraints.push(`BACKGROUND: #${colorDirectives.background} — use as canvas`);
-      if (!styleGuardrails.allowModernDark) intentConstraints.push(`FORBIDDEN: visualStyle='modern-dark' (not appropriate for this purpose/audience)`);
-      if (!styleGuardrails.allowPlayful)   intentConstraints.push(`FORBIDDEN: visualStyle='playful'`);
-      if (!styleGuardrails.allowGlass)     intentConstraints.push(`FORBIDDEN: cardStyle='glass'`);
+      const b3ExemptGuardrails = isB3Mode() && documentPurpose === "company-intro";
+      if (!styleGuardrails.allowModernDark && !b3ExemptGuardrails) intentConstraints.push(`FORBIDDEN: visualStyle='modern-dark' (not appropriate for this purpose/audience)`);
+      if (!styleGuardrails.allowPlayful   && !b3ExemptGuardrails) intentConstraints.push(`FORBIDDEN: visualStyle='playful'`);
+      if (!styleGuardrails.allowGlass     && !b3ExemptGuardrails) intentConstraints.push(`FORBIDDEN: cardStyle='glass'`);
+      if (b3ExemptGuardrails) intentConstraints.push(`B3 MODE ACTIVE: Even for executive audience, company-intro decks MUST use bold, editorial, or modern-dark styles. DO NOT choose corporate-light. Prefer editorial, bold, or modern-dark with a distinctive, impactful color scheme.`);
       if (styleGuardrails.maxAccentIntensity === "low") intentConstraints.push(`Keep colors muted/professional — no vivid neon or heavy saturation`);
       if (designFreedom === "expressive") intentConstraints.push(`ALLOWED: bold/modern-dark/playful/glass — user wants expressive, impactful design`);
     }
@@ -1308,14 +1574,18 @@ async function generateDesignBrief(
       "DESIGN RULES:",
       "- deckPurpose='recruitment' → vibrant, energetic colors. Consider indigo/violet, warm orange, or bold teal.",
       "- deckPurpose='proposal' → authoritative but modern. Dark navy or deep teal with bright accent.",
-      "- deckPurpose='company-intro' → trustworthy, balanced. Industry-appropriate hues.",
+      isB3Mode()
+        ? "- deckPurpose='company-intro' → balanced to expressive. Industry-appropriate hues. Bold/editorial/modern-dark allowed if it fits content."
+        : "- deckPurpose='company-intro' → trustworthy, balanced. Industry-appropriate hues.",
       "- deckPurpose='ir' → conservative, professional. Blue/grey tones.",
       "- deckPurpose='training' → clear, friendly. Warm blues or greens.",
       "- CRITICAL: accentA and accentB MUST be clearly different hues (hue distance > 30°).",
       "- STRICTLY FORBIDDEN: accentA and accentB both in blue/indigo range (#3B82F6/#93C5FD type blue monochrome).",
       "- STRICTLY FORBIDDEN: Using only blue shades for the entire palette. Every palette needs contrast.",
       "- For deckPurpose='proposal' or 'ir': accentB MUST be warm — orange (#F5821F), amber (#D97706), or muted gold (#C98A2E). NOT another shade of blue.",
-      "- Executive proposal baseline: titleBg~13294B (dark navy), accentA~13294B, accentB~F5821F (orange), bodyText~1D2435, sectionBg~EEF2F9, canvas~FFFFFF.",
+      isB3Mode()
+        ? "- Executive proposal baseline (proposal/ir only): titleBg~13294B (dark navy), accentA~13294B, accentB~F5821F (orange). Does NOT apply to company-intro in B3 mode."
+        : "- Executive proposal baseline: titleBg~13294B (dark navy), accentA~13294B, accentB~F5821F (orange), bodyText~1D2435, sectionBg~EEF2F9, canvas~FFFFFF.",
       "- Orange is used at ~5% — only on: metric values, step numbers, accent lines, CTAs. NOT full card fills.",
       "- Do NOT default to green unless the content is specifically environmental/ecological.",
       "- STRICTLY FORBIDDEN: headerStyle='band'. Full-width header color fills make slides look like AI-generated templates.",
@@ -1332,7 +1602,7 @@ async function generateDesignBrief(
     ].filter(Boolean).join("\n");
 
     let res = await openai.chat.completions.create({
-      model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+      model: pptModel,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent },
@@ -1344,7 +1614,7 @@ async function generateDesignBrief(
     if (res.choices[0]?.finish_reason === "length") {
       console.warn("[designBrief] truncated → retrying with higher token limit");
       res = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+        model: pptModel,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userContent },
@@ -1448,8 +1718,10 @@ function resolveTheme(
 
   // styleSpec.visualStyle を優先。キーワードは補助フォールバックのみ
   const lowered = instructionText.toLowerCase();
-  const execMode  = styleSpec.deckPurpose === "ir" || styleSpec.deckPurpose === "proposal" ||
-                    containsAny(lowered, ["executive", "board", "役員", "経営"]);
+  // B3モードの company-intro では execMode を無効化（白ボックス+箇条書き描画を回避）
+  const execMode  = (styleSpec.deckPurpose === "ir" || styleSpec.deckPurpose === "proposal" ||
+                    containsAny(lowered, ["executive", "board", "役員", "経営"]))
+                    && !(isB3Mode() && styleSpec.deckPurpose === "company-intro");
   const playfulMode = styleSpec.visualStyle === "playful" ||
                       containsAny(lowered, ["pop", "ポップ", "親しみ", "やわらか"]);
   const minimalMode = styleSpec.visualStyle === "minimal" ||
@@ -1555,6 +1827,69 @@ async function savePptxPointer(threadId: string, blobName: string, fileName: str
 const W = 13.33;
 const H = 7.5;
 const HEADER_H = 1.05;
+
+function applyB4MotifBackdrop(s: PptxGenJS.Slide, slide: PptxSlide, theme: Theme) {
+  const motif = slide.artDirectionMotif;
+  if (!motif) return;
+
+  const variant = (slide.artDirectionIndex ?? 0) % 3;
+  if (variant === 1) s.background = { color: theme.palette.sectionBg };
+  if (variant === 2 && motif === "data-first") s.background = { color: theme.palette.tableAltBg };
+
+  if (motif === "rounded-cards") {
+    s.addShape("ellipse", {
+      x: W - 2.25, y: -0.80, w: 2.70, h: 2.70,
+      fill: { color: theme.palette.accentA, transparency: 86 },
+      line: { color: theme.palette.accentA, transparency: 100, width: 0 },
+    });
+    s.addShape("ellipse", {
+      x: -0.65, y: H - 1.30, w: 1.70, h: 1.70,
+      fill: { color: theme.palette.accentB, transparency: 86 },
+      line: { color: theme.palette.accentB, transparency: 100, width: 0 },
+    });
+  } else if (motif === "icon-circles") {
+    s.addShape("rect", {
+      x: 0, y: 0, w: 0.12, h: H,
+      fill: { color: theme.palette.accentA },
+      line: { color: theme.palette.accentA, width: 0 },
+    });
+    [0, 1, 2].forEach((index) => {
+      const diameter = 0.24 + index * 0.08;
+      s.addShape("ellipse", {
+        x: W - 0.58 - index * 0.12,
+        y: 0.22 + index * 0.34,
+        w: diameter, h: diameter,
+        fill: { color: index % 2 === 0 ? theme.palette.accentA : theme.palette.accentB, transparency: 18 },
+        line: { color: theme.palette.surface, transparency: 100, width: 0 },
+      });
+    });
+  } else if (motif === "editorial-type") {
+    s.addShape("rect", {
+      x: W - 4.25, y: HEADER_H + 0.08, w: 4.25, h: H - HEADER_H - 0.08,
+      fill: { color: theme.palette.sectionBg, transparency: variant === 1 ? 25 : 48 },
+      line: { color: theme.palette.sectionBg, transparency: 100, width: 0 },
+    });
+    s.addShape("rect", {
+      x: 0.40, y: HEADER_H - 0.06, w: 1.35 + variant * 0.55, h: 0.08,
+      fill: { color: theme.palette.accentB },
+      line: { color: theme.palette.accentB, width: 0 },
+    });
+  } else if (motif === "data-first") {
+    s.addShape("rect", {
+      x: 0, y: 0, w: 0.18, h: H,
+      fill: { color: theme.palette.titleBg },
+      line: { color: theme.palette.titleBg, width: 0 },
+    });
+    const barWidths = [1.10, 0.72, 0.42];
+    barWidths.forEach((barWidth, index) => {
+      s.addShape("rect", {
+        x: W - 0.42 - barWidth, y: 0.20 + index * 0.18, w: barWidth, h: 0.08,
+        fill: { color: index === 1 ? theme.palette.accentB : theme.palette.accentA, transparency: 12 + index * 15 },
+        line: { color: theme.palette.accentA, transparency: 100, width: 0 },
+      });
+    });
+  }
+}
 
 function addHeaderBand(s: PptxGenJS.Slide, title: string, theme: Theme) {
   // 装飾バー完全撤廃 — テキストのみ
@@ -1740,6 +2075,7 @@ function buildDiagramSlide(
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   addVisualAccent(s, visual, theme, faithfulMode);
 
@@ -2339,7 +2675,8 @@ function renderCardBullets(
   theme: Theme,
   startY: number,
   cardW: number,
-  fontScaleMult: number = 1.0
+  fontScaleMult: number = 1.0,
+  fitTextToShape?: boolean
 ) {
   if (bullets.length === 0) return;
 
@@ -2364,6 +2701,7 @@ function renderCardBullets(
       h: H - startY - 0.26,
       margin: 0.1,
       valign: "top",
+      ...(fitTextToShape ? { shrinkText: true } : {}),
     });
     return;
   }
@@ -2437,6 +2775,18 @@ function renderCardBullets(
   });
 }
 
+// ── テキストフィット共通ヘルパー（Phase 1: 全レイアウトへ反映） ─────────────────
+function resolveTextFitOptions(
+  slide: PptxSlide,
+  baseFontSize: number,
+  minimumFontSize: number
+): { fontSize: number; fitOptions: Record<string, unknown> } {
+  const scale = slide.fontScale ?? 1.0;
+  const fontSize = Math.max(minimumFontSize, Math.round(baseFontSize * scale));
+  const fitOptions: Record<string, unknown> = slide.fitTextToShape ? { shrinkText: true } : {};
+  return { fontSize, fitOptions };
+}
+
 function buildBulletsSlide(
   pptx: PptxGenJS,
   slide: PptxSlide,
@@ -2447,6 +2797,7 @@ function buildBulletsSlide(
 ) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   const bFontAdj = densityFontAdj(slide.density);
   const fontScaleMult = slide.fontScale ?? 1.0;
@@ -2630,7 +2981,7 @@ function buildBulletsSlide(
       });
     } else {
       const cardW = showIllustration ? 6.55 : 8.88;
-      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW, fontScaleMult);
+      renderCardBullets(s, slide.bullets, theme, HEADER_H + 0.18, cardW, fontScaleMult, slide.fitTextToShape);
     }
   }
 
@@ -2658,6 +3009,7 @@ function buildConversationSlide(
   pages.forEach((pageTurns, pageIndex) => {
     const s = pptx.addSlide();
     s.background = { color: theme.palette.canvas };
+    applyB4MotifBackdrop(s, slide, theme);
     addHeaderBand(s, pages.length > 1 ? `${slide.title} (${pageIndex + 1}/${pages.length})` : slide.title, theme);
 
     if (pageTurns.length === 0) {
@@ -2836,10 +3188,12 @@ function buildTableSlide(
 
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   addVisualAccent(s, visual, theme, faithfulMode);
 
   const rows = slide.tableRows;
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   const colCount = Math.max(...rows.map((row) => row.length), 1);
   const colW = (W - 1.05) / colCount;
@@ -2848,7 +3202,7 @@ function buildTableSlide(
       text: row[colIndex] ?? "",
       options: {
         bold: rowIndex === 0,
-        fontSize: rowIndex === 0 ? theme.bodyFontSize - 1 : theme.bodyFontSize - 2,
+        fontSize: rowIndex === 0 ? Math.max(9, Math.round((theme.bodyFontSize - 1) * fontScaleMult)) : Math.max(8, Math.round((theme.bodyFontSize - 2) * fontScaleMult)),
         fontFace: theme.fontFace,
         color: rowIndex === 0 ? theme.palette.tableHeaderText : theme.palette.bodyText,
         fill: { color: rowIndex === 0 ? theme.palette.tableHeaderBg : rowIndex % 2 === 0 ? theme.palette.tableAltBg : "FFFFFF" },
@@ -2892,6 +3246,7 @@ function buildMultiColumnSlide(
 
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   // multi-columnはコンテンツが全幅を使うためvisualAccentを省略
 
@@ -2902,6 +3257,7 @@ function buildMultiColumnSlide(
   const colX0 = MARGIN;
   const colY = HEADER_H + 0.22;
   const headerH = faithfulMode ? 0.48 : 0.78;
+  const fontScaleMult = slide.fontScale ?? 1.0;
   const contentH = H - colY - headerH - 0.28;
 
   columns.forEach((column, index) => {
@@ -2997,11 +3353,12 @@ function buildMultiColumnSlide(
           y: itemY + 0.04,
           w: colInnerW - (theme.cardStyle === "filled" ? 0.28 : 0.46),
           h: itemH - 0.08,
-          fontSize: Math.max(theme.bodyFontSize - 3, 10),
+          fontSize: Math.max(Math.round((theme.bodyFontSize - 3) * fontScaleMult), 9),
           fontFace: theme.fontFace,
           color: getCardBodyColor(theme),
           valign: "middle",
           fit: "shrink",
+          ...(slide.fitTextToShape ? { shrinkText: true } : {}),
         });
       });
     } else if (column.bullets.length > 0) {
@@ -3010,7 +3367,7 @@ function buildMultiColumnSlide(
         options: {
           bullet: { indent: 10 },
           breakLine: true,
-          fontSize: theme.bodyFontSize - 3,
+          fontSize: Math.max(Math.round((theme.bodyFontSize - 3) * fontScaleMult), 9),
           fontFace: theme.fontFace,
           color: theme.palette.bodyText,
           paraSpaceAfter: 6,
@@ -3023,6 +3380,7 @@ function buildMultiColumnSlide(
         h: contentH - 0.1,
         margin: 0.05,
         valign: "top",
+        ...(slide.fitTextToShape ? { shrinkText: true } : {}),
       });
     }
   });
@@ -3035,6 +3393,7 @@ function buildMultiColumnSlide(
 function buildCompanyOverviewSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
 
   const { density, textTreatment, visualIntent } = slide;
@@ -3240,6 +3599,7 @@ function buildCompanyOverviewSlide(pptx: PptxGenJS, slide: PptxSlide, theme: The
 function buildProcessCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
 
   let contentY = HEADER_H + 0.18;
@@ -3263,6 +3623,7 @@ function buildProcessCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
   const pRenderMode = parseVisualIntent(pIntent);
   const pFontAdj   = densityFontAdj(pDensity) + (pRenderMode === "process" ? 1 : 0);
   const pSpaceMult = densitySpacingMult(pDensity) * (pRenderMode === "trust" ? 1.15 : 1.0);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   // bodyが空のstepは描画しない（LLMが生成した空ステップによる空白カードを防ぐ）
   const steps = (slide.steps ?? []).filter((s) => s.title?.trim() && s.body?.trim());
@@ -3334,15 +3695,17 @@ function buildProcessCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
     const titleY = contentY + ICON_TOP_PAD + ICON_D + 0.14;
     s.addText(step.title, {
       x: cx + 0.1, y: titleY, w: cardW - 0.2, h: 0.44,
-      fontSize: theme.bodyFontSize + 1, fontFace: theme.fontFace, bold: true,
+      fontSize: Math.max(Math.round((theme.bodyFontSize + 1) * fontScaleMult), 9), fontFace: theme.fontFace, bold: true,
       color: theme.palette.bodyText, align: "center", valign: "middle", fit: "shrink",
+      ...(slide.fitTextToShape ? { shrinkText: true } : {}),
     });
     // ステップ本文
     s.addText(step.body, {
       x: cx + 0.14, y: titleY + 0.48,
       w: cardW - 0.28, h: cardsH - (titleY - contentY) - 0.56,
-      fontSize: Math.max(theme.bodyFontSize - 2 + pFontAdj, 9), fontFace: theme.fontFace,
+      fontSize: Math.max(Math.round((theme.bodyFontSize - 2 + pFontAdj) * fontScaleMult), 9), fontFace: theme.fontFace,
       color: theme.palette.mutedText, valign: "top", fit: "shrink",
+      ...(slide.fitTextToShape ? { shrinkText: true } : {}),
     });
     // 矢印
     if (idx < count - 1) {
@@ -3425,6 +3788,7 @@ function buildClosingSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
 function buildMetricCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
 
   const { density, textTreatment, visualIntent } = slide;
@@ -3560,6 +3924,7 @@ function buildMetricCardsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) 
 function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
 
   const { density: tDensity, textTreatment: tText, visualIntent: tIntent } = slide;
@@ -3567,6 +3932,7 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const tFontAdj    = densityFontAdj(tDensity);
   const tMaxSteps   = densityMaxItems(tDensity, 5);
   const tSpaceMult  = densitySpacingMult(tDensity);
+  const fontScaleMult = slide.fontScale ?? 1.0;
 
   const validSteps = (slide.steps ?? []).filter((s) => s.title?.trim());
   const allFallback = slide.bullets.slice(0, tMaxSteps).map((b, i) => ({
@@ -3643,10 +4009,11 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     s.addText(step.title, {
       x: cx - stepW * 0.42, y: lineY - dotR - 0.98,
       w: stepW * 0.84, h: 0.52,
-      fontSize: Math.max(theme.bodyFontSize - 1 + tFontAdj, 9),
+      fontSize: Math.max(Math.round((theme.bodyFontSize - 1 + tFontAdj) * fontScaleMult), 9),
       fontFace: theme.fontFace,
       bold: true, color: theme.palette.bodyText,
       align: "center", valign: "bottom", fit: "shrink",
+      ...(slide.fitTextToShape ? { shrinkText: true } : {}),
     });
 
     // body below line
@@ -3654,15 +4021,16 @@ function buildTimelineSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     const bodyH = H - bodyY - 0.4;
     // textTreatment=explanatory → bodyを大きめフォント、short → 省略ぎみ
     const bodyFontSize = tText === "explanatory"
-      ? Math.max(theme.smallFontSize + tFontAdj, 9)
+      ? Math.max(Math.round((theme.smallFontSize + tFontAdj) * fontScaleMult), 9)
       : tText === "short"
-        ? Math.max(theme.smallFontSize - 1 + tFontAdj, 8)
-        : Math.max(theme.smallFontSize + tFontAdj, 8);
+        ? Math.max(Math.round((theme.smallFontSize - 1 + tFontAdj) * fontScaleMult), 8)
+        : Math.max(Math.round((theme.smallFontSize + tFontAdj) * fontScaleMult), 8);
     s.addText(step.body, {
       x: cx - stepW * 0.42, y: bodyY,
       w: stepW * 0.84, h: bodyH,
       fontSize: bodyFontSize, fontFace: theme.fontFace,
       color: theme.palette.bodyText, align: "center", valign: "top", fit: "shrink",
+      ...(slide.fitTextToShape ? { shrinkText: true } : {}),
     });
   });
 
@@ -3754,6 +4122,7 @@ function statValueFontSize(value: string): number {
 function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   const fontScaleMult = slide.fontScale ?? 1.0;
 
@@ -3859,8 +4228,10 @@ function buildStatCalloutsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme)
 function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   const fontScaleMult = slide.fontScale ?? 1.0;
+  const b4Motif = slide.artDirectionMotif;
 
   // cards → なければ steps を代用
   const rawCards: PptxCard[] = (slide.cards ?? []).length > 0
@@ -3910,23 +4281,40 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     const cx = MARGIN_X + col * (CARD_W + GAP_X);
     const cy = START_Y + row * (CARD_H + GAP_Y);
     const iconColor = ICON_COLORS[idx % ICON_COLORS.length];
+    const cardFill = b4Motif === "data-first"
+      ? (idx % 2 === 0 ? theme.palette.tableAltBg : theme.palette.surface)
+      : b4Motif === "editorial-type" && idx === 0
+        ? theme.palette.sectionBg
+        : b4Motif ? theme.palette.surface : "FFFFFF";
+    const cardRadius = b4Motif === "rounded-cards" ? 0.18 : b4Motif === "data-first" ? 0.025 : 0.08;
 
-    // カード背景（白 + 薄い影）
+    // B4 apply時だけモチーフに合わせてカードの面・角・影を変える。
+    // motif未設定（B3/off/audit/faithful）は従来の白カード描画を維持する。
     s.addShape("roundRect", {
       x: cx, y: cy, w: CARD_W, h: CARD_H,
-      rectRadius: 0.08,
-      fill: { color: "FFFFFF" },
+      rectRadius: cardRadius,
+      fill: { color: cardFill },
       line: { color: theme.palette.border, width: 0.8 },
-      shadow: { type: "outer", color: "000000", blur: 5, angle: 270, opacity: 0.07 },
+      ...(b4Motif === "data-first" || b4Motif === "editorial-type"
+        ? {}
+        : { shadow: { type: "outer" as const, color: "000000", blur: 5, angle: 270, opacity: 0.07 } }),
     });
+    if (b4Motif === "data-first" || b4Motif === "editorial-type") {
+      s.addShape("rect", {
+        x: cx, y: cy, w: CARD_W, h: 0.06,
+        fill: { color: b4Motif === "data-first" ? iconColor : theme.palette.accentA },
+        line: { color: b4Motif === "data-first" ? iconColor : theme.palette.accentA, width: 0 },
+      });
+    }
 
     // アイコン円（左上）
     const ICON_PAD_X = 0.20;
     const ICON_PAD_Y = CARD_H * 0.14;
     const iconX = cx + ICON_PAD_X;
     const iconY = cy + ICON_PAD_Y;
-    s.addShape("ellipse", {
+    s.addShape(b4Motif === "data-first" ? "roundRect" : "ellipse", {
       x: iconX, y: iconY, w: ICON_D, h: ICON_D,
+      ...(b4Motif === "data-first" ? { rectRadius: 0.04 } : {}),
       fill: { color: iconColor },
       line: { color: iconColor, width: 0 },
     });
@@ -3973,8 +4361,10 @@ function buildCardGridSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
 function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   const s = pptx.addSlide();
   s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
   addHeaderBand(s, slide.title, theme);
   const fontScaleMult = slide.fontScale ?? 1.0;
+  const b4Motif = slide.artDirectionMotif;
 
   const rawRows: PptxCard[] = (slide.cards ?? []).length > 0
     ? slide.cards!
@@ -4012,12 +4402,17 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
   rows.forEach((row, idx) => {
     const cy = START_Y + idx * ROW_SLOT + (ROW_SLOT - ROW_H) / 2;
     const iconColor = tokRow.info;  // 機能アイコンは info で統一（視認性と意味の一貫性）
-    const rowSurface = ROW_SURFACES[idx % ROW_SURFACES.length];
+    const rowSurface = b4Motif === "editorial-type" && idx === 0
+      ? theme.palette.sectionBg
+      : b4Motif === "data-first"
+        ? (idx % 2 === 0 ? theme.palette.tableAltBg : theme.palette.surface)
+        : ROW_SURFACES[idx % ROW_SURFACES.length];
+    const rowRadius = b4Motif === "rounded-cards" ? 0.16 : b4Motif === "data-first" ? 0.02 : 0.06;
 
     // 全行に淡色面（交互）
     s.addShape("roundRect", {
       x: 0.38, y: cy - 0.04, w: W - 0.76, h: ROW_H + 0.08,
-      rectRadius: 0.06,
+      rectRadius: rowRadius,
       fill: { color: rowSurface },
       line: { color: tokRow.borderGray, width: 0.5 },
     });
@@ -4025,8 +4420,9 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
     // アイコン円
     const iconX = 0.52;
     const iconY = cy + ROW_H / 2 - ICON_D / 2;
-    s.addShape("ellipse", {
+    s.addShape(b4Motif === "data-first" ? "roundRect" : "ellipse", {
       x: iconX, y: iconY, w: ICON_D, h: ICON_D,
+      ...(b4Motif === "data-first" ? { rectRadius: 0.04 } : {}),
       fill: { color: iconColor },
       line: { color: iconColor, width: 0 },
     });
@@ -4084,6 +4480,646 @@ function buildIconRowsSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
         color: pillColor, align: "center", valign: "middle",
       });
     }
+  });
+}
+
+// ─── B4 Phase 3: split_visual ────────────────────────────────────────────────
+// 本文を左、既存の構造化データまたは既存イラストを右へ配置する。
+function buildSplitVisualSlide(
+  pptx: PptxGenJS,
+  slide: PptxSlide,
+  theme: Theme,
+  visual: SlideVisualHint,
+  illustration?: GeneratedIllustration | null
+): { illustrationUsed: boolean } {
+  if (!hasSplitVisualData(slide) && !illustration) {
+    buildBulletsSlide(pptx, slide, theme, visual, null, false);
+    return { illustrationUsed: false };
+  }
+
+  const s = pptx.addSlide();
+  s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
+  addHeaderBand(s, slide.title, theme);
+
+  const top = HEADER_H + 0.24;
+  const contentH = H - top - 0.34;
+  const leftX = 0.42;
+  const leftW = 5.78;
+  const gap = 0.30;
+  const rightX = leftX + leftW + gap;
+  const rightW = W - rightX - 0.42;
+  const fontScale = slide.fontScale ?? 1;
+
+  s.addShape("roundRect", {
+    x: leftX, y: top, w: leftW, h: contentH,
+    rectRadius: 0.06,
+    fill: { color: theme.palette.surface },
+    line: { color: theme.palette.border, width: 0.8 },
+  });
+  const bulletItems = (slide.bullets ?? []).filter((b) => b?.trim()).map((bullet) => ({
+    text: bullet,
+    options: {
+      bullet: { indent: 14 },
+      breakLine: true,
+      paraSpaceAfter: 12,
+      fontSize: Math.max(11, Math.round((theme.bodyFontSize - 1) * fontScale)),
+      fontFace: theme.fontFace,
+      color: theme.palette.bodyText,
+    },
+  }));
+  s.addText(bulletItems, {
+    x: leftX + 0.26, y: top + 0.28, w: leftW - 0.52, h: contentH - 0.56,
+    margin: 0.04, valign: "middle",
+    ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+  });
+
+  s.addShape("roundRect", {
+    x: rightX, y: top, w: rightW, h: contentH,
+    rectRadius: 0.08,
+    fill: { color: theme.palette.sectionBg },
+    line: { color: theme.palette.border, width: 0.8 },
+  });
+
+  if (illustration?.dataUri) {
+    s.addImage({
+      data: illustration.dataUri,
+      x: rightX + 0.24, y: top + 0.24, w: rightW - 0.48, h: contentH - 0.48,
+      sizing: { type: "contain", x: rightX + 0.24, y: top + 0.24, w: rightW - 0.48, h: contentH - 0.48 },
+    });
+    addChrome(s, theme);
+    return { illustrationUsed: true };
+  }
+
+  const visualItems: Array<{ heading: string; value?: string; body?: string }> =
+    (slide.metrics ?? []).length > 0
+      ? slide.metrics!.map((metric) => ({
+          heading: metric.label,
+          value: metric.displayValue ?? metric.value,
+          body: metric.note,
+        }))
+      : (slide.statCallouts ?? []).length > 0
+        ? slide.statCallouts!.map((item) => ({
+            heading: item.label,
+            value: `${item.value}${item.unit ? ` ${item.unit}` : ""}`,
+          }))
+        : (slide.cards ?? []).length > 0
+          ? slide.cards!.map((card) => ({ heading: card.heading, body: card.body }))
+          : (slide.visualBlocks ?? []).map((block) => ({ heading: block.text }));
+
+  const itemGap = 0.16;
+  const itemH = (contentH - 0.48 - itemGap * Math.max(0, visualItems.length - 1)) / Math.max(1, visualItems.length);
+  visualItems.forEach((item, index) => {
+    const y = top + 0.24 + index * (itemH + itemGap);
+    const accent = index % 2 === 0 ? theme.palette.accentA : theme.palette.accentB;
+    s.addShape("roundRect", {
+      x: rightX + 0.24, y, w: rightW - 0.48, h: itemH,
+      rectRadius: 0.06,
+      fill: { color: theme.palette.surface },
+      line: { color: theme.palette.border, width: 0.7 },
+    });
+    s.addShape("rect", {
+      x: rightX + 0.24, y, w: 0.12, h: itemH,
+      fill: { color: accent }, line: { color: accent, width: 0 },
+    });
+    const textX = rightX + 0.52;
+    const textW = rightW - 0.86;
+    if (item.value) {
+      s.addText(item.value, {
+        x: textX, y: y + 0.12, w: textW, h: Math.max(0.42, itemH * 0.48),
+        fontSize: Math.max(16, Math.round((theme.titleFontSize + 2) * fontScale)),
+        fontFace: theme.fontFace, bold: true, color: accent,
+        fit: "shrink", valign: "middle",
+      });
+      s.addText([item.heading, item.body].filter(Boolean).join(" — "), {
+        x: textX, y: y + itemH * 0.56, w: textW, h: Math.max(0.28, itemH * 0.32),
+        fontSize: Math.max(9, Math.round((theme.smallFontSize - 1) * fontScale)),
+        fontFace: theme.fontFace, color: theme.palette.mutedText,
+        fit: "shrink", valign: "top",
+      });
+    } else {
+      s.addText(item.heading, {
+        x: textX, y: y + 0.12, w: textW, h: item.body ? itemH * 0.38 : itemH - 0.24,
+        fontSize: Math.max(10, Math.round(theme.bodyFontSize * fontScale)),
+        fontFace: theme.fontFace, bold: true, color: theme.palette.bodyText,
+        fit: "shrink", valign: item.body ? "bottom" : "middle",
+      });
+      if (item.body) {
+        s.addText(item.body, {
+          x: textX, y: y + itemH * 0.50, w: textW, h: itemH * 0.34,
+          fontSize: Math.max(9, Math.round((theme.smallFontSize - 1) * fontScale)),
+          fontFace: theme.fontFace, color: theme.palette.mutedText,
+          fit: "shrink", valign: "top",
+        });
+      }
+    }
+  });
+  addChrome(s, theme);
+  return { illustrationUsed: false };
+}
+
+// ─── B4 Phase 3: comparison_matrix ───────────────────────────────────────────
+function buildComparisonMatrixSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
+  const s = pptx.addSlide();
+  s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
+  addHeaderBand(s, slide.title, theme);
+  const fontScale = slide.fontScale ?? 1;
+  const top = HEADER_H + 0.22;
+  const height = H - top - 0.30;
+
+  const columns = (slide.columns ?? []).filter((column) =>
+    Boolean(column.header?.trim()) || column.bullets.some((bullet) => Boolean(bullet?.trim()))
+  );
+  if (columns.length >= 2 && columns.length <= 3) {
+    const gap = 0.18;
+    const margin = 0.42;
+    const columnW = (W - margin * 2 - gap * (columns.length - 1)) / columns.length;
+    columns.forEach((column, columnIndex) => {
+      const x = margin + columnIndex * (columnW + gap);
+      const accent = columnIndex === 0 ? theme.palette.accentA : columnIndex === 1 ? theme.palette.accentB : theme.palette.headerBg;
+      s.addShape("roundRect", {
+        x, y: top, w: columnW, h: height,
+        rectRadius: 0.06,
+        fill: { color: theme.palette.surface },
+        line: { color: theme.palette.border, width: 0.8 },
+      });
+      s.addShape("rect", {
+        x, y: top, w: columnW, h: 0.74,
+        fill: { color: accent }, line: { color: accent, width: 0 },
+      });
+      s.addText(column.header || String(columnIndex + 1), {
+        x: x + 0.16, y: top + 0.12, w: columnW - 0.32, h: 0.46,
+        fontSize: Math.max(11, Math.round((theme.bodyFontSize + 1) * fontScale)),
+        fontFace: theme.fontFace, bold: true, color: theme.palette.headerText,
+        align: "center", valign: "middle", fit: "shrink",
+      });
+      const items = column.bullets.filter((bullet) => bullet?.trim());
+      const itemGap = 0.08;
+      const itemH = (height - 1.02 - itemGap * Math.max(0, items.length - 1)) / Math.max(1, items.length);
+      items.forEach((item, itemIndex) => {
+        const y = top + 0.88 + itemIndex * (itemH + itemGap);
+        s.addShape("roundRect", {
+          x: x + 0.14, y, w: columnW - 0.28, h: itemH,
+          rectRadius: 0.04,
+          fill: { color: theme.palette.sectionBg },
+          line: { color: theme.palette.border, width: 0.5 },
+        });
+        s.addText(item, {
+          x: x + 0.28, y: y + 0.06, w: columnW - 0.56, h: itemH - 0.12,
+          fontSize: Math.max(9, Math.round((theme.bodyFontSize - 3) * fontScale)),
+          fontFace: theme.fontFace, color: theme.palette.bodyText,
+          valign: "middle", fit: "shrink",
+          ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+        });
+      });
+    });
+  } else if (hasUsableTableRows(slide.tableRows)) {
+    const rows = slide.tableRows!;
+    const columnCount = Math.max(...rows.map((row) => row.length), 1);
+    const tableData = rows.map((row, rowIndex) =>
+      Array.from({ length: columnCount }, (_, columnIndex) => ({
+        text: row[columnIndex] ?? "",
+        options: {
+          bold: rowIndex === 0 || columnIndex === 0,
+          fontSize: Math.max(9, Math.round((theme.bodyFontSize - (rowIndex === 0 ? 2 : 4)) * fontScale)),
+          fontFace: theme.fontFace,
+          color: rowIndex === 0 ? theme.palette.headerText : theme.palette.bodyText,
+          fill: {
+            color: rowIndex === 0
+              ? (columnIndex % 2 === 0 ? theme.palette.accentA : theme.palette.headerBg)
+              : columnIndex === 0 ? theme.palette.sectionBg : theme.palette.surface,
+          },
+          align: columnIndex === 0 ? "left" as const : "center" as const,
+          valign: "middle" as const,
+          margin: 5,
+          border: [
+            { type: "solid" as const, pt: 0.5, color: theme.palette.border },
+            { type: "solid" as const, pt: 0.5, color: theme.palette.border },
+            { type: "solid" as const, pt: 0.5, color: theme.palette.border },
+            { type: "solid" as const, pt: 0.5, color: theme.palette.border },
+          ] as [any, any, any, any],
+        },
+      }))
+    );
+    s.addTable(tableData, {
+      x: 0.42, y: top, w: W - 0.84,
+      colW: Array(columnCount).fill((W - 0.84) / columnCount),
+      rowH: height / rows.length,
+    });
+  }
+  addChrome(s, theme);
+}
+
+// ─── B4 Phase 3: decision_summary ────────────────────────────────────────────
+function buildDecisionSummarySlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
+  const decision = deriveDecisionSummary(slide);
+  if (!decision) {
+    buildBulletsSlide(pptx, slide, theme, { title: slide.title, visualType: "editorial" }, null, false);
+    return;
+  }
+
+  const s = pptx.addSlide();
+  s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
+  addHeaderBand(s, slide.title, theme);
+  const fontScale = slide.fontScale ?? 1;
+  const top = HEADER_H + 0.22;
+
+  s.addShape("roundRect", {
+    x: 0.42, y: top, w: W - 0.84, h: 1.42,
+    rectRadius: 0.08,
+    fill: { color: theme.palette.titleBg },
+    line: { color: theme.palette.titleBg, width: 0 },
+  });
+  s.addText(theme.useJapaneseLabels ? "結論" : "DECISION", {
+    x: 0.68, y: top + 0.18, w: 1.20, h: 0.30,
+    fontSize: theme.smallFontSize, fontFace: theme.fontFace, bold: true,
+    color: theme.palette.accentB,
+  });
+  s.addText(decision.conclusion, {
+    x: 0.68, y: top + 0.48, w: W - 1.36, h: 0.70,
+    fontSize: Math.max(16, Math.round((theme.titleFontSize - 2) * fontScale)),
+    fontFace: theme.fontFace, bold: true, color: theme.palette.headerText,
+    valign: "middle", fit: "shrink",
+  });
+
+  const lowerTop = top + 1.66;
+  const lowerH = H - lowerTop - 0.30;
+  const gap = 0.22;
+  const cardW = (W - 0.84 - gap) / 2;
+  const groups = [
+    { label: theme.useJapaneseLabels ? "根拠" : "EVIDENCE", items: decision.evidence, color: theme.palette.accentA },
+    { label: theme.useJapaneseLabels ? "次のアクション" : "NEXT ACTIONS", items: decision.actions, color: theme.palette.accentB },
+  ];
+  groups.forEach((group, groupIndex) => {
+    const x = 0.42 + groupIndex * (cardW + gap);
+    s.addShape("roundRect", {
+      x, y: lowerTop, w: cardW, h: lowerH,
+      rectRadius: 0.06,
+      fill: { color: theme.palette.surface },
+      line: { color: theme.palette.border, width: 0.8 },
+    });
+    s.addText(group.label, {
+      x: x + 0.22, y: lowerTop + 0.18, w: cardW - 0.44, h: 0.34,
+      fontSize: Math.max(11, Math.round(theme.bodyFontSize * fontScale)),
+      fontFace: theme.fontFace, bold: true, color: group.color,
+    });
+    const itemGap = 0.12;
+    const itemH = (lowerH - 0.78 - itemGap * Math.max(0, group.items.length - 1)) / group.items.length;
+    group.items.forEach((item, itemIndex) => {
+      const y = lowerTop + 0.64 + itemIndex * (itemH + itemGap);
+      s.addShape("ellipse", {
+        x: x + 0.22, y: y + itemH / 2 - 0.14, w: 0.28, h: 0.28,
+        fill: { color: group.color }, line: { color: group.color, width: 0 },
+      });
+      s.addText(String(itemIndex + 1), {
+        x: x + 0.22, y: y + itemH / 2 - 0.14, w: 0.28, h: 0.28,
+        fontSize: 8, fontFace: theme.fontFace, bold: true,
+        color: "FFFFFF", align: "center", valign: "middle", margin: 0,
+      });
+      s.addText(item, {
+        x: x + 0.62, y, w: cardW - 0.84, h: itemH,
+        fontSize: Math.max(10, Math.round((theme.bodyFontSize - 2) * fontScale)),
+        fontFace: theme.fontFace, color: theme.palette.bodyText,
+        valign: "middle", fit: "shrink",
+        ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+      });
+    });
+  });
+  addChrome(s, theme);
+}
+
+// ─── B4 Phase 3: editorial_statement ─────────────────────────────────────────
+// 1〜3件の要点をカードで囲まず、余白・大見出し・罫線で階層化する。
+function buildEditorialStatementSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
+  const bullets = (slide.bullets ?? []).map((bullet) => bullet.trim()).filter(Boolean).slice(0, 3);
+  if (bullets.length === 0) {
+    buildBulletsSlide(pptx, slide, theme, { title: slide.title, visualType: "editorial" }, null, false);
+    return;
+  }
+
+  const s = pptx.addSlide();
+  s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
+  addHeaderBand(s, slide.title, theme);
+  const fontScale = slide.fontScale ?? 1;
+  const top = HEADER_H + 0.30;
+  const role = slide.artDirectionRole ?? "context";
+  const roleLabel = theme.useJapaneseLabels
+    ? ({
+        opening: "導入",
+        context: "背景",
+        evidence: "根拠",
+        comparison: "比較",
+        process: "進め方",
+        decision: "判断",
+        closing: "要点",
+      } as const)[role]
+    : ({
+        opening: "CONTEXT",
+        context: "CONTEXT",
+        evidence: "EVIDENCE",
+        comparison: "PERSPECTIVE",
+        process: "DIRECTION",
+        decision: "DECISION",
+        closing: "TAKEAWAY",
+      } as const)[role];
+
+  s.addText(roleLabel, {
+    x: 0.48, y: top, w: 2.0, h: 0.28,
+    fontSize: Math.max(9, theme.smallFontSize - 1), fontFace: theme.fontFace,
+    bold: true, color: theme.palette.accentB, charSpacing: 1.2, margin: 0,
+  });
+  s.addText("01", {
+    x: W - 2.20, y: top - 0.20, w: 1.65, h: 0.90,
+    fontSize: 42, fontFace: theme.fontFace, bold: true,
+    color: theme.palette.sectionBg, align: "right", margin: 0,
+  });
+  s.addText(bullets[0], {
+    x: 0.48, y: top + 0.52, w: W - 1.35, h: bullets.length === 1 ? 3.35 : 2.20,
+    fontSize: Math.max(20, Math.round((theme.titleFontSize + (bullets.length === 1 ? 6 : 2)) * fontScale)),
+    fontFace: theme.fontFace, bold: true, color: theme.palette.bodyText,
+    breakLine: false, valign: "middle", fit: "shrink", margin: 0,
+    ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+  });
+  s.addShape("rect", {
+    x: 0.48, y: top + (bullets.length === 1 ? 4.18 : 3.10), w: W - 0.96, h: 0.035,
+    fill: { color: theme.palette.accentA }, line: { color: theme.palette.accentA, width: 0 },
+  });
+
+  const supporting = bullets.slice(1);
+  if (supporting.length > 0) {
+    const supportTop = top + 3.38;
+    const gap = 0.55;
+    const supportW = (W - 0.96 - gap * (supporting.length - 1)) / supporting.length;
+    supporting.forEach((item, index) => {
+      const x = 0.48 + index * (supportW + gap);
+      s.addText(String(index + 2).padStart(2, "0"), {
+        x, y: supportTop, w: 0.52, h: 0.34,
+        fontSize: 11, fontFace: theme.fontFace, bold: true,
+        color: index === 0 ? theme.palette.accentA : theme.palette.accentB, margin: 0,
+      });
+      s.addText(item, {
+        x, y: supportTop + 0.48, w: supportW, h: H - supportTop - 0.82,
+        fontSize: Math.max(11, Math.round((theme.bodyFontSize + 1) * fontScale)),
+        fontFace: theme.fontFace, color: theme.palette.bodyText,
+        valign: "top", fit: "shrink", margin: 0,
+        ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+      });
+      if (index > 0) {
+        s.addShape("rect", {
+          x: x - gap / 2, y: supportTop, w: 0.02, h: H - supportTop - 0.38,
+          fill: { color: theme.palette.border }, line: { color: theme.palette.border, width: 0 },
+        });
+      }
+    });
+  }
+  addChrome(s, theme);
+}
+
+// ─── B4 Phase 3: asymmetric_list ─────────────────────────────────────────────
+// 左側の主張と右側の詳細リストを、カードを使わず非対称に配置する。
+function buildAsymmetricListSlide(pptx: PptxGenJS, slide: PptxSlide, theme: Theme) {
+  const bullets = (slide.bullets ?? []).map((bullet) => bullet.trim()).filter(Boolean).slice(0, 6);
+  if (bullets.length < 2) {
+    buildBulletsSlide(pptx, slide, theme, { title: slide.title, visualType: "editorial" }, null, false);
+    return;
+  }
+
+  const s = pptx.addSlide();
+  s.background = { color: theme.palette.canvas };
+  applyB4MotifBackdrop(s, slide, theme);
+  addHeaderBand(s, slide.title, theme);
+  const fontScale = slide.fontScale ?? 1;
+  const top = HEADER_H + 0.30;
+  const leftX = 0.48;
+  const leftW = 4.15;
+  const dividerX = 4.92;
+  const rightX = 5.34;
+  const rightW = W - rightX - 0.48;
+  const lead = splitBulletForCard(bullets[0]);
+
+  s.addText("01", {
+    x: leftX, y: top, w: 0.72, h: 0.42,
+    fontSize: 13, fontFace: theme.fontFace, bold: true,
+    color: theme.palette.accentB, margin: 0,
+  });
+  s.addText(lead.heading || bullets[0], {
+    x: leftX, y: top + 0.64, w: leftW, h: lead.heading ? 1.42 : 3.15,
+    fontSize: Math.max(18, Math.round((theme.titleFontSize + 3) * fontScale)),
+    fontFace: theme.fontFace, bold: true, color: theme.palette.bodyText,
+    valign: "middle", fit: "shrink", margin: 0,
+  });
+  if (lead.heading && lead.body) {
+    s.addText(lead.body, {
+      x: leftX, y: top + 2.24, w: leftW, h: H - top - 2.66,
+      fontSize: Math.max(11, Math.round(theme.bodyFontSize * fontScale)),
+      fontFace: theme.fontFace, color: theme.palette.mutedText,
+      valign: "top", fit: "shrink", margin: 0,
+      ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+    });
+  }
+  s.addShape("rect", {
+    x: dividerX, y: top, w: 0.025, h: H - top - 0.34,
+    fill: { color: theme.palette.accentA }, line: { color: theme.palette.accentA, width: 0 },
+  });
+
+  const details = bullets.slice(1);
+  const rowH = (H - top - 0.34) / details.length;
+  details.forEach((item, index) => {
+    const y = top + index * rowH;
+    const parsed = splitBulletForCard(item);
+    s.addText(String(index + 2).padStart(2, "0"), {
+      x: rightX, y: y + 0.10, w: 0.52, h: 0.30,
+      fontSize: 10, fontFace: theme.fontFace, bold: true,
+      color: index % 2 === 0 ? theme.palette.accentA : theme.palette.accentB, margin: 0,
+    });
+    s.addText(parsed.heading || item, {
+      x: rightX + 0.66, y: y + 0.08, w: rightW - 0.66, h: parsed.heading ? rowH * 0.40 : rowH - 0.18,
+      fontSize: Math.max(10, Math.round((theme.bodyFontSize + 1) * fontScale)),
+      fontFace: theme.fontFace, bold: Boolean(parsed.heading), color: theme.palette.bodyText,
+      valign: parsed.heading ? "bottom" : "middle", fit: "shrink", margin: 0,
+    });
+    if (parsed.heading && parsed.body) {
+      s.addText(parsed.body, {
+        x: rightX + 0.66, y: y + rowH * 0.48, w: rightW - 0.66, h: rowH * 0.42,
+        fontSize: Math.max(9, Math.round((theme.smallFontSize - 1) * fontScale)),
+        fontFace: theme.fontFace, color: theme.palette.mutedText,
+        valign: "top", fit: "shrink", margin: 0,
+        ...(slide.fitTextToShape ? { shrinkText: true } : {}),
+      });
+    }
+    if (index < details.length - 1) {
+      s.addShape("rect", {
+        x: rightX, y: y + rowH - 0.02, w: rightW, h: 0.02,
+        fill: { color: theme.palette.border }, line: { color: theme.palette.border, width: 0 },
+      });
+    }
+  });
+  addChrome(s, theme);
+}
+
+// ── 共通コンテンツスライド描画関数 ────────────────────────────────────────────
+// 初回生成・DeckSpec再描画・Vision Pass 1・Vision Pass 2の重複switchを統合。
+// 戻り値 illustrationUsed: true のときイラスト配置済みフラグを立てること。
+function renderContentSlide(props: {
+  pptx: PptxGenJS;
+  slide: PptxSlide;
+  theme: Theme;
+  visual: SlideVisualHint;
+  faithfulMode: boolean;
+  illustration?: GeneratedIllustration | null;
+  /** true のとき buildBulletsSlide の横並びカード変換を抑制（forceSimpleBullets=true のDeckSpec再描画用） */
+  forceSimpleBullets?: boolean;
+}): { illustrationUsed: boolean } {
+  const { pptx, slide, theme, visual, faithfulMode, illustration = null, forceSimpleBullets = false } = props;
+  const resolvedLt = resolveLayoutType(slide);
+  switch (resolvedLt) {
+    case "title":            buildSectionSlide(pptx, slide.title, theme); break;
+    case "card_grid":        buildCardGridSlide(pptx, slide, theme); break;
+    case "icon_rows":        buildIconRowsSlide(pptx, slide, theme); break;
+    case "timeline":
+    case "roadmap":          buildTimelineSlide(pptx, slide, theme); break;
+    case "stat_callouts":    buildStatCalloutsSlide(pptx, slide, theme); break;
+    case "metric-cards":     buildMetricCardsSlide(pptx, slide, theme); break;
+    case "conversation":     buildConversationSlide(pptx, slide, theme); break;
+    case "company-overview": buildCompanyOverviewSlide(pptx, slide, theme); break;
+    case "process-cards":    buildProcessCardsSlide(pptx, slide, theme); break;
+    case "closing":          buildClosingSlide(pptx, slide, theme); break;
+    case "table":            buildTableSlide(pptx, slide, theme, visual, faithfulMode); break;
+    case "multi-column":     buildMultiColumnSlide(pptx, slide, theme, visual, faithfulMode); break;
+    case "diagram":          buildDiagramSlide(pptx, slide, theme, visual, faithfulMode); break;
+    case "split_visual":     return buildSplitVisualSlide(pptx, slide, theme, visual, illustration);
+    case "comparison_matrix": buildComparisonMatrixSlide(pptx, slide, theme); break;
+    case "decision_summary": buildDecisionSummarySlide(pptx, slide, theme); break;
+    case "editorial_statement": buildEditorialStatementSlide(pptx, slide, theme); break;
+    case "asymmetric_list":  buildAsymmetricListSlide(pptx, slide, theme); break;
+    default:
+      buildBulletsSlide(pptx, slide, theme, visual, illustration, faithfulMode || forceSimpleBullets);
+      return { illustrationUsed: !!illustration };
+  }
+  return { illustrationUsed: false };
+}
+
+// ─── B4: Art Directionをスライドへ適用（派生データをbulletから決定的に構築） ────────
+function applyArtDirectionToSlides(
+  slides: PptxSlide[],
+  direction: DeckArtDirection
+): PptxSlide[] {
+  return slides.map((slideRaw, i) => {
+    const ds = direction.slides.find((d) => d.slideIndex === i);
+    if (!ds) return slideRaw;
+
+    const bullets = Array.isArray(slideRaw.bullets) ? slideRaw.bullets : [];
+    const originalLayout = resolveLayoutType(slideRaw);
+    const targetLayout = ds.layoutType as PptxSlide["layoutType"];
+
+    // These renderers have hard display limits. Never switch layouts when doing
+    // so would hide source bullets; retaining the B3 slide is safer than truncation.
+    const rendererCapacity =
+      targetLayout === "card_grid" ? 6 :
+      targetLayout === "icon_rows" ? 4 :
+      targetLayout === "process-cards" ? (ds.density === "low" ? 3 : 4) :
+      targetLayout === "timeline" ? (ds.density === "low" ? 3 : ds.density === "high" ? 5 : 4) :
+      targetLayout === "closing" ? 4 :
+      targetLayout === "split_visual" ? 5 :
+      targetLayout === "decision_summary" ? 7 :
+      targetLayout === "comparison_matrix" ? 12 :
+      targetLayout === "editorial_statement" ? 3 :
+      targetLayout === "asymmetric_list" ? 6 :
+      Number.POSITIVE_INFINITY;
+    const safeCapacity = Math.min(ds.contentBudget.maxItems, rendererCapacity);
+    if (
+      targetLayout !== originalLayout &&
+      bullets.length > 0 &&
+      bullets.length > safeCapacity
+    ) {
+      console.log(
+        `[ppt-b4] slide=${i} rejected=budget-overflow requested=${targetLayout} ` +
+        `items=${bullets.length} capacity=${safeCapacity} fallback=${originalLayout}`
+      );
+      return slideRaw;
+    }
+
+    const slide: PptxSlide = {
+      ...slideRaw,
+      layoutType: targetLayout,
+      artDirectionMotif: direction.motif,
+      artDirectionTone: direction.dominantTone,
+      artDirectionRole: ds.visualRole,
+      artDirectionIndex: i,
+    };
+    if (ds.density) slide.density = ds.density;
+
+    // company-overview without metrics reserves an empty right panel. In B4
+    // apply only, replace that composition with a content-preserving editorial
+    // layout instead of emitting an empty card/panel.
+    if (
+      ds.layoutType === "company-overview" &&
+      !(slide.metrics ?? []).some((metric) => metric.label?.trim() || metric.value?.trim())
+    ) {
+      const fallbackBullets = bullets.length > 0
+        ? bullets
+        : slide.leadText?.trim()
+          ? [slide.leadText.trim()]
+          : [];
+      const editorialFallback = fallbackBullets.length >= 1 && fallbackBullets.length <= 3
+        ? "editorial_statement"
+        : fallbackBullets.length >= 2 && fallbackBullets.length <= 6
+          ? "asymmetric_list"
+          : fallbackBullets.length > 0 ? "bullets" : "company-overview";
+      if (editorialFallback !== "company-overview") {
+        slide.layoutType = editorialFallback;
+        slide.bullets = fallbackBullets;
+        console.log(
+          `[ppt-b4] slide=${i} empty-panel-prevented from=company-overview to=${editorialFallback}`
+        );
+      }
+    }
+
+    // card_grid / icon_rows: cards/steps がなければ bullets から派生
+    if (ds.layoutType === "card_grid" || ds.layoutType === "icon_rows") {
+      const hasCards = Array.isArray(slide.cards) && slide.cards.length >= 2;
+      const hasSteps = Array.isArray(slide.steps) && slide.steps.length >= 2;
+      if (!hasCards && !hasSteps && bullets.length >= 2) {
+        slide.cards = bullets.map((b, idx) => {
+          const iconKey = UPGRADE_ICON_CYCLE[idx % UPGRADE_ICON_CYCLE.length] as string;
+          const { heading, body } = splitBulletForCard(b);
+          return { iconKey, heading, body };
+        });
+      }
+    }
+
+    // process-cards / timeline: steps がなければ bullets から派生
+    if (ds.layoutType === "process-cards" || ds.layoutType === "timeline") {
+      const hasSteps = Array.isArray(slide.steps) && slide.steps.length >= 2;
+      if (!hasSteps && bullets.length >= 2) {
+        slide.steps = bullets.map((b) => {
+          const { heading, body } = splitBulletForCard(b);
+          return { title: heading || b.slice(0, 20).trim(), body: body || b.trim() };
+        });
+      }
+    }
+
+    // multi-column: columns がなければ bullets を2列に分割
+    if (ds.layoutType === "multi-column" && !hasUsableColumns(slide.columns)) {
+      const mid = Math.ceil(bullets.length / 2);
+      slide.columns = [
+        { header: "", bullets: bullets.slice(0, mid) },
+        { header: "", bullets: bullets.slice(mid) },
+      ];
+    }
+
+    if (ds.layoutType === "decision_summary") {
+      const decision = deriveDecisionSummary(slide);
+      if (!decision) return slideRaw;
+      slide.decisionConclusion = decision.conclusion;
+      slide.decisionEvidence = decision.evidence;
+      slide.decisionActions = decision.actions;
+    }
+
+    return slide;
   });
 }
 
@@ -4186,38 +5222,21 @@ async function handleRerenderFromDeckSpec(body: {
         title: slide.title ?? "",
         visualType: (specSlide.visualHint?.visualType ?? "spotlight") as SlideVisualType,
       };
-      // 初回生成と同じ条件: 最初の bullets スライドにのみイラストを配置
+      // 初回生成と同じ条件: 最初の bullets/split_visual スライドにのみイラストを配置
       const slideIllustration =
-        !rerenderIllustrationPlaced && rerenderIllustration && resolvedLt === "bullets"
+        !rerenderIllustrationPlaced && rerenderIllustration &&
+        (resolvedLt === "bullets" || resolvedLt === "split_visual")
           ? rerenderIllustration
           : null;
 
-      switch (resolvedLt) {
-        case "title":            buildSectionSlide(pptx, slide.title, theme); break;
-        case "card_grid":        buildCardGridSlide(pptx, slide, theme); break;
-        case "icon_rows":        buildIconRowsSlide(pptx, slide, theme); break;
-        case "timeline":         buildTimelineSlide(pptx, slide, theme); break;
-        case "roadmap":          buildTimelineSlide(pptx, slide, theme); break;
-        case "stat_callouts":    buildStatCalloutsSlide(pptx, slide, theme); break;
-        case "metric-cards":     buildMetricCardsSlide(pptx, slide, theme); break;
-        case "conversation":     buildConversationSlide(pptx, slide, theme); break;
-        case "company-overview": buildCompanyOverviewSlide(pptx, slide, theme); break;
-        case "process-cards":    buildProcessCardsSlide(pptx, slide, theme); break;
-        case "closing":          buildClosingSlide(pptx, slide, theme); break;
-        case "table":            buildTableSlide(pptx, slide, theme, visual, false); break;
-        case "multi-column":     buildMultiColumnSlide(pptx, slide, theme, visual, false); break;
-        case "diagram":          buildDiagramSlide(pptx, slide, theme, visual, false); break;
-        default:
-          buildBulletsSlide(
-            pptx,
-            slide,
-            theme,
-            visual,
-            slideIllustration,
-            forceSimpleBullets
-          );
-          if (slideIllustration) rerenderIllustrationPlaced = true;
-          break;
+      {
+        const { illustrationUsed } = renderContentSlide({
+          pptx, slide, theme, visual,
+          faithfulMode: rerenderFaithful,
+          illustration: slideIllustration,
+          forceSimpleBullets,
+        });
+        if (illustrationUsed) rerenderIllustrationPlaced = true;
       }
     }
 
@@ -4278,12 +5297,26 @@ export async function POST(req: NextRequest) {
       return handleRerenderFromDeckSpec(rawBody as Parameters<typeof handleRerenderFromDeckSpec>[0]);
     }
     const body: GenPptxRequest = rawBody as GenPptxRequest;
-    const { title, slides, threadId, fontFace, designInstruction, deckPreferences, mode, fileBaseName, promptIntent, palette: requestedPalette } = body;
+    const { title, slides, threadId, targetTotalSlides, fontFace, designInstruction, deckPreferences, mode, fileBaseName, promptIntent, palette: requestedPalette } = body;
     if (!title || !slides || slides.length === 0) {
       return NextResponse.json({ error: "title and slides are required" }, { status: 400 });
     }
 
     const faithfulMode = mode === "faithful";
+    const expectedTotalSlides = Number.isInteger(targetTotalSlides) && Number(targetTotalSlides) > 0
+      ? Number(targetTotalSlides)
+      : undefined;
+    const expectedBodySlides = expectedTotalSlides === undefined
+      ? undefined
+      : expectedTotalSlides - (faithfulMode ? 0 : 1);
+    const assertExpectedBodySlides = (actual: number, stage: string) => {
+      if (expectedBodySlides !== undefined && actual !== expectedBodySlides) {
+        throw new Error(
+          `[gen-pptx] Story Planner slide count mismatch at ${stage}: ` +
+          `expected body=${expectedBodySlides} total=${expectedTotalSlides}, actual body=${actual}`
+        );
+      }
+    };
 
     const instructionText = [designInstruction, deckPreferences?.designInstruction, ...(deckPreferences?.recentDesignNotes ?? [])]
       .filter(Boolean)
@@ -4357,12 +5390,14 @@ export async function POST(req: NextRequest) {
         }
         return true;
       });
+    assertExpectedBodySlides(rawCleaned.length, "input");
 
     // PromptIntent の layoutDirectives を先に適用してから品質ゲートを通す
     const intentApplied = promptIntent && !faithfulMode
       ? applyPromptIntentToSlides(rawCleaned, promptIntent)
       : rawCleaned;
     const sanitizedSlides = validateAndRepairSlides(normalizeSlidesForPptx(intentApplied));
+    assertExpectedBodySlides(sanitizedSlides.length, "validateAndRepairSlides");
 
     // ── guaranteed chart: stat_callouts がなければ最も数値が多いスライドを強制変換 ──
     // 年 (2000〜2099) のみの値は有効なKPIとみなさない（既存 stat_callouts でも適用）
@@ -4450,73 +5485,53 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // B4 Art Director フロー（audit: ログのみ。apply: B3描画後にB4描画を追加）
+    let _b4DirectionResult: DeckArtDirection | null = null;
+    let _b4PreflightResult: PreflightResult | null = null;
+    if (!faithfulMode && isArtDirectorActive() && isB3Mode()) {
+      const b4Mode = getArtDirectorMode();
+      const b4AuditStartedAt = Date.now();
+      console.log(`[ppt-b4] mode=${b4Mode} model=${process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME ?? ""} slides=${sanitizedSlides.length} fallbackToB3=true`);
+      try {
+        const b4Direction = await generateDeckArtDirection({
+          title,
+          slides: sanitizedSlides,
+          promptIntent: promptIntent ?? null,
+          designThesis: designBrief.mood,
+          signal: req.signal,
+        });
+        if (b4Direction) {
+          _b4DirectionResult = b4Direction;
+          const b4Preflight = runPreflight(b4Direction, sanitizedSlides);
+          _b4PreflightResult = b4Preflight;
+          console.log(`[ppt-b4] audit completed durationMs=${Date.now() - b4AuditStartedAt} accepted=${b4Preflight.accepted} repaired=${b4Preflight.repaired}`);
+        } else {
+          console.log(`[ppt-b4] art-director returned null — B3 maintained durationMs=${Date.now() - b4AuditStartedAt}`);
+        }
+      } catch (b4Err) {
+        console.warn("[ppt-b4] art-director error (non-fatal):", (b4Err as Error)?.message ?? b4Err);
+      }
+    }
+
     sanitizedSlides.forEach((slideRaw, index) => {
       const slide = upgradeTextOnlySlide(slideRaw);
       const resolvedLt = resolveLayoutType(slide);
       const visual = designBrief.visualHints[index] ?? {
         title: slide.title,
-        visualType:
-          resolvedLt === "table"         ? "table" :
-          resolvedLt === "multi-column"  ? "comparison" :
-          resolvedLt === "diagram" || resolvedLt === "process-cards" ? "process" :
-          resolvedLt === "timeline"      ? "timeline" :
-          resolvedLt === "company-overview" || resolvedLt === "metric-cards" ? "cards" :
-          resolvedLt === "closing"       ? "spotlight" : "editorial",
+        visualType: resolveVisualTypeForLayout(resolvedLt),
         emphasis: (Array.isArray(slide.bullets) && slide.bullets[0]) || slide.title,
       };
       const slideIllustration =
         !illustrationPlaced &&
         coverIllustration &&
-        resolvedLt === "bullets"
+        (resolvedLt === "bullets" || resolvedLt === "split_visual")
           ? coverIllustration
           : null;
-      switch (resolvedLt) {
-        case "title":
-          buildSectionSlide(pptx, slide.title, theme);
-          break;
-        case "table":
-          buildTableSlide(pptx, slide, theme, visual, faithfulMode);
-          break;
-        case "multi-column":
-          buildMultiColumnSlide(pptx, slide, theme, visual, faithfulMode);
-          break;
-        case "diagram":
-          buildDiagramSlide(pptx, slide, theme, visual, faithfulMode);
-          break;
-        case "conversation":
-          buildConversationSlide(pptx, slide, theme);
-          break;
-        case "company-overview":
-          buildCompanyOverviewSlide(pptx, slide, theme);
-          break;
-        case "process-cards":
-          buildProcessCardsSlide(pptx, slide, theme);
-          break;
-        case "closing":
-          buildClosingSlide(pptx, slide, theme);
-          break;
-        case "metric-cards":
-          buildMetricCardsSlide(pptx, slide, theme);
-          break;
-        case "timeline":
-          buildTimelineSlide(pptx, slide, theme);
-          break;
-        case "stat_callouts":
-          buildStatCalloutsSlide(pptx, slide, theme);
-          break;
-        case "card_grid":
-          buildCardGridSlide(pptx, slide, theme);
-          break;
-        case "icon_rows":
-          buildIconRowsSlide(pptx, slide, theme);
-          break;
-        case "roadmap":
-          buildTimelineSlide(pptx, slide, theme);
-          break;
-        default:
-          buildBulletsSlide(pptx, slide, theme, visual, slideIllustration, faithfulMode);
-          if (slideIllustration) illustrationPlaced = true;
-          break;
+      {
+        const { illustrationUsed } = renderContentSlide({
+          pptx, slide, theme, visual, faithfulMode, illustration: slideIllustration,
+        });
+        if (illustrationUsed) illustrationPlaced = true;
       }
     });
 
@@ -4528,18 +5543,131 @@ export async function POST(req: NextRequest) {
       if (!isZip) throw new Error("[gen-pptx] Generated PPTX is not a valid ZIP file — aborting");
       if (!hasSlides) throw new Error("[gen-pptx] Generated PPTX has no slide content — aborting");
     }
+    if (expectedTotalSlides !== undefined) {
+      const targetPkgResult = await validateGeneratedPptx(buffer, {
+        expectedSlideCount: expectedTotalSlides,
+        context: "story-target",
+      });
+      if (!targetPkgResult.valid) {
+        throw new Error(
+          `[gen-pptx] Story Planner target validation failed: ${targetPkgResult.errors.join("; ")}`
+        );
+      }
+    }
+
+    // Vision再描画・B4適用で更新する。初期値はB3のsanitizedSlides。
+    let finalSlidesForSpec = sanitizedSlides;
+    // Immutable B3 baseline used whenever B4 generation or validation fails.
+    const b3Buffer = Buffer.from(buffer);
+    const b3SlidesForSpec = sanitizedSlides;
+
+    // ── B4 apply: Preflightを通過したArt DirectionをB3バッファ後に適用 ──────────
+    let _b4Applied = false;
+    if (getArtDirectorMode() === "apply" && _b4PreflightResult?.accepted && _b4DirectionResult && !faithfulMode) {
+      const b4ApplyStartedAt = Date.now();
+      try {
+        // Apply only the repaired/validated direction returned by Preflight.
+        const effectiveB4Direction = _b4PreflightResult.direction;
+        const b4Slides = applyArtDirectionToSlides(sanitizedSlides, effectiveB4Direction);
+        assertExpectedBodySlides(b4Slides.length, "b4-apply");
+        console.log(
+          `[ppt-b4] motif-render motif=${effectiveB4Direction.motif} ` +
+          `tone=${effectiveB4Direction.dominantTone} slides=${b4Slides.length}`
+        );
+
+        const pptx4 = new PptxGenJS();
+        pptx4.layout = "LAYOUT_WIDE";
+        pptx4.theme  = { headFontFace: "Meiryo", bodyFontFace: "Meiryo" };
+        pptx4.author = "azurechat";
+        pptx4.subject = title;
+        pptx4.title = title;
+        buildTitleSlide(pptx4, title, designBrief, theme, b4Slides.length + 1, coverIllustration);
+
+        let b4IllustrationPlaced = false;
+        b4Slides.forEach((slideRaw, index) => {
+          const slide = upgradeTextOnlySlide(slideRaw);
+          const resolvedLt = resolveLayoutType(slide);
+          const visual = designBrief.visualHints[index] ?? {
+            title: slide.title,
+            visualType: resolveVisualTypeForLayout(resolvedLt),
+            emphasis: (Array.isArray(slide.bullets) && slide.bullets[0]) || slide.title,
+          };
+          const slideIllustration =
+            !b4IllustrationPlaced && coverIllustration &&
+            (resolvedLt === "bullets" || resolvedLt === "split_visual")
+              ? coverIllustration : null;
+          const { illustrationUsed } = renderContentSlide({
+            pptx: pptx4, slide, theme, visual, faithfulMode, illustration: slideIllustration,
+          });
+          if (illustrationUsed) b4IllustrationPlaced = true;
+        });
+
+        const b4Buffer = await patchEastAsianFont((await pptx4.write({ outputType: "nodebuffer" })) as Buffer);
+
+        // B4パッケージ検査（blocking: 失敗時はB3へ戻す）
+        const b4PkgResult = await validateGeneratedPptx(b4Buffer, {
+          expectedSlideCount: expectedTotalSlides ?? b4Slides.length + 1,
+          context: "b4-apply",
+        });
+        if (b4PkgResult.valid) {
+          // レイアウト変更ログ
+          effectiveB4Direction.slides.forEach((ds) => {
+            const origLayout = sanitizedSlides[ds.slideIndex]?.layoutType ?? "bullets";
+            if (ds.layoutType !== origLayout) {
+              console.log(`[ppt-b4] slide=${ds.slideIndex} layout from=${origLayout} to=${ds.layoutType} reason=${ds.visualRole}`);
+            }
+          });
+          buffer = b4Buffer;
+          finalSlidesForSpec = b4Slides;
+          _b4Applied = true;
+          console.log(`[ppt-b4] apply completed durationMs=${Date.now() - b4ApplyStartedAt} fallbackToB3=false`);
+        } else {
+          buffer = b3Buffer;
+          finalSlidesForSpec = b3SlidesForSpec;
+          _b4Applied = false;
+          console.warn(`[ppt-b4] package validation failed — fallback to B3: ${b4PkgResult.errors.join("; ")}`);
+          console.log(`[ppt-b4] apply fallbackToB3=true durationMs=${Date.now() - b4ApplyStartedAt}`);
+        }
+      } catch (b4ApplyErr) {
+        buffer = b3Buffer;
+        finalSlidesForSpec = b3SlidesForSpec;
+        _b4Applied = false;
+        console.warn("[ppt-b4] apply error — fallback to B3:", (b4ApplyErr as Error)?.message ?? b4ApplyErr);
+      }
+    }
+
+    // B4有効時だけB3バッファも非致命検査する。off時の既存処理には負荷を加えない。
+    if (isArtDirectorActive() && !_b4Applied) {
+      void validateGeneratedPptx(buffer, {
+        expectedSlideCount: sanitizedSlides.length + (faithfulMode ? 0 : 1),
+        context: "b3-baseline",
+      }).then((pkgResult) => {
+        if (!pkgResult.valid) {
+          console.warn(`[ppt-b4] package validation errors: ${pkgResult.errors.join("; ")}`);
+        } else if (pkgResult.warnings.length > 0) {
+          console.log(`[ppt-b4] package warnings: ${pkgResult.warnings.join("; ")}`);
+        }
+      }).catch(() => { /* 検査失敗でもPPTX返却は継続 */ });
+    }
 
     // ── Phase 2: Vision レビュー → パッチ適用 → 再生成 ──────────────────
     // Vision が patchedSlides を生成し再描画に成功した場合のみ finalSlidesForSpec を更新する。
+    // B4 apply成功時は applyArtDirectionToSlides の結果が既にセット済み。
     // バリデーション失敗時は sanitizedSlides にとどまる（DeckSpec の整合性を保証するため）。
-    let finalSlidesForSpec = sanitizedSlides;
     if (!faithfulMode && process.env.PPTX_VISION_REVIEW_ENABLED === "true") {
+      // Keep the exact deck/slides that entered Vision so a rejected candidate
+      // cannot leave the PPTX buffer and DeckSpec out of sync.
+      const preVisionBuffer = Buffer.from(buffer);
+      const preVisionSlides = finalSlidesForSpec;
       try {
         const reviewForm = new FormData();
         const pptxBytes = new Uint8Array(buffer.byteLength);
         pptxBytes.set(buffer);
         reviewForm.append("pptx", new Blob([pptxBytes], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }));
         reviewForm.append("title", title);
+        // Generated decks keep the cover outside sanitizedSlides, so Vision page
+        // indices must be shifted before fixes are applied to content slides.
+        reviewForm.append("slideIndexMode", "cover-separated");
         if (promptIntent) {
           reviewForm.append("promptIntent", JSON.stringify(promptIntent));
         }
@@ -4549,6 +5677,16 @@ export async function POST(req: NextRequest) {
           (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
         ).replace(/\/+$/, "");
 
+        const b3StartedAt = Date.now();
+        const b3Active = isB3Mode();
+        if (b3Active) {
+          console.log(`[ppt-b3] mode=guarded-creative model=${process.env.AZURE_OPENAI_PPT_VISION_DEPLOYMENT_NAME ?? ""}`);
+          reviewForm.append("b3mode", "true");
+        }
+        if (_b4Applied) {
+          reviewForm.append("b4mode", "true");
+        }
+
         const reviewRes = await fetch(`${baseUrl}/api/vision-review-pptx`, {
           method: "POST",
           body: reviewForm,
@@ -4556,10 +5694,37 @@ export async function POST(req: NextRequest) {
 
         if (reviewRes.ok) {
           const review = await reviewRes.json() as { deckScore: number; fixes: Array<{ slideIndex: number; field: string; value: string }> };
-          console.log(`[gen-pptx] Vision review: deckScore=${review.deckScore} fixes=${review.fixes.length}`);
+          const scoreBefore = review.deckScore;
+          console.log(`[gen-pptx] Vision review: deckScore=${scoreBefore} fixes=${review.fixes.length}`);
+
+          // B3モード: スライドあたり最大修正件数を制限
+          const maxFixesPerSlide = b3Active
+            ? Math.max(1, parseInt(process.env.PPTX_VISION_MAX_FIXES_PER_SLIDE ?? "2", 10) || 2)
+            : Infinity;
+          if (b3Active) {
+            const slideFixCounts = new Map<number, number>();
+            review.fixes = (review.fixes as any[]).filter((f) => {
+              if (f.slideIndex === -1) return true; // deck-wide fixes always allowed
+              const count = slideFixCounts.get(f.slideIndex) ?? 0;
+              if (count >= maxFixesPerSlide) {
+                console.log(`[ppt-b3] rejected slide=${f.slideIndex} field=${f.field} reason=max-fixes-exceeded`);
+                return false;
+              }
+              slideFixCounts.set(f.slideIndex, count + 1);
+              return true;
+            });
+            console.log(`[ppt-b3] pass=1 scoreBefore=${scoreBefore} proposed=${review.fixes.length} accepted=${review.fixes.length}`);
+          }
 
           if (review.fixes.length > 0) {
             const SLIDE_FIELD_ALLOWLIST = new Set(["density", "textTreatment", "layoutType", "subtitle"]);
+            const VISION_LAYOUT_ALLOWLIST: ReadonlySet<string> = new Set([
+              "bullets", "table", "multi-column", "diagram", "conversation",
+              "company-overview", "process-cards", "closing", "metric-cards",
+              "timeline", "roadmap", "stat_callouts", "card_grid", "icon_rows",
+              "split_visual", "comparison_matrix", "decision_summary",
+              "editorial_statement", "asymmetric_list",
+            ]);
 
             // deleteSlide 対象インデックスを先に収集
             const deleteIndices = new Set<number>(
@@ -4575,9 +5740,14 @@ export async function POST(req: NextRequest) {
             const DECORATED_LAYOUTS = new Set([
               "icon_rows", "card_grid", "stat_callouts", "metric-cards", "metric_cards",
               "company-overview", "process-cards", "timeline", "roadmap",
+              "split_visual", "comparison_matrix", "decision_summary",
+              "editorial_statement", "asymmetric_list",
+            ]);
+            const B4_CARD_HEAVY_LAYOUTS = new Set([
+              "company-overview", "process-cards", "metric-cards", "card_grid", "icon_rows",
             ]);
 
-            const patchedSlidesRaw = sanitizedSlides
+            const patchedSlidesRaw = finalSlidesForSpec
               .map((slide, idx) => {
                 if (deleteIndices.has(idx)) {
                   console.log(`[gen-pptx] Vision deleted slide[${idx}]: "${slide.title}"`);
@@ -4621,7 +5791,25 @@ export async function POST(req: NextRequest) {
                     const newLt = fix.value as string;
                     const currentLt = (slide.layoutType as string) ?? "bullets";
                     // 装飾ありレイアウトから bullets への直落ちを阻止（装飾保全ガード D）
-                    if (DECORATED_LAYOUTS.has(currentLt) && newLt === "bullets") {
+                    const phase3StructureMissing =
+                      (newLt === "split_visual" && !hasSplitVisualData(slide)) ||
+                      (newLt === "comparison_matrix" && !hasComparisonMatrixData(slide)) ||
+                      (newLt === "decision_summary" && !deriveDecisionSummary(slide)) ||
+                      (newLt === "editorial_statement" && !(
+                        (slide.bullets ?? []).filter((bullet: string) => bullet?.trim()).length >= 1 &&
+                        (slide.bullets ?? []).filter((bullet: string) => bullet?.trim()).length <= 3
+                      )) ||
+                      (newLt === "asymmetric_list" && !(
+                        (slide.bullets ?? []).filter((bullet: string) => bullet?.trim()).length >= 2 &&
+                        (slide.bullets ?? []).filter((bullet: string) => bullet?.trim()).length <= 6
+                      ));
+                    if (!VISION_LAYOUT_ALLOWLIST.has(newLt)) {
+                      console.log(`[gen-pptx] layoutType fix BLOCKED slide[${idx}]: unsupported ${newLt}`);
+                    } else if (phase3StructureMissing) {
+                      console.log(`[gen-pptx] layoutType fix BLOCKED slide[${idx}]: ${newLt} missing required source structure`);
+                    } else if (_b4Applied && B4_CARD_HEAVY_LAYOUTS.has(newLt) && newLt !== currentLt) {
+                      console.log(`[gen-pptx] layoutType fix BLOCKED slide[${idx}]: ${currentLt} → ${newLt} (B4 card-ratio guard)`);
+                    } else if (DECORATED_LAYOUTS.has(currentLt) && newLt === "bullets") {
                       console.log(`[gen-pptx] layoutType fix BLOCKED slide[${idx}]: ${currentLt} → bullets (decoration guard)`);
                     } else {
                       patch.layoutType = fix.value;
@@ -4713,9 +5901,19 @@ export async function POST(req: NextRequest) {
                     // 装飾ありレイアウトから bullets への直落ちを阻止（装飾保全ガード C）
                     const requestedLt = (fix.value || "card_grid").trim();
                     const currentLtFb = (slide.layoutType as string) ?? "bullets";
-                    if (DECORATED_LAYOUTS.has(currentLtFb) && requestedLt === "bullets") {
-                      patch.layoutType = "card_grid";
-                      console.log(`[gen-pptx] fallbackLayout GUARDED slide[${idx}]: ${currentLtFb} → card_grid (bullets blocked from decorated layout)`);
+                    if (!VISION_LAYOUT_ALLOWLIST.has(requestedLt)) {
+                      console.log(`[gen-pptx] fallbackLayout BLOCKED slide[${idx}]: unsupported ${requestedLt}`);
+                    } else if (_b4Applied && B4_CARD_HEAVY_LAYOUTS.has(requestedLt) && requestedLt !== currentLtFb) {
+                      console.log(`[gen-pptx] fallbackLayout BLOCKED slide[${idx}]: ${currentLtFb} → ${requestedLt} (B4 card-ratio guard)`);
+                    } else if (DECORATED_LAYOUTS.has(currentLtFb) && requestedLt === "bullets") {
+                      const bulletCount = (slide.bullets ?? []).filter((bullet: string) => bullet?.trim()).length;
+                      const editorialFallback = bulletCount >= 1 && bulletCount <= 3
+                        ? "editorial_statement"
+                        : bulletCount >= 2 && bulletCount <= 6
+                          ? "asymmetric_list"
+                          : currentLtFb;
+                      patch.layoutType = editorialFallback;
+                      console.log(`[gen-pptx] fallbackLayout GUARDED slide[${idx}]: ${currentLtFb} → ${editorialFallback} (content-preserving visual fallback)`);
                     } else {
                       patch.layoutType = requestedLt;
                       console.log(`[gen-pptx] fallbackLayout slide[${idx}] → ${requestedLt}`);
@@ -4736,6 +5934,7 @@ export async function POST(req: NextRequest) {
               })
               .filter((s): s is PptxSlide => s !== null);
             const patchedSlides = validateAndRepairSlides(normalizeSlidesForPptx(patchedSlidesRaw));
+            assertExpectedBodySlides(patchedSlides.length, "vision-pass1");
 
             // coverSubtitle パッチ
             const coverFix = review.fixes.find((f: any) => f.slideIndex === -1 && f.field === "coverSubtitle");
@@ -4779,59 +5978,131 @@ export async function POST(req: NextRequest) {
               const resolvedLt = resolveLayoutType(slide);
               const visual = designBrief.visualHints[index] ?? {
                 title: slide.title,
-                visualType:
-                  resolvedLt === "table"         ? "table" :
-                  resolvedLt === "multi-column"  ? "comparison" :
-                  resolvedLt === "diagram" || resolvedLt === "process-cards" ? "process" :
-                  resolvedLt === "timeline"      ? "timeline" :
-                  resolvedLt === "company-overview" || resolvedLt === "metric-cards" ? "cards" :
-                  resolvedLt === "closing"       ? "spotlight" : "editorial",
+                visualType: resolveVisualTypeForLayout(resolvedLt),
               };
               const slideIllustration =
                 !regeneratedIllustrationPlaced &&
                 coverIllustration &&
-                resolvedLt === "bullets"
+                (resolvedLt === "bullets" || resolvedLt === "split_visual")
                   ? coverIllustration
                   : null;
-              switch (resolvedLt) {
-                case "title":          buildSectionSlide(pptx2, slide.title, theme); break;
-                case "table":          buildTableSlide(pptx2, slide, theme, visual, faithfulMode); break;
-                case "multi-column":   buildMultiColumnSlide(pptx2, slide, theme, visual, faithfulMode); break;
-                case "diagram":        buildDiagramSlide(pptx2, slide, theme, visual, faithfulMode); break;
-                case "conversation":   buildConversationSlide(pptx2, slide, theme); break;
-                case "company-overview": buildCompanyOverviewSlide(pptx2, slide, theme); break;
-                case "process-cards":  buildProcessCardsSlide(pptx2, slide, theme); break;
-                case "closing":        buildClosingSlide(pptx2, slide, theme); break;
-                case "metric-cards":   buildMetricCardsSlide(pptx2, slide, theme); break;
-                case "timeline":       buildTimelineSlide(pptx2, slide, theme); break;
-                case "stat_callouts":  buildStatCalloutsSlide(pptx2, slide, theme); break;
-                case "card_grid":      buildCardGridSlide(pptx2, slide, theme); break;
-                case "icon_rows":      buildIconRowsSlide(pptx2, slide, theme); break;
-                case "roadmap":        buildTimelineSlide(pptx2, slide, theme); break;
-                default:
-                  buildBulletsSlide(pptx2, slide, theme, visual, slideIllustration, faithfulMode);
-                  if (slideIllustration) regeneratedIllustrationPlaced = true;
-                  break;
+              {
+                const { illustrationUsed } = renderContentSlide({
+                  pptx: pptx2, slide, theme, visual, faithfulMode, illustration: slideIllustration,
+                });
+                if (illustrationUsed) regeneratedIllustrationPlaced = true;
               }
             });
-            buffer = await patchEastAsianFont((await pptx2.write({ outputType: "nodebuffer" })) as Buffer);
-            {
-              const isZip2 = buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B;
-              const hasSlides2 = isZip2 && buffer.includes(Buffer.from("ppt/slides/slide"));
-              if (!isZip2 || !hasSlides2) {
-                console.warn("[gen-pptx] Re-generated PPTX invalid — keeping original buffer");
-                buffer = await patchEastAsianFont((await pptx.write({ outputType: "nodebuffer" })) as Buffer);
-              } else {
-                // 再生成バッファが有効な場合のみ patchedSlides を DeckSpec 構築に使用する
-                finalSlidesForSpec = patchedSlides;
-              }
+            const visionCandidateBuffer = await patchEastAsianFont(
+              (await pptx2.write({ outputType: "nodebuffer" })) as Buffer
+            );
+            const visionPkgResult = await validateGeneratedPptx(visionCandidateBuffer, {
+              expectedSlideCount: expectedTotalSlides ?? patchedSlides.length + 1,
+              context: "vision-pass1",
+            });
+            if (!visionPkgResult.valid) {
+              console.warn(
+                `[gen-pptx] Re-generated PPTX invalid — keeping pre-Vision buffer: ` +
+                visionPkgResult.errors.join("; ")
+              );
+              buffer = preVisionBuffer;
+              finalSlidesForSpec = preVisionSlides;
+            } else {
+              buffer = visionCandidateBuffer;
+              finalSlidesForSpec = patchedSlides;
             }
             if (buffer && buffer.length >= 100 && buffer[0] === 0x50 && buffer[1] === 0x4B) {
               console.log(`[gen-pptx] Re-generated after Vision review`);
             }
+
+            // ── B3 Pass 2: 再生成後に再度Visionで文字切れ・重なりのみ確認 ────────────
+            const maxPasses = Math.min(2, parseInt(process.env.PPTX_VISION_MAX_PASSES ?? "1", 10) || 1);
+            if (b3Active && process.env.PPTX_VISION_SECOND_PASS_ENABLED === "true" && maxPasses >= 2) {
+              try {
+                const pass2Form = new FormData();
+                const pass2Bytes = new Uint8Array(buffer.byteLength);
+                pass2Bytes.set(buffer);
+                pass2Form.append("pptx", new Blob([pass2Bytes], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }));
+                pass2Form.append("title", title);
+                pass2Form.append("slideIndexMode", "cover-separated");
+                pass2Form.append("b3mode", "true");
+                pass2Form.append("b3pass", "2");
+                if (promptIntent) pass2Form.append("promptIntent", JSON.stringify(promptIntent));
+
+                const pass2Res = await fetch(`${baseUrl}/api/vision-review-pptx`, { method: "POST", body: pass2Form });
+                if (pass2Res.ok) {
+                  const pass2Review = await pass2Res.json() as { deckScore: number; fixes: any[] };
+                  const scoreAfter = pass2Review.deckScore;
+                  // Pass 2: regenerateStyle・レイアウト変更を禁止、文字切れ系修正のみ許可
+                  const PASS2_SAFE_FIELDS = new Set(["fitTextToShape", "fontScaleDown", "trimText"]);
+                  const pass2Fixes = (pass2Review.fixes ?? []).filter((f: any) =>
+                    f.slideIndex !== -1 && PASS2_SAFE_FIELDS.has(f.field)
+                  );
+                  console.log(`[ppt-b3] pass=2 scoreAfter=${scoreAfter} proposed=${pass2Review.fixes?.length ?? 0} accepted=${pass2Fixes.length}`);
+
+                  if (pass2Fixes.length > 0) {
+                    const patchedForPass2 = finalSlidesForSpec.map((slide) => {
+                      const fixes2 = pass2Fixes.filter((f: any) => f.slideIndex === finalSlidesForSpec.indexOf(slide));
+                      if (fixes2.length === 0) return slide;
+                      const p2: Record<string, unknown> = {};
+                      for (const f of fixes2) {
+                        if (f.field === "fitTextToShape") p2.fitTextToShape = true;
+                        else if (f.field === "fontScaleDown") {
+                          const r = parseFloat(f.value);
+                          if (!isNaN(r) && r > 0 && r < 1) p2.fontScale = Math.max(0.70, r);
+                        } else if (f.field === "trimText" && f.value?.trim()) {
+                          p2.bullets = f.value.split("|").map((b: string) => b.trim()).filter(Boolean);
+                        }
+                        console.log(`[ppt-b3] applied slide=${finalSlidesForSpec.indexOf(slide)} field=${f.field}`);
+                      }
+                      return { ...slide, ...p2 };
+                    });
+                    assertExpectedBodySlides(patchedForPass2.length, "vision-pass2");
+
+                    const pptx3 = new PptxGenJS();
+                    pptx3.layout = "LAYOUT_WIDE";
+                    pptx3.theme = { headFontFace: "Meiryo", bodyFontFace: "Meiryo" };
+                    pptx3.author = "azurechat";
+                    pptx3.subject = title;
+                    pptx3.title = title;
+                    if (!faithfulMode) buildTitleSlide(pptx3, title, designBrief, theme, patchedForPass2.length + 1, coverIllustration);
+                    patchedForPass2.forEach((slideRaw) => {
+                      const slide = upgradeTextOnlySlide(slideRaw);
+                      const vis = designBrief.visualHints[patchedForPass2.indexOf(slideRaw)] ?? { title: slide.title, visualType: "editorial" };
+                      renderContentSlide({
+                        pptx: pptx3, slide, theme, visual: vis, faithfulMode, illustration: null,
+                      });
+                    });
+                    const buf3 = await patchEastAsianFont((await pptx3.write({ outputType: "nodebuffer" })) as Buffer);
+                    const pass2PkgResult = await validateGeneratedPptx(buf3, {
+                      expectedSlideCount: expectedTotalSlides ?? patchedForPass2.length + 1,
+                      context: "vision-pass2",
+                    });
+                    if (pass2PkgResult.valid) {
+                      buffer = buf3;
+                      finalSlidesForSpec = patchedForPass2;
+                      console.log(`[ppt-b3] pass=2 re-render applied`);
+                    } else {
+                      console.warn(
+                        `[ppt-b3] pass=2 candidate rejected — keeping previous deck: ` +
+                        pass2PkgResult.errors.join("; ")
+                      );
+                    }
+                  }
+                }
+              } catch (pass2Err) {
+                console.warn("[ppt-b3] Pass 2 Vision failed (non-fatal):", pass2Err);
+              }
+            }
+            // ── B3 完了ログ ────────────────────────────────────────────────────────
+            if (b3Active) {
+              console.log(`[ppt-b3] completed durationMs=${Date.now() - b3StartedAt} terraFallback=false`);
+            }
           }
         }
       } catch (visionErr) {
+        buffer = preVisionBuffer;
+        finalSlidesForSpec = preVisionSlides;
         console.warn("[gen-pptx] Vision review failed (non-fatal):", visionErr);
       }
     }
@@ -4942,6 +6213,11 @@ export async function POST(req: NextRequest) {
           titleFontSize: theme.titleFontSize,
           bodyFontSize:  theme.bodyFontSize,
           smallFontSize: theme.smallFontSize,
+          // B4 Art Director メタ情報
+          artDirectorMode: isArtDirectorActive() ? getArtDirectorMode() : undefined,
+          artDirectionVersion: _b4DirectionResult ? (1 as const) : undefined,
+          artDirectionMotif: _b4DirectionResult?.motif ?? undefined,
+          artDirectionApplied: _b4Applied || undefined,
         },
         savedAt: new Date().toISOString(),
       });
