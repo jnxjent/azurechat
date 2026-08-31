@@ -1,6 +1,14 @@
 import "server-only";
 
-import { OpenAIInstance } from "@/features/common/services/openai";
+import { OpenAIPptInstance } from "@/features/common/services/openai";
+
+function resolvePptModelName(): string {
+  return (
+    process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME?.trim() ||
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() ||
+    ""
+  );
+}
 
 export type TeamsPptSlide = {
   title: string;
@@ -27,9 +35,9 @@ export async function createTeamsPptPlan(props: {
   title: string;
   referenceContext?: string;
 }): Promise<{ title: string; slides: TeamsPptSlide[] }> {
-  const openai = OpenAIInstance();
+  const openai = OpenAIPptInstance();
   const response = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model: resolvePptModelName(),
     messages: [
       {
         role: "system",
@@ -90,9 +98,9 @@ export async function createTeamsPptCardEdits(props: {
   targetItemCount: number;
   instruction: string;
 }): Promise<TeamsPptCardEdit[]> {
-  const openai = OpenAIInstance();
+  const openai = OpenAIPptInstance();
   const response = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model: resolvePptModelName(),
     messages: [
       {
         role: "system",

@@ -18,8 +18,11 @@ import {
 import type { SlSearchScope } from "@/lib/sl-search-target";
 import { CreateCitations, FormatCitations } from "../citation-service";
 import { resolveUserContext } from "./chat-api-rag";
-import { buildSendOptionsFromMode } from "./reasoning-utils";
 import { createSharePointPdfSummaryTool } from "../sharepoint-summary-tool";
+import { isDeskNetsAgentEnabled } from "@/features/desknets-agent/desknets-agent-client";
+import {
+  shouldRouteToDeskNetsAgent,
+} from "@/features/desknets-agent/desknets-agent-intent";
 
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID;
 
@@ -231,6 +234,7 @@ function resolveModelForExtensions(chatThread: ChatThreadModel): string {
   const threadModel = (chatThread as any)?.model as string | undefined;
 
   const defaultModel =
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() ||
     threadModel?.trim() ||
     process.env.OPENAI_CHAT_MODEL?.trim() ||
     process.env.AZURE_OPENAI_CHAT_MODEL?.trim() ||
@@ -525,19 +529,26 @@ export const ChatApiExtensions = async (props: {
     });
   }
 
-  const modeOpts = buildSendOptionsFromMode(mode ?? "normal");
+  const forceDeskNetsAgent =
+    isDeskNetsAgentEnabled() &&
+    shouldRouteToDeskNetsAgent(userMessage, history);
   const _openAI = openAI as any;
   // @ts-ignore
   return _openAI.beta.chat.completions.runTools(
     {
       model,
-      reasoning_effort: modeOpts.reasoning_effort,
+      // Azure Chat Completions rejects function tools with non-none reasoning.
+      reasoning_effort: "none",
       stream: true,
-      ...(requiredToolName
+      ...(forceDeskNetsAgent || requiredToolName
         ? {
             tool_choice: {
               type: "function",
-              function: { name: requiredToolName },
+              function: {
+                name: forceDeskNetsAgent
+                  ? "desknets_schedule_agent"
+                  : requiredToolName,
+              },
             },
           }
         : {}),
@@ -635,6 +646,7 @@ export const ChatApiExtensions = async (props: {
                 : "",
               "- ABSOLUTE: If the user asks to read, summarize, analyze, compare, check, find, or answer from a document in SharePoint/SL, 個人ファイル, 個人フォルダー, 部署共通, 全社共通, or a named project folder, you MUST call sl_doc_search before answering. Never say that the file is unavailable or ask the user to upload it before calling sl_doc_search. For a stated filename, put the filename itself in query. Map 個人ファイル/個人フォルダー to scope=personal without setting folder; map 部署共通 to scope=dept_common; map 全社共通 to scope=global_common; use folder only for a specifically named folder such as 〇〇プロジェクトフォルダー.",
               "- OVERRIDE FOR PDF SUMMARY: If the user asks to summarize one named SharePoint PDF (including 要約, 全文要約, 全体要約, or 全ページ要約), call summarize_sp_pdf instead of sl_doc_search unless they explicitly request only a specific topic or page range. Preserve every [p.N] page reference returned by the tool in the final answer. Do not claim full-document coverage from sl_doc_search results.",
+              "- PDF SUMMARY LINK RULE: Use only the exact citation tag returned by summarize_sp_pdf. Never output a raw SharePoint URL or add a separate Markdown link such as '原文を開く'.",
               "- PDF SUMMARY TO WORD: If the same request asks for Word/docx output, complete both tool calls in order: (1) summarize_sp_pdf, then (2) create_word. Pass an explicitly requested page count to summarize_sp_pdf.targetPages. Copy the short Word出力用summaryRef returned by summarize_sp_pdf into create_word.summaryRef, set create_word.content='[summaryRef]', create_word.formatMode='markdown', create_word.title='元ファイル名 要約', and create_word.fileName to the exact recommended '元ファイル名_要約.docx'. Never copy or rewrite the long summary into create_word.content and never call convert_pdf_to_word for this case.",
               "- IMPORTANT: If the user asks to compare multiple documents or find contradictions across files: (1) First call sl_doc_search with a broad query (e.g. '議事録' or 'IR議事録') to discover available document names from the returned file names. (2) Then call sl_doc_search once per discovered document using 'company name + document type + keyword' queries. (3) Only answer after collecting content from all relevant documents.",
               "- Do NOT answer based solely on prior conversation context when multi-document comparison is requested.",

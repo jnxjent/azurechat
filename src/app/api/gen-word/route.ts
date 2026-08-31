@@ -126,7 +126,9 @@ async function generateWordPlan(
   const openai = OpenAIInstance();
 
   const res = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model:
+      process.env.AZURE_OPENAI_WORD_EDIT_DEPLOYMENT_NAME?.trim() ||
+      process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
     messages: [
       {
         role: "system",
