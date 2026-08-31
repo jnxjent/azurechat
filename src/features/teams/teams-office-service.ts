@@ -31,6 +31,10 @@ import type { TeamsStoredFile } from "./teams-file-policy";
 import { summarizeSharePointPdf } from "@/features/chat-page/chat-services/sharepoint-summary-service";
 import { hashValue } from "@/features/auth-page/helpers";
 import { resolveSlAccess } from "@/lib/sl-dept";
+import {
+  resolveBraveSearchRequest,
+  searchBraveWeb,
+} from "./teams-brave-search-service";
 
 const PDF_TRANSLATION_LANGUAGE_NAMES = {
   en: "英語",
@@ -243,6 +247,37 @@ export function parseTeamsOfficeRequest(
     /(どういう|どんな|何色|候補|一覧|種類|できる|教えて)/i.test(normalized);
   if (asksForPptColorHelp) {
     return { action: "ppt_color_help" };
+  }
+
+  const hasPptEditingContext =
+    /(ppt|pptx|powerpoint|パワーポイント|スライド|プレゼン)/i.test(
+      normalized
+    );
+  const asksForPptAssetInsertion =
+    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って)/i.test(
+      normalized
+    ) ||
+    /(?:入れ|挿入|配置|載せ|追加|貼り|使って).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
+      normalized
+    );
+  const asksForWholeDeckPptEdit =
+    /(?:各|全)(?:スライド|ページ)|スライド全体|資料全体|表紙/i.test(
+      normalized
+    ) &&
+    /(変更|修正|編集|変えて|にして|統一|基調|入れ|挿入|配置|追加)/i.test(
+      normalized
+    );
+  if (
+    hasPptEditingContext &&
+    (asksForPptAssetInsertion || asksForWholeDeckPptEdit) &&
+    !/(新規|一から|ゼロから).{0,12}(?:作成|生成|作って)/i.test(normalized)
+  ) {
+    return {
+      action: "edit_latest_ppt",
+      instruction: normalized,
+      targetPages: [],
+      cardLayout: false,
+    };
   }
 
   const asksForPptColorEdit =
@@ -504,6 +539,7 @@ export async function executeTeamsOfficeRequest(props: {
     return editLatestTeamsPowerPoint({
       request: props.request,
       threadId: teamsThreadId,
+      uploadedFiles: props.uploadedFiles,
     });
   }
 
@@ -589,11 +625,40 @@ export async function executeTeamsOfficeRequest(props: {
     props.request.action === "create_word" ||
     props.request.action === "create_ppt"
   ) {
+    let webContext = "";
+    let webSources: TeamsSearchSource[] = [];
+    if (props.request.action === "create_ppt") {
+      const braveRequest = resolveBraveSearchRequest(props.request.prompt);
+      const explicitlyRequiresWeb = requestsWebGroundedPpt(
+        props.request.prompt
+      );
+      if (braveRequest.enabled) {
+        try {
+          const web = await searchBraveWeb({
+            query: braveRequest.query,
+            startIndex: 1,
+          });
+          webContext = web.context;
+          webSources = web.sources;
+        } catch (error) {
+          console.error("[teams-ppt-web] search failed", error);
+          if (explicitlyRequiresWeb) {
+            return `公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。\n\n${String(
+              (error as Error)?.message ?? error
+            )}`;
+          }
+        }
+      }
+      if (explicitlyRequiresWeb && !webContext.trim()) {
+        return "公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。Brave Searchの設定と検索結果を確認してください。";
+      }
+    }
     const result = await createDirectOfficeFile({
       action: props.request.action,
       prompt: props.request.prompt,
       title: props.request.title,
       threadId: teamsThreadId,
+      ...(webContext ? { referenceContext: webContext } : {}),
     });
 
     if ("error" in result) {
@@ -633,7 +698,7 @@ export async function executeTeamsOfficeRequest(props: {
     }
     return `Officeファイルを作成しました。\n\n${icon} [${escapeMarkdownLinkText(
       outputName
-    )}](${result.downloadUrl})`;
+    )}](${result.downloadUrl})${formatOfficeSources(webSources)}`;
   }
 
   if (props.request.action === "refine_excel_sheets") {
@@ -1234,11 +1299,23 @@ function buildEditedOfficeBaseName(fileName: string): string {
 async function editLatestTeamsPowerPoint(props: {
   request: Extract<TeamsOfficeRequest, { action: "edit_latest_ppt" }>;
   threadId: string;
+  uploadedFiles?: TeamsStoredFile[];
 }): Promise<string> {
   const pointer = await readPptxPointer(props.threadId);
   if (!pointer?.url) {
     return "このTeams会話で作成したPowerPointが見つかりません。先にPowerPointを作成してください。";
   }
+
+  const uploadedImage = selectUploadedOfficeFile(props.uploadedFiles, [
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+  ]);
+  if (uploadedImage.error) return uploadedImage.error;
+  const effectiveInstruction = uploadedImage.file
+    ? `${uploadedImage.file.url} ${props.request.instruction}`
+    : props.request.instruction;
 
   let result: Record<string, unknown>;
   let editLabel: "編集済み" | "カード型" | "レイアウト変更" = "編集済み";
@@ -1256,7 +1333,7 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
@@ -1316,7 +1393,7 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
@@ -1338,7 +1415,7 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
       }),
@@ -1364,9 +1441,10 @@ async function editLatestTeamsPowerPoint(props: {
       ? result.fileName
       : `${buildEditedPptxBaseName(pointer.fileName, editLabel)}.pptx`;
   await savePptxResult(props.threadId, result, outputName);
-  return `PowerPointを編集しました（${props.request.targetPages
-    .map((page) => `P${page}`)
-    .join("、")}）。\n\n📊 [${escapeMarkdownLinkText(outputName)}](${
+  const editedTarget = props.request.targetPages.length
+    ? props.request.targetPages.map((page) => `P${page}`).join("、")
+    : "全体";
+  return `PowerPointを編集しました（${editedTarget}）。\n\n📊 [${escapeMarkdownLinkText(outputName)}](${
     result.downloadUrl
   })`;
 }
@@ -1728,6 +1806,9 @@ async function createDirectOfficeFile(props: {
       title: plan.title,
       slides: plan.slides,
       threadId: props.threadId,
+      ...(plan.targetTotalSlides
+        ? { targetTotalSlides: plan.targetTotalSlides }
+        : {}),
       deckPreferences: {},
       fileBaseName: sanitizeOfficeBaseName(plan.title),
     });
@@ -1742,6 +1823,12 @@ async function createDirectOfficeFile(props: {
     threadId: props.threadId,
     ...(props.action === "create_word" ? { fontFace: "Meiryo" } : {}),
   });
+}
+
+function requestsWebGroundedPpt(prompt: string): boolean {
+  return /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
+    prompt.normalize("NFKC")
+  );
 }
 
 function formatOfficeSources(sources: TeamsSearchSource[]): string {

@@ -4,6 +4,9 @@ const Module = require("module");
 const path = require("path");
 const ts = require("typescript");
 
+const braveQueries = [];
+const pptPlanInputs = [];
+
 function loadOfficeService() {
   const storedBlobs = new Map();
   const fileName = path.resolve("features/teams/teams-office-service.ts");
@@ -57,9 +60,48 @@ function loadOfficeService() {
     ) {
       return { summarizeSharePointPdf: async () => ({}) };
     }
+    if (request === "./teams-brave-search-service") {
+      return {
+        resolveBraveSearchRequest: (message) => ({
+          enabled: /公式\s*(?:HP|ホームページ|サイト)/i.test(message),
+          query: message,
+          skipInternalSearch: false,
+        }),
+        searchBraveWeb: async ({ query }) => {
+          braveQueries.push(query);
+          return {
+            context:
+              "[1] 株式会社ミダックホールディングス 公式サイト\nURL: https://www.midac.jp/\n産業廃棄物処理事業を展開しています。",
+            sources: [
+              {
+                index: 1,
+                name: "株式会社ミダックホールディングス 公式サイト",
+                url: "https://www.midac.jp/",
+                kind: "web",
+              },
+            ],
+          };
+        },
+      };
+    }
+    if (request === "./teams-ppt-plan-service") {
+      return {
+        createTeamsPptPlan: async (props) => {
+          pptPlanInputs.push(props);
+          return {
+            title: props.title,
+            slides: Array.from({ length: 11 }, (_, index) => ({
+              title: `本文${index + 1}`,
+              bullets: ["確認済み情報"],
+            })),
+            targetTotalSlides: 12,
+          };
+        },
+        createTeamsPptCardEdits: async () => [],
+      };
+    }
     if (
       request === "./teams-search-service" ||
-      request === "./teams-ppt-plan-service" ||
       request === "./teams-word-proofread-service"
     ) {
       return {};
@@ -150,6 +192,16 @@ assert.equal(
   "edit_latest_ppt"
 );
 
+const webPptRequest = parseTeamsOfficeRequest(
+  "ミダックホールディングスの初回訪問用営業資料を12枚でPPT作成してください。会社概要は公式HPを参考にしてください"
+);
+assert.equal(webPptRequest?.action, "create_ppt");
+const logoEditRequest = parseTeamsOfficeRequest(
+  "添付ロゴを表紙に大きめに、各スライドの右上に小さく配置してください。また、スライド全体の色のトーンを白に変更してください"
+);
+assert.equal(logoEditRequest?.action, "edit_latest_ppt");
+assert.deepEqual(logoEditRequest?.targetPages, []);
+
 const refine = parseTeamsOfficeRequest(
   "P2のシートを再変換して\n添付ファイル: report.xlsx"
 );
@@ -221,7 +273,66 @@ async function testPdfTranslationExecutionAndFollowup() {
   }
 }
 
+async function testWebGroundedPptAndLogoFollowup() {
+  const conversationId = "web-ppt-logo-test-conversation";
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url: String(url), body });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        downloadUrl:
+          requests.length === 1
+            ? "https://example.test/initial.pptx"
+            : "https://example.test/edited.pptx",
+        fileName: requests.length === 1 ? "initial.pptx" : "edited.pptx",
+      }),
+    };
+  };
+
+  try {
+    const createReply = await executeTeamsOfficeRequest({
+      request: webPptRequest,
+      conversationId,
+      uploadedFiles: [],
+    });
+    assert.match(createReply, /Officeファイルを作成しました/);
+    assert.match(createReply, /https:\/\/www\.midac\.jp\//);
+    assert.equal(braveQueries.at(-1), webPptRequest.prompt);
+    assert.match(pptPlanInputs.at(-1).referenceContext, /公式サイト/);
+    assert.equal(requests[0].body.slides.length, 11);
+    assert.equal(requests[0].body.targetTotalSlides, 12);
+
+    const logo = {
+      extension: "png",
+      fileName: "midac_logo.png",
+      savedAt: Date.now(),
+      size: 100,
+      url: "https://example.test/midac_logo.png?sig=test",
+    };
+    const editReply = await executeTeamsOfficeRequest({
+      request: logoEditRequest,
+      conversationId,
+      uploadedFiles: [logo],
+    });
+    assert.match(editReply, /PowerPointを編集しました（全体）/);
+    assert.equal(requests[1].body.fileUrl, "https://example.test/initial.pptx");
+    assert.match(
+      requests[1].body.instruction,
+      /^https:\/\/example\.test\/midac_logo\.png\?sig=test /
+    );
+    assert.match(requests[1].body.instruction, /色のトーンを白/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 testPdfTranslationExecutionAndFollowup()
+  .then(testWebGroundedPptAndLogoFollowup)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })

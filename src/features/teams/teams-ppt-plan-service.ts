@@ -34,7 +34,15 @@ export async function createTeamsPptPlan(props: {
   prompt: string;
   title: string;
   referenceContext?: string;
-}): Promise<{ title: string; slides: TeamsPptSlide[] }> {
+}): Promise<{
+  title: string;
+  slides: TeamsPptSlide[];
+  targetTotalSlides?: number;
+}> {
+  const targetTotalSlides = extractRequestedTotalSlides(props.prompt);
+  const expectedBodySlides = targetTotalSlides
+    ? Math.max(1, targetTotalSlides - 1)
+    : undefined;
   const openai = OpenAIPptInstance();
   const response = await openai.chat.completions.create({
     model: resolvePptModelName(),
@@ -45,10 +53,13 @@ export async function createTeamsPptPlan(props: {
           "You create concise Japanese presentation outlines.",
           "Return JSON only with this schema:",
           '{"title":"資料タイトル","slides":[{"title":"スライドタイトル","bullets":["要点"],"layoutType":"title|bullets|multi-column|closing","columns":[{"header":"列見出し","bullets":["要点"]}]}]}',
-          "Create 5 to 8 slides unless the user specifies otherwise.",
+          "The slides array must contain body slides only. Do not include a title/cover slide because the rendering API adds it automatically.",
+          expectedBodySlides
+            ? `The user requested ${targetTotalSlides} total slides including the cover. Return exactly ${expectedBodySlides} body slides.`
+            : "Return 4 to 7 body slides so the rendered deck has 5 to 8 total slides including its automatic cover.",
           "When referenceContext is provided, use it as the factual source and do not supplement it with general web knowledge.",
           "Use only information supplied by the user or referenceContext; clearly label any proposed ideas as suggestions.",
-          "The first slide should be a title slide and the last may be a closing slide.",
+          "The first body slide should start the substance or agenda; the last may be a closing slide.",
           "For each non-title slide, write 4 to 7 substantive bullets whenever the referenceContext supports them.",
           "Each substantive Japanese bullet should normally contain 35 to 70 characters and include concrete facts, activities, results, issues, or next actions.",
           "Do not reduce a source-rich section to only one or two short phrases.",
@@ -62,6 +73,8 @@ export async function createTeamsPptPlan(props: {
           title: props.title,
           request: props.prompt,
           referenceContext: props.referenceContext,
+          targetTotalSlides,
+          expectedBodySlides,
         }),
       },
     ],
@@ -74,14 +87,30 @@ export async function createTeamsPptPlan(props: {
     title?: unknown;
     slides?: unknown;
   };
-  const slides = Array.isArray(parsed.slides)
+  let slides = Array.isArray(parsed.slides)
     ? parsed.slides
         .map(normalizeSlide)
         .filter((slide): slide is TeamsPptSlide => slide !== null)
     : [];
 
+  if (
+    expectedBodySlides &&
+    slides.length === targetTotalSlides &&
+    isTitleOnlySlide(slides[0], parsed.title, props.title)
+  ) {
+    slides = slides.slice(1);
+  }
+  if (expectedBodySlides && slides.length > expectedBodySlides) {
+    slides = slides.slice(0, expectedBodySlides);
+  }
+
   if (slides.length === 0) {
     throw new Error("PowerPointの構成を作成できませんでした。");
+  }
+  if (expectedBodySlides && slides.length !== expectedBodySlides) {
+    throw new Error(
+      `PowerPointの本文枚数が指定と一致しません（期待: ${expectedBodySlides}枚、生成: ${slides.length}枚）。再度お試しください。`
+    );
   }
 
   return {
@@ -90,7 +119,36 @@ export async function createTeamsPptPlan(props: {
         ? parsed.title.trim()
         : props.title,
     slides,
+    ...(targetTotalSlides ? { targetTotalSlides } : {}),
   };
+}
+
+function extractRequestedTotalSlides(prompt: string): number | undefined {
+  const matched = prompt
+    .normalize("NFKC")
+    .match(/(?:約\s*)?(\d{1,2})\s*(?:枚|ページ)/i);
+  if (!matched?.[1]) return undefined;
+  const count = Number(matched[1]);
+  return Number.isInteger(count) && count >= 2 && count <= 50
+    ? count
+    : undefined;
+}
+
+function isTitleOnlySlide(
+  slide: TeamsPptSlide | undefined,
+  generatedTitle: unknown,
+  requestedTitle: string
+): boolean {
+  if (!slide) return false;
+  if (slide.layoutType === "title") return true;
+  if (slide.bullets.length > 1 || slide.columns?.length) return false;
+  const normalizedSlideTitle = slide.title.normalize("NFKC").replace(/\s+/g, "");
+  return [generatedTitle, requestedTitle].some(
+    (value) =>
+      typeof value === "string" &&
+      value.trim() &&
+      normalizedSlideTitle === value.normalize("NFKC").replace(/\s+/g, "")
+  );
 }
 
 export async function createTeamsPptCardEdits(props: {
