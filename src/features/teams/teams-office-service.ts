@@ -108,6 +108,9 @@ export type TeamsOfficeRequest =
   | {
       action: "summarize_sp_pdf";
       fileQuery: string;
+      targetPages?: number;
+      targetCharsLow?: number;
+      targetCharsHigh?: number;
     }
   | {
       action: "pdf_to_excel";
@@ -203,7 +206,19 @@ export function parseTeamsOfficeRequest(
     attachedFileQuery
   );
   if (summaryFileQuery) {
-    return { action: "summarize_sp_pdf", fileQuery: summaryFileQuery };
+    const targetPagesMatch = normalized.match(/約?\s*(\d+)\s*ページ/i);
+    const targetCharsMatch = normalized.match(
+      /([\d,，]+)\s*[～〜~\-]\s*([\d,，]+)\s*文字/i
+    );
+    const parseCount = (value: string | undefined) =>
+      value ? Number(value.replace(/[,，]/g, "")) : undefined;
+    return {
+      action: "summarize_sp_pdf",
+      fileQuery: summaryFileQuery,
+      targetPages: parseCount(targetPagesMatch?.[1]),
+      targetCharsLow: parseCount(targetCharsMatch?.[1]),
+      targetCharsHigh: parseCount(targetCharsMatch?.[2]),
+    };
   }
 
   const targetExcelSheets = extractTargetSheetNames(normalized);
@@ -411,6 +426,9 @@ export async function executeTeamsOfficeRequest(props: {
         fileQuery: props.request.fileQuery,
         deptLower: access.dept,
         userHash: hashValue(userEmail),
+        targetPages: props.request.targetPages,
+        targetCharsLow: props.request.targetCharsLow,
+        targetCharsHigh: props.request.targetCharsHigh,
       });
       const summaryRef = `sp-summary-cache/${teamsThreadId}/${randomUUID()}.json`;
       const cached = await UploadBlob(
@@ -451,6 +469,7 @@ export async function executeTeamsOfficeRequest(props: {
         url: wordResult.downloadUrl,
         fileName: outputName,
         savedAt: Date.now(),
+        trackChanges: false,
       });
       console.log("[teams-pdf-summary] completed", {
         fileName: result.fileName,
@@ -848,6 +867,7 @@ type TeamsWordPointer = {
   url: string;
   fileName: string;
   savedAt: number;
+  trackChanges?: boolean;
 };
 
 type TeamsPdfTranslationSourcePointer = {
@@ -1004,6 +1024,7 @@ async function editLatestTeamsOfficeFile(props: {
   const pointer = isExcel
     ? await readExcelPointer(props.threadId)
     : await readWordPointer(props.threadId);
+  const wordPointer = isExcel ? null : (pointer as TeamsWordPointer | null);
   const label = isExcel ? "Excel" : "Word";
   if (!pointer?.url) {
     return `このTeams会話で作成した${label}ファイルが見つかりません。先に${label}ファイルを作成してください。`;
@@ -1019,6 +1040,8 @@ async function editLatestTeamsOfficeFile(props: {
       originalFileName: pointer.fileName,
       outputBaseName: buildEditedOfficeBaseName(pointer.fileName),
       ...(!isExcel && /(修正履歴|変更履歴)/.test(props.instruction)
+        ? { trackChanges: true }
+        : wordPointer?.trackChanges
         ? { trackChanges: true }
         : {}),
     }),
@@ -1054,6 +1077,7 @@ async function editLatestTeamsOfficeFile(props: {
       url: result.downloadUrl,
       fileName: outputName,
       savedAt: Date.now(),
+      trackChanges: wordPointer?.trackChanges === true,
     });
   }
 
@@ -1148,6 +1172,7 @@ async function proofreadTeamsSharePointWord(props: {
     url: result.downloadUrl,
     fileName: outputName,
     savedAt: Date.now(),
+    trackChanges: true,
   });
 
   return `SharePointのWordを校正し、${replacements.length}件を変更履歴付きで修正しました。\n\n📄 [${escapeMarkdownLinkText(
@@ -2087,6 +2112,7 @@ async function readWordPointer(
       blobName?: string;
       fileName?: string;
       savedAt?: number;
+      trackChanges?: boolean;
     };
     if (!pointer.blobName) return null;
     const sas = await GenerateSasUrl("docx", pointer.blobName);
@@ -2095,6 +2121,7 @@ async function readWordPointer(
       url: sas.response,
       fileName: pointer.fileName?.trim() || "Word.docx",
       savedAt: pointer.savedAt ?? Date.now(),
+      trackChanges: pointer.trackChanges === true,
     };
   } catch {
     return null;

@@ -45,6 +45,18 @@ function loadOfficeService() {
         resolvePptxPaletteInstruction: () => null,
       };
     }
+    if (request === "@/features/auth-page/helpers") {
+      return { hashValue: (value) => value };
+    }
+    if (request === "@/lib/sl-dept") {
+      return { resolveSlAccess: () => ({ dept: "bm" }) };
+    }
+    if (
+      request ===
+      "@/features/chat-page/chat-services/sharepoint-summary-service"
+    ) {
+      return { summarizeSharePointPdf: async () => ({}) };
+    }
     if (
       request === "./teams-search-service" ||
       request === "./teams-ppt-plan-service" ||
@@ -77,6 +89,14 @@ assert.equal(
   )?.action,
   "pdf_to_word"
 );
+const summaryRequest = parseTeamsOfficeRequest(
+  "SharePointにある「令和7年度環境白書.pdf」を先頭から最終ページまで全文要約し、約10ページ（7,000～8,000文字）のWordファイルにしてください"
+);
+assert.equal(summaryRequest?.action, "summarize_sp_pdf");
+assert.equal(summaryRequest?.fileQuery, "令和7年度環境白書.pdf");
+assert.equal(summaryRequest?.targetPages, 10);
+assert.equal(summaryRequest?.targetCharsLow, 7000);
+assert.equal(summaryRequest?.targetCharsHigh, 8000);
 assert.equal(
   parseTeamsOfficeRequest(
     "PowerPointに変換して\n添付ファイル: report.pdf"

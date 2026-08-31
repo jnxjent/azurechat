@@ -773,7 +773,13 @@ function extractLatestPdfOrDocxUrlFromMessages(messages: string[]): string | nul
   return null;
 }
 
-async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{ url: string; fileName: string; savedAt: number } | null> {
+async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{
+  url: string;
+  blobName: string;
+  fileName: string;
+  savedAt: number;
+  trackChanges: boolean;
+} | null> {
   const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
   const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   if (!acc || !key) return null;
@@ -783,8 +789,11 @@ async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{ url
     ).getContainerClient("docx")
       .getBlockBlobClient(`thread-${chatThreadId}-word-pointer.json`)
       .downloadToBuffer();
-    const { blobName, fileName, savedAt } = JSON.parse(buf.toString()) as {
-      blobName: string; fileName: string; savedAt: number;
+    const { blobName, fileName, savedAt, trackChanges } = JSON.parse(buf.toString()) as {
+      blobName: string;
+      fileName: string;
+      savedAt: number;
+      trackChanges?: boolean;
     };
     if (!blobName) return null;
     // SASを再発行（docxコンテナのアクセスレベルに依存せず確実にDL可能）
@@ -794,7 +803,13 @@ async function resolveLatestDocxFromPointer(chatThreadId: string): Promise<{ url
       return null;
     }
     console.log(`[resolveLatestDocxFromPointer] found: ${fileName}`);
-    return { url: sasRes.response, fileName, savedAt: savedAt ?? 0 };
+    return {
+      url: sasRes.response,
+      blobName,
+      fileName,
+      savedAt: savedAt ?? 0,
+      trackChanges: trackChanges !== false,
+    };
   } catch {
     return null;
   }
@@ -6774,7 +6789,13 @@ async function executeCreateWord(
 ) {
   const { content, title, fileName, formatMode, summaryRef, instruction, fontFace } = args ?? {};
 
-  if (!content?.trim() && !title?.trim()) {
+  if (content?.trim() === "[summaryRef]" && !summaryRef?.trim()) {
+    return {
+      error: "要約本文の参照情報（summaryRef）がないため、Word生成を中止しました。もう一度全文要約から実行してください。",
+    };
+  }
+
+  if (!content?.trim() && !title?.trim() && !summaryRef?.trim()) {
     return { error: "content を指定してください。作成する内容を入力してください。" };
   }
 
@@ -6829,27 +6850,38 @@ async function executeEditWord(
   chatThread: ChatThreadModel
 ) {
   let { fileUrl, instruction, trackChanges, originalFileName } = args ?? {};
+  const trackChangesWasExplicit = typeof args?.trackChanges === "boolean";
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
 
-  if (!fileUrl?.trim()) {
-    // Pointer check first — also recovers the display name for correct rev-numbering
-    const ptr = await resolveLatestDocxFromPointer(chatThread.id);
-    if (ptr?.url) {
-      fileUrl = ptr.url;
-      if (!originalFileName) originalFileName = ptr.fileName;
-    } else {
-      const resolved = await resolveLatestDocxUrlFromThread(chatThread.id);
-      if (!resolved) {
-        return {
-          error:
-            "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
-        };
-      }
-      fileUrl = resolved;
+  const ptr = await resolveLatestDocxFromPointer(chatThread.id);
+  const suppliedFileUrl = String(fileUrl ?? "").trim();
+  const suppliedUrlUsesPointer = (() => {
+    if (!ptr || !suppliedFileUrl) return false;
+    try {
+      return decodeURIComponent(new URL(suppliedFileUrl).pathname).endsWith(`/${ptr.blobName}`);
+    } catch {
+      return suppliedFileUrl.includes(ptr.blobName);
     }
+  })();
+
+  if (ptr?.url && (!suppliedFileUrl || suppliedUrlUsesPointer)) {
+    fileUrl = ptr.url;
+    if (!originalFileName) originalFileName = ptr.fileName;
+    if (!trackChangesWasExplicit) trackChanges = ptr.trackChanges;
+  } else if (!suppliedFileUrl) {
+    const resolved = await resolveLatestDocxUrlFromThread(chatThread.id);
+    if (!resolved) {
+      return {
+        error:
+          "編集対象のWordファイルが見つかりませんでした。このスレッドでWordファイルをアップロードしてください。",
+      };
+    }
+    fileUrl = resolved;
+  } else {
+    fileUrl = suppliedFileUrl;
   }
 
   // account name 欠落 Blob URL を補正（LLM が直接 effectiveFileUrl を渡してきた場合への保険）
@@ -6883,6 +6915,10 @@ async function executeEditWord(
     if (!res.ok) {
       const t = await res.text().catch(() => "");
       console.error("[edit_word] edit-pptx route failed:", res.status, t);
+      try {
+        const parsed = JSON.parse(t) as { error?: string };
+        if (parsed.error) return { error: parsed.error };
+      } catch {}
       return { error: `Word編集に失敗しました: HTTP ${res.status}` };
     }
 
@@ -7981,7 +8017,10 @@ async function executeEditSpWord(
   }
 
   // 5. edit_word に委託（SP ファイルは常に変更履歴を残す）
-  return executeEditWord({ fileUrl: resolvedUrl, instruction, trackChanges: true }, chatThread);
+  return executeEditWord(
+    { fileUrl: resolvedUrl, instruction, trackChanges: true, originalFileName: fileName },
+    chatThread
+  );
 }
 
 // ---------------- 画像生成（NEW image 用） ----------------

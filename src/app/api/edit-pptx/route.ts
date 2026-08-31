@@ -545,7 +545,12 @@ import type { DeckSpec } from "@/types/deck-spec";
 
 // Word ポインター保存（次回 edit_word 呼び出しで修正済みファイルを参照できるよう）
 // blobName を保存し読み取り時にSAS再発行 → docxコンテナのアクセスレベルに依存しない
-async function saveWordPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+async function saveWordPointer(
+  threadId: string,
+  blobName: string,
+  fileName: string,
+  trackChanges: boolean
+): Promise<void> {
   const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
   const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   if (!acc || !key || !threadId?.trim()) return;
@@ -556,7 +561,7 @@ async function saveWordPointer(threadId: string, blobName: string, fileName: str
     const cc = svc.getContainerClient("docx");
     await cc.createIfNotExists({ access: "blob" });
     await cc.getBlockBlobClient(`thread-${threadId}-word-pointer.json`).uploadData(
-      Buffer.from(JSON.stringify({ blobName, fileName, savedAt: Date.now() })),
+      Buffer.from(JSON.stringify({ blobName, fileName, trackChanges, savedAt: Date.now() })),
       { blobHTTPHeaders: { blobContentType: "application/json" } }
     );
     console.log(`[saveWordPointer] saved for thread ${threadId}: ${fileName}`);
@@ -1157,8 +1162,20 @@ async function runPythonEditExcel(
       console.warn("[edit-excel] python stderr:", stderr.trim());
     }
 
-    const outputBuffer = await fs.readFile(outputPath);
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const changedParagraphs = Number(pythonResult.changedParagraphs ?? 0);
+    const requestedReplacementCount = (plan.replaceText ?? []).filter(
+      (replacement) => String(replacement?.find ?? "").length > 0
+    ).length;
+    if (requestedReplacementCount > 0 && changedParagraphs === 0) {
+      const noChangeError = new Error(
+        "指定された置換元の文字列が最新Word内に見つからなかったため、修正版は作成しませんでした。既に修正済みか、表記が異なる可能性があります。"
+      ) as Error & { statusCode?: number };
+      noChangeError.statusCode = 422;
+      throw noChangeError;
+    }
+
+    const outputBuffer = await fs.readFile(outputPath);
     const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.xlsx`;
     const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
 
@@ -2060,7 +2077,7 @@ async function runPythonEditWord(
       downloadUrl,
       blobName: blobKey,
       fileName: displayName,
-      changedParagraphs: Number(pythonResult.changedParagraphs ?? 0),
+      changedParagraphs,
       totalParagraphs: Number(pythonResult.totalParagraphs ?? 0),
     };
   } finally {
@@ -2679,7 +2696,12 @@ export async function POST(req: NextRequest) {
 
       const result = await runPythonEditWord(wordBuffer, plan, threadId, originalFileName);
       if (result.blobName) {
-        await saveWordPointer(threadId, result.blobName, result.fileName ?? "");
+        await saveWordPointer(
+          threadId,
+          result.blobName,
+          result.fileName ?? "",
+          plan.trackChanges === true
+        );
       }
       const wordWarning = skippedChunks > 0
         ? `${skippedChunks}件の段落チャンクが処理できませんでした。修正漏れの可能性があります。`
@@ -2756,7 +2778,7 @@ export async function POST(req: NextRequest) {
     console.error("[edit-pptx] error:", e);
     return NextResponse.json(
       { ok: false, error: String(e?.message ?? e) },
-      { status: 500 }
+      { status: Number(e?.statusCode) || 500 }
     );
   }
 }
