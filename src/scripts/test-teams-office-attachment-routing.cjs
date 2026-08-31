@@ -6,6 +6,7 @@ const ts = require("typescript");
 
 const braveQueries = [];
 const pptPlanInputs = [];
+const sharedCompanyPlanInputs = [];
 
 function loadOfficeService() {
   const storedBlobs = new Map();
@@ -59,6 +60,37 @@ function loadOfficeService() {
       "@/features/chat-page/chat-services/sharepoint-summary-service"
     ) {
       return { summarizeSharePointPdf: async () => ({}) };
+    }
+    if (
+      request ===
+      "@/features/chat-page/chat-services/chat-api/chat-api-default-extensions"
+    ) {
+      return {
+        isSharedCompanyProfilePptRequest: async ({ title, userPrompt }) =>
+          /初回訪問|会社概要|公式\s*(?:HP|ホームページ|サイト)/i.test(
+            `${title} ${userPrompt}`
+          ),
+        createSharedCompanyProfilePptPlan: async (props) => {
+          sharedCompanyPlanInputs.push(props);
+          return {
+            companyName: "株式会社ミダックホールディングス",
+            slides: Array.from({ length: 11 }, (_, index) => ({
+              title: `公式情報${index + 1}`,
+              bullets: ["公式サイト本文から確認した具体的な会社情報"],
+            })),
+            targetTotalSlides: 12,
+            sourceEvidence: "公式サイト本文",
+            sourceUrls: ["https://www.midac.jp/company/"],
+            officialDomain: "midac.jp",
+            promptIntent: {
+              documentPurpose: "company-intro",
+              audience: "customer",
+              designFreedom: "guided",
+              layoutDirectives: {},
+            },
+          };
+        },
+      };
     }
     if (request === "./teams-brave-search-service") {
       return {
@@ -278,6 +310,13 @@ async function testWebGroundedPptAndLogoFollowup() {
   const requests = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, init) => {
+    if (!init?.body) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from("test-logo-image"),
+      };
+    }
     const body = JSON.parse(init.body);
     requests.push({ url: String(url), body });
     return {
@@ -301,11 +340,11 @@ async function testWebGroundedPptAndLogoFollowup() {
       uploadedFiles: [],
     });
     assert.match(createReply, /Officeファイルを作成しました/);
-    assert.match(createReply, /https:\/\/www\.midac\.jp\//);
-    assert.equal(braveQueries.at(-1), webPptRequest.prompt);
-    assert.match(pptPlanInputs.at(-1).referenceContext, /公式サイト/);
+    assert.match(createReply, /https:\/\/www\.midac\.jp\/company\//);
+    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, webPptRequest.prompt);
     assert.equal(requests[0].body.slides.length, 11);
     assert.equal(requests[0].body.targetTotalSlides, 12);
+    assert.equal(requests[0].body.promptIntent.documentPurpose, "company-intro");
 
     const logo = {
       extension: "png",
@@ -321,10 +360,8 @@ async function testWebGroundedPptAndLogoFollowup() {
     });
     assert.match(editReply, /PowerPointを編集しました（全体）/);
     assert.equal(requests[1].body.fileUrl, "https://example.test/initial.pptx");
-    assert.match(
-      requests[1].body.instruction,
-      /^https:\/\/example\.test\/midac_logo\.png\?sig=test /
-    );
+    assert.equal(requests[1].body.instruction, logoEditRequest.instruction);
+    assert.match(requests[1].body.imageDataUrl, /^data:image\/png;base64,/);
     assert.match(requests[1].body.instruction, /色のトーンを白/);
   } finally {
     global.fetch = originalFetch;

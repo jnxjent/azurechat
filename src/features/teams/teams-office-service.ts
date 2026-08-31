@@ -35,6 +35,10 @@ import {
   resolveBraveSearchRequest,
   searchBraveWeb,
 } from "./teams-brave-search-service";
+import {
+  createSharedCompanyProfilePptPlan,
+  isSharedCompanyProfilePptRequest,
+} from "@/features/chat-page/chat-services/chat-api/chat-api-default-extensions";
 
 const PDF_TRANSLATION_LANGUAGE_NAMES = {
   en: "英語",
@@ -632,7 +636,13 @@ export async function executeTeamsOfficeRequest(props: {
       const explicitlyRequiresWeb = requestsWebGroundedPpt(
         props.request.prompt
       );
-      if (braveRequest.enabled) {
+      const usesSharedCompanyProfile = await isSharedCompanyProfilePptRequest({
+        title: props.request.title,
+        userPrompt: props.request.prompt,
+      });
+      // 会社紹介はAzureChatと同じ共通処理が公式ページ本文まで収集する。
+      // それ以外のWeb参照PPTだけ、Teamsの汎用Brave検索を使用する。
+      if (braveRequest.enabled && !usesSharedCompanyProfile) {
         try {
           const web = await searchBraveWeb({
             query: braveRequest.query,
@@ -649,7 +659,11 @@ export async function executeTeamsOfficeRequest(props: {
           }
         }
       }
-      if (explicitlyRequiresWeb && !webContext.trim()) {
+      if (
+        explicitlyRequiresWeb &&
+        !usesSharedCompanyProfile &&
+        !webContext.trim()
+      ) {
         return "公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。Brave Searchの設定と検索結果を確認してください。";
       }
     }
@@ -668,6 +682,16 @@ export async function executeTeamsOfficeRequest(props: {
     }
     if (typeof result.downloadUrl !== "string") {
       return "Officeファイルは作成されましたが、ダウンロードリンクを取得できませんでした。";
+    }
+    if (Array.isArray(result.companyProfileSourceUrls)) {
+      webSources = result.companyProfileSourceUrls
+        .filter((url): url is string => typeof url === "string")
+        .map((url, index) => ({
+          index: index + 1,
+          name: companyProfileSourceName(url),
+          url,
+          kind: "web" as const,
+        }));
     }
 
     const extension =
@@ -1313,9 +1337,17 @@ async function editLatestTeamsPowerPoint(props: {
     "webp",
   ]);
   if (uploadedImage.error) return uploadedImage.error;
-  const effectiveInstruction = uploadedImage.file
-    ? `${uploadedImage.file.url} ${props.request.instruction}`
-    : props.request.instruction;
+  const effectiveInstruction = props.request.instruction;
+  let imageDataUrl: string | undefined;
+  if (uploadedImage.file) {
+    try {
+      imageDataUrl = await loadTeamsImageAsDataUrl(uploadedImage.file);
+    } catch (error) {
+      return `添付ロゴを読み込めなかったため、PowerPointの編集を中止しました。\n\n${String(
+        (error as Error)?.message ?? error
+      )}`;
+    }
+  }
 
   let result: Record<string, unknown>;
   let editLabel: "編集済み" | "カード型" | "レイアウト変更" = "編集済み";
@@ -1338,6 +1370,7 @@ async function editLatestTeamsPowerPoint(props: {
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
         plan: { slideEdits },
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1398,6 +1431,7 @@ async function editLatestTeamsPowerPoint(props: {
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
         plan: { slideEdits },
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1418,6 +1452,7 @@ async function editLatestTeamsPowerPoint(props: {
         instruction: effectiveInstruction,
         threadId: props.threadId,
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1447,6 +1482,39 @@ async function editLatestTeamsPowerPoint(props: {
   return `PowerPointを編集しました（${editedTarget}）。\n\n📊 [${escapeMarkdownLinkText(outputName)}](${
     result.downloadUrl
   })`;
+}
+
+async function loadTeamsImageAsDataUrl(file: TeamsStoredFile): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(file.url, {
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`画像取得 HTTP ${response.status}`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > 15 * 1024 * 1024) {
+      throw new Error("画像サイズが0バイト、または15MBを超えています。");
+    }
+    const extension = file.extension.toLowerCase();
+    const mime =
+      extension === "png"
+        ? "image/png"
+        : extension === "webp"
+        ? "image/webp"
+        : "image/jpeg";
+    console.log("[teams-ppt-edit] attached image loaded", {
+      fileName: file.fileName,
+      bytes: bytes.length,
+      mime,
+    });
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function editLatestTeamsPptColor(props: {
@@ -1797,6 +1865,41 @@ async function createDirectOfficeFile(props: {
   referenceContext?: string;
 }): Promise<Record<string, unknown>> {
   if (props.action === "create_ppt") {
+    if (
+      await isSharedCompanyProfilePptRequest({
+        title: props.title,
+        userPrompt: props.prompt,
+      })
+    ) {
+      const companyPlan = await createSharedCompanyProfilePptPlan({
+        title: props.title,
+        userPrompt: props.prompt,
+      });
+      if (
+        companyPlan.slides.length !==
+        companyPlan.targetTotalSlides - 1
+      ) {
+        return {
+          error:
+            "公式サイトの会社情報を十分に構造化できなかったため、一般論だけのPowerPointは作成しませんでした。",
+        };
+      }
+      const generated = await postOfficeGenerationApi("/api/gen-pptx", {
+        title: props.title,
+        slides: companyPlan.slides,
+        threadId: props.threadId,
+        targetTotalSlides: companyPlan.targetTotalSlides,
+        deckPreferences: {},
+        promptIntent: companyPlan.promptIntent,
+        fileBaseName: sanitizeOfficeBaseName(props.title),
+      });
+      return {
+        ...generated,
+        companyProfileSourceUrls: companyPlan.sourceUrls,
+        companyProfileOfficialDomain: companyPlan.officialDomain,
+      };
+    }
+
     const plan = await createTeamsPptPlan({
       prompt: props.prompt,
       title: props.title,
@@ -1823,6 +1926,14 @@ async function createDirectOfficeFile(props: {
     threadId: props.threadId,
     ...(props.action === "create_word" ? { fontFace: "Meiryo" } : {}),
   });
+}
+
+function companyProfileSourceName(url: string): string {
+  try {
+    return `${new URL(url).hostname.replace(/^www\./, "")} 公式サイト`;
+  } catch {
+    return "公式サイト";
+  }
 }
 
 function requestsWebGroundedPpt(prompt: string): boolean {

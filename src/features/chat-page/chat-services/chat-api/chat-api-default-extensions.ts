@@ -4644,6 +4644,107 @@ function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
   return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
 }
 
+export type SharedCompanyProfileSeedSlide = {
+  title: string;
+  bullets: string[];
+  layoutType?: string;
+  columns?: Array<{ header: string; bullets: string[] }>;
+  tableRows?: string[][];
+};
+
+export type SharedCompanyProfilePptPlan = {
+  companyName: string;
+  slides: RawPptSlide[];
+  targetTotalSlides: number;
+  sourceEvidence: string;
+  sourceUrls: string[];
+  officialDomain?: string;
+  promptIntent: PromptIntentLocal;
+};
+
+/**
+ * AzureChat と Teams が同じ会社紹介判定を使うための薄い公開関数。
+ * PPT の描画処理は含まず、公式サイト調査とスライド計画だけを返す。
+ */
+export async function isSharedCompanyProfilePptRequest(props: {
+  title: string;
+  userPrompt: string;
+  seedSlides?: SharedCompanyProfileSeedSlide[];
+  designInstruction?: string;
+}): Promise<boolean> {
+  return detectCompanyProfileMode(
+    props.title,
+    (props.seedSlides ?? []) as RawPptSlide[],
+    props.designInstruction,
+    props.userPrompt
+  );
+}
+
+/**
+ * AzureChat で実績のある次の処理を Teams からも再利用する共通入口。
+ *   公式サイト検索・本文取得 -> CompanyBrief 構造化 -> 会社紹介スライド計画
+ */
+export async function createSharedCompanyProfilePptPlan(props: {
+  title: string;
+  userPrompt: string;
+  targetTotalSlides?: number;
+  seedSlides?: SharedCompanyProfileSeedSlide[];
+  designInstruction?: string;
+}): Promise<SharedCompanyProfilePptPlan> {
+  const seedSlides = (props.seedSlides ?? []) as RawPptSlide[];
+  const companyName = extractCompanyNameFromTitle(
+    props.title,
+    props.userPrompt
+  );
+  const query = companyName
+    ? `${companyName} 公式サイト 会社概要 事業内容 強み 許可 拠点 グループ会社`
+    : `${props.title} 会社概要 事業内容`;
+  console.log("[shared-company-profile] collectWebEvidence:", query);
+
+  const evidence = await collectWebEvidence(query, companyName);
+  const sourceEvidence = [evidence.snippets, evidence.pages]
+    .filter(Boolean)
+    .join("\n\n");
+  const brief = await buildCompanyBrief(
+    companyName,
+    props.userPrompt,
+    props.title,
+    evidence
+  );
+  const requestedTotal =
+    props.targetTotalSlides ??
+    extractRequestedTotalSlideCount(props.userPrompt) ??
+    Math.max(8, Math.min(13, seedSlides.length + 1));
+  const targetTotalSlides = Math.max(2, requestedTotal);
+  const slides = await planCompanyProfileSlides(
+    props.title,
+    brief,
+    props.userPrompt,
+    props.designInstruction,
+    targetTotalSlides - 1,
+    seedSlides
+  );
+
+  console.log(
+    `[shared-company-profile] planned company=${companyName || "unknown"} ` +
+      `slides=${slides.length}/${targetTotalSlides - 1} ` +
+      `officialDomain=${evidence.officialDomain ?? "none"} pages=${evidence.pages.length}c`
+  );
+  return {
+    companyName,
+    slides,
+    targetTotalSlides,
+    sourceEvidence,
+    sourceUrls: evidence.sourceUrls,
+    officialDomain: evidence.officialDomain,
+    promptIntent: parsePromptIntent(
+      [props.designInstruction ?? "", props.title, props.userPrompt]
+        .filter(Boolean)
+        .join(" ")
+    ),
+  };
+}
+
 // ---------------- Python レンダラー経由 PowerPoint 生成 ----------------
 
 async function executeCreatePptxPython(
@@ -4927,33 +5028,17 @@ async function executeCreatePptx(
       finalSlides = await enrichSlidesWithDocContent(slides, spContent, title, userMessage ?? "");
     }
   } else if (companyProfileMode) {
-    // 初回訪問・会社HP参照はproposalModeより優先し、公式ページ本文を使って骨子を肉付けする。
-    const companyName = extractCompanyNameFromTitle(title, userMessage ?? "");
-    const query = companyName
-      ? `${companyName} 公式サイト 会社概要 事業案内 強み 許可 拠点 グループ会社`
-      : (searchQuery || `${title} 会社概要 事業内容`);
-    console.log("[create_pptx] company profile mode — collectWebEvidence:", query);
-    const evidence = await collectWebEvidence(query, companyName);
-    storySourceEvidence = [evidence.snippets, evidence.pages].filter(Boolean).join("\n\n");
-    const brief = await buildCompanyBrief(companyName, userMessage ?? "", title, evidence);
-    console.log(
-      `[create_pptx] brief built: areas=${brief.businessAreas.length} strengths=${brief.strengths.length} ` +
-      `metrics=${brief.metrics.length} facilities=${brief.facilities.length} permits=${brief.permits.length} ` +
-      `groups=${brief.groupCompanies.length} outline=${brief.recommendedSlideOutline.length}`
-    );
-    const requestedTotal = extractRequestedTotalSlideCount(userMessage ?? "");
-    const companyTargetTotal = requestedTotal ?? Math.max(8, Math.min(13, slides.length + 1));
-    const planned = await planCompanyProfileSlides(
+    // AzureChat/Teams 共通の公式サイト会社紹介パイプラインを使用する。
+    const companyPlan = await createSharedCompanyProfilePptPlan({
       title,
-      brief,
-      userMessage ?? "",
+      userPrompt: userMessage ?? "",
       designInstruction,
-      companyTargetTotal - 1,
-      slides
-    );
-    if (planned.length > 0) {
-      finalSlides = planned;
-      targetTotalSlides = companyTargetTotal;
+      seedSlides: slides,
+    });
+    storySourceEvidence = companyPlan.sourceEvidence;
+    if (companyPlan.slides.length > 0) {
+      finalSlides = companyPlan.slides;
+      targetTotalSlides = companyPlan.targetTotalSlides;
       companyPlanApplied = true;
     } else {
       // 公式ブリーフの再設計に失敗しても、従来の提案書/補完経路へ安全に戻す。
