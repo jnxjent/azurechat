@@ -93,4 +93,3 @@ export async function ConsumePendingPptxEdit(threadId: string): Promise<void> {
     console.warn("[pptx-pending-edit] Failed to consume state");
   }
 }
-

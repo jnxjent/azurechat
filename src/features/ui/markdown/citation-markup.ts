@@ -101,4 +101,3 @@ export function removeCitationMarkup(text: string): string {
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
 }
-

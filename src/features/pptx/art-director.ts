@@ -663,4 +663,3 @@ function validateArtDirection(
     slides: slides.sort((a, b) => a.slideIndex - b.slideIndex),
   };
 }
-
