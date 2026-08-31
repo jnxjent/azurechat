@@ -6,6 +6,10 @@ import { Citation } from "./citation";
 import { CodeBlock } from "./code-block";
 import { MarkdownProvider } from "./markdown-context";
 import { Paragraph } from "./paragraph";
+import {
+  CITATION_MARKUP_RE,
+  parseCitationItems,
+} from "./citation-markup";
 
 interface Props {
   content: string;
@@ -93,7 +97,10 @@ function preprocessCitations(src: string): string {
   if (!src) return src;
 
   // Markdoc citation
-  const MARKDOC_RE = /\{%\s*citation\s+items=\[([\s\S]*?)\]\s*\/%\}/gi;
+  const MARKDOC_RE = new RegExp(
+    CITATION_MARKUP_RE.source,
+    CITATION_MARKUP_RE.flags
+  );
   src = src.replace(MARKDOC_RE, (_all, inner) => {
     const payload = encodeURIComponent(String(inner ?? "").trim());
     return `[引用](citation:${payload})`;
@@ -120,17 +127,7 @@ function decodeCitationItemsFromHref(
   const inner = decodeURIComponent(href.slice("citation:".length)).trim();
   if (!inner) return null;
 
-  const items: Array<{ name: string; id: string }> = [];
-  const objRe =
-    /name\s*:\s*["']([^"']+)["']\s*,\s*id\s*:\s*["']([^"']+)["']/gi;
-
-  let m: RegExpExecArray | null;
-  while ((m = objRe.exec(inner)) !== null) {
-    if (m[1] && m[2]) {
-      items.push({ name: m[1].trim(), id: m[2].trim() });
-    }
-  }
-
+  const items = parseCitationItems(inner);
   return items.length ? items : null;
 }
 

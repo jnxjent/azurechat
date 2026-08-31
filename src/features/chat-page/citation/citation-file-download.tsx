@@ -55,7 +55,24 @@ async function resolveDriveId(token: string, siteUrl: string, driveName: string)
   }
 }
 
-async function getWebUrlBySpItemId(dept: string, spItemId: string): Promise<string | null> {
+type FreshSharePointLink = {
+  url: string;
+  kind: "download" | "web";
+};
+
+function validHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+async function getFreshLinkBySpItemId(
+  dept: string,
+  spItemId: string
+): Promise<FreshSharePointLink | null> {
   const token = await getAppOnlyToken();
   if (!token) return null;
 
@@ -68,13 +85,20 @@ async function getWebUrlBySpItemId(dept: string, spItemId: string): Promise<stri
       if (!driveId) continue;
 
       const res = await fetch(
-        `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${spItemId}?$select=webUrl,deleted`,
+        `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${encodeURIComponent(spItemId)}`,
         { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" }
       );
       if (!res.ok) continue;
       const item = await res.json();
-      if (item?.deleted || !item?.webUrl) continue;
-      return item.webUrl as string;
+      if (item?.deleted) continue;
+
+      const downloadUrl = item?.["@microsoft.graph.downloadUrl"];
+      if (validHttpsUrl(downloadUrl)) {
+        return { url: downloadUrl, kind: "download" };
+      }
+      if (validHttpsUrl(item?.webUrl)) {
+        return { url: item.webUrl, kind: "web" };
+      }
     } catch {
       continue;
     }
@@ -87,15 +111,27 @@ export const CitationFileDownload = async (formData: FormData) => {
   const searchResponse = await FindCitationByID(formData.get("id") as string);
   if (searchResponse.status === "OK") {
     const { document } = searchResponse.response.content;
-    console.log("[DL] spItemId=", document.spItemId, "dept=", document.dept, "effectiveFileUrl=", document.effectiveFileUrl);
+    console.log("[DL] spItemId=", document.spItemId, "dept=", document.dept);
 
     if (document.spItemId) {
-      const freshUrl = await getWebUrlBySpItemId(document.dept ?? "", document.spItemId);
-      if (freshUrl) {
-        console.log("[DL] fresh URL from Graph API:", freshUrl);
-        return freshUrl;
+      const freshLink = await getFreshLinkBySpItemId(
+        document.dept ?? "",
+        document.spItemId
+      );
+      if (freshLink) {
+        // Do not log the actual download URL because Graph embeds a short-lived token.
+        console.log(`[DL] Graph link resolved kind=${freshLink.kind}`);
+        return freshLink.url;
       }
-      console.warn("[DL] Graph API lookup failed, falling back to stored URL");
+      console.warn(
+        "[DL] Graph API lookup failed; refusing stale stored SharePoint URL"
+      );
+      return null;
+    }
+
+    if (document.isSlDoc === true) {
+      console.warn("[DL] SharePoint citation has no spItemId; link unavailable");
+      return null;
     }
 
     return document.effectiveFileUrl || document.fileUrl;

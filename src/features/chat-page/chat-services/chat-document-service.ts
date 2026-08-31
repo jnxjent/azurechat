@@ -15,6 +15,10 @@ import {
   GenerateSasUrl,
   UploadBlob,
 } from "@/features/common/services/azure-storage";
+import {
+  extractLegacyWordText,
+  extractPlainText,
+} from "@/lib/document-extract";
 
 // ─────────────────────────────────────────────
 // アップロード上限（バイト）
@@ -109,9 +113,8 @@ export const CrackDocument = async (
   }
 };
 
-// ---------- Excel (.xlsx / .xlsm) テキスト抽出 ----------
+// ---------- Excel (.xlsx / .xlsm / .xls) テキスト抽出 ----------
 async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const XLSX = require("xlsx");
 
   const workbook = XLSX.read(Buffer.from(buffer), {
@@ -162,12 +165,20 @@ async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
 // Excel拡張子判定
 function isExcelFile(fileName: string): boolean {
   const lower = fileName.toLowerCase();
-  return lower.endsWith(".xlsx") || lower.endsWith(".xlsm");
+  return lower.endsWith(".xlsx") || lower.endsWith(".xlsm") || lower.endsWith(".xls");
 }
 
-// Word拡張子判定（.docx のみ対応。旧形式 .doc は非対応）
+// Modern Word (.docx) uses the existing OOXML extractor.
 function isWordFile(fileName: string): boolean {
   return fileName.toLowerCase().endsWith(".docx");
+}
+
+function isLegacyWordFile(fileName: string): boolean {
+  return fileName.toLowerCase().endsWith(".doc");
+}
+
+function isPlainTextFile(fileName: string): boolean {
+  return fileName.toLowerCase().endsWith(".txt");
 }
 
 function _decodeXmlEntities(s: string): string {
@@ -224,7 +235,21 @@ const LoadFile = async (
     if (file && file.size < MAX_UPLOAD_DOCUMENT_SIZE) {
       const buffer = await file.arrayBuffer();
 
-      // Excel ファイル (.xlsx / .xlsm) は SheetJS で全シート抽出
+      // Plain text is decoded locally because Document Intelligence does not
+      // accept .txt input. Japanese UTF-8/UTF-16/Shift-JIS are supported.
+      if (isPlainTextFile(file.name)) {
+        console.log(`[LoadFile] Plain-text extraction: ${file.name}`);
+        const docs = extractPlainText(buffer);
+        if (!docs.length) {
+          return {
+            status: "ERROR",
+            errors: [{ message: "テキストファイルが空か、読み取れる文字がありません。" }],
+          };
+        }
+        return { status: "OK", response: docs };
+      }
+
+      // Excel ファイル (.xlsx / .xlsm / .xls) は SheetJS で全シート抽出
       if (isExcelFile(file.name)) {
         console.log(`[LoadFile] Excel extraction: ${file.name}`);
         const docs = await extractExcelText(buffer);
@@ -232,6 +257,20 @@ const LoadFile = async (
           return {
             status: "ERROR",
             errors: [{ message: "Excelファイルの内容が空か読み取れませんでした。" }],
+          };
+        }
+        return { status: "OK", response: docs };
+      }
+
+      // Legacy binary Word files need an OLE parser. Sending .doc directly
+      // to Document Intelligence results in InvalidRequest.
+      if (isLegacyWordFile(file.name)) {
+        console.log(`[LoadFile] Legacy Word extraction: ${file.name}`);
+        const docs = await extractLegacyWordText(buffer);
+        if (!docs.length) {
+          return {
+            status: "ERROR",
+            errors: [{ message: "旧形式Word（.doc）から本文を抽出できませんでした。" }],
           };
         }
         return { status: "OK", response: docs };

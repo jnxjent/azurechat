@@ -108,6 +108,13 @@ const linkifyPhoneInTableRow = (line: string): string => {
 const normalizeContent = (src: string): string => {
   if (!src) return "";
 
+  // SharePoint summaries use the interactive Citation component. Remove only
+  // duplicate source links invented by the model that may contain stale URLs.
+  src = src.replace(
+    /\[(?:原文を開く|原文を見る|元資料を開く)\]\(https?:\/\/[^)]*\.sharepoint\.com[^)]*\)/gi,
+    ""
+  );
+
   // 一覧の冒頭でページ件数（20等）が総件数として誤表示された場合、
   // 同じ回答内のページ情報「全109件中…」を正として補正する。
   const paginationTotal = src.match(/全\s*(\d+)\s*件中/);

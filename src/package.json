@@ -60,6 +60,7 @@
     "tailwind-merge": "^2.1.0",
     "tailwindcss-animate": "^1.0.7",
     "valtio": "^1.12.1",
+    "word-extractor": "^1.0.4",
     "xlsx": "^0.18.5",
     "zod": "^3.22.4"
   },

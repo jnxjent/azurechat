@@ -104,12 +104,10 @@ export const FormatCitations = (citation: DocumentSearchResponse[]) => {
     const effectiveFileUrl = d.document.effectiveFileUrl ?? fileUrl;
 
     console.log(
-      "[CITATION] effectiveFileUrl=",
+      "[CITATION] stored effectiveFileUrl=",
       d.document.effectiveFileUrl,
       "fileUrl=",
-      d.document.fileUrl,
-      "downloadUrl=",
-      effectiveFileUrl || fileUrl
+      d.document.fileUrl
     );
 
     withoutEmbedding.push({

@@ -55,6 +55,80 @@ export async function extractExcelText(buffer: ArrayBuffer): Promise<string[]> {
   return docs;
 }
 
+function cleanExtractedText(value: string): string {
+  return value
+    .replace(/\u0000/g, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\t ]+\n/g, "\n")
+    .trim();
+}
+
+/**
+ * Decode a plain-text upload locally. Japanese business documents are
+ * commonly UTF-8, UTF-16, or CP932/Shift-JIS.
+ */
+export function extractPlainText(buffer: ArrayBuffer): string[] {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length === 0) return [];
+
+  let text = "";
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 0xef &&
+    bytes[1] === 0xbb &&
+    bytes[2] === 0xbf
+  ) {
+    text = new TextDecoder("utf-8").decode(bytes.subarray(3));
+  } else if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    text = new TextDecoder("utf-16le").decode(bytes.subarray(2));
+  } else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // TextDecoder does not consistently expose utf-16be in every Node build.
+    const swapped = new Uint8Array(bytes.length - 2);
+    for (let i = 2; i + 1 < bytes.length; i += 2) {
+      swapped[i - 2] = bytes[i + 1];
+      swapped[i - 1] = bytes[i];
+    }
+    text = new TextDecoder("utf-16le").decode(swapped);
+  } else {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      // WHATWG Encoding maps shift_jis to Windows-31J/CP932 in Node.js.
+      text = new TextDecoder("shift_jis").decode(bytes);
+    }
+  }
+
+  const cleaned = cleanExtractedText(text);
+  return cleaned ? [cleaned] : [];
+}
+
+/** Extract text from the legacy OLE-based Word .doc format. */
+export async function extractLegacyWordText(
+  buffer: ArrayBuffer
+): Promise<string[]> {
+  try {
+    const WordExtractor = require("word-extractor");
+    const extractor = new WordExtractor();
+    const document = await extractor.extract(Buffer.from(buffer));
+    const sections = [
+      document.getHeaders?.(),
+      document.getBody?.(),
+      document.getTextboxes?.(),
+      document.getFootnotes?.(),
+      document.getEndnotes?.(),
+    ]
+      .map((part: unknown) => cleanExtractedText(String(part ?? "")))
+      .filter(Boolean);
+    const text = sections.join("\n");
+    return text ? [text] : [];
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `旧形式Word（.doc）を読み取れませんでした。パスワード保護、破損、または未対応の旧形式である可能性があります。${detail ? ` (${detail})` : ""}`
+    );
+  }
+}
+
 function decodeXmlEntities(s: string): string {
   return s
     .replace(/&amp;/g, "&")
@@ -251,8 +325,18 @@ export async function extractTextFromBuffer(
   fileName: string
 ): Promise<string[]> {
   const lower = fileName.toLowerCase();
-  if (lower.endsWith(".xlsx") || lower.endsWith(".xlsm")) {
+  if (
+    lower.endsWith(".xlsx") ||
+    lower.endsWith(".xlsm") ||
+    lower.endsWith(".xls")
+  ) {
     return extractExcelText(buffer);
+  }
+  if (lower.endsWith(".txt")) {
+    return extractPlainText(buffer);
+  }
+  if (lower.endsWith(".doc")) {
+    return extractLegacyWordText(buffer);
   }
   if (lower.endsWith(".msg")) {
     return extractMsgText(buffer);
