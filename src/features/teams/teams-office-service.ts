@@ -240,10 +240,10 @@ export function parseTeamsOfficeRequest(
   }
 
   const asksForPptAssetInsertion =
-    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って)/i.test(
+    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換)/i.test(
       normalized
     ) ||
-    /(?:入れ|挿入|配置|載せ|追加|貼り|使って).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
+    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
       normalized
     );
   const asksForWholeDeckPptEdit =

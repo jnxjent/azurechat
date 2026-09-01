@@ -246,6 +246,11 @@ const logoEditRequest = parseTeamsOfficeRequest(
 );
 assert.equal(logoEditRequest?.action, "edit_latest_ppt");
 assert.deepEqual(logoEditRequest?.targetPages, []);
+const logoReplacementRequest = parseTeamsOfficeRequest(
+  "PPTに入れたLogoを添付と差し替えてPPTを出してください"
+);
+assert.equal(logoReplacementRequest?.action, "edit_latest_ppt");
+assert.deepEqual(logoReplacementRequest?.targetPages, []);
 
 assert.equal(
   parseTeamsOfficeRequest("スライドの色を変えたい")?.action,
@@ -355,10 +360,18 @@ async function testWebGroundedPptAndLogoFollowup() {
       status: 200,
       json: async () => ({
         ok: true,
-        downloadUrl: requests.length === 1
-          ? "https://example.test/initial.pptx"
-          : "https://example.test/edited.pptx",
-        fileName: requests.length === 1 ? "initial.pptx" : "edited.pptx",
+        downloadUrl:
+          requests.length === 1
+            ? "https://example.test/initial.pptx"
+            : requests.length === 2
+            ? "https://example.test/edited.pptx"
+            : "https://example.test/replaced.pptx",
+        fileName:
+          requests.length === 1
+            ? "initial.pptx"
+            : requests.length === 2
+            ? "edited.pptx"
+            : "replaced.pptx",
       }),
     };
   };
@@ -394,6 +407,26 @@ async function testWebGroundedPptAndLogoFollowup() {
     assert.equal(requests[1].body.instruction, logoEditRequest.instruction);
     assert.match(requests[1].body.imageDataUrl, /^data:image\/png;base64,/);
     assert.match(requests[1].body.instruction, /色のトーンを白/);
+
+    const replacementLogo = {
+      extension: "png",
+      fileName: "replacement_logo.png",
+      savedAt: Date.now(),
+      size: 100,
+      url: "https://example.test/replacement_logo.png?sig=test",
+    };
+    const replacementReply = await executeTeamsOfficeRequest({
+      request: logoReplacementRequest,
+      conversationId,
+      uploadedFiles: [replacementLogo],
+    });
+    assert.match(replacementReply, /PowerPointを編集しました（全体）/);
+    assert.equal(requests[2].body.fileUrl, "https://example.test/edited.pptx");
+    assert.equal(
+      requests[2].body.instruction,
+      logoReplacementRequest.instruction
+    );
+    assert.match(requests[2].body.imageDataUrl, /^data:image\/png;base64,/);
   } finally {
     global.fetch = originalFetch;
   }
