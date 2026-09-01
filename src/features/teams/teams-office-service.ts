@@ -222,18 +222,23 @@ export function parseTeamsOfficeRequest(
     };
   }
 
+  const hasPptEditingContext =
+    /(ppt|pptx|powerpoint|パワーポイント|スライド|プレゼン|資料)/i.test(
+      normalized
+    );
+  const hasPptColorTopic = /(色味|配色|カラー|色)/i.test(normalized);
   const asksForPptColorHelp =
-    /(ppt|pptx|powerpoint|パワーポイント)/i.test(normalized) &&
-    /(色味|配色|カラー|色)/i.test(normalized) &&
-    /(どういう|どんな|何色|候補|一覧|種類|できる|教えて)/i.test(normalized);
+    hasPptEditingContext &&
+    hasPptColorTopic &&
+    (/(どういう|どんな|何色|候補|一覧|種類|できる|教えて)/i.test(
+      normalized
+    ) ||
+      (/(変えたい|変更したい)/i.test(normalized) &&
+        !resolvePptxPaletteInstruction(normalized)));
   if (asksForPptColorHelp) {
     return { action: "ppt_color_help" };
   }
 
-  const hasPptEditingContext =
-    /(ppt|pptx|powerpoint|パワーポイント|スライド|プレゼン)/i.test(
-      normalized
-    );
   const asksForPptAssetInsertion =
     /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って)/i.test(
       normalized
@@ -262,21 +267,30 @@ export function parseTeamsOfficeRequest(
   }
 
   const asksForPptColorEdit =
-    /(ppt|pptx|powerpoint|パワーポイント)/i.test(normalized) &&
-    /(色味|配色|カラー|色)/i.test(normalized) &&
+    hasPptEditingContext &&
+    hasPptColorTopic &&
     /(変更|変え|替え|にして|統一|基調)/i.test(normalized);
   const selectsListedPptColor =
-    /^(?:(?:では|じゃあ|それでは|ok)[、,，\s]*)?[1-6]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|して|します)?[。.!！]?$/i.test(
+    /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-6１-６]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
       normalized
     );
   const selectsNamedPptColor =
     /(ネイビー|深緑|バーガンディ|ティール|チャコール|テラコッタ|コーラル|アンバー|ゴールド).{0,12}(?:で|に|変更|変えて|お願い)/i.test(
       normalized
+    ) ||
+    /^(?:ネイビー.{0,2}オレンジ|深緑.{0,2}アンバー|バーガンディ.{0,2}ゴールド|ティール.{0,2}コーラル|チャコール.{0,2}テラコッタ|深緑.{0,4}コーラルオレンジ)[。.!！]?$/i.test(
+      normalized
+    );
+  const selectsResolvedPptColor =
+    Boolean(resolvePptxPaletteInstruction(normalized)) &&
+    /(?:で|に|へ|変更|変えて|お願いします|お願い|にして)[。.!！]?$/i.test(
+      normalized
     );
   if (
     asksForPptColorEdit ||
     selectsListedPptColor ||
-    selectsNamedPptColor
+    selectsNamedPptColor ||
+    selectsResolvedPptColor
   ) {
     return { action: "edit_latest_ppt_color", instruction: normalized };
   }

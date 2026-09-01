@@ -247,6 +247,24 @@ const logoEditRequest = parseTeamsOfficeRequest(
 assert.equal(logoEditRequest?.action, "edit_latest_ppt");
 assert.deepEqual(logoEditRequest?.targetPages, []);
 
+assert.equal(
+  parseTeamsOfficeRequest("スライドの色を変えたい")?.action,
+  "ppt_color_help"
+);
+assert.equal(
+  parseTeamsOfficeRequest("ティール×コーラル")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(
+  parseTeamsOfficeRequest("4でお願いします")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(
+  parseTeamsOfficeRequest("やはり２に変えて")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(parseTeamsOfficeRequest("緑について教えて"), null);
+
 const refine = parseTeamsOfficeRequest(
   "P2のシートを再変換して\n添付ファイル: report.xlsx"
 );
