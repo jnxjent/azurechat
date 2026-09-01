@@ -1936,7 +1936,8 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeEditSpWord(args, props.chatThread),
+      function: async (args: any) =>
+        await executeEditSpWord(args, props.chatThread, props.userMessage),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -2067,22 +2068,6 @@ export const GetDefaultExtensions = async (props: {
             description:
               "ドキュメントのタイトル。省略時はcontentから自動推定する。",
           },
-          fileName: {
-            type: "string",
-            description:
-              "ダウンロード時のWordファイル名（.docx）。summarize_sp_pdfから要約をWord化する場合は、同ツールが推奨した『元ファイル名_要約.docx』を正確に指定する。",
-          },
-          formatMode: {
-            type: "string",
-            enum: ["auto", "markdown"],
-            description:
-              "通常はauto。summarize_sp_pdfが返したMarkdown要約をWord化する場合だけmarkdownを指定する。",
-          },
-          summaryRef: {
-            type: "string",
-            description:
-              "summarize_sp_pdfが返したWord出力用summaryRef。全文要約Wordの場合のみ、その値を一字一句変えずに渡す。",
-          },
           instruction: {
             type: "string",
             description:
@@ -2092,14 +2077,26 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             description: "使用フォント名。例: 'Meiryo', 'Yu Gothic', 'Yu Mincho'（省略時: Meiryo）",
           },
+          fileName: {
+            type: "string",
+            description: "出力するWordファイル名（.docx）。summarize_sp_pdf が推奨した名前は変更せず指定する。",
+          },
+          formatMode: {
+            type: "string",
+            enum: ["auto", "markdown"],
+            description: "summaryRefからWordを作る場合はmarkdownを指定する。",
+          },
+          summaryRef: {
+            type: "string",
+            description: "summarize_sp_pdf が返したWord出力用summaryRef。値を変更せず指定する。",
+          },
         },
         required: ["content"],
       },
       description:
         "ユーザーが会話中で直接提供したテキスト・内容からWordファイル（.docx）を新規作成するツール。\n" +
         "使用タイミング：ユーザーが会話中で直接テキストを渡して「Wordにして」「Wordで作って」「Word文書を作成して」「docxにして」と言った場合のみ。\n" +
-        "【禁止】SharePoint/SL の文書検索（sl_doc_search）で取得したコンテンツや、既存PDFや既存docxを変換・編集する目的には絶対に使わないこと。\n" +
-        "【唯一の例外】summarize_sp_pdf が返した全文要約を新規Word文書にする場合は create_word を使う。content='[summaryRef]'、summaryRef=ツールが返した値、formatMode=markdownを指定する。長い要約本文やPDF原文をcontentへコピーしない。\n" +
+        "【禁止】SharePoint/SL の文書検索（sl_doc_search）で取得したコンテンツや、既存PDFや既存docxを変換・編集する目的には絶対に使わないこと。ただし summarize_sp_pdf が返した summaryRef から要約Wordを作る場合は例外。\n" +
         "  - SharePoint/SL の PDF を Word に変換したい場合 → convert_pdf_to_word(fileQuery=ファイル名) を使う。\n" +
         "  - SharePoint/SL の docx を編集したい場合 → edit_sp_word(fileQuery=ファイル名) を使う。\n" +
         "既存Wordファイルの編集は edit_word ツールを使うこと（このツールは新規作成専用）。\n" +
@@ -2112,7 +2109,8 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) => await executeEditWord(args, props.chatThread),
+      function: async (args: any) =>
+        await executeEditWord(args, props.chatThread, props.userMessage),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -3680,6 +3678,21 @@ function defaultStoryRole(slideIndex: number, totalSlides: number): NarrativeRol
   return slideIndex <= Math.floor(totalSlides / 2) ? "value" : "process";
 }
 
+type PptContentModelSource = "api" | "ppt";
+
+function resolvePptContentModel(source: PptContentModelSource = "ppt") {
+  if (source === "api") {
+    return {
+      client: OpenAIInstance(),
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() || "",
+    };
+  }
+  return {
+    client: OpenAIPptInstance(),
+    model: resolvePptModelName(),
+  };
+}
+
 function normalizeStoryRole(value: unknown, slideIndex: number, totalSlides: number): {
   role: NarrativeRole;
   repairedFrom?: string;
@@ -4642,21 +4655,6 @@ function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
   return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
 }
 
-type PptContentModelSource = "api" | "ppt";
-
-function resolvePptContentModel(source: PptContentModelSource = "ppt") {
-  if (source === "api") {
-    return {
-      client: OpenAIInstance(),
-      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() || "",
-    };
-  }
-  return {
-    client: OpenAIPptInstance(),
-    model: resolvePptModelName(),
-  };
-}
-
 export type SharedCompanyProfileSeedSlide = {
   title: string;
   bullets: string[];
@@ -5115,6 +5113,29 @@ async function executeCreatePptx(
   // 完成した内容をデッキ全体として再読し、本文を変えずにストーリー役割と
   // 読み手向けメッセージタイトルだけを安全に補正する。
   finalSlides = await reviewDeckNarrative(title, finalSlides, reviewInstruction);
+
+  // 明示された枚数は、Story Planner の有効/無効にかかわらず表紙込みで守る。
+  // /api/gen-pptx が表紙を1枚自動生成するため、本文は指定枚数-1枚に補正する。
+  const explicitlyRequestedTotalSlides = userMessage
+    ? extractRequestedTotalSlideCount(userMessage)
+    : null;
+  if (explicitlyRequestedTotalSlides !== null) {
+    const requestedBodySlides = explicitlyRequestedTotalSlides - 1;
+    const beforeCount = finalSlides.length;
+    finalSlides = applyRequestedCountFallback(finalSlides, requestedBodySlides);
+    if (finalSlides.length === requestedBodySlides) {
+      targetTotalSlides = explicitlyRequestedTotalSlides;
+      console.log(
+        `[create_pptx] enforced explicit slide count total=${explicitlyRequestedTotalSlides} ` +
+        `body=${beforeCount}->${finalSlides.length}`
+      );
+    } else {
+      console.warn(
+        `[create_pptx] could not enforce explicit slide count total=${explicitlyRequestedTotalSlides}: ` +
+        `body=${finalSlides.length}/${requestedBodySlides}`
+      );
+    }
+  }
 
   const explicitInstruction = designInstruction?.trim() ||
     (proposalMode
@@ -8428,11 +8449,11 @@ async function executeCreateWord(
       body: JSON.stringify({
         content: content ?? "",
         title: title ?? "",
+        instruction: instruction ?? "",
+        fontFace: fontFace ?? "Meiryo",
         fileName: fileName ?? "",
         formatMode: formatMode ?? "auto",
         summaryRef: summaryRef ?? "",
-        instruction: instruction ?? "",
-        fontFace: fontFace ?? "Meiryo",
         threadId: chatThread.id,
       }),
     });
@@ -8464,10 +8485,21 @@ async function executeCreateWord(
 // ---------------- Word 編集 ----------------
 async function executeEditWord(
   args: { fileUrl?: string; instruction: string; trackChanges?: boolean; originalFileName?: string },
-  chatThread: ChatThreadModel
+  chatThread: ChatThreadModel,
+  userMessage?: string
 ) {
   let { fileUrl, instruction, trackChanges, originalFileName } = args ?? {};
   const trackChangesWasExplicit = typeof args?.trackChanges === "boolean";
+
+  // ツール選択LLMが正誤の向きを言い換え・逆転しても、ユーザー原文を
+  // Word編集の最終的な指示として扱う。
+  const originalUserInstruction = userMessage?.trim();
+  if (originalUserInstruction) {
+    if (originalUserInstruction !== instruction?.trim()) {
+      console.log("[edit_word] using original user instruction instead of tool-generated instruction");
+    }
+    instruction = originalUserInstruction;
+  }
 
   if (!instruction?.trim()) {
     return { error: "instructionは必須です。編集内容を指定してください。" };
@@ -8561,16 +8593,6 @@ async function executeEditWord(
 }
 
 // ---------------- SP ファイル → SAS URL 解決（Word/Excel共用） ----------------
-function normalizeSpFileLookupName(value: string): string {
-  return value
-    .normalize("NFKC")
-    .trim()
-    .toLocaleLowerCase("ja-JP")
-    .replace(/\.(pdf|docx)$/i, "")
-    .replace(/\(株\)|株式会社/g, "株式会社")
-    .replace(/[\s\u3000'"「」『』]/g, "");
-}
-
 async function resolveSpFileToSasUrl(
   fileQuery: string,
   allowedExts: RegExp,
@@ -9514,7 +9536,8 @@ async function executeEditSpExcel(
 // ---------------- SharePoint SL の Word を編集 ----------------
 async function executeEditSpWord(
   args: { fileQuery: string; instruction: string },
-  chatThread: ChatThreadModel
+  chatThread: ChatThreadModel,
+  userMessage?: string
 ) {
   const { fileQuery, instruction } = args ?? {};
 
@@ -9529,7 +9552,11 @@ async function executeEditSpWord(
     const queryBase = fileQuery.trim().toLowerCase().replace(/\.docx$/i, "").replace(/_rev\d+$/i, "");
     if (ptrBase && queryBase && (ptrBase === queryBase || ptrBase.includes(queryBase) || queryBase.includes(ptrBase))) {
       console.log(`[edit_sp_word] pointer matched (${existingPtr.fileName}) → redirecting to executeEditWord for additional edit`);
-      return executeEditWord({ fileUrl: existingPtr.url, instruction, trackChanges: true, originalFileName: existingPtr.fileName }, chatThread);
+      return executeEditWord(
+        { fileUrl: existingPtr.url, instruction, trackChanges: true, originalFileName: existingPtr.fileName },
+        chatThread,
+        userMessage
+      );
     }
   }
 
@@ -9673,7 +9700,8 @@ async function executeEditSpWord(
   // 5. edit_word に委託（SP ファイルは常に変更履歴を残す）
   return executeEditWord(
     { fileUrl: resolvedUrl, instruction, trackChanges: true, originalFileName: fileName },
-    chatThread
+    chatThread,
+    userMessage
   );
 }
 

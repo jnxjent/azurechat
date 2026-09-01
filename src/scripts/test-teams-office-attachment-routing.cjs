@@ -7,6 +7,7 @@ const ts = require("typescript");
 const braveQueries = [];
 const pptPlanInputs = [];
 const sharedCompanyPlanInputs = [];
+const sharePointSummaryInputs = [];
 
 function loadOfficeService() {
   const storedBlobs = new Map();
@@ -59,7 +60,15 @@ function loadOfficeService() {
       request ===
       "@/features/chat-page/chat-services/sharepoint-summary-service"
     ) {
-      return { summarizeSharePointPdf: async () => ({}) };
+      return {
+        summarizeSharePointPdf: async (props) => {
+          sharePointSummaryInputs.push(props);
+          return {
+            fileName: "令和7年度環境白書.pdf",
+            summary: "全文要約テスト",
+          };
+        },
+      };
     }
     if (
       request ===
@@ -166,7 +175,7 @@ assert.equal(
 const summaryRequest = parseTeamsOfficeRequest(
   "SharePointにある「令和7年度環境白書.pdf」を先頭から最終ページまで全文要約し、約10ページ（7,000～8,000文字）のWordファイルにしてください"
 );
-assert.equal(summaryRequest?.action, "summarize_sp_pdf");
+assert.equal(summaryRequest?.action, "summarize_sp_pdf_to_word");
 assert.equal(summaryRequest?.fileQuery, "令和7年度環境白書.pdf");
 assert.equal(summaryRequest?.targetPages, 10);
 assert.equal(summaryRequest?.targetCharsLow, 7000);
@@ -328,10 +337,9 @@ async function testWebGroundedPptAndLogoFollowup() {
       status: 200,
       json: async () => ({
         ok: true,
-        downloadUrl:
-          requests.length === 1
-            ? "https://example.test/initial.pptx"
-            : "https://example.test/edited.pptx",
+        downloadUrl: requests.length === 1
+          ? "https://example.test/initial.pptx"
+          : "https://example.test/edited.pptx",
         fileName: requests.length === 1 ? "initial.pptx" : "edited.pptx",
       }),
     };
@@ -373,8 +381,47 @@ async function testWebGroundedPptAndLogoFollowup() {
   }
 }
 
+async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalLocalEmail = process.env.SL_LOCAL_DEFAULT_EMAIL;
+  const originalFetch = global.fetch;
+  process.env.NODE_ENV = "development";
+  process.env.SL_LOCAL_DEFAULT_EMAIL = "j.nomoto@midac.jp";
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      downloadUrl: "https://example.test/environment-summary.docx",
+      fileName: "令和7年度環境白書_要約.docx",
+    }),
+  });
+
+  try {
+    const reply = await executeTeamsOfficeRequest({
+      request: summaryRequest,
+      conversationId: "local-summary-test-conversation",
+      uploadedFiles: [],
+      userEmail: "playground-user@example.com",
+    });
+    assert.match(reply, /SharePoint PDFを先頭から最終ページまで要約/);
+    assert.equal(
+      sharePointSummaryInputs.at(-1).userHash,
+      "j.nomoto@midac.jp"
+    );
+    assert.equal(sharePointSummaryInputs.at(-1).deptLower, "bm");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalLocalEmail === undefined)
+      delete process.env.SL_LOCAL_DEFAULT_EMAIL;
+    else process.env.SL_LOCAL_DEFAULT_EMAIL = originalLocalEmail;
+  }
+}
+
 testPdfTranslationExecutionAndFollowup()
   .then(testWebGroundedPptAndLogoFollowup)
+  .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })

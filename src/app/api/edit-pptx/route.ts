@@ -1257,8 +1257,8 @@ async function runPythonEditExcel(
       console.warn("[edit-excel] python stderr:", stderr.trim());
     }
 
-    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const outputBuffer = await fs.readFile(outputPath);
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const fileName = `${threadId || uniqueId()}_edited_${uniqueId()}.xlsx`;
     const downloadUrl = await uploadExcelToBlob(outputBuffer, fileName);
 
@@ -1815,8 +1815,9 @@ function parseExplicitWordReplacements(instruction: string): Array<{ find: strin
   let m: RegExpExecArray | null;
   while ((m = re1.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
 
-  // 【誤】A【正】B 形式（同一行 or 改行・空白ありも許容）
-  const re2 = /【誤】\s*([^【】\r\n]+?)\s*(?:\r?\n\s*)?【正】\s*([^【】\r\n]*)/g;
+  // 【誤】A【正】B / （誤）A（正）B / (誤)A(正)B 形式
+  // （同一行 or 改行・空白ありも許容）
+  const re2 = /(?:【誤】|[（(]誤[）)])\s*([^【】\r\n]+?)\s*(?:\r?\n\s*)?(?:【正】|[（(]正[）)])\s*([^【】\r\n]*)/g;
   while ((m = re2.exec(instruction)) !== null) addPair(m[1], m[2] ?? "");
 
   // 「A」を「B」に 形式（「太平興産」を「大平興産」に全件置換、など）
