@@ -1874,6 +1874,7 @@ async function createDirectOfficeFile(props: {
       const companyPlan = await createSharedCompanyProfilePptPlan({
         title: props.title,
         userPrompt: props.prompt,
+        contentModelSource: "api",
       });
       if (
         companyPlan.slides.length !==
@@ -2464,6 +2465,16 @@ function extractDirectOutputTitle(
 ): string {
   const quoted = extractQuotedFileQuery(message);
   if (quoted) return quoted.slice(0, 60);
+
+  if (action === "create_ppt") {
+    const normalized = message.normalize("NFKC");
+    const companyMaterial = normalized.match(
+      /(?:^|[。！？\n、])\s*((?:(?:株式会社|有限会社|合同会社)\s*)?[ァ-ヶー一-龠A-Za-z0-9・&＆]{2,40}?)の((?:初回訪問(?:用|向け)?|お客様向け|顧客向け|営業員向け)?(?:営業資料|会社紹介資料|会社案内|会社概要資料|提案資料))(?=を|で|に|、|。|\s|$)/i
+    );
+    if (companyMaterial) {
+      return `${companyMaterial[1]} ${companyMaterial[2]}`.trim().slice(0, 60);
+    }
+  }
 
   const about = message.match(/(.{1,60}?)について(?:の)?/i)?.[1]?.trim();
   if (about) {

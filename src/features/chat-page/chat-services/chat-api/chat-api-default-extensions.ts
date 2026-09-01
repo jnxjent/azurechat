@@ -3,7 +3,7 @@
 import "server-only";
 
 import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
-import { OpenAIDALLEInstance, OpenAIPptInstance } from "@/features/common/services/openai";
+import { OpenAIDALLEInstance, OpenAIInstance, OpenAIPptInstance } from "@/features/common/services/openai";
 import { ServerActionResponse } from "@/features/common/server-action-response";
 import { uniqueId } from "@/features/common/util";
 import {
@@ -2749,7 +2749,8 @@ async function buildCompanyBrief(
   companyName: string,
   userPrompt: string,
   title: string,
-  evidence: BraveWebEvidence
+  evidence: BraveWebEvidence,
+  modelSource: PptContentModelSource = "ppt"
 ): Promise<CompanyBrief> {
   const { audience, purpose } = detectAudienceAndPurpose(userPrompt, title);
 
@@ -2777,9 +2778,9 @@ async function buildCompanyBrief(
   const webText = cleanWebText(rawCombined).slice(0, 14000);
 
   try {
-    const openai = OpenAIPptInstance();
+    const { client: openai, model } = resolvePptContentModel(modelSource);
     const completion = await openai.chat.completions.create({
-      model: resolvePptModelName(),
+      model,
       max_completion_tokens: 6000,
       response_format: { type: "json_object" } as const,
       messages: [
@@ -2876,14 +2877,11 @@ async function planCompanyProfileSlides(
   userPrompt: string,
   designInstruction?: string,
   targetContentSlides = 7,
-  seedSlides: RawPptSlide[] = []
+  seedSlides: RawPptSlide[] = [],
+  modelSource: PptContentModelSource = "ppt"
 ): Promise<RawPptSlide[]> {
   try {
-    const openai = OpenAIPptInstance();
-    const pptModel =
-      process.env.AZURE_OPENAI_PPT_DEPLOYMENT_NAME?.trim() ||
-      process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() ||
-      "";
+    const { client: openai, model: pptModel } = resolvePptContentModel(modelSource);
     console.log(`[ppt-ai] stage=company-profile model=${pptModel}`);
 
     const outlineHint = brief.recommendedSlideOutline.length > 0
@@ -4621,7 +4619,7 @@ function detectCompanyProfileMode(
 }
 
 const TITLE_SUFFIXES =
-  /[\s　]*(会社紹介|紹介資料|営業資料|提案資料|提案書|会社概要|初回訪問|COMPANY\s*PROFILE|Company\s*Profile|プロフィール|Profile)/gi;
+  /[\s　]*(会社紹介|紹介資料|営業資料|提案資料|提案書|会社概要|初回訪問(?:用|向け)?|COMPANY\s*PROFILE|Company\s*Profile|プロフィール|Profile)/gi;
 
 function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
   const explicit = `${userMessage} ${title}`.match(
@@ -4642,6 +4640,21 @@ function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
   // 株式会社などのプレフィックスを除去してから先頭語を返す
   const noPrefix = cleaned.replace(/^(株式会社|有限会社|合同会社|（株）|\(株\))\s*/, "");
   return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
+}
+
+type PptContentModelSource = "api" | "ppt";
+
+function resolvePptContentModel(source: PptContentModelSource = "ppt") {
+  if (source === "api") {
+    return {
+      client: OpenAIInstance(),
+      model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() || "",
+    };
+  }
+  return {
+    client: OpenAIPptInstance(),
+    model: resolvePptModelName(),
+  };
 }
 
 export type SharedCompanyProfileSeedSlide = {
@@ -4690,6 +4703,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
   targetTotalSlides?: number;
   seedSlides?: SharedCompanyProfileSeedSlide[];
   designInstruction?: string;
+  contentModelSource?: PptContentModelSource;
 }): Promise<SharedCompanyProfilePptPlan> {
   const seedSlides = (props.seedSlides ?? []) as RawPptSlide[];
   const companyName = extractCompanyNameFromTitle(
@@ -4709,7 +4723,8 @@ export async function createSharedCompanyProfilePptPlan(props: {
     companyName,
     props.userPrompt,
     props.title,
-    evidence
+    evidence,
+    props.contentModelSource
   );
   const requestedTotal =
     props.targetTotalSlides ??
@@ -4722,7 +4737,8 @@ export async function createSharedCompanyProfilePptPlan(props: {
     props.userPrompt,
     props.designInstruction,
     targetTotalSlides - 1,
-    seedSlides
+    seedSlides,
+    props.contentModelSource
   );
 
   console.log(

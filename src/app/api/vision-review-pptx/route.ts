@@ -8,8 +8,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import {
+  OpenAIInstance,
   OpenAIPptVisionInstance,
-  OpenAIVisionInstance,
 } from "@/features/common/services/openai";
 
 const execFileAsync = promisify(execFile);
@@ -181,7 +181,7 @@ async function reviewWithVision(
     process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME?.trim() ||
     "";
   const fallbackModel =
-    process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME?.trim() || "";
+    process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME?.trim() || "";
 
   // 全スライドをレビュー対象にする（上限 12枚 — 10枚資料は全ページカバー）
   const reviewPaths = pngPaths.slice(0, 12);
@@ -312,7 +312,7 @@ async function reviewWithVision(
   ].join("\n");
 
   const requestReview = (
-    client: ReturnType<typeof OpenAIVisionInstance>,
+    client: ReturnType<typeof OpenAIInstance>,
     deploymentName: string
   ) =>
     client.chat.completions.create({
@@ -348,7 +348,7 @@ async function reviewWithVision(
       }`
     );
     model = fallbackModel;
-    res = await requestReview(OpenAIVisionInstance(), model);
+    res = await requestReview(OpenAIInstance(), model);
   }
 
   let choice = res.choices[0];
@@ -360,7 +360,7 @@ async function reviewWithVision(
       `[vision-review] empty response from ${model}; retrying with ${fallbackModel}`
     );
     model = fallbackModel;
-    res = await requestReview(OpenAIVisionInstance(), model);
+    res = await requestReview(OpenAIInstance(), model);
     choice = res.choices[0];
     raw = choice?.message?.content ?? "";
     console.log(
@@ -395,7 +395,7 @@ async function reviewWithVision(
       `[vision-review] JSON parse failed for ${model}; retrying with ${fallbackModel}`
     );
     model = fallbackModel;
-    res = await requestReview(OpenAIVisionInstance(), model);
+    res = await requestReview(OpenAIInstance(), model);
     raw = res.choices[0]?.message?.content ?? "";
     try {
       parsed = parseReviewJson(raw);

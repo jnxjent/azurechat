@@ -1,9 +1,15 @@
 import { OpenAI } from "openai";
 
+function azureOpenAIEndpoint(): string {
+  const explicit = process.env.AZURE_OPENAI_ENDPOINT?.trim().replace(/\/+$/, "");
+  if (explicit) return explicit;
+  return `https://${process.env.AZURE_OPENAI_API_INSTANCE_NAME}.openai.azure.com`;
+}
+
 export const OpenAIInstance = () => {
   const openai = new OpenAI({
     apiKey: process.env.AZURE_OPENAI_API_KEY,
-    baseURL: `https://${process.env.AZURE_OPENAI_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME}`,
+    baseURL: `${azureOpenAIEndpoint()}/openai/deployments/${process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME}`,
     defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
     defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
   });
@@ -17,7 +23,7 @@ export const OpenAIPptInstance = () => {
 
   const openai = new OpenAI({
     apiKey: process.env.AZURE_OPENAI_API_KEY,
-    baseURL: `https://${process.env.AZURE_OPENAI_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${deploymentName}`,
+    baseURL: `${azureOpenAIEndpoint()}/openai/deployments/${deploymentName}`,
     defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
     defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
   });
@@ -37,7 +43,7 @@ export const OpenAIEmbeddingInstance = () => {
 
   const openai = new OpenAI({
     apiKey: process.env.AZURE_OPENAI_API_KEY,
-    baseURL: `https://${process.env.AZURE_OPENAI_API_INSTANCE_NAME}.openai.azure.com/openai/deployments/${process.env.AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME}`,
+    baseURL: `${azureOpenAIEndpoint()}/openai/deployments/${process.env.AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME}`,
     defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
     defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
   });

@@ -228,6 +228,10 @@ const webPptRequest = parseTeamsOfficeRequest(
   "ミダックホールディングスの初回訪問用営業資料を12枚でPPT作成してください。会社概要は公式HPを参考にしてください"
 );
 assert.equal(webPptRequest?.action, "create_ppt");
+assert.equal(
+  webPptRequest?.title,
+  "ミダックホールディングス 初回訪問用営業資料"
+);
 const logoEditRequest = parseTeamsOfficeRequest(
   "添付ロゴを表紙に大きめに、各スライドの右上に小さく配置してください。また、スライド全体の色のトーンを白に変更してください"
 );
@@ -342,6 +346,7 @@ async function testWebGroundedPptAndLogoFollowup() {
     assert.match(createReply, /Officeファイルを作成しました/);
     assert.match(createReply, /https:\/\/www\.midac\.jp\/company\//);
     assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, webPptRequest.prompt);
+    assert.equal(sharedCompanyPlanInputs.at(-1).contentModelSource, "api");
     assert.equal(requests[0].body.slides.length, 11);
     assert.equal(requests[0].body.targetTotalSlides, 12);
     assert.equal(requests[0].body.promptIntent.documentPurpose, "company-intro");
