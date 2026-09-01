@@ -26,6 +26,7 @@ export type SharePointPdfSummaryResult = {
   pageCount: number;
   chunkCount: number;
   summary: string;
+  citationSource: DocumentSearchResponse;
 };
 
 function normalizedFileName(value: string): string {
@@ -296,10 +297,9 @@ export async function summarizeSharePointPdf(props: {
   const partials = await mapWithConcurrency(batches, MAP_CONCURRENCY, async (batch) =>
     withRetry(async () => {
       const completion = await openai.chat.completions.create(
-        {
-          model: "",
-          temperature: 0,
-          messages: [
+          {
+            model: "",
+            messages: [
             {
               role: "system",
               content:
@@ -331,7 +331,6 @@ export async function summarizeSharePointPdf(props: {
       openai.chat.completions.create(
         {
           model: "",
-          temperature: 0,
           max_completion_tokens: 16000,
           messages: [
             {
@@ -353,7 +352,6 @@ export async function summarizeSharePointPdf(props: {
           openai.chat.completions.create(
             {
               model: "",
-              temperature: 0,
               messages: [
                 {
                   role: "system",
@@ -386,7 +384,6 @@ export async function summarizeSharePointPdf(props: {
       openai.chat.completions.create(
         {
           model: "",
-          temperature: 0,
           max_completion_tokens: 16000,
           messages: [
             {
@@ -431,5 +428,6 @@ export async function summarizeSharePointPdf(props: {
     pageCount: validated.pageCount,
     chunkCount: validated.chunkCount,
     summary,
+    citationSource: candidate,
   };
 }
