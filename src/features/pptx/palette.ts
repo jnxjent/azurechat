@@ -135,6 +135,23 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
 
   // 数字参照: "1で"/"2で"... → palette by index (色名未検出時のみ)
   // 候補を個別評価し、ページ番号文脈・箇条書き/項目数文脈は除外
+  const barePaletteNumber = s.trim().match(/^([1-6１２３４５６])(?:番)?$/);
+  if (barePaletteNumber) {
+    const digit = barePaletteNumber[1];
+    const number = digit >= "1" && digit <= "6"
+      ? Number(digit)
+      : "１２３４５６".indexOf(digit) + 1;
+    const paletteKey = PPTX_PALETTE_KEYS[number - 1];
+    if (paletteKey) {
+      const palette = buildPaletteFromKey(paletteKey)!;
+      return {
+        paletteKey,
+        palette,
+        accentColor: PPTX_NAMED_PALETTES[paletteKey].main,
+      };
+    }
+  }
+
   let paletteNumMatch: RegExpMatchArray | null = null;
   const paletteNumberRe = /([1-6１-６])番?[でに]/g;
   let m: RegExpExecArray | null;

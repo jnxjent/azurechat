@@ -46,6 +46,14 @@ assert.equal(
   "1B4D3E"
 );
 assert.equal(
+  pptxPalette.resolvePptxPaletteInstruction("4").paletteKey,
+  "teal_coral"
+);
+assert.equal(
+  pptxPalette.resolvePptxPaletteInstruction("４").paletteKey,
+  "teal_coral"
+);
+assert.equal(
   intent.resolveRequiredImageToolName(
     "添付ロゴを使って白いパッカー車をデザインして",
     1
@@ -291,6 +299,16 @@ assert.ok(imageExtensions.includes("SavePendingPptxEdit"));
 assert.ok(imageExtensions.includes("LoadPendingPptxEdit"));
 assert.ok(imageExtensions.includes("ConsumePendingPptxEdit"));
 assert.ok(imageExtensions.includes("[pptx-pending-edit] resumed"));
+assert.ok(
+  imageExtensions.includes(
+    "[pptx-pending-edit] using bound attachment over model imageUrl"
+  )
+);
+assert.ok(
+  imageExtensions.includes(
+    "pendingAttachedImageDataUrl || validArgImageUrl"
+  )
+);
 assert.ok(imageExtensions.includes("pendingEdit.instruction"));
 assert.ok(imageExtensions.includes("requiresImage: needsImageUrl"));
 assert.ok(imageExtensions.includes("白基調の例外"));
@@ -301,6 +319,8 @@ assert.ok(
 
 const editPptxRoute = fs.readFileSync("app/api/edit-pptx/route.ts", "utf8");
 assert.ok(editPptxRoute.includes("normalizeLogoEditPlan"));
+assert.ok(editPptxRoute.includes("replaceExistingLogo"));
+assert.ok(editPptxRoute.includes("replaceExisting: true"));
 assert.ok(editPptxRoute.includes("prepareLogoImage"));
 assert.ok(editPptxRoute.includes("harmonizeWithLogo"));
 assert.ok(editPptxRoute.includes("slideIndex: -2"));
@@ -322,6 +342,9 @@ assert.ok(editPptxPython.includes("def _add_logo_contrast_plate"));
 assert.ok(editPptxPython.includes("MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE"));
 assert.ok(editPptxPython.includes("LOGO_SHAPE_NAME_PREFIX"));
 assert.ok(editPptxPython.includes("def ensure_logo_contrast_after_recolor"));
+assert.ok(editPptxPython.includes("def remove_existing_generated_logos"));
+assert.ok(editPptxPython.includes('item.get("replaceExisting")'));
+assert.ok(editPptxPython.includes('"removedImages": removed_images'));
 assert.ok(editPptxPython.includes('"repairedLogoPlates": repaired_logo_plates'));
 assert.ok(editPptxPython.includes("def force_slide_base_background"));
 assert.ok(editPptxPython.includes("def force_white_base_surfaces"));
@@ -343,6 +366,9 @@ const openAiStream = fs.readFileSync(
 assert.ok(openAiStream.includes('.on("end"'));
 assert.ok(openAiStream.includes("buildToolResultFallbackContent"));
 assert.ok(openAiStream.includes("runner ended without finalContent"));
+assert.ok(openAiStream.includes("hasGeneratedPptxResult"));
+assert.ok(openAiStream.includes("suppressed citations for PPTX result"));
+assert.ok(openAiStream.includes("removeCitationMarkup(content).trimEnd()"));
 
 const chatStoreSource = fs.readFileSync(
   "features/chat-page/chat-store.tsx",
@@ -364,4 +390,17 @@ assert.ok(
     baseSelection.indexOf("explicitBaseUrl")
 );
 
-console.log("Image upload/edit regression tests: 83 assertions passed");
+const chatApiSource = fs.readFileSync(
+  "features/chat-page/chat-services/chat-api/chat-api.ts",
+  "utf8"
+);
+assert.ok(chatApiSource.includes("asksToReplaceLogoWithAttachment"));
+assert.ok(chatApiSource.includes("差し替"));
+assert.ok(imageExtensions.includes("hasReplacementAction"));
+assert.ok(imageExtensions.includes("needsAttachedImage"));
+assert.ok(imageExtensions.includes("resolveLatestStoredImageDataUrl(props.chatThread.id)"));
+assert.ok(editPptxRoute.includes("explicitlyReplacesExistingLogo"));
+assert.ok(editPptxRoute.includes("replaceExistingLogo || explicitlyReplacesExistingLogo"));
+assert.ok(editPptxRoute.includes("needsDefaultReplacementPlacement"));
+
+console.log("Image upload/edit regression tests: 96 assertions passed");

@@ -96,6 +96,30 @@ function extractToolCitationItems(toolResults: string[]): CitationMarkupItem[] {
   return Array.from(new Map(items.map((item) => [item.id, item])).values());
 }
 
+function hasGeneratedPptxResult(toolResults: string[]): boolean {
+  return toolResults.some((toolResult) => {
+    try {
+      const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+      const fileName =
+        typeof parsed.fileName === "string" ? parsed.fileName : "";
+      const displayName =
+        typeof parsed.displayName === "string" ? parsed.displayName : "";
+      const downloadUrl =
+        typeof parsed.downloadUrl === "string" ? parsed.downloadUrl : "";
+      const message = typeof parsed.message === "string" ? parsed.message : "";
+
+      return (
+        /\.pptx$/i.test(fileName) ||
+        /\.pptx$/i.test(displayName) ||
+        /\.pptx(?:$|[?#])/i.test(downloadUrl) ||
+        (Boolean(downloadUrl) && /PowerPoint/i.test(message))
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
 /**
  * Rebuild citations from IDs that were actually created by server-side tools.
  * This prevents model-specific Markdoc formatting differences from leaking into UI.
@@ -104,6 +128,15 @@ function normalizeFinalCitations(
   content: string,
   toolResults: string[]
 ): string {
+  // Search results may be used to ground a generated deck, but they are not
+  // citations for the short PPTX download response. Do not expose every
+  // retrieval candidate as a citation list after PPTX creation or editing.
+  if (hasGeneratedPptxResult(toolResults)) {
+    const body = removeCitationMarkup(content).trimEnd();
+    console.log("[open-ai-stream] suppressed citations for PPTX result");
+    return body;
+  }
+
   const available = extractToolCitationItems(toolResults);
   if (!available.length) return content;
 

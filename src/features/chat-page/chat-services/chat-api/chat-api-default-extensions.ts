@@ -1793,22 +1793,43 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) =>
-        await executeEditPptx(
+      function: async (args: any) => {
+        const imageIntentText = [props.userMessage, args?.instruction]
+          .map((value) => String(value ?? "").trim())
+          .filter(Boolean)
+          .join("\n");
+        const needsAttachedImage =
+          hasExplicitPptxImageInsertRequest(imageIntentText);
+        let resolvedImageUrl = resolvePptxEditImageSource(
+          args?.imageUrl,
+          props.imageAttachmentUrls
+        );
+        if (!resolvedImageUrl && needsAttachedImage) {
+          resolvedImageUrl =
+            (await resolveLatestStoredImageDataUrl(props.chatThread.id).catch(
+              () => null
+            )) ?? "";
+        }
+        if (!resolvedImageUrl && needsAttachedImage) {
+          return {
+            error:
+              "添付画像を取得できなかったため、PPTXは変更していません。差し替える画像を添付して、もう一度実行してください。",
+          };
+        }
+
+        return await executeEditPptx(
           {
             ...args,
             fileUrl:
               String(args?.fileUrl ?? "").trim() ||
               (await resolveLatestPptxInfoFromThread(props.chatThread.id))?.url ||
               "",
-            imageUrl: resolvePptxEditImageSource(
-              args?.imageUrl,
-              props.imageAttachmentUrls
-            ),
+            imageUrl: resolvedImageUrl,
           },
           props.chatThread,
           props.userMessage
-        ),
+        );
+      },
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -6827,6 +6848,8 @@ function buildEditLabel(instruction: string): string {
 
 function hasExplicitPptxImageInsertRequest(text: string): boolean {
   const value = String(text ?? "");
+  const hasReplacementAction =
+    /差し替|差替|置き換|交換|replace|swap/i.test(value);
   const hasAsset = /ロゴ|logo|画像|写真|添付画像|イラスト|image|photo/i.test(value);
   const hasPositiveAction =
     /(?:ロゴ|logo|画像|写真|添付画像|イラスト).{0,28}(?:入れ|挿入|配置して|載せ|追加|貼り|使って|右肩に|表紙に)/i.test(value) ||
@@ -6834,7 +6857,7 @@ function hasExplicitPptxImageInsertRequest(text: string): boolean {
   const preservationOnly =
     /(?:ロゴ|logo|画像|写真|イラスト).{0,28}(?:変更しない|変えない|そのまま|維持|触らない)/i.test(value) &&
     !hasPositiveAction;
-  return hasAsset && hasPositiveAction && !preservationOnly;
+  return hasAsset && (hasPositiveAction || hasReplacementAction) && !preservationOnly;
 }
 
 // ---------------- 既存 PPTX 改良 ----------------
@@ -6849,6 +6872,7 @@ async function executeEditPptx(
     return { error: "instructionは必須です。編集内容を指定してください。" };
   }
   let resumedPendingEdit = false;
+  let pendingAttachedImageDataUrl = "";
   const accentReplyText = userMessage?.trim() || instruction.trim();
   const accentReplyPalette = resolvePptxPaletteInstruction(accentReplyText);
   const isStandaloneAccentReply =
@@ -6873,6 +6897,16 @@ async function executeEditPptx(
           return {
             error:
               "保留中のPPT編集で使用する添付画像を確認できませんでした。同じロゴを添付し、白基調とアクセントカラーを一度のメッセージで指定してください。",
+          };
+        }
+        pendingAttachedImageDataUrl =
+          (await resolveLatestStoredImageDataUrl(chatThread.id).catch(
+            () => null
+          )) ?? "";
+        if (!pendingAttachedImageDataUrl) {
+          return {
+            error:
+              "保留中のPPT編集で使用する添付画像を読み込めませんでした。同じロゴを添付して、もう一度編集を依頼してください。",
           };
         }
       }
@@ -6934,7 +6968,13 @@ async function executeEditPptx(
       reason: needsImageUrl ? "unsupported-reference" : "no-current-image-insert-intent",
     });
   }
-  let resolvedImageUrl = validArgImageUrl;
+  // 保留編集に紐づけた添付画像は、2ターン目にツールLLMが生成した
+  // Web検索URLより常に優先する。これによりロゴが無関係なWeb画像へ
+  // 置き換わることを防ぐ。
+  let resolvedImageUrl = pendingAttachedImageDataUrl || validArgImageUrl;
+  if (pendingAttachedImageDataUrl && validArgImageUrl !== pendingAttachedImageDataUrl) {
+    console.log("[pptx-pending-edit] using bound attachment over model imageUrl");
+  }
   if (!resolvedImageUrl && needsImageUrl && !/https?:\/\//.test(instruction)) {
     const historyImageUrl =
       (await resolveLatestImageUrlFromThread(chatThread.id)) ?? "";

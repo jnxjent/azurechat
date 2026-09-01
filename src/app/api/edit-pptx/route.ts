@@ -33,6 +33,7 @@ type ImageInsert = {
   widthPct?: number;
   role?: "logo" | "image";
   removeWhiteBackground?: boolean;
+  replaceExisting?: boolean; // system-added image of the same roleを先に削除
   imagePath?: string; // set after download/generation, before Python call
 };
 
@@ -235,6 +236,8 @@ function tryBuildDirectPlan(instruction: string, _slides: unknown[]): EditPlan |
 
   const naturalLogoIntegration =
     isLogo && /自然|なじ|馴染|背景.{0,8}白|配色|色.{0,8}調整|ブランド/i.test(instruction);
+  const explicitlyReplacesLogo =
+    /差し替|差替|置き換|交換|replace|swap/i.test(instruction);
   const coverAndBodyLogo =
     isLogo &&
     /表紙|フロント|front/i.test(instruction) &&
@@ -295,19 +298,32 @@ function normalizeLogoEditPlan(
     "";
   const naturalLogoIntegration =
     /自然|なじ|馴染|背景.{0,8}白|配色|色.{0,8}調整|ブランド/i.test(instruction);
+  const replaceExistingLogo =
+    /(?:ロゴ|logo).{0,24}(?:差し替|差替|置き換|入れ替|交換)/i.test(instruction) ||
+    /(?:差し替|差替|置き換|入れ替|交換).{0,24}(?:ロゴ|logo)/i.test(instruction);
   const coverAndBodyLogo =
     /表紙|フロント|front/i.test(instruction) &&
     /各スライド|全スライド|各ページ|全ページ|右肩/i.test(instruction);
+
+  const explicitlyReplacesExistingLogo =
+    /差し替|差替|置き換|交換|replace|swap/i.test(instruction);
 
   const logoDefaults = (item: ImageInsert): ImageInsert => ({
     ...item,
     ...(existingUrl ? { imageUrl: existingUrl, imagePrompt: undefined } : {}),
     role: "logo",
     removeWhiteBackground: true,
+    ...(replaceExistingLogo || explicitlyReplacesExistingLogo
+      ? { replaceExisting: true }
+      : {}),
     position: item.position ?? "top-right",
   });
 
-  const imageInserts = coverAndBodyLogo && existingUrl
+  const needsDefaultReplacementPlacement =
+    (replaceExistingLogo || explicitlyReplacesExistingLogo) &&
+    (plan.imageInserts?.length ?? 0) === 0;
+  const imageInserts =
+    (coverAndBodyLogo || needsDefaultReplacementPlacement) && existingUrl
     ? [
         logoDefaults({ slideIndex: 0, widthPct: 24, position: "top-right" }),
         logoDefaults({ slideIndex: -2, widthPct: 8, position: "top-right" }),
@@ -369,7 +385,8 @@ Return JSON only in this shape:
       "position": "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center",
       "widthPct": number,
       "role": "logo" | "image",
-      "removeWhiteBackground": boolean
+      "removeWhiteBackground": boolean,
+      "replaceExisting": boolean
     }
   ]
 }
@@ -390,6 +407,7 @@ Rules:
   - position: fallback position if nearText shape is not found. Use "top-right" for decorative icons and logos. Never use "top-left" as it may overlap slide content.
   - widthPct: image width as percentage of slide width. Use 6-8 for small inline icons, 10-15 for logos, 30-50 for large illustrations. Default 12 for logos (imageUrl), 8 when nearText is set, 13 otherwise.
   - For an existing logo asset, set role="logo" and removeWhiteBackground=true. Never redraw or regenerate a supplied logo.
+  - If the user explicitly asks to replace/swap an existing logo, set replaceExisting=true. Do not set it for a normal add/insert request.
   - If the cover needs a larger logo and every other slide needs a small top-right logo, emit two inserts: slideIndex=0 at widthPct 20-26 and slideIndex=-2 at widthPct 6-9.
 - Only emit imageInserts when the user explicitly requests an image or visual element.
 - Keep the JSON minimal. Use null or [] when not needed.`;

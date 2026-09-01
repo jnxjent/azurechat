@@ -71,6 +71,10 @@ function normalizeImageAttachments(value: unknown): string[] {
  */
 function isPptxAssetPlacementRequest(message: string): boolean {
   const value = String(message ?? "");
+  const asksToReplaceLogoWithAttachment =
+    /^(?=[\s\S]*(?:ロゴ|logo))(?=[\s\S]*(?:添付|アップロード|attachment))(?=[\s\S]*(?:差し替|差替|置き換|交換|replace|swap))[\s\S]*$/i.test(
+      value
+    );
   const referencesExistingDeck =
     /(?:添付|上記|この|今の|先ほど|さきほど|出力した|生成した|作成した|既存の).{0,16}(?:PPTX?|PowerPoint|スライド|資料)/i.test(
       value
@@ -85,7 +89,8 @@ function isPptxAssetPlacementRequest(message: string): boolean {
     /(?:入れ|挿入|配置|載せ|追加).{0,20}(?:ロゴ|logo|添付画像)/i.test(
       value
     );
-  return referencesExistingDeck && asksForAssetPlacement;
+  return asksToReplaceLogoWithAttachment ||
+    (referencesExistingDeck && asksForAssetPlacement);
 }
 
 /** ★最小ガード：直前 assistant.tool_calls に紐付かない tool を history から除外 */

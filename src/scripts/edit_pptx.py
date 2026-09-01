@@ -683,6 +683,24 @@ def _find_logo_plate(slide, logo_shape):
     return None
 
 
+def remove_existing_generated_logos(slide) -> int:
+    """Remove only logos and contrast plates previously inserted by this editor."""
+    removed = 0
+    for shape in list(slide.shapes):
+        name = str(getattr(shape, "name", ""))
+        if not (
+            name.startswith(LOGO_SHAPE_NAME_PREFIX)
+            or name.startswith(LOGO_PLATE_NAME_PREFIX)
+        ):
+            continue
+        try:
+            slide.shapes._spTree.remove(shape.element)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
 def ensure_logo_contrast_after_recolor(
     slide,
     slide_width: int,
@@ -1988,6 +2006,7 @@ def main() -> None:
     chars_before = count_all_run_chars(prs)
     changed_slides: set[int] = set()
     inserted_images: int = 0
+    removed_images: int = 0
     repaired_logo_plates: int = 0
     layout_warnings: list[str] = []
     changed_fills: int = 0
@@ -2140,6 +2159,11 @@ def main() -> None:
             + all_slides_inserts
             + (body_slides_inserts if slide_index > 0 else [])
         )
+        if any(
+            bool(item.get("replaceExisting")) and item.get("role") == "logo"
+            for item in effective_image_inserts
+        ):
+            removed_images += remove_existing_generated_logos(slide)
         for img_item in effective_image_inserts:
             image_path = img_item.get("imagePath")
             if image_path and Path(image_path).exists():
@@ -2187,6 +2211,7 @@ def main() -> None:
       "changedSlideIndices": sorted(changed_slides),
       "totalSlides": len(prs.slides),
       "insertedImages": inserted_images,
+      "removedImages": removed_images,
       "repairedLogoPlates": repaired_logo_plates,
       "charsBefore": chars_before,
       "charsAfter": chars_after,
