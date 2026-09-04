@@ -6,6 +6,7 @@
     "dev": "next dev",
     "dev:teams": "next dev",
     "teams:playground": "teamsapptester start --app-endpoint http://localhost:3000/api/teams/messages --channel-id msteams --disable-telemetry",
+    "test:sf-routing": "node scripts/test-salesforce-routing.cjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

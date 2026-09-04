@@ -6,6 +6,10 @@ import "server-only";
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
 
 import { getCurrentUser } from "@/features/auth-page/helpers";
+import { isSalesforceAllowedEmail } from "@/features/common/services/salesforce-access";
+import {
+  resolveSalesforceRoute,
+} from "@/features/common/services/salesforce-routing";
 import { FindAllExtensionForCurrentUser } from "@/features/extensions-page/extension-services/extension-service";
 import { CHAT_DEFAULT_SYSTEM_PROMPT } from "@/features/theme/theme-config";
 import { ChatCompletionStreamingRunner } from "openai/resources/beta/chat/completions";
@@ -137,6 +141,32 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     return new Response("", { status: 401 });
   }
   const currentChatThread = currentChatThreadResponse.response;
+  const user = await getCurrentUser();
+  const hasSalesforceExtension =
+    Boolean(SF_EXTENSION_ID) &&
+    currentChatThread.extension.includes(SF_EXTENSION_ID);
+  const salesforceAllowed = isSalesforceAllowedEmail(user.email);
+  const salesforceRouting = resolveSalesforceRoute({
+    message: props.message,
+    isSalesforceAllowed: salesforceAllowed,
+    hasSalesforceExtension,
+  });
+  const executionChatThread: ChatThreadModel =
+    salesforceRouting.route === "salesforce" || !hasSalesforceExtension
+      ? currentChatThread
+      : {
+          ...currentChatThread,
+          extension: currentChatThread.extension.filter(
+            (extensionId) => extensionId !== SF_EXTENSION_ID
+          ),
+        };
+
+  console.log("[SF Route]", {
+    channel: "web",
+    allowed: salesforceAllowed,
+    intent: salesforceRouting.intent,
+    route: salesforceRouting.route,
+  });
 
   const p = props as UserPromptWithMode;
   const imageAttachmentUrls = normalizeImageAttachments(
@@ -192,12 +222,11 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   }
 
   // 並列取得（extensions に mode を渡す）
-  const [user, history, docs, extension] = await Promise.all([
-    getCurrentUser(),
+  const [history, docs, extension] = await Promise.all([
     _getHistory(currentChatThread),
     _getDocuments(currentChatThread),
     _getExtensions({
-      chatThread: currentChatThread,
+      chatThread: executionChatThread,
       userMessage: props.message,
       imageAttachmentUrls,
       signal,
@@ -220,9 +249,12 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   }
 
   currentChatThread.personaMessage = `${CHAT_DEFAULT_SYSTEM_PROMPT} \n\n ${currentChatThread.personaMessage}`;
+  executionChatThread.personaMessage = currentChatThread.personaMessage;
 
   let chatType: ChatTypes = "extensions";
-  if (shouldUseImageEditTools) {
+  if (salesforceRouting.route !== "normal") {
+    chatType = "extensions";
+  } else if (shouldUseImageEditTools) {
     chatType = "extensions";
   } else if (imageAttachmentUrls.length > 0) {
     chatType = "multimodal";
@@ -261,11 +293,13 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     case "extensions":
     default:
       runner = await ChatApiExtensions({
-        chatThread: currentChatThread,
+        chatThread: executionChatThread,
         userMessage: props.message,
         history,
         extensions: extension,
         requiredToolName: requiredImageToolName,
+        loginEmail: user.email,
+        salesforceRouting,
         signal,
         mode: resolvedMode,
       });

@@ -18,6 +18,12 @@ import {
 } from "./teams-usage-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
 import { readLatestTeamsFiles, receiveTeamsFiles } from "./teams-file-service";
+import { isSalesforceAllowedEmail } from "@/features/common/services/salesforce-access";
+import { resolveSalesforceRoute } from "@/features/common/services/salesforce-routing";
+import {
+  isTeamsSalesforceConfigured,
+  queryTeamsSalesforce,
+} from "./teams-salesforce-service";
 import {
   referencesTeamsUpload,
   stripTeamsAttachmentMarkup,
@@ -174,6 +180,46 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
       // The LLM may decide to use ACL-aware internal search after this routing
       // step, so resolve the Teams member before entering the chat service.
       const userEmail = await resolveActivityUserEmail({ activity, api });
+      const salesforceAllowed = isSalesforceAllowedEmail(userEmail);
+      const salesforceRouting = resolveSalesforceRoute({
+        message: messageText,
+        isSalesforceAllowed: salesforceAllowed,
+        hasSalesforceExtension: isTeamsSalesforceConfigured(),
+      });
+      console.log("[SF Route]", {
+        channel: "teams",
+        allowed: salesforceAllowed,
+        intent: salesforceRouting.intent,
+        route: salesforceRouting.route,
+      });
+
+      if (salesforceRouting.route === "denied") {
+        await send(
+          "Salesforceの参照権限を確認できないため、Salesforce上の情報は取得できません。SharePoint上の社内資料を検索する場合は、そのように指定してください。"
+        );
+        await recordCompletedTeamsTurn({
+          conversationId,
+          activityId,
+          teamsUserId,
+        });
+        return;
+      }
+
+      if (salesforceRouting.route === "salesforce" && userEmail) {
+        const reply = await queryTeamsSalesforce({
+          message: messageText,
+          userEmail,
+          conversationId,
+          activityId,
+        });
+        await send(reply);
+        await recordCompletedTeamsTurn({
+          conversationId,
+          activityId,
+          teamsUserId,
+        });
+        return;
+      }
 
       if (officeRequest) {
         const startMessage = buildOfficeStartMessage(officeRequest);
@@ -197,6 +243,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         conversationId,
         message: messageText,
         userEmail,
+        forceKnowledgeSearch: salesforceRouting.route === "knowledge",
       });
       await send(result.text);
       if (result.type === "reply") {
@@ -354,20 +401,24 @@ async function resolveActivityUserEmail(props: {
     };
   };
 }): Promise<string | null> {
-  const directEmail = firstEmail(
-    props.activity.from?.properties?.email,
-    props.activity.from?.properties?.userPrincipalName
-  );
-  if (directEmail) return directEmail;
+  const localDevEmail = isLocalAuthSkipped()
+    ? firstEmail(process.env.NEXT_PUBLIC_DEV_USER_EMAIL)
+    : null;
+  if (localDevEmail) {
+    return localDevEmail;
+  }
 
   const conversationId = props.activity.conversation?.id;
   const memberId = props.activity.from?.id;
-  if (
-    String(props.activity.channelId ?? "") !== "msteams" ||
-    !conversationId ||
-    !memberId
-  ) {
-    return null;
+  if (String(props.activity.channelId ?? "") !== "msteams") {
+    return isLocalAuthSkipped()
+      ? firstEmail(process.env.NEXT_PUBLIC_DEV_USER_EMAIL)
+      : null;
+  }
+  if (!conversationId || !memberId) {
+    return isLocalAuthSkipped()
+      ? firstEmail(process.env.NEXT_PUBLIC_DEV_USER_EMAIL)
+      : null;
   }
 
   try {
@@ -377,7 +428,9 @@ async function resolveActivityUserEmail(props: {
     return firstEmail(member.email, member.userPrincipalName);
   } catch (error) {
     console.warn("[teams] Failed to resolve conversation member", error);
-    return null;
+    return isLocalAuthSkipped()
+      ? firstEmail(process.env.NEXT_PUBLIC_DEV_USER_EMAIL)
+      : null;
   }
 }
 
