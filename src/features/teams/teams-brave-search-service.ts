@@ -51,7 +51,7 @@ export function resolveBraveSearchRequest(message: string): {
   }
 
   const autoSearchPattern =
-    /(最新|現在|今日|ニュース|天気|株価|為替|価格|検索して|調べて|ウェブ|web|brave|インターネット|外部情報|公式サイト)/i;
+    /(最新|現在|今日|ニュース|天気|株価|為替|価格|検索して|調べて|ウェブ|web|brave|インターネット|外部情報|公式\s*(?:サイト|hp|ホームページ))/i;
   return {
     enabled: autoSearchPattern.test(trimmed),
     query: trimmed,

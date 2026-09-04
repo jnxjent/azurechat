@@ -96,13 +96,16 @@ export const DeleteBlob = async (
   blobPath: string
 ): Promise<ServerActionResponse<boolean>> => {
   try {
-    const deleted = await InitBlobServiceClient()
+    const blockBlobClient = InitBlobServiceClient()
       .getContainerClient(containerName)
-      .getBlockBlobClient(blobPath)
-      .deleteIfExists();
-    return { status: "OK", response: deleted.succeeded };
+      .getBlockBlobClient(blobPath);
+    await blockBlobClient.deleteIfExists({ deleteSnapshots: "include" });
+    return { status: "OK", response: true };
   } catch (e) {
-    return { status: "ERROR", errors: [{ message: `DeleteBlob failed: ${String(e)}` }] };
+    return {
+      status: "ERROR",
+      errors: [{ message: `DeleteBlob failed: ${String(e)}` }],
+    };
   }
 };
 

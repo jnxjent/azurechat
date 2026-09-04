@@ -6,6 +6,7 @@
     "dev": "next dev",
     "dev:teams": "next dev",
     "teams:playground": "teamsapptester start --app-endpoint http://localhost:3000/api/teams/messages --channel-id msteams --disable-telemetry",
+    "test:sf-routing": "node scripts/test-salesforce-routing.cjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
@@ -60,6 +61,7 @@
     "tailwind-merge": "^2.1.0",
     "tailwindcss-animate": "^1.0.7",
     "valtio": "^1.12.1",
+    "word-extractor": "^1.0.4",
     "xlsx": "^0.18.5",
     "zod": "^3.22.4"
   },

@@ -4,6 +4,11 @@ const Module = require("module");
 const path = require("path");
 const ts = require("typescript");
 
+const braveQueries = [];
+const pptPlanInputs = [];
+const sharedCompanyPlanInputs = [];
+const sharePointSummaryInputs = [];
+
 function loadOfficeService() {
   const storedBlobs = new Map();
   const fileName = path.resolve("features/teams/teams-office-service.ts");
@@ -45,9 +50,99 @@ function loadOfficeService() {
         resolvePptxPaletteInstruction: () => null,
       };
     }
+    if (request === "@/features/auth-page/helpers") {
+      return { hashValue: (value) => value };
+    }
+    if (request === "@/lib/sl-dept") {
+      return { resolveSlAccess: () => ({ dept: "bm" }) };
+    }
+    if (
+      request ===
+      "@/features/chat-page/chat-services/sharepoint-summary-service"
+    ) {
+      return {
+        summarizeSharePointPdf: async (props) => {
+          sharePointSummaryInputs.push(props);
+          return {
+            fileName: "令和7年度環境白書.pdf",
+            summary: "全文要約テスト",
+          };
+        },
+      };
+    }
+    if (
+      request ===
+      "@/features/chat-page/chat-services/chat-api/chat-api-default-extensions"
+    ) {
+      return {
+        isSharedCompanyProfilePptRequest: async ({ title, userPrompt }) =>
+          /初回訪問|会社概要|公式\s*(?:HP|ホームページ|サイト)/i.test(
+            `${title} ${userPrompt}`
+          ),
+        createSharedCompanyProfilePptPlan: async (props) => {
+          sharedCompanyPlanInputs.push(props);
+          return {
+            companyName: "株式会社ミダックホールディングス",
+            slides: Array.from({ length: 11 }, (_, index) => ({
+              title: `公式情報${index + 1}`,
+              bullets: ["公式サイト本文から確認した具体的な会社情報"],
+            })),
+            targetTotalSlides: 12,
+            sourceEvidence: "公式サイト本文",
+            sourceUrls: ["https://www.midac.jp/company/"],
+            officialDomain: "midac.jp",
+            promptIntent: {
+              documentPurpose: "company-intro",
+              audience: "customer",
+              designFreedom: "guided",
+              layoutDirectives: {},
+            },
+          };
+        },
+      };
+    }
+    if (request === "./teams-brave-search-service") {
+      return {
+        resolveBraveSearchRequest: (message) => ({
+          enabled: /公式\s*(?:HP|ホームページ|サイト)/i.test(message),
+          query: message,
+          skipInternalSearch: false,
+        }),
+        searchBraveWeb: async ({ query }) => {
+          braveQueries.push(query);
+          return {
+            context:
+              "[1] 株式会社ミダックホールディングス 公式サイト\nURL: https://www.midac.jp/\n産業廃棄物処理事業を展開しています。",
+            sources: [
+              {
+                index: 1,
+                name: "株式会社ミダックホールディングス 公式サイト",
+                url: "https://www.midac.jp/",
+                kind: "web",
+              },
+            ],
+          };
+        },
+      };
+    }
+    if (request === "./teams-ppt-plan-service") {
+      return {
+        createTeamsPptPlan: async (props) => {
+          pptPlanInputs.push(props);
+          return {
+            title: props.title,
+            slides: Array.from({ length: 11 }, (_, index) => ({
+              title: `本文${index + 1}`,
+              bullets: ["確認済み情報"],
+            })),
+            targetTotalSlides: 12,
+          };
+        },
+        createTeamsPptCardEdits: async () => [],
+      };
+    }
     if (
       request === "./teams-search-service" ||
-      request === "./teams-ppt-plan-service" ||
       request === "./teams-word-proofread-service"
     ) {
       return {};
@@ -77,6 +172,14 @@ assert.equal(
   )?.action,
   "pdf_to_word"
 );
+const summaryRequest = parseTeamsOfficeRequest(
+  "SharePointにある「令和7年度環境白書.pdf」を先頭から最終ページまで全文要約し、約10ページ（7,000～8,000文字）のWordファイルにしてください"
+);
+assert.equal(summaryRequest?.action, "summarize_sp_pdf_to_word");
+assert.equal(summaryRequest?.fileQuery, "令和7年度環境白書.pdf");
+assert.equal(summaryRequest?.targetPages, 10);
+assert.equal(summaryRequest?.targetCharsLow, 7000);
+assert.equal(summaryRequest?.targetCharsHigh, 8000);
 assert.equal(
   parseTeamsOfficeRequest(
     "PowerPointに変換して\n添付ファイル: report.pdf"
@@ -129,6 +232,43 @@ assert.equal(
   parseTeamsOfficeRequest("P2のタイトルだけを英語に変更して")?.action,
   "edit_latest_ppt"
 );
+
+const webPptRequest = parseTeamsOfficeRequest(
+  "ミダックホールディングスの初回訪問用営業資料を12枚でPPT作成してください。会社概要は公式HPを参考にしてください"
+);
+assert.equal(webPptRequest?.action, "create_ppt");
+assert.equal(
+  webPptRequest?.title,
+  "ミダックホールディングス 初回訪問用営業資料"
+);
+const logoEditRequest = parseTeamsOfficeRequest(
+  "添付ロゴを表紙に大きめに、各スライドの右上に小さく配置してください。また、スライド全体の色のトーンを白に変更してください"
+);
+assert.equal(logoEditRequest?.action, "edit_latest_ppt");
+assert.deepEqual(logoEditRequest?.targetPages, []);
+const logoReplacementRequest = parseTeamsOfficeRequest(
+  "PPTに入れたLogoを添付と差し替えてPPTを出してください"
+);
+assert.equal(logoReplacementRequest?.action, "edit_latest_ppt");
+assert.deepEqual(logoReplacementRequest?.targetPages, []);
+
+assert.equal(
+  parseTeamsOfficeRequest("スライドの色を変えたい")?.action,
+  "ppt_color_help"
+);
+assert.equal(
+  parseTeamsOfficeRequest("ティール×コーラル")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(
+  parseTeamsOfficeRequest("4でお願いします")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(
+  parseTeamsOfficeRequest("やはり２に変えて")?.action,
+  "edit_latest_ppt_color"
+);
+assert.equal(parseTeamsOfficeRequest("緑について教えて"), null);
 
 const refine = parseTeamsOfficeRequest(
   "P2のシートを再変換して\n添付ファイル: report.xlsx"
@@ -201,7 +341,138 @@ async function testPdfTranslationExecutionAndFollowup() {
   }
 }
 
+async function testWebGroundedPptAndLogoFollowup() {
+  const conversationId = "web-ppt-logo-test-conversation";
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    if (!init?.body) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from("test-logo-image"),
+      };
+    }
+    const body = JSON.parse(init.body);
+    requests.push({ url: String(url), body });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        downloadUrl:
+          requests.length === 1
+            ? "https://example.test/initial.pptx"
+            : requests.length === 2
+            ? "https://example.test/edited.pptx"
+            : "https://example.test/replaced.pptx",
+        fileName:
+          requests.length === 1
+            ? "initial.pptx"
+            : requests.length === 2
+            ? "edited.pptx"
+            : "replaced.pptx",
+      }),
+    };
+  };
+
+  try {
+    const createReply = await executeTeamsOfficeRequest({
+      request: webPptRequest,
+      conversationId,
+      uploadedFiles: [],
+    });
+    assert.match(createReply, /Officeファイルを作成しました/);
+    assert.match(createReply, /https:\/\/www\.midac\.jp\/company\//);
+    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, webPptRequest.prompt);
+    assert.equal(sharedCompanyPlanInputs.at(-1).contentModelSource, "api");
+    assert.equal(requests[0].body.slides.length, 11);
+    assert.equal(requests[0].body.targetTotalSlides, 12);
+    assert.equal(requests[0].body.promptIntent.documentPurpose, "company-intro");
+
+    const logo = {
+      extension: "png",
+      fileName: "midac_logo.png",
+      savedAt: Date.now(),
+      size: 100,
+      url: "https://example.test/midac_logo.png?sig=test",
+    };
+    const editReply = await executeTeamsOfficeRequest({
+      request: logoEditRequest,
+      conversationId,
+      uploadedFiles: [logo],
+    });
+    assert.match(editReply, /PowerPointを編集しました（全体）/);
+    assert.equal(requests[1].body.fileUrl, "https://example.test/initial.pptx");
+    assert.equal(requests[1].body.instruction, logoEditRequest.instruction);
+    assert.match(requests[1].body.imageDataUrl, /^data:image\/png;base64,/);
+    assert.match(requests[1].body.instruction, /色のトーンを白/);
+
+    const replacementLogo = {
+      extension: "png",
+      fileName: "replacement_logo.png",
+      savedAt: Date.now(),
+      size: 100,
+      url: "https://example.test/replacement_logo.png?sig=test",
+    };
+    const replacementReply = await executeTeamsOfficeRequest({
+      request: logoReplacementRequest,
+      conversationId,
+      uploadedFiles: [replacementLogo],
+    });
+    assert.match(replacementReply, /PowerPointを編集しました（全体）/);
+    assert.equal(requests[2].body.fileUrl, "https://example.test/edited.pptx");
+    assert.equal(
+      requests[2].body.instruction,
+      logoReplacementRequest.instruction
+    );
+    assert.match(requests[2].body.imageDataUrl, /^data:image\/png;base64,/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalLocalEmail = process.env.SL_LOCAL_DEFAULT_EMAIL;
+  const originalFetch = global.fetch;
+  process.env.NODE_ENV = "development";
+  process.env.SL_LOCAL_DEFAULT_EMAIL = "j.nomoto@midac.jp";
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      downloadUrl: "https://example.test/environment-summary.docx",
+      fileName: "令和7年度環境白書_要約.docx",
+    }),
+  });
+
+  try {
+    const reply = await executeTeamsOfficeRequest({
+      request: summaryRequest,
+      conversationId: "local-summary-test-conversation",
+      uploadedFiles: [],
+      userEmail: "playground-user@example.com",
+    });
+    assert.match(reply, /SharePoint PDFを先頭から最終ページまで要約/);
+    assert.equal(
+      sharePointSummaryInputs.at(-1).userHash,
+      "j.nomoto@midac.jp"
+    );
+    assert.equal(sharePointSummaryInputs.at(-1).deptLower, "bm");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalLocalEmail === undefined)
+      delete process.env.SL_LOCAL_DEFAULT_EMAIL;
+    else process.env.SL_LOCAL_DEFAULT_EMAIL = originalLocalEmail;
+  }
+}
+
 testPdfTranslationExecutionAndFollowup()
+  .then(testWebGroundedPptAndLogoFollowup)
+  .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })

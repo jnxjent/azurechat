@@ -221,6 +221,27 @@ export function isSupportedImageReferenceUrl(value: string): boolean {
   }
 }
 
+/**
+ * Resolve the image source for a PowerPoint edit. An image attached in the
+ * current turn is authoritative; model-authored placeholders such as
+ * "添付画像" or "attachment://logo" must never shadow it.
+ */
+export function resolvePptxEditImageSource(
+  modelImageUrl: unknown,
+  currentAttachmentUrls: unknown
+): string {
+  const attachments = Array.isArray(currentAttachmentUrls)
+    ? currentAttachmentUrls
+    : [];
+  for (let index = attachments.length - 1; index >= 0; index--) {
+    const candidate = String(attachments[index] ?? "").trim();
+    if (isSupportedImageReferenceUrl(candidate)) return candidate;
+  }
+
+  const modelCandidate = String(modelImageUrl ?? "").trim();
+  return isSupportedImageReferenceUrl(modelCandidate) ? modelCandidate : "";
+}
+
 /** Removes query strings such as SAS signatures before an image location is logged. */
 export function sanitizeImageLocationForLog(value: string): string {
   const normalized = String(value ?? "").trim();

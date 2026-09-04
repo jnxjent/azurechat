@@ -4,7 +4,7 @@ export type ThinkingModeInput = "standard" | "thinking" | "fast" | "normal";
 /** 内部で使う正規化済み3値 */
 export type ThinkingModeCanonical = "normal" | "thinking" | "fast";
 export type ReasoningOptions = {
-  reasoning_effort: "minimal" | "medium" | "high";  // ← "low" → "minimal"
+  reasoning_effort: "low" | "medium" | "high";  // ← "low" → "minimal"
   temperature: number;
 };
 /** 表記ゆれ → 正規化（standard→normal） */
@@ -15,10 +15,11 @@ export function canonicalizeMode(m?: ThinkingModeInput | null): ThinkingModeCano
   if (v === "standard" || v === "normal") return "normal";
   return "normal";
 }
-/** プリセット：fast=minimal / normal=medium / thinking=high */
+
+/** プリセット：fast=low / normal=low / thinking=high */
 const PRESETS: Record<ThinkingModeCanonical, ReasoningOptions> = {
-  fast:     { reasoning_effort: "minimal", temperature: 0.10 },  // ← "low" → "minimal"
-  normal:   { reasoning_effort: "minimal", temperature: 0.20 },
+  fast:     { reasoning_effort: "low", temperature: 0.10 },  // ← "low" → "minimal"
+  normal:   { reasoning_effort: "low", temperature: 0.20 },
   thinking: { reasoning_effort: "high",    temperature: 0.40 },
 };
 /** モードに応じて送信オプションを返す（auto は存在しない想定） */

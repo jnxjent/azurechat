@@ -34,6 +34,7 @@ export async function createTeamsChatReply(props: {
   conversationId: string;
   message: string;
   userEmail?: string | null;
+  forceKnowledgeSearch?: boolean;
 }): Promise<TeamsChatResult> {
   const message = props.message.trim();
   if (!message) {
@@ -86,11 +87,21 @@ export async function createTeamsChatReply(props: {
   let forceFinalAnswer = false;
 
   while (!answer) {
+    const forceInternalSearch =
+      Boolean(props.forceKnowledgeSearch) && internalSearchCalls === 0;
     const completion = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME ?? "",
       messages,
       ...(!braveRequest.skipInternalSearch && !forceFinalAnswer
-        ? { tools: [TEAMS_INTERNAL_SEARCH_TOOL], tool_choice: "auto" as const }
+        ? {
+            tools: [TEAMS_INTERNAL_SEARCH_TOOL],
+            tool_choice: forceInternalSearch
+              ? ({
+                  type: "function",
+                  function: { name: TEAMS_INTERNAL_SEARCH_TOOL_NAME },
+                } as const)
+              : ("auto" as const),
+          }
         : {}),
     });
     const assistantMessage = completion.choices[0]?.message;

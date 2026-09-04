@@ -28,9 +28,17 @@ import {
   findTeamsWordProofreadingReplacements,
 } from "./teams-word-proofread-service";
 import type { TeamsStoredFile } from "./teams-file-policy";
-import { summarizeSharePointPdf } from "@/features/chat-page/chat-services/sharepoint-summary-service";
 import { hashValue } from "@/features/auth-page/helpers";
 import { resolveSlAccess } from "@/lib/sl-dept";
+import { summarizeSharePointPdf } from "@/features/chat-page/chat-services/sharepoint-summary-service";
+import {
+  resolveBraveSearchRequest,
+  searchBraveWeb,
+} from "./teams-brave-search-service";
+import {
+  createSharedCompanyProfilePptPlan,
+  isSharedCompanyProfilePptRequest,
+} from "@/features/chat-page/chat-services/chat-api/chat-api-default-extensions";
 
 const PDF_TRANSLATION_LANGUAGE_NAMES = {
   en: "英語",
@@ -106,10 +114,6 @@ function parsePdfTranslationRequest(
 
 export type TeamsOfficeRequest =
   | {
-      action: "summarize_sp_pdf";
-      fileQuery: string;
-    }
-  | {
       action: "pdf_to_excel";
       fileQuery: string;
     }
@@ -141,6 +145,13 @@ export type TeamsOfficeRequest =
       action: "create_word";
       prompt: string;
       title: string;
+    }
+  | {
+      action: "summarize_sp_pdf_to_word";
+      fileQuery: string;
+      targetPages?: number;
+      targetCharsLow?: number;
+      targetCharsHigh?: number;
     }
   | {
       action: "create_ppt";
@@ -195,17 +206,6 @@ export function parseTeamsOfficeRequest(
   );
   if (pdfTranslationRequest) return pdfTranslationRequest;
 
-  // A PDF summary is not a PDF-to-Word conversion.  Route it before the
-  // generic Office conversion rules so requests such as "PDFを要約して、Word
-  // でも出して" do not accidentally select pdf_to_word.
-  const summaryFileQuery = extractPdfSummaryFileQuery(
-    normalized,
-    attachedFileQuery
-  );
-  if (summaryFileQuery) {
-    return { action: "summarize_sp_pdf", fileQuery: summaryFileQuery };
-  }
-
   const targetExcelSheets = extractTargetSheetNames(normalized);
   const hasExcelRefinementIntent =
     /(再変換|再抽出|精度|読み直|再読込|もう一度変換)/i.test(normalized);
@@ -222,30 +222,75 @@ export function parseTeamsOfficeRequest(
     };
   }
 
+  const hasPptEditingContext =
+    /(ppt|pptx|powerpoint|パワーポイント|スライド|プレゼン|資料)/i.test(
+      normalized
+    );
+  const hasPptColorTopic = /(色味|配色|カラー|色)/i.test(normalized);
   const asksForPptColorHelp =
-    /(ppt|pptx|powerpoint|パワーポイント)/i.test(normalized) &&
-    /(色味|配色|カラー|色)/i.test(normalized) &&
-    /(どういう|どんな|何色|候補|一覧|種類|できる|教えて)/i.test(normalized);
+    hasPptEditingContext &&
+    hasPptColorTopic &&
+    (/(どういう|どんな|何色|候補|一覧|種類|できる|教えて)/i.test(
+      normalized
+    ) ||
+      (/(変えたい|変更したい)/i.test(normalized) &&
+        !resolvePptxPaletteInstruction(normalized)));
   if (asksForPptColorHelp) {
     return { action: "ppt_color_help" };
   }
 
+  const asksForPptAssetInsertion =
+    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換)/i.test(
+      normalized
+    ) ||
+    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
+      normalized
+    );
+  const asksForWholeDeckPptEdit =
+    /(?:各|全)(?:スライド|ページ)|スライド全体|資料全体|表紙/i.test(
+      normalized
+    ) &&
+    /(変更|修正|編集|変えて|にして|統一|基調|入れ|挿入|配置|追加)/i.test(
+      normalized
+    );
+  if (
+    hasPptEditingContext &&
+    (asksForPptAssetInsertion || asksForWholeDeckPptEdit) &&
+    !/(新規|一から|ゼロから).{0,12}(?:作成|生成|作って)/i.test(normalized)
+  ) {
+    return {
+      action: "edit_latest_ppt",
+      instruction: normalized,
+      targetPages: [],
+      cardLayout: false,
+    };
+  }
+
   const asksForPptColorEdit =
-    /(ppt|pptx|powerpoint|パワーポイント)/i.test(normalized) &&
-    /(色味|配色|カラー|色)/i.test(normalized) &&
+    hasPptEditingContext &&
+    hasPptColorTopic &&
     /(変更|変え|替え|にして|統一|基調)/i.test(normalized);
   const selectsListedPptColor =
-    /^(?:(?:では|じゃあ|それでは|ok)[、,，\s]*)?[1-6]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|して|します)?[。.!！]?$/i.test(
+    /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-6１-６]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
       normalized
     );
   const selectsNamedPptColor =
     /(ネイビー|深緑|バーガンディ|ティール|チャコール|テラコッタ|コーラル|アンバー|ゴールド).{0,12}(?:で|に|変更|変えて|お願い)/i.test(
       normalized
+    ) ||
+    /^(?:ネイビー.{0,2}オレンジ|深緑.{0,2}アンバー|バーガンディ.{0,2}ゴールド|ティール.{0,2}コーラル|チャコール.{0,2}テラコッタ|深緑.{0,4}コーラルオレンジ)[。.!！]?$/i.test(
+      normalized
+    );
+  const selectsResolvedPptColor =
+    Boolean(resolvePptxPaletteInstruction(normalized)) &&
+    /(?:で|に|へ|変更|変えて|お願いします|お願い|にして)[。.!！]?$/i.test(
+      normalized
     );
   if (
     asksForPptColorEdit ||
     selectsListedPptColor ||
-    selectsNamedPptColor
+    selectsNamedPptColor ||
+    selectsResolvedPptColor
   ) {
     return { action: "edit_latest_ppt_color", instruction: normalized };
   }
@@ -308,6 +353,31 @@ export function parseTeamsOfficeRequest(
   const asksForConversion = /(変換|出力|作成|にして|して)/i.test(normalized);
   const hasPdfSource =
     /(sharepoint|\bsp\b|\bsl\b|pdf)/i.test(normalized);
+  const asksForFullPdfSummary =
+    asksForWord &&
+    hasPdfSource &&
+    /要約/i.test(normalized) &&
+    /(全文|全体|全ページ|先頭.{0,12}(?:最終|最後)|最初.{0,12}(?:最終|最後))/i.test(normalized);
+  if (asksForFullPdfSummary) {
+    const fileQuery =
+      attachedFileQuery ||
+      extractQuotedFileQuery(normalized) ||
+      extractUnquotedFileQuery(normalized, "word");
+    if (!fileQuery) return null;
+    const targetPagesMatch = normalized.match(/約?\s*(\d+)\s*ページ/i);
+    const targetCharsMatch = normalized.match(
+      /([\d,，]+)\s*[～〜~\-]\s*([\d,，]+)\s*文字/i
+    );
+    const parseCount = (value: string | undefined) =>
+      value ? Number(value.replace(/[,，]/g, "")) : undefined;
+    return {
+      action: "summarize_sp_pdf_to_word",
+      fileQuery,
+      targetPages: parseCount(targetPagesMatch?.[1]),
+      targetCharsLow: parseCount(targetCharsMatch?.[1]),
+      targetCharsHigh: parseCount(targetCharsMatch?.[2]),
+    };
+  }
   const asksForKnowledgeBasedPpt =
     asksForPowerPoint &&
     /(作成|生成|作って|まとめて)/i.test(normalized) &&
@@ -399,78 +469,12 @@ export async function executeTeamsOfficeRequest(props: {
 }): Promise<string> {
   const teamsThreadId = buildTeamsThreadId(props.conversationId);
 
-  if (props.request.action === "summarize_sp_pdf") {
-    const userEmail = props.userEmail?.trim().toLowerCase();
-    if (!userEmail) {
-      return "PDF全文要約を実行するためのTeamsユーザー情報を取得できませんでした。もう一度お試しください。";
-    }
-
-    try {
-      const access = resolveSlAccess(userEmail);
-      const result = await summarizeSharePointPdf({
-        fileQuery: props.request.fileQuery,
-        deptLower: access.dept,
-        userHash: hashValue(userEmail),
-      });
-      const summaryRef = `sp-summary-cache/${teamsThreadId}/${randomUUID()}.json`;
-      const cached = await UploadBlob(
-        "dl-link",
-        summaryRef,
-        Buffer.from(
-          JSON.stringify({
-            summary: result.summary,
-            characters: result.summary.length,
-            createdAt: new Date().toISOString(),
-          }),
-          "utf8"
-        )
-      );
-      if (cached.status !== "OK") {
-        throw new Error(
-          `Word出力用の要約保存に失敗しました: ${cached.errors[0]?.message ?? "unknown"}`
-        );
-      }
-      const outputBaseName = result.fileName.replace(/\.pdf$/i, "") || "PDF要約";
-      const wordResult = await postOfficeGenerationApi("/api/gen-word", {
-        content: "[summaryRef]",
-        title: `${outputBaseName} 要約`,
-        fileName: `${outputBaseName}_要約.docx`,
-        formatMode: "markdown",
-        summaryRef,
-        threadId: teamsThreadId,
-        fontFace: "Meiryo",
-      });
-      if (typeof wordResult.downloadUrl !== "string") {
-        throw new Error(String(wordResult.error ?? "Word出力URLを取得できませんでした。"));
-      }
-      const outputName =
-        typeof wordResult.fileName === "string"
-          ? wordResult.fileName
-          : `${outputBaseName}_要約.docx`;
-      await saveWordPointer(teamsThreadId, {
-        url: wordResult.downloadUrl,
-        fileName: outputName,
-        savedAt: Date.now(),
-      });
-      console.log("[teams-pdf-summary] completed", {
-        fileName: result.fileName,
-        pageCount: result.pageCount,
-        chunkCount: result.chunkCount,
-        outputName,
-      });
-      return [
-        `PDF全文要約をWordで作成しました（${result.fileName}、${result.pageCount}ページ、${result.chunkCount}チャンク）。`,
-        "",
-        `📄 [${escapeMarkdownLinkText(outputName)}](${wordResult.downloadUrl})`,
-      ].join("\n");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error("[teams-pdf-summary] failed", {
-        fileQuery: props.request.fileQuery,
-        message,
-      });
-      return `PDF全文要約に失敗しました。\n\n${message}`;
-    }
+  if (props.request.action === "summarize_sp_pdf_to_word") {
+    return summarizeTeamsSharePointPdfToWord({
+      request: props.request,
+      threadId: teamsThreadId,
+      userEmail: props.userEmail,
+    });
   }
 
   if (props.request.action === "translate_pdf_to_pptx") {
@@ -485,6 +489,7 @@ export async function executeTeamsOfficeRequest(props: {
     return editLatestTeamsPowerPoint({
       request: props.request,
       threadId: teamsThreadId,
+      uploadedFiles: props.uploadedFiles,
     });
   }
 
@@ -570,11 +575,50 @@ export async function executeTeamsOfficeRequest(props: {
     props.request.action === "create_word" ||
     props.request.action === "create_ppt"
   ) {
+    let webContext = "";
+    let webSources: TeamsSearchSource[] = [];
+    if (props.request.action === "create_ppt") {
+      const braveRequest = resolveBraveSearchRequest(props.request.prompt);
+      const explicitlyRequiresWeb = requestsWebGroundedPpt(
+        props.request.prompt
+      );
+      const usesSharedCompanyProfile = await isSharedCompanyProfilePptRequest({
+        title: props.request.title,
+        userPrompt: props.request.prompt,
+      });
+      // 会社紹介はAzureChatと同じ共通処理が公式ページ本文まで収集する。
+      // それ以外のWeb参照PPTだけ、Teamsの汎用Brave検索を使用する。
+      if (braveRequest.enabled && !usesSharedCompanyProfile) {
+        try {
+          const web = await searchBraveWeb({
+            query: braveRequest.query,
+            startIndex: 1,
+          });
+          webContext = web.context;
+          webSources = web.sources;
+        } catch (error) {
+          console.error("[teams-ppt-web] search failed", error);
+          if (explicitlyRequiresWeb) {
+            return `公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。\n\n${String(
+              (error as Error)?.message ?? error
+            )}`;
+          }
+        }
+      }
+      if (
+        explicitlyRequiresWeb &&
+        !usesSharedCompanyProfile &&
+        !webContext.trim()
+      ) {
+        return "公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。Brave Searchの設定と検索結果を確認してください。";
+      }
+    }
     const result = await createDirectOfficeFile({
       action: props.request.action,
       prompt: props.request.prompt,
       title: props.request.title,
       threadId: teamsThreadId,
+      ...(webContext ? { referenceContext: webContext } : {}),
     });
 
     if ("error" in result) {
@@ -584,6 +628,16 @@ export async function executeTeamsOfficeRequest(props: {
     }
     if (typeof result.downloadUrl !== "string") {
       return "Officeファイルは作成されましたが、ダウンロードリンクを取得できませんでした。";
+    }
+    if (Array.isArray(result.companyProfileSourceUrls)) {
+      webSources = result.companyProfileSourceUrls
+        .filter((url): url is string => typeof url === "string")
+        .map((url, index) => ({
+          index: index + 1,
+          name: companyProfileSourceName(url),
+          url,
+          kind: "web" as const,
+        }));
     }
 
     const extension =
@@ -614,7 +668,7 @@ export async function executeTeamsOfficeRequest(props: {
     }
     return `Officeファイルを作成しました。\n\n${icon} [${escapeMarkdownLinkText(
       outputName
-    )}](${result.downloadUrl})`;
+    )}](${result.downloadUrl})${formatOfficeSources(webSources)}`;
   }
 
   if (props.request.action === "refine_excel_sheets") {
@@ -848,6 +902,7 @@ type TeamsWordPointer = {
   url: string;
   fileName: string;
   savedAt: number;
+  trackChanges?: boolean;
 };
 
 type TeamsPdfTranslationSourcePointer = {
@@ -1004,6 +1059,7 @@ async function editLatestTeamsOfficeFile(props: {
   const pointer = isExcel
     ? await readExcelPointer(props.threadId)
     : await readWordPointer(props.threadId);
+  const wordPointer = isExcel ? null : (pointer as TeamsWordPointer | null);
   const label = isExcel ? "Excel" : "Word";
   if (!pointer?.url) {
     return `このTeams会話で作成した${label}ファイルが見つかりません。先に${label}ファイルを作成してください。`;
@@ -1019,6 +1075,8 @@ async function editLatestTeamsOfficeFile(props: {
       originalFileName: pointer.fileName,
       outputBaseName: buildEditedOfficeBaseName(pointer.fileName),
       ...(!isExcel && /(修正履歴|変更履歴)/.test(props.instruction)
+        ? { trackChanges: true }
+        : wordPointer?.trackChanges
         ? { trackChanges: true }
         : {}),
     }),
@@ -1054,6 +1112,7 @@ async function editLatestTeamsOfficeFile(props: {
       url: result.downloadUrl,
       fileName: outputName,
       savedAt: Date.now(),
+      trackChanges: wordPointer?.trackChanges === true,
     });
   }
 
@@ -1148,6 +1207,7 @@ async function proofreadTeamsSharePointWord(props: {
     url: result.downloadUrl,
     fileName: outputName,
     savedAt: Date.now(),
+    trackChanges: true,
   });
 
   return `SharePointのWordを校正し、${replacements.length}件を変更履歴付きで修正しました。\n\n📄 [${escapeMarkdownLinkText(
@@ -1209,10 +1269,30 @@ function buildEditedOfficeBaseName(fileName: string): string {
 async function editLatestTeamsPowerPoint(props: {
   request: Extract<TeamsOfficeRequest, { action: "edit_latest_ppt" }>;
   threadId: string;
+  uploadedFiles?: TeamsStoredFile[];
 }): Promise<string> {
   const pointer = await readPptxPointer(props.threadId);
   if (!pointer?.url) {
     return "このTeams会話で作成したPowerPointが見つかりません。先にPowerPointを作成してください。";
+  }
+
+  const uploadedImage = selectUploadedOfficeFile(props.uploadedFiles, [
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+  ]);
+  if (uploadedImage.error) return uploadedImage.error;
+  const effectiveInstruction = props.request.instruction;
+  let imageDataUrl: string | undefined;
+  if (uploadedImage.file) {
+    try {
+      imageDataUrl = await loadTeamsImageAsDataUrl(uploadedImage.file);
+    } catch (error) {
+      return `添付ロゴを読み込めなかったため、PowerPointの編集を中止しました。\n\n${String(
+        (error as Error)?.message ?? error
+      )}`;
+    }
   }
 
   let result: Record<string, unknown>;
@@ -1231,11 +1311,12 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
         plan: { slideEdits },
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1291,11 +1372,12 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         action: "apply_pptx_plan",
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
         plan: { slideEdits },
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1313,9 +1395,10 @@ async function editLatestTeamsPowerPoint(props: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fileUrl: pointer.url,
-        instruction: props.request.instruction,
+        instruction: effectiveInstruction,
         threadId: props.threadId,
         outputBaseName: buildEditedPptxBaseName(pointer.fileName, editLabel),
+        ...(imageDataUrl ? { imageDataUrl } : {}),
       }),
     });
     result = (await editResponse.json().catch(() => ({}))) as Record<
@@ -1339,11 +1422,45 @@ async function editLatestTeamsPowerPoint(props: {
       ? result.fileName
       : `${buildEditedPptxBaseName(pointer.fileName, editLabel)}.pptx`;
   await savePptxResult(props.threadId, result, outputName);
-  return `PowerPointを編集しました（${props.request.targetPages
-    .map((page) => `P${page}`)
-    .join("、")}）。\n\n📊 [${escapeMarkdownLinkText(outputName)}](${
+  const editedTarget = props.request.targetPages.length
+    ? props.request.targetPages.map((page) => `P${page}`).join("、")
+    : "全体";
+  return `PowerPointを編集しました（${editedTarget}）。\n\n📊 [${escapeMarkdownLinkText(outputName)}](${
     result.downloadUrl
   })`;
+}
+
+async function loadTeamsImageAsDataUrl(file: TeamsStoredFile): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(file.url, {
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`画像取得 HTTP ${response.status}`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > 15 * 1024 * 1024) {
+      throw new Error("画像サイズが0バイト、または15MBを超えています。");
+    }
+    const extension = file.extension.toLowerCase();
+    const mime =
+      extension === "png"
+        ? "image/png"
+        : extension === "webp"
+        ? "image/webp"
+        : "image/jpeg";
+    console.log("[teams-ppt-edit] attached image loaded", {
+      fileName: file.fileName,
+      bytes: bytes.length,
+      mime,
+    });
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function editLatestTeamsPptColor(props: {
@@ -1694,6 +1811,42 @@ async function createDirectOfficeFile(props: {
   referenceContext?: string;
 }): Promise<Record<string, unknown>> {
   if (props.action === "create_ppt") {
+    if (
+      await isSharedCompanyProfilePptRequest({
+        title: props.title,
+        userPrompt: props.prompt,
+      })
+    ) {
+      const companyPlan = await createSharedCompanyProfilePptPlan({
+        title: props.title,
+        userPrompt: props.prompt,
+        contentModelSource: "api",
+      });
+      if (
+        companyPlan.slides.length !==
+        companyPlan.targetTotalSlides - 1
+      ) {
+        return {
+          error:
+            "公式サイトの会社情報を十分に構造化できなかったため、一般論だけのPowerPointは作成しませんでした。",
+        };
+      }
+      const generated = await postOfficeGenerationApi("/api/gen-pptx", {
+        title: props.title,
+        slides: companyPlan.slides,
+        threadId: props.threadId,
+        targetTotalSlides: companyPlan.targetTotalSlides,
+        deckPreferences: {},
+        promptIntent: companyPlan.promptIntent,
+        fileBaseName: sanitizeOfficeBaseName(props.title),
+      });
+      return {
+        ...generated,
+        companyProfileSourceUrls: companyPlan.sourceUrls,
+        companyProfileOfficialDomain: companyPlan.officialDomain,
+      };
+    }
+
     const plan = await createTeamsPptPlan({
       prompt: props.prompt,
       title: props.title,
@@ -1703,6 +1856,9 @@ async function createDirectOfficeFile(props: {
       title: plan.title,
       slides: plan.slides,
       threadId: props.threadId,
+      ...(plan.targetTotalSlides
+        ? { targetTotalSlides: plan.targetTotalSlides }
+        : {}),
       deckPreferences: {},
       fileBaseName: sanitizeOfficeBaseName(plan.title),
     });
@@ -1717,6 +1873,114 @@ async function createDirectOfficeFile(props: {
     threadId: props.threadId,
     ...(props.action === "create_word" ? { fontFace: "Meiryo" } : {}),
   });
+}
+
+function companyProfileSourceName(url: string): string {
+  try {
+    return `${new URL(url).hostname.replace(/^www\./, "")} 公式サイト`;
+  } catch {
+    return "公式サイト";
+  }
+}
+
+function requestsWebGroundedPpt(prompt: string): boolean {
+  return /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
+    prompt.normalize("NFKC")
+  );
+}
+
+async function summarizeTeamsSharePointPdfToWord(props: {
+  request: Extract<
+    TeamsOfficeRequest,
+    { action: "summarize_sp_pdf_to_word" }
+  >;
+  threadId: string;
+  userEmail?: string | null;
+}): Promise<string> {
+  const userEmail = resolveTeamsOfficeUserEmail(props.userEmail);
+  if (!userEmail) {
+    return "Teamsユーザーのメールアドレスを確認できないため、SharePoint全文要約を実行できませんでした。";
+  }
+
+  try {
+    const access = resolveSlAccess(userEmail);
+    const summary = await summarizeSharePointPdf({
+      fileQuery: props.request.fileQuery,
+      deptLower: access.dept,
+      userHash: hashValue(userEmail),
+      targetPages: props.request.targetPages,
+      targetCharsLow: props.request.targetCharsLow,
+      targetCharsHigh: props.request.targetCharsHigh,
+    });
+    const summaryRef = `sp-summary-cache/${props.threadId}/${randomUUID()}.json`;
+    const cached = await UploadBlob(
+      "dl-link",
+      summaryRef,
+      Buffer.from(
+        JSON.stringify({
+          summary: summary.summary,
+          characters: summary.summary.length,
+          createdAt: new Date().toISOString(),
+        }),
+        "utf8"
+      )
+    );
+    if (cached.status !== "OK") {
+      throw new Error(
+        `Word用要約の一時保存に失敗しました: ${cached.errors[0]?.message ?? "unknown"}`
+      );
+    }
+
+    const title = `${summary.fileName.replace(/\.pdf$/i, "")} 要約`;
+    const fileName = `${summary.fileName.replace(/\.pdf$/i, "")}_要約.docx`;
+    const result = await postOfficeGenerationApi("/api/gen-word", {
+      content: "[summaryRef]",
+      summaryRef,
+      formatMode: "markdown",
+      title,
+      fileName,
+      fontFace: "Meiryo",
+      threadId: props.threadId,
+    });
+    if ("error" in result || typeof result.downloadUrl !== "string") {
+      return `全文要約Wordの作成に失敗しました。\n\n${String(
+        result.error ?? "ダウンロードURLを取得できませんでした。"
+      )}`;
+    }
+
+    const outputName =
+      typeof result.fileName === "string" ? result.fileName : fileName;
+    await saveWordPointer(props.threadId, {
+      url: result.downloadUrl,
+      fileName: outputName,
+      savedAt: Date.now(),
+      trackChanges: false,
+    });
+    return `SharePoint PDFを先頭から最終ページまで要約し、Wordを作成しました。\n\n📄 [${escapeMarkdownLinkText(
+      outputName
+    )}](${result.downloadUrl})`;
+  } catch (error) {
+    console.error("[teams-sp-pdf-summary] failed", error);
+    return `全文要約Wordの作成に失敗しました。\n\n${String(
+      (error as Error)?.message ?? error
+    )}`;
+  }
+}
+
+function resolveTeamsOfficeUserEmail(
+  activityUserEmail?: string | null
+): string | null {
+  if (process.env.NODE_ENV !== "production") {
+    const localDefaultEmail = process.env.SL_LOCAL_DEFAULT_EMAIL
+      ?.trim()
+      .toLowerCase();
+    if (localDefaultEmail?.includes("@")) return localDefaultEmail;
+  }
+
+  const normalizedActivityEmail = activityUserEmail?.trim().toLowerCase();
+  return normalizedActivityEmail?.includes("@")
+    ? normalizedActivityEmail
+    : null;
 }
 
 function formatOfficeSources(sources: TeamsSearchSource[]): string {
@@ -2087,6 +2351,7 @@ async function readWordPointer(
       blobName?: string;
       fileName?: string;
       savedAt?: number;
+      trackChanges?: boolean;
     };
     if (!pointer.blobName) return null;
     const sas = await GenerateSasUrl("docx", pointer.blobName);
@@ -2095,6 +2360,7 @@ async function readWordPointer(
       url: sas.response,
       fileName: pointer.fileName?.trim() || "Word.docx",
       savedAt: pointer.savedAt ?? Date.now(),
+      trackChanges: pointer.trackChanges === true,
     };
   } catch {
     return null;
@@ -2205,24 +2471,6 @@ function extractQuotedFileQuery(message: string): string | null {
   );
 }
 
-function extractPdfSummaryFileQuery(
-  message: string,
-  attachedFileQuery: string | null
-): string | null {
-  if (!/(?:要約|まとめ|サマリー|summary)/i.test(message)) return null;
-
-  if (/\.pdf$/i.test(attachedFileQuery ?? "")) return attachedFileQuery;
-
-  const quoted = extractQuotedFileQuery(message);
-  // The PDF extension is often omitted in natural Teams requests. The
-  // summary service resolves this quoted file stem against indexed PDFs.
-  if (quoted && !/(?:word|docx|excel|xlsx|powerpoint|pptx)/i.test(quoted)) {
-    return quoted;
-  }
-
-  return message.match(/([^\s「」"']+\.pdf)(?=\s|$|を|の|に|、|,)/i)?.[1] ?? null;
-}
-
 function extractAttachedFileQuery(message: string): string | null {
   return (
     message
@@ -2239,6 +2487,16 @@ function extractDirectOutputTitle(
 ): string {
   const quoted = extractQuotedFileQuery(message);
   if (quoted) return quoted.slice(0, 60);
+
+  if (action === "create_ppt") {
+    const normalized = message.normalize("NFKC");
+    const companyMaterial = normalized.match(
+      /(?:^|[。！？\n、])\s*((?:(?:株式会社|有限会社|合同会社)\s*)?[ァ-ヶー一-龠A-Za-z0-9・&＆]{2,40}?)の((?:初回訪問(?:用|向け)?|お客様向け|顧客向け|営業員向け)?(?:営業資料|会社紹介資料|会社案内|会社概要資料|提案資料))(?=を|で|に|、|。|\s|$)/i
+    );
+    if (companyMaterial) {
+      return `${companyMaterial[1]} ${companyMaterial[2]}`.trim().slice(0, 60);
+    }
+  }
 
   const about = message.match(/(.{1,60}?)について(?:の)?/i)?.[1]?.trim();
   if (about) {

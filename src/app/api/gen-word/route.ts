@@ -126,7 +126,9 @@ async function generateWordPlan(
   const openai = OpenAIInstance();
 
   const res = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
+    model:
+      process.env.AZURE_OPENAI_WORD_EDIT_DEPLOYMENT_NAME?.trim() ||
+      process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME!,
     messages: [
       {
         role: "system",
@@ -353,6 +355,12 @@ export async function POST(req: NextRequest) {
 
     let resolvedContent = content ?? "";
     let resolvedFormatMode = formatMode;
+    if (resolvedContent.trim() === "[summaryRef]" && !summaryRef?.trim()) {
+      return NextResponse.json(
+        { error: "summaryRef is required when content is [summaryRef]." },
+        { status: 400 }
+      );
+    }
     if (summaryRef?.trim()) {
       const expectedPrefix = `sp-summary-cache/${threadId}/`;
       if (!threadId || !summaryRef.startsWith(expectedPrefix) || !summaryRef.endsWith(".json")) {
@@ -367,6 +375,12 @@ export async function POST(req: NextRequest) {
       }
       const payload = JSON.parse(cached.response);
       resolvedContent = String(payload?.summary ?? "");
+      if (resolvedContent.trim().length < 100) {
+        return NextResponse.json(
+          { error: "The cached summary is empty or too short to create a Word document." },
+          { status: 400 }
+        );
+      }
       resolvedFormatMode = "markdown";
       console.log(
         `[gen-word] loaded summaryRef chars=${resolvedContent.length} ref=${summaryRef}`

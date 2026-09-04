@@ -33,6 +33,11 @@ export type DeckSpecSlide = {
     | "conversation"
     | "company-overview"
     | "process-cards"
+    | "split_visual"
+    | "comparison_matrix"
+    | "decision_summary"
+    | "editorial_statement"
+    | "asymmetric_list"
     | "closing";
   /** 正規化済み項目リスト（renderer と同じ優先順で抽出） */
   items: DeckSpecItem[];
@@ -89,6 +94,11 @@ export type DeckSpecGenMeta = {
   titleFontSize?: number;
   bodyFontSize?: number;
   smallFontSize?: number;
+  /** B4 Art Director メタ情報（再描画では Art Director を再実行しない） */
+  artDirectorMode?: "off" | "audit" | "apply";
+  artDirectionVersion?: 1;
+  artDirectionMotif?: string;
+  artDirectionApplied?: boolean;
 };
 
 export type DeckSpec = {

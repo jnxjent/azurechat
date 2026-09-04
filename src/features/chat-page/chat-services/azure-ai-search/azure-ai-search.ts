@@ -182,6 +182,87 @@ export const SimpleSearch = async (
   }
 };
 
+function buildMetadataSearchText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\.[a-z0-9]+$/i, "")
+    // Corporate designators vary between 株式会社, (株), and the compatibility
+    // character ㈱ (which NFKC converts to (株)). They are poor search terms.
+    .replace(/(?:株式会社|有限会社|\(株\)|\(有\))/g, " ")
+    // Remove characters that have special meaning in Azure simple query syntax.
+    // Separating them with spaces preserves useful terms such as ABCD and 財務諸表.
+    .replace(/[+|!(){}\[\]^"~*?:\\/\-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Search the filename field directly while preserving the same SL ACL used by
+ * regular document search. No `top` is supplied, so the SDK follows result
+ * pages instead of silently truncating the candidate set at 1,000 chunks.
+ */
+export const SearchSharePointDocumentsByFileName = async (
+  fileQuery: string,
+  filter?: string,
+  deptLower?: string | null,
+  userHash?: string
+): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
+  try {
+    const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
+    const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
+    const finalFilter = combineFilters(filter, scopeFilter);
+    const searchText = buildMetadataSearchText(fileQuery);
+    if (!searchText) return { status: "OK", response: [] };
+
+    const searchResults = await instance.search(searchText, {
+      filter: finalFilter,
+      searchFields: ["metadata"],
+      searchMode: "all",
+      select: ["id", "metadata", "fileUrl", "effectiveFileUrl", "spItemId"],
+    });
+    const results: Array<DocumentSearchResponse> = [];
+    for await (const result of searchResults.results) {
+      results.push({
+        score: result.score,
+        document: result.document as AzureSearchDocumentIndex,
+      });
+    }
+    return { status: "OK", response: results };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
+  }
+};
+
+/**
+ * Exhaustive ACL-aware fallback for unusual filenames that the lexical
+ * analyzer cannot tokenize. The iterator follows continuation pages.
+ */
+export const SearchAllAccessibleSharePointDocuments = async (
+  filter?: string,
+  deptLower?: string | null,
+  userHash?: string
+): Promise<ServerActionResponse<Array<DocumentSearchResponse>>> => {
+  try {
+    const instance = AzureAISearchInstance<AzureSearchDocumentIndex>();
+    const scopeFilter = await buildSearchAclFilter(deptLower, userHash);
+    const finalFilter = combineFilters(filter, scopeFilter);
+    const searchResults = await instance.search("*", {
+      filter: finalFilter,
+      select: ["id", "metadata", "fileUrl", "effectiveFileUrl", "spItemId"],
+    });
+    const results: Array<DocumentSearchResponse> = [];
+    for await (const result of searchResults.results) {
+      results.push({
+        score: result.score,
+        document: result.document as AzureSearchDocumentIndex,
+      });
+    }
+    return { status: "OK", response: results };
+  } catch (e) {
+    return { status: "ERROR", errors: [{ message: `${e}` }] };
+  }
+};
+
 /**
  * Fetches every page-aware chunk for one SharePoint drive item in source order.
  * ACL filtering is applied here as well, so callers cannot bypass document scope.
