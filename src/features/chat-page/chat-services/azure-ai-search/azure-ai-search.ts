@@ -218,7 +218,14 @@ export const SearchSharePointDocumentsByFileName = async (
       filter: finalFilter,
       searchFields: ["metadata"],
       searchMode: "all",
-      select: ["id", "metadata", "fileUrl", "effectiveFileUrl", "spItemId"],
+      select: [
+        "id",
+        "metadata",
+        "fileUrl",
+        "effectiveFileUrl",
+        "spItemId",
+        "dept",
+      ],
     });
     const results: Array<DocumentSearchResponse> = [];
     for await (const result of searchResults.results) {
@@ -248,7 +255,14 @@ export const SearchAllAccessibleSharePointDocuments = async (
     const finalFilter = combineFilters(filter, scopeFilter);
     const searchResults = await instance.search("*", {
       filter: finalFilter,
-      select: ["id", "metadata", "fileUrl", "effectiveFileUrl", "spItemId"],
+      select: [
+        "id",
+        "metadata",
+        "fileUrl",
+        "effectiveFileUrl",
+        "spItemId",
+        "dept",
+      ],
     });
     const results: Array<DocumentSearchResponse> = [];
     for await (const result of searchResults.results) {

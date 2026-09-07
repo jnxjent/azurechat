@@ -61,6 +61,11 @@ async function main() {
     {
       "server-only": {},
       "@/features/common/services/azure-storage": storage,
+      "@/lib/document-extract": {
+        extractTextFromBuffer: async (_buffer, fileName) => [
+          `${fileName} の抽出本文`,
+        ],
+      },
       "./teams-file-policy": policy,
     }
   );
@@ -126,6 +131,44 @@ async function main() {
       "local-integration-test"
     );
     assert.deepEqual(latest, stored);
+
+    const ole = Buffer.from([
+      0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00,
+    ]);
+    global.fetch = async (url) => {
+      const requestedUrl = String(url);
+      const body = requestedUrl.endsWith(".txt")
+        ? Buffer.from("plain text")
+        : requestedUrl.endsWith(".pdf")
+          ? Buffer.from("%PDF-1.7 test")
+          : ole;
+      const response = new Response(body, { status: 200 });
+      Object.defineProperty(response, "url", {
+        value: requestedUrl,
+      });
+      return response;
+    };
+    const attachmentContext = await service.buildTeamsTextAttachmentContext(
+      [
+        ["pdf", "financial-results.pdf"],
+        ["xls", "legacy.xls"],
+        ["doc", "legacy.doc"],
+        ["txt", "notes.txt"],
+      ].map(([extension, fileName]) => ({
+        extension,
+        fileName,
+        savedAt: Date.now(),
+        size: ole.length,
+        url: `https://storage.example.test/${fileName}`,
+      }))
+    );
+    assert.match(
+      attachmentContext,
+      /financial-results\.pdf の抽出本文/
+    );
+    assert.match(attachmentContext, /legacy\.xls の抽出本文/);
+    assert.match(attachmentContext, /legacy\.doc の抽出本文/);
+    assert.match(attachmentContext, /notes\.txt の抽出本文/);
 
     const uploadsBeforeInvalidFile = uploads.length;
     global.fetch = async () => {

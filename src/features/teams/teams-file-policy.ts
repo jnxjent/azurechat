@@ -8,8 +8,11 @@ export const MAX_TEAMS_TOTAL_BYTES = 40 * 1024 * 1024;
 
 const ALLOWED_EXTENSIONS = new Set([
   "pdf",
+  "doc",
   "docx",
+  "xls",
   "xlsx",
+  "txt",
   "pptx",
   "png",
   "jpg",
@@ -119,6 +122,10 @@ export function validateTeamsFileBytes(
   }
 
   const zipBased = new Set(["docx", "xlsx", "pptx"]);
+  const oleBased = new Set(["doc", "xls"]);
+  const hasOleSignature = buffer.subarray(0, 8).equals(
+    Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+  );
   const valid =
     (extension === "pdf" && buffer.subarray(0, 5).toString() === "%PDF-") ||
     (extension === "png" &&
@@ -132,6 +139,8 @@ export function validateTeamsFileBytes(
     (extension === "webp" &&
       buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
       buffer.subarray(8, 12).toString("ascii") === "WEBP") ||
+    extension === "txt" ||
+    (oleBased.has(extension) && hasOleSignature) ||
     (zipBased.has(extension) &&
       buffer[0] === 0x50 &&
       buffer[1] === 0x4b);
