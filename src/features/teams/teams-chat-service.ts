@@ -35,6 +35,7 @@ export async function createTeamsChatReply(props: {
   message: string;
   userEmail?: string | null;
   forceKnowledgeSearch?: boolean;
+  attachmentContext?: string;
 }): Promise<TeamsChatResult> {
   const message = props.message.trim();
   if (!message) {
@@ -67,7 +68,8 @@ export async function createTeamsChatReply(props: {
     "",
     webSearch.context,
     false,
-    braveRequest.enabled
+    braveRequest.enabled,
+    props.attachmentContext ?? ""
   );
   const baseSystemPrompt =
     process.env.TEAMS_SYSTEM_PROMPT?.trim() ||
@@ -238,9 +240,15 @@ function buildUserContent(
   internalContext: string,
   webContext: string,
   internalSearchPerformed: boolean,
-  webSearchPerformed: boolean
+  webSearchPerformed: boolean,
+  attachmentContext: string
 ): string {
   const sections = [`質問:\n${message}`];
+  if (attachmentContext.trim()) {
+    sections.push(
+      `添付ファイル本文:\n${attachmentContext}\n\n添付ファイルに関する回答は、この本文だけを根拠にしてください。`
+    );
+  }
   if (internalSearchPerformed) {
     sections.push(
       `社内検索資料:\n${

@@ -122,12 +122,26 @@ const chatService = loadTypeScriptModule("features/teams/teams-chat-service.ts",
 
 const slSearchTarget = loadTypeScriptModule("lib/sl-search-target.ts");
 const vectorSearchCalls = [];
+const filenameSearchResults = [];
+const filenameSearchCalls = [];
+const exhaustiveSearchCalls = [];
 const searchService = loadTypeScriptModule(
   "features/teams/teams-search-service.ts",
   {
     "server-only": {},
     "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search": {
-      SimpleSearch: async () => ({ status: "OK", response: [] }),
+      SimpleSearch: async () => ({
+        status: "OK",
+        response: [],
+      }),
+      SearchSharePointDocumentsByFileName: async (...args) => {
+        filenameSearchCalls.push(args);
+        return { status: "OK", response: filenameSearchResults };
+      },
+      SearchAllAccessibleSharePointDocuments: async (...args) => {
+        exhaustiveSearchCalls.push(args);
+        return { status: "OK", response: [] };
+      },
       ExtensionSimilaritySearch: async (args) => {
         vectorSearchCalls.push(args);
         return {
@@ -256,6 +270,41 @@ async function run() {
   );
   assert.equal(vectorSearchCalls[0].deptLower, "bm");
   assert.equal(vectorSearchCalls[0].userHash, "hash:user@example.com");
+
+  filenameSearchResults.push(
+    ...[
+      ["bm-1", "bm", "bm-item", 0, "https://example.test/sites/bm/ABCD.pdf"],
+      ["bm-2", "bm", "bm-item", 1, "https://example.test/sites/bm/ABCD.pdf"],
+      ["tk-1", "tk", "tk-item", 0, "https://example.test/sites/tk/ABCD.pdf"],
+    ].map(([id, dept, spItemId, chunkIndex, fileUrl]) => ({
+      score: 1,
+      document: {
+        id,
+        metadata: "ABCD㈱財務諸表.pdf",
+        pageContent: `chunk-${chunkIndex}`,
+        fileUrl,
+        effectiveFileUrl: fileUrl,
+        spItemId,
+        chunkIndex,
+        dept,
+        isSlDoc: true,
+      },
+    }))
+  );
+  const officeCandidates = await searchService.findTeamsOfficeFileCandidates({
+    query: "ABCD(株)財務諸表",
+    userEmail: "user@example.com",
+    extensions: ["pdf"],
+  });
+  assert.equal(filenameSearchCalls.length, 1);
+  assert.equal(filenameSearchCalls[0][0], "ABCD(株)財務諸表");
+  assert.equal(exhaustiveSearchCalls.length, 0);
+  assert.deepEqual(officeCandidates.exactMatches, [
+    {
+      name: "ABCD㈱財務諸表.pdf",
+      url: "https://example.test/sites/bm/ABCD.pdf",
+    },
+  ]);
 
   console.log("Teams LLM search tool tests passed.");
 }

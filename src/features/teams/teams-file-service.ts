@@ -1,6 +1,7 @@
 import "server-only";
 
 import { randomUUID } from "crypto";
+import { extractTextFromBuffer } from "@/lib/document-extract";
 import {
   DownloadBlobAsText,
   GenerateSasUrl,
@@ -17,6 +18,8 @@ import {
 } from "./teams-file-policy";
 
 const DOWNLOAD_TIMEOUT_MS = 30_000;
+const MAX_TEAMS_ATTACHMENT_CONTEXT_CHARS = 50_000;
+const TEXT_READABLE_EXTENSIONS = new Set(["pdf", "doc", "xls", "txt"]);
 const latestUploadPointerName = (threadId: string) =>
   `thread-${threadId}-teams-upload-latest.json`;
 
@@ -104,6 +107,37 @@ export async function readLatestTeamsFiles(
   } catch {
     return [];
   }
+}
+
+export async function buildTeamsTextAttachmentContext(
+  files: readonly TeamsStoredFile[]
+): Promise<string> {
+  const readableFiles = files.filter((file) =>
+    TEXT_READABLE_EXTENSIONS.has(file.extension.toLowerCase())
+  );
+  if (readableFiles.length === 0) return "";
+
+  const sections: string[] = [];
+  let remainingChars = MAX_TEAMS_ATTACHMENT_CONTEXT_CHARS;
+  for (const file of readableFiles) {
+    if (remainingChars <= 0) break;
+    const buffer = await downloadTeamsFile(file.url);
+    validateTeamsFileBytes(file.fileName, file.extension, buffer);
+    const arrayBuffer = buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    ) as ArrayBuffer;
+    const text = (await extractTextFromBuffer(arrayBuffer, file.fileName))
+      .join("\n\n")
+      .trim();
+    if (!text) {
+      throw new Error(`「${file.fileName}」から本文を抽出できませんでした。`);
+    }
+    const content = text.slice(0, remainingChars);
+    sections.push(`添付ファイル「${file.fileName}」の本文:\n${content}`);
+    remainingChars -= content.length;
+  }
+  return sections.join("\n\n");
 }
 
 async function downloadTeamsFile(url: string): Promise<Buffer> {

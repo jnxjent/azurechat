@@ -326,6 +326,15 @@ export function parseTeamsOfficeRequest(
     );
   const isExplicitConversion = /変換/i.test(normalized);
   const asksForProofreading = /(誤字|誤記|誤変換|校正)/i.test(normalized);
+  const hasExplicitCorrectionPair =
+    /[（(]\s*誤\s*[）)][\s\S]{1,500}?[（(]\s*正\s*[）)]/i.test(
+      normalized
+    );
+  const referencesAdditionalWordCorrection =
+    asksForProofreading &&
+    /(?:まだ|追加|さらに|引き続き|残り).{0,24}(?:修正|訂正|変更|置換)/i.test(
+      normalized
+    );
   const explicitlyReferencesLatestWord =
     /(今|直前|先ほど|さっき).{0,16}(出力|作成|変換|編集).{0,16}(word|ワード|docx)/i.test(
       normalized
@@ -348,6 +357,14 @@ export function parseTeamsOfficeRequest(
     return { action: "edit_latest_excel", instruction: normalized };
   }
   if (asksForFileEdit && asksForWord && !isExplicitConversion) {
+    return { action: "edit_latest_word", instruction: normalized };
+  }
+  if (
+    asksForFileEdit &&
+    !isExplicitConversion &&
+    !hasAttachedFileMarker &&
+    (hasExplicitCorrectionPair || referencesAdditionalWordCorrection)
+  ) {
     return { action: "edit_latest_word", instruction: normalized };
   }
   const asksForConversion = /(変換|出力|作成|にして|して)/i.test(normalized);
@@ -1828,7 +1845,9 @@ async function createDirectOfficeFile(props: {
       ) {
         return {
           error:
-            "公式サイトの会社情報を十分に構造化できなかったため、一般論だけのPowerPointは作成しませんでした。",
+            companyPlan.sourceEvidence.trim().length === 0
+              ? "公式サイトの会社情報を取得できなかったため、一般論だけのPowerPointは作成しませんでした。"
+              : `公式サイトの会社情報は取得できましたが、指定された${companyPlan.targetTotalSlides}枚構成に整形できませんでした。再度お試しください。`,
         };
       }
       const generated = await postOfficeGenerationApi("/api/gen-pptx", {
@@ -1859,7 +1878,10 @@ async function createDirectOfficeFile(props: {
       ...(plan.targetTotalSlides
         ? { targetTotalSlides: plan.targetTotalSlides }
         : {}),
-      deckPreferences: {},
+      designInstruction: plan.designInstruction,
+      deckPreferences: plan.deckPreferences,
+      promptIntent: plan.promptIntent,
+      palette: plan.palette,
       fileBaseName: sanitizeOfficeBaseName(plan.title),
     });
   }

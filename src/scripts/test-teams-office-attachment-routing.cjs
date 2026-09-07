@@ -8,6 +8,7 @@ const braveQueries = [];
 const pptPlanInputs = [];
 const sharedCompanyPlanInputs = [];
 const sharePointSummaryInputs = [];
+const sharePointPptSearchInputs = [];
 
 function loadOfficeService() {
   const storedBlobs = new Map();
@@ -129,22 +130,73 @@ function loadOfficeService() {
       return {
         createTeamsPptPlan: async (props) => {
           pptPlanInputs.push(props);
+          const isExecutiveSharePointDeck = /経営層|DX_AI活動報告/.test(
+            props.prompt
+          );
+          const designInstruction =
+            "日本語のみで作成し、英語だけの表紙ラベルを使用しない。経営層向けに洗練された構成にする。";
           return {
             title: props.title,
-            slides: Array.from({ length: 11 }, (_, index) => ({
+            slides: Array.from(
+              { length: isExecutiveSharePointDeck ? 7 : 11 },
+              (_, index) => ({
               title: `本文${index + 1}`,
               bullets: ["確認済み情報"],
-            })),
-            targetTotalSlides: 12,
+              })
+            ),
+            targetTotalSlides: isExecutiveSharePointDeck ? 8 : 12,
+            designInstruction,
+            deckPreferences: {
+              designInstruction,
+              language: "ja",
+              avoidEnglishLabels: true,
+              fontScale: "medium",
+            },
+            promptIntent: {
+              documentPurpose: "internal",
+              audience: isExecutiveSharePointDeck ? "executive" : "general",
+              designFreedom: "conservative",
+              toneKeywords: ["洗練", "信頼感"],
+              layoutDirectives: {
+                preferTwoColumn: true,
+                includeTables: false,
+                avoidBulletOnly: true,
+                preferMetrics: true,
+                preferProcess: true,
+              },
+              styleGuardrails: {
+                allowModernDark: false,
+                allowPlayful: false,
+                allowGlass: false,
+                maxAccentIntensity: "medium",
+              },
+            },
+            palette: "navy_orange",
           };
         },
         createTeamsPptCardEdits: async () => [],
       };
     }
-    if (
-      request === "./teams-search-service" ||
-      request === "./teams-word-proofread-service"
-    ) {
+    if (request === "./teams-search-service") {
+      return {
+        searchTeamsKnowledgeByFileFamily: async (props) => {
+          sharePointPptSearchInputs.push(props);
+          return {
+            context:
+              "DX_AI活動報告 2025年度1Q〜4Q: AzureChatの利用率、SharePoint対応、Salesforce連携、ロードマップ。",
+            sources: [
+              {
+                index: 1,
+                name: "DX_AI活動報告_2025年度.pdf",
+                url: "https://example.test/sharepoint/dx-ai-report.pdf",
+                kind: "sharepoint",
+              },
+            ],
+          };
+        },
+      };
+    }
+    if (request === "./teams-word-proofread-service") {
       return {};
     }
     return originalRequire(request);
@@ -217,6 +269,84 @@ for (const [languageName, languageCode] of [
   );
 }
 
+function loadTypeScriptModule(relativePath, mocks = {}) {
+  const fileName = path.resolve(relativePath);
+  const source = fs.readFileSync(fileName, "utf8");
+  const javascript = ts.transpileModule(source, {
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+  }).outputText;
+  const loaded = new Module(fileName);
+  loaded.filename = fileName;
+  loaded.paths = Module._nodeModulePaths(path.dirname(fileName));
+  const originalRequire = loaded.require.bind(loaded);
+  loaded.require = (request) =>
+    Object.prototype.hasOwnProperty.call(mocks, request)
+      ? mocks[request]
+      : originalRequire(request);
+  loaded._compile(javascript, fileName);
+  return loaded.exports;
+}
+
+const { buildTeamsPptRenderingOptions } = loadTypeScriptModule(
+  "features/teams/teams-ppt-plan-service.ts",
+  {
+    "server-only": {},
+    "@/features/common/services/openai": {
+      OpenAIPptInstance: () => {
+        throw new Error("OpenAI must not be called by rendering policy tests");
+      },
+    },
+  }
+);
+const executiveRenderingOptions = buildTeamsPptRenderingOptions(
+  "当社のAIシステムAzureChatの経営層向け機能紹介資料を8枚で作成してください。SharePointのDX_AI活動報告を参考にしてください",
+  "AzureChat 経営層向け機能紹介資料"
+);
+assert.equal(executiveRenderingOptions.deckPreferences.language, "ja");
+assert.equal(executiveRenderingOptions.deckPreferences.avoidEnglishLabels, true);
+assert.equal(executiveRenderingOptions.deckPreferences.fontScale, "medium");
+assert.equal(executiveRenderingOptions.promptIntent.audience, "executive");
+assert.equal(executiveRenderingOptions.promptIntent.documentPurpose, "internal");
+assert.equal(
+  executiveRenderingOptions.promptIntent.layoutDirectives.avoidBulletOnly,
+  true
+);
+assert.match(executiveRenderingOptions.designInstruction, /英語だけの/);
+
+const { fitCompanyProfileSlideCount } = loadTypeScriptModule(
+  "features/pptx/company-profile-slide-count.ts"
+);
+const overProducedSlides = Array.from({ length: 12 }, (_, index) => ({
+  title: index === 11 ? "まとめ・次のステップ" : `本文${index + 1}`,
+  bullets: [`内容${index + 1}`],
+}));
+const fittedOverProducedSlides = fitCompanyProfileSlideCount(
+  overProducedSlides,
+  "ミダックホールディングス 初回訪問用営業資料",
+  11
+);
+assert.equal(fittedOverProducedSlides.length, 11);
+assert.equal(fittedOverProducedSlides.at(-1).title, "まとめ・次のステップ");
+
+const fittedSlidesWithCover = fitCompanyProfileSlideCount(
+  [
+    {
+      title: "ミダックホールディングス 初回訪問用営業資料",
+      layoutType: "title",
+      bullets: [],
+    },
+    ...overProducedSlides.slice(0, 11),
+  ],
+  "ミダックホールディングス 初回訪問用営業資料",
+  11
+);
+assert.equal(fittedSlidesWithCover.length, 11);
+assert.equal(fittedSlidesWithCover[0].title, "本文1");
+
 assert.equal(
   parseTeamsOfficeRequest(
     "添付を英語にして編集可能なPPTXで出力して\n添付ファイル: guide.pdf"
@@ -241,6 +371,14 @@ assert.equal(
   webPptRequest?.title,
   "ミダックホールディングス 初回訪問用営業資料"
 );
+const executiveSharePointPptRequest = parseTeamsOfficeRequest(
+  "当社のAIシステム「AzureChat」の経営層向けに機能紹介資料を8枚でPPTで作ってください。AzureChatについては一般的なネットから得る情報ではなく、SharePointにあるDX_AI活動報告の2025年度(1Q,2Q,3Q,4Q)を参考に把握してください"
+);
+assert.equal(
+  executiveSharePointPptRequest?.action,
+  "create_ppt_from_sharepoint"
+);
+assert.equal(executiveSharePointPptRequest?.title, "AzureChat");
 const logoEditRequest = parseTeamsOfficeRequest(
   "添付ロゴを表紙に大きめに、各スライドの右上に小さく配置してください。また、スライド全体の色のトーンを白に変更してください"
 );
@@ -288,6 +426,12 @@ assert.equal(
   )?.action,
   "edit_latest_word"
 );
+const additionalWordCorrection = parseTeamsOfficeRequest(
+  "まだ以下誤字があります。追加で修正してください。\n（誤）太平興産\n（正）大平興産"
+);
+assert.equal(additionalWordCorrection?.action, "edit_latest_word");
+assert.match(additionalWordCorrection?.instruction ?? "", /太平興産/);
+assert.match(additionalWordCorrection?.instruction ?? "", /大平興産/);
 
 async function testPdfTranslationExecutionAndFollowup() {
   const conversationId = "translation-test-conversation";
@@ -432,6 +576,53 @@ async function testWebGroundedPptAndLogoFollowup() {
   }
 }
 
+async function testExecutiveSharePointPptRenderingOptions() {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url: String(url), body });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        downloadUrl: "https://example.test/azurechat-executive.pptx",
+        fileName: "AzureChat_経営層向け機能紹介資料.pptx",
+      }),
+    };
+  };
+
+  try {
+    const reply = await executeTeamsOfficeRequest({
+      request: executiveSharePointPptRequest,
+      conversationId: "executive-sharepoint-ppt-test-conversation",
+      uploadedFiles: [],
+      userEmail: "executive@example.com",
+    });
+    assert.match(reply, /SharePoint資料を基にPowerPointを作成しました/);
+    assert.equal(sharePointPptSearchInputs.length, 1);
+    assert.match(pptPlanInputs.at(-1).referenceContext, /DX_AI活動報告/);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/api\/gen-pptx$/);
+    assert.equal(requests[0].body.targetTotalSlides, 8);
+    assert.equal(requests[0].body.slides.length, 7);
+    assert.equal(requests[0].body.deckPreferences.language, "ja");
+    assert.equal(requests[0].body.deckPreferences.avoidEnglishLabels, true);
+    assert.equal(requests[0].body.deckPreferences.fontScale, "medium");
+    assert.equal(requests[0].body.promptIntent.audience, "executive");
+    assert.equal(requests[0].body.promptIntent.documentPurpose, "internal");
+    assert.equal(
+      requests[0].body.promptIntent.layoutDirectives.avoidBulletOnly,
+      true
+    );
+    assert.match(requests[0].body.designInstruction, /日本語のみ/);
+    assert.equal(requests[0].body.palette, "navy_orange");
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
   const originalNodeEnv = process.env.NODE_ENV;
   const originalLocalEmail = process.env.SL_LOCAL_DEFAULT_EMAIL;
@@ -472,6 +663,7 @@ async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
 
 testPdfTranslationExecutionAndFollowup()
   .then(testWebGroundedPptAndLogoFollowup)
+  .then(testExecutiveSharePointPptRenderingOptions)
   .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");

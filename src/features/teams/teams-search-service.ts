@@ -2,6 +2,8 @@ import "server-only";
 
 import {
   ExtensionSimilaritySearch,
+  SearchAllAccessibleSharePointDocuments,
+  SearchSharePointDocumentsByFileName,
   SimpleSearch,
   type DocumentSearchResponse,
 } from "@/features/chat-page/chat-services/azure-ai-search/azure-ai-search";
@@ -257,27 +259,37 @@ export async function findTeamsOfficeFileCandidates(props: {
 
   const access = resolveSlAccess(userEmail);
   const userHash = hashValue(userEmail);
-  const filenameList = await SimpleSearch(
-    "*",
+  const filenameMatches = await SearchSharePointDocumentsByFileName(
+    props.query,
     "isSlDoc eq true",
     access.dept,
-    1000,
     userHash
   );
+  const accessibleDocuments =
+    filenameMatches.status === "OK" && filenameMatches.response.length > 0
+      ? null
+      : await SearchAllAccessibleSharePointDocuments(
+          "isSlDoc eq true",
+          access.dept,
+          userHash
+        );
   const response =
-    filenameList.status === "OK" && filenameList.response.length > 0
-      ? filenameList
+    filenameMatches.status === "OK" && filenameMatches.response.length > 0
+      ? filenameMatches
+      : accessibleDocuments?.status === "OK" &&
+        accessibleDocuments.response.length > 0
+      ? accessibleDocuments
       : await ExtensionSimilaritySearch({
-    searchText: props.query,
-    vectors: ["embedding"],
-    apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
-    searchName: requiredEnv("AZURE_SEARCH_NAME"),
-    indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
-    filter: "isSlDoc eq true",
-    deptLower: access.dept,
-    userHash,
-    top: 20,
-  });
+          searchText: props.query,
+          vectors: ["embedding"],
+          apiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
+          searchName: requiredEnv("AZURE_SEARCH_NAME"),
+          indexName: requiredEnv("AZURE_SEARCH_INDEX_NAME"),
+          filter: "isSlDoc eq true",
+          deptLower: access.dept,
+          userHash,
+          top: 20,
+        });
 
   if (response.status !== "OK") {
     const detail = response.errors?.map((error) => error.message).join("; ");
@@ -287,7 +299,10 @@ export async function findTeamsOfficeFileCandidates(props: {
   const allowedExtensions = new Set(
     props.extensions.map((extension) => extension.toLowerCase())
   );
-  const unique = new Map<string, TeamsOfficeFileCandidate>();
+  type ScopedOfficeFileCandidate = TeamsOfficeFileCandidate & {
+    dept: string;
+  };
+  const unique = new Map<string, ScopedOfficeFileCandidate>();
 
   for (const item of response.response) {
     const document = item.document;
@@ -297,12 +312,24 @@ export async function findTeamsOfficeFileCandidates(props: {
 
     const extension = name.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
     if (!extension || !allowedExtensions.has(extension)) continue;
-    if (!unique.has(url)) unique.set(url, { name, url });
+    const itemKey = document.spItemId?.trim() || url;
+    if (!unique.has(itemKey)) {
+      unique.set(itemKey, {
+        name,
+        url,
+        dept: document.dept?.trim().toLowerCase() ?? "",
+      });
+    }
   }
 
-  const suggestions = Array.from(unique.values());
+  const currentDept = access.dept.trim().toLowerCase();
+  const candidates = Array.from(unique.values()).sort((left, right) => {
+    const leftPreferred = left.dept === currentDept ? 1 : 0;
+    const rightPreferred = right.dept === currentDept ? 1 : 0;
+    return rightPreferred - leftPreferred;
+  });
   const normalizedQuery = normalizeFileSearchText(props.query);
-  const exactMatches = suggestions.filter((candidate) => {
+  const allExactMatches = candidates.filter((candidate) => {
     const normalizedName = normalizeFileSearchText(
       candidate.name.replace(/\.[^.]+$/i, "")
     );
@@ -311,19 +338,35 @@ export async function findTeamsOfficeFileCandidates(props: {
       normalizedQuery.includes(normalizedName)
     );
   });
+  const currentDeptMatches = allExactMatches.filter(
+    (candidate) => candidate.dept === currentDept
+  );
+  const exactMatches =
+    currentDeptMatches.length > 0 ? currentDeptMatches : allExactMatches;
+  const toPublicCandidate = ({
+    name,
+    url,
+  }: ScopedOfficeFileCandidate): TeamsOfficeFileCandidate => ({ name, url });
 
   console.log("[teams-office-search] filename-first completed", {
     dept: access.dept,
     query: props.query,
+    strategy:
+      response === filenameMatches
+        ? "metadata"
+        : response === accessibleDocuments
+        ? "exhaustive"
+        : "vector",
     scannedDocuments:
       response.status === "OK" ? response.response.length : 0,
-    candidateFiles: suggestions.length,
+    candidateFiles: candidates.length,
     exactMatches: exactMatches.length,
+    preferredDeptMatches: currentDeptMatches.length,
   });
 
   return {
-    exactMatches,
-    suggestions: suggestions.slice(0, 5),
+    exactMatches: exactMatches.map(toPublicCandidate),
+    suggestions: candidates.slice(0, 5).map(toPublicCandidate),
   };
 }
 

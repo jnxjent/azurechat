@@ -39,6 +39,20 @@ assert.equal(candidates.length, 1);
 assert.equal(candidates[0].fileName, "決算資料.pdf");
 assert.equal(candidates[0].extension, "pdf");
 
+const legacyCandidates = policy.parseTeamsFileCandidates(
+  ["legacy.xls", "legacy.doc", "notes.txt"].map((name) => ({
+    contentType: "application/vnd.microsoft.teams.file.download.info",
+    name,
+    content: {
+      downloadUrl: `https://tenant.sharepoint.com/download/${name}`,
+    },
+  }))
+);
+assert.deepEqual(
+  legacyCandidates.map((candidate) => candidate.extension),
+  ["xls", "doc", "txt"]
+);
+
 assert.throws(
   () =>
     policy.parseTeamsFileCandidates([
@@ -68,6 +82,21 @@ policy.validateTeamsFileBytes(
   "sample.docx",
   "docx",
   Buffer.from([0x50, 0x4b, 0x03, 0x04])
+);
+const oleHeader = Buffer.from([
+  0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00,
+]);
+policy.validateTeamsFileBytes("sample.xls", "xls", oleHeader);
+policy.validateTeamsFileBytes("sample.doc", "doc", oleHeader);
+policy.validateTeamsFileBytes("sample.txt", "txt", Buffer.from("本文"));
+assert.throws(
+  () =>
+    policy.validateTeamsFileBytes(
+      "fake.xls",
+      "xls",
+      Buffer.from("not an OLE file")
+    ),
+  /一致しません/
 );
 assert.throws(
   () =>

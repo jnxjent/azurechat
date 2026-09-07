@@ -13,8 +13,75 @@ function resolvePptModelName(): string {
 export type TeamsPptSlide = {
   title: string;
   bullets: string[];
-  layoutType?: "title" | "bullets" | "multi-column" | "closing";
+  layoutType?:
+    | "title"
+    | "bullets"
+    | "multi-column"
+    | "closing"
+    | "metric-cards"
+    | "stat_callouts"
+    | "card_grid"
+    | "process-cards"
+    | "timeline"
+    | "roadmap"
+    | "editorial_statement";
   columns?: Array<{ header: string; bullets: string[] }>;
+  metrics?: Array<{
+    label: string;
+    value: string;
+    unit?: string;
+    note?: string;
+    iconKey?: string;
+  }>;
+  statCallouts?: Array<{
+    value: string;
+    unit?: string;
+    label: string;
+    note?: string;
+  }>;
+  cards?: Array<{ iconKey?: string; heading: string; body: string }>;
+  steps?: Array<{ title: string; body: string; iconKey?: string }>;
+  benefits?: string[];
+  subtitle?: string;
+};
+
+export type TeamsPptRenderingOptions = {
+  designInstruction: string;
+  deckPreferences: {
+    designInstruction: string;
+    language: "ja";
+    avoidEnglishLabels: true;
+    fontScale: "medium";
+  };
+  promptIntent: {
+    documentPurpose:
+      | "proposal"
+      | "company-intro"
+      | "recruitment"
+      | "training"
+      | "analysis"
+      | "internal"
+      | "ir"
+      | "campaign"
+      | "other";
+    audience: "executive" | "customer" | "employee" | "candidate" | "general";
+    designFreedom: "conservative" | "balanced" | "expressive";
+    toneKeywords: string[];
+    layoutDirectives: {
+      preferTwoColumn: boolean;
+      includeTables: boolean;
+      avoidBulletOnly: boolean;
+      preferMetrics: boolean;
+      preferProcess: boolean;
+    };
+    styleGuardrails: {
+      allowModernDark: boolean;
+      allowPlayful: boolean;
+      allowGlass: boolean;
+      maxAccentIntensity: "low" | "medium" | "high";
+    };
+  };
+  palette: "navy_orange";
 };
 
 export type TeamsPptExtractedSlide = {
@@ -38,7 +105,7 @@ export async function createTeamsPptPlan(props: {
   title: string;
   slides: TeamsPptSlide[];
   targetTotalSlides?: number;
-}> {
+} & TeamsPptRenderingOptions> {
   const targetTotalSlides = extractRequestedTotalSlides(props.prompt);
   const expectedBodySlides = targetTotalSlides
     ? Math.max(1, targetTotalSlides - 1)
@@ -52,7 +119,7 @@ export async function createTeamsPptPlan(props: {
         content: [
           "You create concise Japanese presentation outlines.",
           "Return JSON only with this schema:",
-          '{"title":"資料タイトル","slides":[{"title":"スライドタイトル","bullets":["要点"],"layoutType":"title|bullets|multi-column|closing","columns":[{"header":"列見出し","bullets":["要点"]}]}]}',
+          '{"title":"資料タイトル","slides":[{"title":"スライドタイトル","bullets":["要点"],"layoutType":"bullets|multi-column|metric-cards|stat_callouts|card_grid|process-cards|timeline|roadmap|editorial_statement|closing","columns":[{"header":"列見出し","bullets":["要点"]}],"metrics":[{"label":"指標","value":"43","unit":"%","note":"補足"}],"statCallouts":[{"value":"43","unit":"%","label":"利用率","note":"補足"}],"cards":[{"iconKey":"gear","heading":"見出し","body":"本文"}],"steps":[{"title":"段階","body":"説明","iconKey":"gear"}],"benefits":["効果"],"subtitle":"補足"}]}',
           "The slides array must contain body slides only. Do not include a title/cover slide because the rendering API adds it automatically.",
           expectedBodySlides
             ? `The user requested ${targetTotalSlides} total slides including the cover. Return exactly ${expectedBodySlides} body slides.`
@@ -60,8 +127,12 @@ export async function createTeamsPptPlan(props: {
           "When referenceContext is provided, use it as the factual source and do not supplement it with general web knowledge.",
           "Use only information supplied by the user or referenceContext; clearly label any proposed ideas as suggestions.",
           "The first body slide should start the substance or agenda; the last may be a closing slide.",
-          "For each non-title slide, write 4 to 7 substantive bullets whenever the referenceContext supports them.",
-          "Each substantive Japanese bullet should normally contain 35 to 70 characters and include concrete facts, activities, results, issues, or next actions.",
+          "Write all viewer-facing labels and sentences in Japanese. Product names such as AzureChat and Salesforce may remain in their official spelling.",
+          "Do not put English-only kickers, subtitles, section labels, or page-count labels on the cover.",
+          "Use one clear message per slide and normally 2 to 4 concise bullets of 20 to 55 Japanese characters.",
+          "Avoid bullet-only repetition. Use stat_callouts or metric-cards for KPIs, card_grid for grouped capabilities, process-cards/timeline/roadmap for sequences, and multi-column for comparisons.",
+          "For structured layouts, populate the matching structured fields and keep bullets empty unless they add distinct evidence.",
+          "Limit every structured collection to 4 items so text remains legible without aggressive shrinking.",
           "Do not reduce a source-rich section to only one or two short phrases.",
           "When quarterly materials are provided, cover every requested quarter and make changes across quarters understandable.",
           "Include specific names, figures, systems, and outcomes found in referenceContext; never invent missing facts.",
@@ -120,6 +191,86 @@ export async function createTeamsPptPlan(props: {
         : props.title,
     slides,
     ...(targetTotalSlides ? { targetTotalSlides } : {}),
+    ...buildTeamsPptRenderingOptions(props.prompt, props.title),
+  };
+}
+
+export function buildTeamsPptRenderingOptions(
+  prompt: string,
+  title: string
+): TeamsPptRenderingOptions {
+  const text = `${title} ${prompt}`.normalize("NFKC").toLowerCase();
+  const has = (...words: string[]) => words.some((word) => text.includes(word));
+
+  const audience: TeamsPptRenderingOptions["promptIntent"]["audience"] = has(
+    "経営層",
+    "役員",
+    "取締役",
+    "経営会議",
+    "社長",
+    "executive",
+    "board"
+  )
+    ? "executive"
+    : has("顧客", "お客様", "取引先", "customer")
+    ? "customer"
+    : has("社員", "社内", "従業員", "employee")
+    ? "employee"
+    : "general";
+
+  const documentPurpose: TeamsPptRenderingOptions["promptIntent"]["documentPurpose"] =
+    has("決算", "ir", "投資家", "株主")
+      ? "ir"
+      : has("分析", "調査", "リサーチ", "analysis")
+      ? "analysis"
+      : has("提案", "営業資料", "proposal")
+      ? "proposal"
+      : has("会社紹介", "会社概要", "初回訪問", "company profile")
+      ? "company-intro"
+      : has("研修", "教育", "training")
+      ? "training"
+      : has("社内", "当社", "活動報告", "報告")
+      ? "internal"
+      : "other";
+
+  const designInstruction = [
+    "日本語のみで作成し、表紙を含め英語だけのキッカー、キャッチコピー、ページ数表記を使用しない。",
+    audience === "executive"
+      ? "経営層が短時間で判断できる、洗練されたコーポレート資料にする。"
+      : "読み手が短時間で要点を把握できる、洗練されたコーポレート資料にする。",
+    "白を基調にネイビーと控えめなオレンジを使い、余白と視覚的階層を確保する。",
+    "1スライド1メッセージとし、長文箇条書きの反復を避け、KPI、カード、比較、プロセス、ロードマップを内容に応じて使い分ける。",
+    "文字切れ、過度な縮小、グラフの長い軸ラベルを避ける。",
+  ].join(" ");
+
+  return {
+    designInstruction,
+    deckPreferences: {
+      designInstruction,
+      language: "ja",
+      avoidEnglishLabels: true,
+      fontScale: "medium",
+    },
+    promptIntent: {
+      documentPurpose,
+      audience,
+      designFreedom: audience === "executive" ? "conservative" : "balanced",
+      toneKeywords: ["洗練", "信頼感", "コーポレート"],
+      layoutDirectives: {
+        preferTwoColumn: true,
+        includeTables: has("表", "一覧", "比較", "table"),
+        avoidBulletOnly: true,
+        preferMetrics: true,
+        preferProcess: has("計画", "ロードマップ", "進捗", "工程", "プロセス"),
+      },
+      styleGuardrails: {
+        allowModernDark: false,
+        allowPlayful: false,
+        allowGlass: false,
+        maxAccentIntensity: "medium",
+      },
+    },
+    palette: "navy_orange",
   };
 }
 
@@ -259,12 +410,87 @@ function normalizeSlide(value: unknown): TeamsPptSlide | null {
     ? (source.layoutType as TeamsPptSlide["layoutType"])
     : undefined;
 
+  const structuredLayoutTypes: TeamsPptSlide["layoutType"][] = [
+    "metric-cards",
+    "stat_callouts",
+    "card_grid",
+    "process-cards",
+    "timeline",
+    "roadmap",
+    "editorial_statement",
+  ];
+  const normalizedLayoutType = structuredLayoutTypes.includes(
+    source.layoutType as TeamsPptSlide["layoutType"]
+  )
+    ? (source.layoutType as TeamsPptSlide["layoutType"])
+    : layoutType;
+
+  const metrics = normalizeObjectArray(source.metrics, (item) => ({
+    label: stringValue(item.label),
+    value: stringValue(item.value),
+    unit: optionalString(item.unit),
+    note: optionalString(item.note),
+    iconKey: optionalString(item.iconKey),
+  })).filter((item) => item.label && item.value).slice(0, 4);
+  const statCallouts = normalizeObjectArray(source.statCallouts, (item) => ({
+    value: stringValue(item.value),
+    unit: optionalString(item.unit),
+    label: stringValue(item.label),
+    note: optionalString(item.note),
+  })).filter((item) => item.value && item.label).slice(0, 4);
+  const cards = normalizeObjectArray(source.cards, (item) => ({
+    iconKey: optionalString(item.iconKey),
+    heading: stringValue(item.heading),
+    body: stringValue(item.body),
+  })).filter((item) => item.heading && item.body).slice(0, 4);
+  const steps = normalizeObjectArray(source.steps, (item) => ({
+    title: stringValue(item.title),
+    body: stringValue(item.body),
+    iconKey: optionalString(item.iconKey),
+  })).filter((item) => item.title && item.body).slice(0, 4);
+  const benefits = Array.isArray(source.benefits)
+    ? source.benefits
+        .filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+        .map((item) => item.trim())
+        .slice(0, 4)
+    : [];
+
   return {
     title: source.title.trim(),
-    bullets,
-    layoutType,
+    bullets: bullets.map((item) => item.trim()).filter(Boolean).slice(0, 4),
+    layoutType: normalizedLayoutType,
     ...(columns?.length ? { columns } : {}),
+    ...(metrics.length ? { metrics } : {}),
+    ...(statCallouts.length ? { statCallouts } : {}),
+    ...(cards.length ? { cards } : {}),
+    ...(steps.length ? { steps } : {}),
+    ...(benefits.length ? { benefits } : {}),
+    ...(optionalString(source.subtitle)
+      ? { subtitle: optionalString(source.subtitle) }
+      : {}),
   };
+}
+
+function normalizeObjectArray<T>(
+  value: unknown,
+  map: (item: Record<string, unknown>) => T
+): T[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (item): item is Record<string, unknown> =>
+        Boolean(item) && typeof item === "object"
+    )
+    .map(map);
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function optionalString(value: unknown): string | undefined {
+  const normalized = stringValue(value);
+  return normalized || undefined;
 }
 
 function normalizeCard(

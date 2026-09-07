@@ -17,7 +17,11 @@ import {
   recordTeamsThreadUsage,
 } from "./teams-usage-service";
 import { resolveTeamsInstantReply } from "./teams-instant-reply";
-import { readLatestTeamsFiles, receiveTeamsFiles } from "./teams-file-service";
+import {
+  buildTeamsTextAttachmentContext,
+  readLatestTeamsFiles,
+  receiveTeamsFiles,
+} from "./teams-file-service";
 import { isSalesforceAllowedEmail } from "@/features/common/services/salesforce-access";
 import { resolveSalesforceRoute } from "@/features/common/services/salesforce-routing";
 import {
@@ -239,11 +243,15 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         return;
       }
 
+      const attachmentContext = await buildTeamsTextAttachmentContext(
+        uploadedFiles
+      );
       const result = await createTeamsChatReply({
         conversationId,
         message: messageText,
         userEmail,
         forceKnowledgeSearch: salesforceRouting.route === "knowledge",
+        attachmentContext,
       });
       await send(result.text);
       if (result.type === "reply") {
@@ -272,12 +280,18 @@ function buildTeamsFileReceivedMessage(files: TeamsStoredFile[]): string {
         `- ${file.fileName}（${Math.max(1, Math.ceil(file.size / 1024))} KB）`
     )
     .join("\n");
+  const supportsTextQuestions = files.some((file) =>
+    ["pdf", "doc", "xls", "txt"].includes(file.extension.toLowerCase())
+  );
   return [
     "ファイルを受信しました。",
     "",
     list,
     "",
     "PDFはExcel・Word・PowerPoint変換、Excel・Word・PowerPointは既存の編集機能で利用できます。",
+    ...(supportsTextQuestions
+      ? ["PDF・旧形式Word・Excel・テキストは、内容について質問できます。"]
+      : []),
   ].join("\n");
 }
 

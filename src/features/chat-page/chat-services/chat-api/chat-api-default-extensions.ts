@@ -36,6 +36,7 @@ import { userSession } from "@/features/auth-page/helpers";
 import { toFile } from "openai";
 import { createHash } from "crypto";
 import sharp from "sharp";
+import { fitCompanyProfileSlideCount } from "@/features/pptx/company-profile-slide-count";
 import {
   buildFaithfulImagePrompt,
   buildMultiImageReferenceInstruction,
@@ -3032,13 +3033,27 @@ ${JSON.stringify(brief, null, 2)}`,
         steps: Array.isArray(s.steps) ? s.steps : undefined,
         benefits: Array.isArray(s.benefits) ? s.benefits : undefined,
       }));
-    if (normalizedSlides.length !== targetContentSlides) {
+    const fittedSlides =
+      modelSource === "api"
+        ? fitCompanyProfileSlideCount(
+            normalizedSlides,
+            title,
+            targetContentSlides
+          )
+        : normalizedSlides;
+    if (fittedSlides.length !== targetContentSlides) {
       console.warn(
-        `[planCompanyProfileSlides] rejected slide-count expected=${targetContentSlides} actual=${normalizedSlides.length}`
+        `[planCompanyProfileSlides] rejected slide-count expected=${targetContentSlides} actual=${fittedSlides.length}`
       );
       return [];
     }
-    return normalizedSlides;
+    if (normalizedSlides.length !== fittedSlides.length) {
+      console.warn(
+        `[planCompanyProfileSlides] repaired slide-count expected=${targetContentSlides} ` +
+          `actual=${normalizedSlides.length} fitted=${fittedSlides.length}`
+      );
+    }
+    return fittedSlides;
   } catch (e) {
     console.error("[planCompanyProfileSlides] error:", e);
     return [];

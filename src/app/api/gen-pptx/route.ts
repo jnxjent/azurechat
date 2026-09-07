@@ -1516,6 +1516,23 @@ function createFallbackBrief(
   };
 }
 
+function localizeGeneratedCoverText(
+  value: unknown,
+  fallback: string,
+  prefs?: DeckPreferencesInput
+): string {
+  const text = String(value ?? "").trim() || fallback.trim();
+  const requiresJapanese =
+    prefs?.language === "ja" || prefs?.avoidEnglishLabels === true;
+  if (!requiresJapanese || !text) return text;
+
+  // 日本語指定時は、Design Agentが返した英語だけの装飾コピーを表示しない。
+  // AzureChat/Salesforceなど正式名称を含む日本語文はそのまま保持する。
+  return /[\u3040-\u30ff\u3400-\u9fff]/.test(text)
+    ? text
+    : "";
+}
+
 async function generateDesignBrief(
   title: string,
   slides: PptxSlide[],
@@ -1694,8 +1711,16 @@ async function generateDesignBrief(
     );
     return {
       palette: correctedPalette,
-      coverKicker:   String(parsed?.coverKicker   ?? "").trim() || fallback.coverKicker,
-      coverSubtitle: String(parsed?.coverSubtitle ?? "").trim() || fallback.coverSubtitle,
+      coverKicker: localizeGeneratedCoverText(
+        parsed?.coverKicker,
+        fallback.coverKicker,
+        prefs
+      ),
+      coverSubtitle: localizeGeneratedCoverText(
+        parsed?.coverSubtitle,
+        fallback.coverSubtitle,
+        prefs
+      ),
       footerNote:    fallback.footerNote,
       mood:          String(parsed?.mood ?? "").trim() || fallback.mood,
       visualHints:   fallback.visualHints,
