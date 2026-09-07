@@ -7,6 +7,7 @@ import { isTeamsSearchConfigured } from "./teams-search-service";
 import { isTeamsBraveSearchConfigured } from "./teams-brave-search-service";
 import {
   buildTeamsThreadId,
+  executePendingTeamsOfficeSelection,
   executeTeamsOfficeRequest,
   parseTeamsOfficeRequest,
   registerTeamsUploadedOfficeFiles,
@@ -217,6 +218,20 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
           activityId,
         });
         await send(reply);
+        await recordCompletedTeamsTurn({
+          conversationId,
+          activityId,
+          teamsUserId,
+        });
+        return;
+      }
+
+      const pendingOfficeReply = await executePendingTeamsOfficeSelection({
+        message: messageText,
+        conversationId,
+      });
+      if (pendingOfficeReply) {
+        await send(pendingOfficeReply);
         await recordCompletedTeamsTurn({
           conversationId,
           activityId,

@@ -866,7 +866,8 @@ export async function executeTeamsOfficeRequest(props: {
     return buildNotFoundMessage(props.request.fileQuery, search.suggestions);
   }
   if (search.exactMatches.length > 1) {
-    return buildMultipleFilesMessage(search.exactMatches);
+    await savePendingExcelSelection(teamsThreadId, search.exactMatches);
+    return buildNumberedFilesMessage(search.exactMatches);
   }
 
   const file = search.exactMatches[0];
@@ -902,6 +903,48 @@ export async function executeTeamsOfficeRequest(props: {
   )}](${result.downloadUrl})`;
 }
 
+export async function executePendingTeamsOfficeSelection(props: {
+  message: string;
+  conversationId: string;
+}): Promise<string | null> {
+  const threadId = buildTeamsThreadId(props.conversationId);
+  const pending = await readPendingExcelSelection(threadId);
+  if (!pending || Date.now() - pending.savedAt > 10 * 60 * 1000) return null;
+
+  const selectedIndex = parseOfficeCandidateSelection(
+    props.message,
+    pending.files.length
+  );
+  if (selectedIndex === null) return null;
+  if (selectedIndex < 0 || selectedIndex >= pending.files.length) {
+    return `1番から${pending.files.length}番の間で指定してください。`;
+  }
+
+  const file = pending.files[selectedIndex];
+  const result = await convertDocumentToExcel({
+    fileUrl: file.url,
+    fileName: file.name,
+    threadId,
+  });
+  if (result && typeof result === "object" && "error" in result) {
+    return `Excelへの変換に失敗しました。\n\n${String(result.error)}`;
+  }
+  if (typeof result.downloadUrl !== "string") {
+    return "Excelへの変換は完了しましたが、ダウンロードリンクを取得できませんでした。";
+  }
+
+  await clearPendingExcelSelection(threadId);
+  const outputName =
+    typeof result.fileName === "string"
+      ? result.fileName
+      : file.name.replace(/\.(pdf|docx)$/i, ".xlsx");
+  const detail =
+    typeof result.message === "string" ? `\n\n${result.message}` : "";
+  return `選択した「${file.name}」をExcelへ変換しました。${detail}\n\n📊 [${escapeMarkdownLinkText(
+    outputName
+  )}](${result.downloadUrl})`;
+}
+
 type TeamsExcelPointer = {
   url: string;
   fileName: string;
@@ -925,6 +968,12 @@ type TeamsWordPointer = {
 type TeamsPdfTranslationSourcePointer = {
   url: string;
   fileName: string;
+  savedAt: number;
+};
+
+type TeamsPendingExcelSelection = {
+  action: "pdf_to_excel";
+  files: TeamsOfficeFileCandidate[];
   savedAt: number;
 };
 
@@ -1633,6 +1682,9 @@ function buildEditedPptxBaseName(
 const excelPointerBlobName = (threadId: string) =>
   `thread-${threadId}-excel-latest.json`;
 
+const pendingExcelSelectionBlobName = (threadId: string) =>
+  `thread-${threadId}-excel-candidates.json`;
+
 async function convertDocumentToExcel(props: {
   fileUrl: string;
   fileName: string;
@@ -2295,6 +2347,55 @@ async function saveExcelPointer(
   }
 }
 
+async function savePendingExcelSelection(
+  threadId: string,
+  files: TeamsOfficeFileCandidate[]
+): Promise<void> {
+  const pending: TeamsPendingExcelSelection = {
+    action: "pdf_to_excel",
+    files: files.slice(0, 10),
+    savedAt: Date.now(),
+  };
+  const response = await UploadBlob(
+    "dl-link",
+    pendingExcelSelectionBlobName(threadId),
+    Buffer.from(JSON.stringify(pending))
+  );
+  if (response.status !== "OK") {
+    throw new Error("Failed to save Teams Office candidate selection.");
+  }
+}
+
+async function readPendingExcelSelection(
+  threadId: string
+): Promise<TeamsPendingExcelSelection | null> {
+  const response = await DownloadBlobAsText(
+    "dl-link",
+    pendingExcelSelectionBlobName(threadId)
+  );
+  if (response.status !== "OK") return null;
+  try {
+    const pending = JSON.parse(response.response) as TeamsPendingExcelSelection;
+    return pending.action === "pdf_to_excel" &&
+      Array.isArray(pending.files) &&
+      typeof pending.savedAt === "number"
+      ? pending
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function clearPendingExcelSelection(threadId: string): Promise<void> {
+  await UploadBlob(
+    "dl-link",
+    pendingExcelSelectionBlobName(threadId),
+    Buffer.from(
+      JSON.stringify({ action: "pdf_to_excel", files: [], savedAt: 0 })
+    )
+  );
+}
+
 async function saveWordPointer(
   threadId: string,
   pointer: TeamsWordPointer
@@ -2641,6 +2742,37 @@ function buildNotFoundMessage(
 function buildMultipleFilesMessage(files: TeamsOfficeFileCandidate[]): string {
   const list = files.slice(0, 10).map((file) => `- ${file.name}`).join("\n");
   return `複数のファイルが見つかりました。変換するファイル名を「」で囲んで指定してください。\n\n${list}`;
+}
+
+function buildNumberedFilesMessage(files: TeamsOfficeFileCandidate[]): string {
+  const list = files
+    .slice(0, 10)
+    .map((file, index) => `${index + 1}. ${file.name}`)
+    .join("\n");
+  return `複数のファイルが見つかりました。変換する番号を指定してください。\n\n${list}\n\n例: 「1番」「上」`;
+}
+
+function parseOfficeCandidateSelection(
+  message: string,
+  candidateCount: number
+): number | null {
+  const normalized = message.trim().replace(/[。．.!！]/g, "");
+  if (/^(?:上|一番上|最初)(?:で|を|に)?(?:お願いします)?$/.test(normalized)) {
+    return 0;
+  }
+  if (/^(?:下|一番下|最後)(?:で|を|に)?(?:お願いします)?$/.test(normalized)) {
+    return candidateCount - 1;
+  }
+  const match = normalized.match(
+    /^(?:候補)?\s*([0-9０-９]+)\s*(?:番|番目)?(?:で|を|に)?(?:お願いします)?$/
+  );
+  if (!match) return null;
+  const numeric = Number(
+    match[1].replace(/[０-９]/g, (value) =>
+      String(value.charCodeAt(0) - 0xfee0)
+    )
+  );
+  return Number.isInteger(numeric) ? numeric - 1 : null;
 }
 
 export function buildTeamsThreadId(conversationId: string): string {
