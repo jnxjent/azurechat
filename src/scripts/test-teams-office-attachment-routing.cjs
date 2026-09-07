@@ -9,6 +9,7 @@ const pptPlanInputs = [];
 const sharedCompanyPlanInputs = [];
 const sharePointSummaryInputs = [];
 const sharePointPptSearchInputs = [];
+const officeFileSearchResults = [];
 
 function loadOfficeService() {
   const storedBlobs = new Map();
@@ -179,6 +180,11 @@ function loadOfficeService() {
     }
     if (request === "./teams-search-service") {
       return {
+        findTeamsOfficeFileCandidates: async () =>
+          officeFileSearchResults.shift() ?? {
+            exactMatches: [],
+            suggestions: [],
+          },
         searchTeamsKnowledgeByFileFamily: async (props) => {
           sharePointPptSearchInputs.push(props);
           return {
@@ -207,10 +213,77 @@ function loadOfficeService() {
 
 const {
   buildTeamsThreadId,
+  executePendingTeamsOfficeSelection,
   executeTeamsOfficeRequest,
   parseTeamsOfficeRequest,
   registerTeamsUploadedOfficeFiles,
 } = loadOfficeService();
+
+async function testNumberedExcelCandidateSelection() {
+  const conversationId = "excel-candidate-selection-conversation";
+  officeFileSearchResults.push({
+    exactMatches: [
+      {
+        name: "ABCD㈱財務諸表.pdf",
+        url: "https://example.test/old-index-record.pdf",
+      },
+      {
+        name: "ABCD㈱財務諸表.pdf",
+        url: "https://example.test/current-index-record.pdf",
+      },
+    ],
+    suggestions: [],
+  });
+
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        downloadUrl: "https://example.test/selected.xlsx",
+        fileName: "ABCD㈱財務諸表.xlsx",
+        pages: 2,
+      }),
+    };
+  };
+
+  try {
+    const firstReply = await executeTeamsOfficeRequest({
+      request: { action: "pdf_to_excel", fileQuery: "ABCD㈱財務諸表" },
+      conversationId,
+      uploadedFiles: [],
+      userEmail: "user@example.com",
+    });
+    assert.match(firstReply, /1\. ABCD㈱財務諸表\.pdf/);
+    assert.match(firstReply, /2\. ABCD㈱財務諸表\.pdf/);
+    assert.match(firstReply, /「1番」「上」/);
+    assert.equal(requests.length, 0);
+
+    const selectedReply = await executePendingTeamsOfficeSelection({
+      message: "2番でお願いします",
+      conversationId,
+    });
+    assert.match(selectedReply ?? "", /選択した「ABCD㈱財務諸表\.pdf」/);
+    assert.equal(requests.length, 1);
+    assert.equal(
+      requests[0].fileUrl,
+      "https://example.test/current-index-record.pdf"
+    );
+
+    assert.equal(
+      await executePendingTeamsOfficeSelection({
+        message: "1番",
+        conversationId,
+      }),
+      null
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
 
 assert.equal(
   parseTeamsOfficeRequest(
@@ -665,6 +738,7 @@ testPdfTranslationExecutionAndFollowup()
   .then(testWebGroundedPptAndLogoFollowup)
   .then(testExecutiveSharePointPptRenderingOptions)
   .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
+  .then(testNumberedExcelCandidateSelection)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })
