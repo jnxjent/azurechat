@@ -51,6 +51,7 @@ import {
   sanitizeImageLocationForLog,
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
+import { resolveWordEditInstruction } from "./word-edit-instruction";
 
 import {
   buildSendOptionsFromMode,
@@ -8546,14 +8547,25 @@ async function executeEditWord(
   let { fileUrl, instruction, trackChanges, originalFileName } = args ?? {};
   const trackChangesWasExplicit = typeof args?.trackChanges === "boolean";
 
-  // ツール選択LLMが正誤の向きを言い換え・逆転しても、ユーザー原文を
-  // Word編集の最終的な指示として扱う。
+  // ユーザー自身の明示 A→B は最優先する。一方、元指示が抽象的な校正依頼で
+  // sl_doc_search 後のツール指示が具体的な閉じた置換リストなら、それを保持する。
   const originalUserInstruction = userMessage?.trim();
   if (originalUserInstruction) {
-    if (originalUserInstruction !== instruction?.trim()) {
+    const resolvedInstruction = resolveWordEditInstruction(
+      instruction,
+      originalUserInstruction
+    );
+    if (
+      resolvedInstruction.source === "tool-explicit" &&
+      originalUserInstruction !== instruction?.trim()
+    ) {
+      console.log(
+        "[edit_word] preserving explicit tool instruction derived from document review"
+      );
+    } else if (originalUserInstruction !== instruction?.trim()) {
       console.log("[edit_word] using original user instruction instead of tool-generated instruction");
     }
-    instruction = originalUserInstruction;
+    instruction = resolvedInstruction.instruction;
   }
 
   if (!instruction?.trim()) {

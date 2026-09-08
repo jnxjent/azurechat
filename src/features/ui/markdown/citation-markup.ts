@@ -8,6 +8,20 @@ export type CitationMarkupItem = {
 export const CITATION_MARKUP_RE =
   /\{%\s*citation\s+items\s*=\s*\[([\s\S]*?)\]\s*\/\s*%\}?/gi;
 
+// ChatGPT-style internal references can occasionally leak from the model even
+// though AzureChat uses its own citation markup. They are presentation tokens,
+// not usable document links (for example: `fileciteturn0file0`).
+const OPENAI_INTERNAL_CITATION_RE =
+  /(?:file)?cite[^\r\n]*(?:|$)/gi;
+
+export function removeOpenAIInternalCitationMarkup(text: string): string {
+  return text
+    .replace(OPENAI_INTERNAL_CITATION_RE, "")
+    .replace(/[ \t]+(?=\r?$)/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
 function decodeQuotedValue(value: string): string {
   try {
     return JSON.parse(`"${value.replace(/"/g, '\\"')}"`);
@@ -93,11 +107,12 @@ export function formatCitationMarkup(items: CitationMarkupItem[]): string {
 
 export function removeCitationMarkup(text: string): string {
   const re = new RegExp(CITATION_MARKUP_RE.source, CITATION_MARKUP_RE.flags);
-  return text
+  const withoutAzureChatCitations = text
     .replace(re, "")
     // Citation is required at the end of an answer. If a model truncated the
     // closing `] /%}`, remove that incomplete tail before appending canonical markup.
     .replace(/\{%\s*citation\b[\s\S]*$/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
+  return removeOpenAIInternalCitationMarkup(withoutAzureChatCitations);
 }

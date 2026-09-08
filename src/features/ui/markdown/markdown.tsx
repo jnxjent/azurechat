@@ -9,6 +9,7 @@ import { Paragraph } from "./paragraph";
 import {
   CITATION_MARKUP_RE,
   parseCitationItems,
+  removeOpenAIInternalCitationMarkup,
 } from "./citation-markup";
 
 interface Props {
@@ -95,6 +96,10 @@ function normalizeBrTags(src: string): string {
  */
 function preprocessCitations(src: string): string {
   if (!src) return src;
+
+  // Hide leaked model-internal file/search references, including ones already
+  // persisted before server-side final-response normalization was added.
+  src = removeOpenAIInternalCitationMarkup(src);
 
   // Markdoc citation
   const MARKDOC_RE = new RegExp(
