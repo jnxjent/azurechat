@@ -366,8 +366,8 @@ const openAiStream = fs.readFileSync(
 assert.ok(openAiStream.includes('.on("end"'));
 assert.ok(openAiStream.includes("buildToolResultFallbackContent"));
 assert.ok(openAiStream.includes("runner ended without finalContent"));
-assert.ok(openAiStream.includes("hasGeneratedPptxResult"));
-assert.ok(openAiStream.includes("suppressed citations for PPTX result"));
+assert.ok(openAiStream.includes("hasGeneratedFileResult"));
+assert.ok(openAiStream.includes("suppressed citations for generated file result"));
 assert.ok(openAiStream.includes("removeCitationMarkup(content).trimEnd()"));
 
 const chatStoreSource = fs.readFileSync(

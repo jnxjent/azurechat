@@ -13,6 +13,7 @@ import {
   formatCitationMarkup,
   removeCitationMarkup,
 } from "@/features/ui/markdown/citation-markup";
+import { hasGeneratedFileResult } from "./generated-file-result";
 
 /**
  * LLM が壊れた Markdown リンクを生成した場合に修復する。
@@ -96,30 +97,6 @@ function extractToolCitationItems(toolResults: string[]): CitationMarkupItem[] {
   return Array.from(new Map(items.map((item) => [item.id, item])).values());
 }
 
-function hasGeneratedPptxResult(toolResults: string[]): boolean {
-  return toolResults.some((toolResult) => {
-    try {
-      const parsed = JSON.parse(toolResult) as Record<string, unknown>;
-      const fileName =
-        typeof parsed.fileName === "string" ? parsed.fileName : "";
-      const displayName =
-        typeof parsed.displayName === "string" ? parsed.displayName : "";
-      const downloadUrl =
-        typeof parsed.downloadUrl === "string" ? parsed.downloadUrl : "";
-      const message = typeof parsed.message === "string" ? parsed.message : "";
-
-      return (
-        /\.pptx$/i.test(fileName) ||
-        /\.pptx$/i.test(displayName) ||
-        /\.pptx(?:$|[?#])/i.test(downloadUrl) ||
-        (Boolean(downloadUrl) && /PowerPoint/i.test(message))
-      );
-    } catch {
-      return false;
-    }
-  });
-}
-
 /**
  * Rebuild citations from IDs that were actually created by server-side tools.
  * This prevents model-specific Markdoc formatting differences from leaking into UI.
@@ -128,12 +105,12 @@ function normalizeFinalCitations(
   content: string,
   toolResults: string[]
 ): string {
-  // Search results may be used to ground a generated deck, but they are not
-  // citations for the short PPTX download response. Do not expose every
-  // retrieval candidate as a citation list after PPTX creation or editing.
-  if (hasGeneratedPptxResult(toolResults)) {
+  // Search results may ground a generated or edited file, but they are not
+  // citations for the short download response. Do not expose every retrieval
+  // candidate after Word/Excel/PDF/PPTX creation, conversion, or editing.
+  if (hasGeneratedFileResult(toolResults)) {
     const body = removeCitationMarkup(content).trimEnd();
-    console.log("[open-ai-stream] suppressed citations for PPTX result");
+    console.log("[open-ai-stream] suppressed citations for generated file result");
     return body;
   }
 

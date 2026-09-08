@@ -107,8 +107,9 @@ def convert_pptx_to_pdf_libreoffice(pptx_path: str, out_dir: str) -> str | None:
         return None
 
     # プロセスごとに独立したLOプロファイルを使用（並行実行時の競合回避）
-    lo_profile = f"/tmp/lo_profile_{os.getpid()}"
-    os.makedirs(lo_profile, exist_ok=True)
+    lo_profile = tempfile.mkdtemp(
+        prefix=f"lo_profile_{os.getpid()}_", dir=tempfile.gettempdir()
+    )
 
     result = subprocess.run(
         [
@@ -117,7 +118,7 @@ def convert_pptx_to_pdf_libreoffice(pptx_path: str, out_dir: str) -> str | None:
             "--norestore",
             "--nologo",
             f"-env:UserInstallation=file://{lo_profile}",
-            "--convert-to", "pdf",
+            "--convert-to", "pdf:impress_pdf_Export",
             "--outdir", out_dir,
             pptx_path,
         ],
@@ -126,12 +127,36 @@ def convert_pptx_to_pdf_libreoffice(pptx_path: str, out_dir: str) -> str | None:
 
     shutil.rmtree(lo_profile, ignore_errors=True)
 
-    if result.returncode != 0:
-        print(f"[pptx_to_png] LibreOffice error: {result.stderr}", file=sys.stderr)
-        return None
     pdf_name = os.path.splitext(os.path.basename(pptx_path))[0] + ".pdf"
     pdf_path = os.path.join(out_dir, pdf_name)
-    return pdf_path if os.path.exists(pdf_path) else None
+    if result.returncode == 0 and os.path.exists(pdf_path):
+        return pdf_path
+
+    # LibreOffice can return rc=0 while producing no file, or occasionally
+    # choose a slightly different output name. The output directory is unique
+    # to this conversion, so a single PDF is safe to accept.
+    pdf_candidates = sorted(
+        os.path.join(out_dir, name)
+        for name in os.listdir(out_dir)
+        if name.lower().endswith(".pdf")
+    )
+    if result.returncode == 0 and len(pdf_candidates) == 1:
+        print(
+            f"[pptx_to_png] LibreOffice used unexpected PDF name: "
+            f"{os.path.basename(pdf_candidates[0])}",
+            file=sys.stderr,
+        )
+        return pdf_candidates[0]
+
+    stdout = (result.stdout or "").strip().replace("\n", " | ")[:800]
+    stderr = (result.stderr or "").strip().replace("\n", " | ")[:800]
+    output_files = ",".join(sorted(os.listdir(out_dir)))[:800]
+    print(
+        f"[pptx_to_png] LibreOffice produced no PDF: rc={result.returncode} "
+        f"stdout={stdout!r} stderr={stderr!r} outputs={output_files!r}",
+        file=sys.stderr,
+    )
+    return None
 
 
 def pdf_to_pngs(pdf_path: str, output_dir: str, max_slides: int,
@@ -217,7 +242,23 @@ def convert_pptx_to_pngs(pptx_path: str, output_dir: str, max_slides: int = 8) -
 
             result = convert_pptx_to_pdf_libreoffice(lo_input, tmp_dir)
             if not result:
-                return []
+                retry_input = pptx_path
+                retry_kind = "original PPTX" if lo_input != pptx_path else "same PPTX"
+                print(
+                    f"[pptx_to_png] LibreOffice conversion failed; retrying once with {retry_kind}",
+                    file=sys.stderr,
+                )
+                result = convert_pptx_to_pdf_libreoffice(retry_input, tmp_dir)
+                if not result:
+                    print(
+                        "[pptx_to_png] LibreOffice conversion failed after retry",
+                        file=sys.stderr,
+                    )
+                    return []
+                # When the scaled copy fails and the original succeeds, use the
+                # original dimensions for the residual aspect-ratio correction.
+                render_w = pptx_w_in
+                render_h = pptx_h_in
 
             return pdf_to_pngs(result, output_dir, max_slides,
                                pptx_w_in, pptx_h_in, render_w, render_h)

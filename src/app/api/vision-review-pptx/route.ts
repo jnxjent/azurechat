@@ -153,12 +153,12 @@ async function pptxToPngs(pptxBuffer: Buffer, maxSlides = 12): Promise<string[]>
     );
 
     if (stderr) {
-      console.log(`[vision-review] pptx_to_png stderr: ${stderr.slice(0, 300)}`);
+      console.log(`[vision-review] pptx_to_png stderr: ${stderr.slice(0, 2000)}`);
     }
 
     const pngList = stdout.replace(/\r/g, "").trim().split("\n").filter(Boolean);
     if (pngList.length === 0) {
-      console.warn("[vision-review] No PNGs generated — converter not available");
+      console.warn("[vision-review] PPTX-to-PNG conversion produced no output");
     }
     return pngList;
   } catch (e) {
