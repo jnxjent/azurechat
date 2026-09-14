@@ -83,6 +83,11 @@ const guard = loadTs("sl-sync-guard.ts", {
   "@azure/storage-blob": fakeStorage,
   "./document-extract": { extractWordText: async () => [] },
   "./sl-sync-budget": budget,
+  "pdfjs-dist/legacy/build/pdf.js": {
+    getDocument({ data }) {
+      return { promise: Promise.resolve({ numPages: new DataView(data.buffer).getUint16(0, true) }) };
+    },
+  },
 });
 
 const file = (itemId) => ({
@@ -113,6 +118,7 @@ async function main() {
   process.env.SL_SYNC_INITIAL_MONTHLY_OCR_PAGES = "2";
   process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "200";
   process.env.SL_SYNC_MAX_FILE_ATTEMPTS = "2";
+  process.env.SL_SYNC_MAX_FILE_TOTAL_ATTEMPTS = "2";
   delete process.env.SL_SYNC_PAUSE_AT;
 
   const prodId = await guard.claimSlSyncFile(file("same"));
@@ -120,6 +126,12 @@ async function main() {
   const testId = await guard.claimSlSyncFile(file("same"));
   assert.notEqual(prodId, testId, "each Search index needs its own attempt record");
   await assert.rejects(guard.claimSlSyncFile(file("extra")), blocked("monthly_page_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([file("extra")])], [0],
+    "a file that does not fit the remaining monthly budget must not block smaller files");
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "5";
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([file("extra")])], [],
+    "raising the monthly limit must release a deferred file");
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "4";
   const ledger = [...blobs.entries()].find(([name]) => name.endsWith(".json"));
   assert.equal(JSON.parse(ledger[1].data).monthlyPages, 4, "both sites share one page budget");
 
@@ -128,13 +140,72 @@ async function main() {
   process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "100";
   const retryId = await guard.claimSlSyncFile(file("retry"));
   assert.equal(retryId, await guard.claimSlSyncFile(file("retry")));
-  await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("attempt_limit"));
+  await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("total_attempt_limit"));
+  const exhausted = ["retry", "retry", "retry", "retry", "retry", "next"].map((itemId) => file(itemId));
+  const excluded = await guard.getSlSyncExcludedCandidatePositions(exhausted);
+  assert.deepEqual([...excluded], [0, 1, 2, 3, 4]);
+  assert.equal(exhausted.filter((_, position) => !excluded.has(position)).slice(0, 5)[0].itemId,
+    "next", "a retry-exhausted first batch must not block later files");
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([
+    { ...file("retry"), contentTag: "v2" },
+  ])], [], "a changed file version may be retried");
+  const retryBlob = [...blobs.keys()].find((name) => name.endsWith(".json") &&
+    JSON.parse(blobs.get(name).data).attempts[retryId]);
+  const retryRecord = JSON.parse(blobs.get(retryBlob).data);
+  retryRecord.attempts[retryId].day = "2000-01-01";
+  await blobClient(retryBlob).uploadData(Buffer.from(JSON.stringify(retryRecord)));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([file("retry")])], [0],
+    "two cumulative attempts remain exhausted on the next day");
+  await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("total_attempt_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([file("retry")])], [0],
+    "two cumulative attempts stop a small file from blocking later files");
   await guard.markSlSyncFileIndexed(retryId);
   await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("already_indexed_this_version"));
+
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-pre-ocr.test/";
+  const badDownload = file("bad-download");
+  assert.deepEqual(await guard.recordSlSyncFilePreOcrFailure(badDownload), { count: 1, limit: 2 });
+  assert.deepEqual(await guard.recordSlSyncFilePreOcrFailure(badDownload), { count: 2, limit: 2 });
+  assert.deepEqual(await guard.recordSlSyncFilePreOcrFailure(badDownload), { count: 2, limit: 2 });
+  const preOcrBatch = ["bad-download", "bad-download", "next-file"].map((itemId) => file(itemId));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions(preOcrBatch)], [0, 1],
+    "a failed download or page count must release the first batch slot");
+  const preOcrExcluded = await guard.getSlSyncExcludedCandidatePositions(preOcrBatch);
+  assert.equal(preOcrBatch.filter((_, position) => !preOcrExcluded.has(position))[0].itemId,
+    "next-file", "the next candidate must enter the batch");
+  const preOcrBlob = [...blobs.entries()].find(([name, blob]) =>
+    name.endsWith(".json") && Object.values(JSON.parse(blob.data).attempts).some((entry) =>
+      entry.totalCount === 2 && !Object.hasOwn(entry, "pages")));
+  assert.ok(preOcrBlob, "pre-OCR failures must be written to the shared ledger");
+  assert.equal(JSON.parse(preOcrBlob[1].data).monthlyPages, 0,
+    "a failed download must not charge OCR pages");
+  await assert.rejects(guard.claimSlSyncFile(badDownload), blocked("total_attempt_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([
+    { ...badDownload, contentTag: "v2" },
+  ])], [], "a corrected file version can be retried");
+
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-large.test/";
+  process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "1000";
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "10000";
+  process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "500";
+  const pdf = (itemId, pages) => ({
+    ...file(itemId), fileName: "large.pdf", buffer: new Uint16Array([pages]).buffer,
+  });
+  await guard.claimSlSyncFile(pdf("large", 400));
+  await guard.claimSlSyncFile(pdf("large", 400));
+  await assert.rejects(guard.claimSlSyncFile(pdf("large", 400)), blocked("total_attempt_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([pdf("large", 400)])], [0],
+    "a failed large PDF must stop occupying the next batch");
+  await assert.rejects(guard.claimSlSyncFile(pdf("oversized", 600)), blocked("file_page_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([pdf("oversized", 600)])], [0]);
+  process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "600";
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([pdf("oversized", 600)])], [],
+    "raising the page limit must release an oversized PDF");
 
   process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "bad";
   await assert.rejects(guard.claimSlSyncFile(file("invalid")), blocked("invalid_sl_sync_daily_ocr_page_limit"));
   process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "10";
+  process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "200";
   process.env.SL_SYNC_PAUSE_AT = "2026-09-21T00:00:00+09:00";
   assert.equal(guard.slSyncPauseReason(new Date("2026-09-20T14:59:59Z")), null);
   assert.equal(guard.slSyncPauseReason(new Date("2026-09-20T15:00:00Z")), "scheduled_pause");

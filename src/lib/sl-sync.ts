@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
 import { OpenAIEmbeddingInstance } from "@/features/common/services/openai";
 import { extractIndexDocumentFromBuffer } from "./document-extract";
-import { claimSlSyncFile, markSlSyncFileIndexed, SlSyncGuardBlockedError } from "./sl-sync-guard";
+import { claimSlSyncFile, getSlSyncExcludedCandidatePositions, markSlSyncFileIndexed, recordSlSyncFilePreOcrFailure, SlSyncGuardBlockedError } from "./sl-sync-guard";
 
 export type SpFileItem = {
   id: string;
@@ -1028,6 +1028,9 @@ function findUnindexedSpItems(
   const indexedByRelPath = new Set<string>();
 
   for (const doc of indexDocs) {
+    // Error sentinels contain no searchable file content. A failed file must
+    // remain eligible according to the retry policy.
+    if (doc.id.startsWith("sl_error_")) continue;
     if (doc.spItemId) indexedBySpItemId.add(doc.spItemId);
     if (doc.relativePath) indexedByRelPath.add(doc.relativePath.toLowerCase());
   }
@@ -1114,24 +1117,45 @@ async function indexNewSpFiles(params: {
     hasPageMetadataFields = false,
   } = params;
 
-  const batch = unindexedItems.slice(0, batchSize);
-  if (batch.length === 0) return { indexed: 0, skipped: 0, guardBlocked: 0 };
+  if (unindexedItems.length === 0) return { indexed: 0, skipped: 0, guardBlocked: 0 };
 
   const siteId = await resolveSiteId(accessToken, siteUrl);
   const driveId = await resolveDriveId(accessToken, siteId, driveName);
+  const excluded = await getSlSyncExcludedCandidatePositions(
+    unindexedItems.map((item) => ({
+      sourceSite: item.sourceSiteUrl || siteUrl,
+      driveId,
+      itemId: item.id,
+      contentTag: item.contentTag,
+    }))
+  );
+  const batch = unindexedItems.filter((_, position) => !excluded.has(position)).slice(0, batchSize);
+  if (excluded.size > 0) {
+    const examples = unindexedItems
+      .filter((_, position) => excluded.has(position))
+      .slice(0, 5)
+      .map((item) => item.name);
+    console.warn(`[SL sync guard] Skipped ${excluded.size} already indexed or retry-exhausted file versions before batch selection; examples=${JSON.stringify(examples)}`);
+  }
+  if (batch.length === 0) return { indexed: 0, skipped: excluded.size, guardBlocked: excluded.size };
   const openai = OpenAIEmbeddingInstance();
 
   let indexed = 0;
-  let skipped = 0;
-  let guardBlocked = 0;
+  let skipped = excluded.size;
+  let guardBlocked = excluded.size;
+  const legacyErrorIdsToRemove: string[] = [];
 
   for (const item of batch) {
+    let downloaded = false;
+    let ocrClaimed = false;
     try {
       console.log(`[SL sync] Indexing new SP file: ${item.name} (id=${item.id})`);
 
       const buffer = await downloadSpFile(accessToken, driveId, item.id);
+      downloaded = true;
 
       // Reserve the OCR cost and this file-version attempt before extraction.
+      // The ledger is shared across timer executions and App Service instances.
       const guardId = await claimSlSyncFile({
         sourceSite: item.sourceSiteUrl || siteUrl,
         driveId,
@@ -1140,11 +1164,12 @@ async function indexNewSpFiles(params: {
         fileName: item.name,
         buffer,
       });
+      ocrClaimed = true;
 
       const extractedDocument = await extractIndexDocumentFromBuffer(buffer, item.name);
       const allChunks = extractedDocument.chunks;
       if (allChunks.length === 0) {
-        console.warn(`[SL sync] No text extracted from ${item.name}, skipping`);
+        console.error(`[SL sync] No text extracted from ${item.name}; this OCR attempt failed`);
         skipped++;
         continue;
       }
@@ -1234,56 +1259,51 @@ async function indexNewSpFiles(params: {
       try {
         await markSlSyncFileIndexed(guardId);
       } catch (guardError) {
+        // A successful index write must stay successful even if status
+        // recording fails.
         console.error(`[SL sync guard] Could not mark ${item.name} as indexed:`, guardError);
       }
+      legacyErrorIdsToRemove.push(`sl_error_${hashValue(item.id || item.name)}`);
       indexed++;
       console.log(
         `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length} embeddingDim=${firstEmbeddingDim}`
       );
     } catch (e) {
+      const pageCountFailed = e instanceof SlSyncGuardBlockedError &&
+        (e.reason === "page_count_unknown" ||
+          e.reason.endsWith("_page_count_unknown") ||
+          e.reason === "unsupported_page_count");
+      if (!ocrClaimed && (!downloaded || pageCountFailed)) {
+        try {
+          const attempt = await recordSlSyncFilePreOcrFailure({
+            sourceSite: item.sourceSiteUrl || siteUrl,
+            driveId,
+            itemId: item.id,
+            contentTag: item.contentTag,
+          });
+          console.warn(`[SL sync guard] Pre-OCR failure for ${item.name}: attempt=${attempt.count}/${attempt.limit}`);
+        } catch (recordError) {
+          console.error(`[SL sync guard] Could not record failure for ${item.name}:`, recordError);
+        }
+      }
       if (e instanceof SlSyncGuardBlockedError) {
-        console.warn(`[SL sync guard] Deferred ${item.name}: ${e.reason}`);
+        const log = e.reason === "file_page_limit" || e.reason === "attempt_limit" || e.reason === "total_attempt_limit"
+          ? console.error : console.warn;
+        log(`[SL sync guard] Deferred ${item.name}: ${e.reason}`);
         skipped++;
         guardBlocked++;
         continue;
       }
       console.error(`[SL sync] Failed to index ${item.name}:`, e);
-      // sentinel エントリを登録して次回Syncで再キューされないようにする
-      try {
-        const sentinelText = `[INDEXING_FAILED] ${item.name}`;
-        const sentinelEmbRes = await openai.embeddings.create({
-          input: [sentinelText],
-          model: "",
-        });
-        const sentinelEmbedding = sentinelEmbRes.data[0]?.embedding ?? [];
-        const sentinelId = `sl_error_${hashValue(item.id || item.name)}`;
-        await addNewIndexDocs([{
-          id: sentinelId,
-          pageContent: sentinelText,
-          embedding: sentinelEmbedding,
-          metadata: JSON.stringify({ indexingError: true, fileName: item.name }),
-          fileUrl: item.webUrl,
-          effectiveFileUrl: item.webUrl,
-          chatThreadId: "system",
-          user: "system",
-          dept: dept,
-          isSlDoc: true,
-          slScope: "dept_common",
-          slOwner: null,
-          spItemId: item.id,
-          relativePath: item.relativePath ?? null,
-          ...(hasChangeTrackingFields
-            ? {
-                spContentTag: item.contentTag || null,
-                spLastModifiedAt: item.lastModifiedAt,
-              }
-            : {}),
-        }]);
-        console.warn(`[SL sync] Sentinel registered for ${item.name} to prevent re-queue`);
-      } catch (sentinelErr) {
-        console.error(`[SL sync] Sentinel registration also failed for ${item.name}:`, sentinelErr);
-      }
       skipped++;
+    }
+  }
+
+  if (legacyErrorIdsToRemove.length > 0) {
+    try {
+      await deleteIndexDocs(legacyErrorIdsToRemove);
+    } catch (cleanupError) {
+      console.warn("[SL sync] Could not remove old error sentinels:", cleanupError);
     }
   }
 
@@ -1300,6 +1320,7 @@ function findReindexCandidates(
   >();
 
   for (const entry of matchedDocs) {
+    if (entry.doc.id.startsWith("sl_error_")) continue;
     if (!entry.spItem?.id || !entry.spItem.contentTag) continue;
     const current = groups.get(entry.spItem.id) ?? {
       item: entry.spItem,
@@ -1659,9 +1680,21 @@ export async function runSlSync({
       };
 
       if (indexNew && !reindexOnly) {
-        const unindexed = findUnindexedSpItems(inventory, indexDocs);
+        // The department scan also contains global Common files for metadata
+        // matching. Index those only in the dedicated global_common pass, which
+        // uses the Common site's drive instead of the department drive.
+        const allUnindexed = findUnindexedSpItems(inventory, indexDocs);
+        const unindexed = allUnindexed.filter((item) => resolveScopeFromLocation({
+          webUrl: item.webUrl,
+          sourceSiteUrl: item.sourceSiteUrl,
+          deptSiteUrl: siteUrl,
+          deptBaseFolder: baseFolder,
+          itemRelativePath: item.relativePath,
+          globalCommonSiteUrl: globalCommon?.siteUrl ?? null,
+          globalCommonFolder: globalCommon?.folder ?? null,
+        }) !== "global_common");
         console.log(
-          `[SL sync] dept=${dept} unindexedSPFiles=${unindexed.length} apply=${apply}`
+          `[SL sync] dept=${dept} unindexedSPFiles=${unindexed.length} globalCommonDeferred=${allUnindexed.length - unindexed.length} apply=${apply}`
         );
         if (apply && unindexed.length > 0) {
           const { indexed, skipped, guardBlocked } = await indexNewSpFiles({
@@ -1852,7 +1885,7 @@ export async function runSlSync({
 
   // Prioritize real content changes across every department, then spend any
   // remaining budget on the gradual migration of legacy untagged documents.
-  const selectedReindexJobs = reindexJobs
+  const sortedReindexJobs = reindexJobs
     .sort((a, b) => {
       if (a.candidate.reason !== b.candidate.reason) {
         return a.candidate.reason === "content_changed" ? -1 : 1;
@@ -1863,7 +1896,41 @@ export async function runSlSync({
         (Number.isNaN(bModified) ? 0 : bModified) -
         (Number.isNaN(aModified) ? 0 : aModified)
       );
-    })
+    });
+  const reindexDriveIds = new Map<string, string>();
+  const reindexIdentities = [];
+  for (const job of sortedReindexJobs) {
+    const location = `${job.siteUrl}|${job.driveName}`;
+    let driveId = reindexDriveIds.get(location);
+    if (driveId === undefined) {
+      try {
+        const siteId = await resolveSiteId(accessToken, job.siteUrl);
+        driveId = await resolveDriveId(accessToken, siteId, job.driveName);
+      } catch (error) {
+        // The existing per-job handler reports a location error. An empty ID
+        // cannot match an attempt, so this job remains eligible for that handler.
+        console.error(`[SL sync] Could not resolve reindex drive for ${job.siteUrl}:`, error);
+        driveId = "";
+      }
+      reindexDriveIds.set(location, driveId);
+    }
+    reindexIdentities.push({
+      sourceSite: job.candidate.item.sourceSiteUrl || job.siteUrl,
+      driveId,
+      itemId: job.candidate.item.id,
+      contentTag: job.candidate.item.contentTag,
+    });
+  }
+  const excludedReindexPositions = await getSlSyncExcludedCandidatePositions(reindexIdentities);
+  if (excludedReindexPositions.size > 0) {
+    const examples = sortedReindexJobs
+      .filter((_, position) => excludedReindexPositions.has(position))
+      .slice(0, 5)
+      .map((job) => job.candidate.item.name);
+    console.warn(`[SL sync guard] Skipped ${excludedReindexPositions.size} already indexed or retry-exhausted reindex file versions before batch selection; examples=${JSON.stringify(examples)}`);
+  }
+  const selectedReindexJobs = sortedReindexJobs
+    .filter((_, position) => !excludedReindexPositions.has(position))
     .slice(0, batchSize);
 
   for (const job of selectedReindexJobs) {

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BlobServiceClient, type ContainerClient } from "@azure/storage-blob";
 import { extractWordText } from "./document-extract";
-import { reserveSlSyncBudget, rolloverSlSyncLedger, type SlSyncLedger } from "./sl-sync-budget";
+import { recordSlSyncPreOcrFailure as recordPreOcrFailure, reserveSlSyncBudget, rolloverSlSyncLedger, SL_SYNC_CONTINUING_RETRY_MAX_PAGES, type SlSyncLedger } from "./sl-sync-budget";
 
 export class SlSyncGuardBlockedError extends Error {
   constructor(public readonly reason: string) {
@@ -9,6 +9,13 @@ export class SlSyncGuardBlockedError extends Error {
     this.name = "SlSyncGuardBlockedError";
   }
 }
+
+export type SlSyncFileIdentity = {
+  sourceSite: string;
+  driveId: string;
+  itemId: string;
+  contentTag: string | null;
+};
 
 const CONTAINER = "sl-sync-guard";
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -27,8 +34,9 @@ const positiveInt = (name: string, fallback: number) => {
 const limits = () => ({
   daily: positiveInt("SL_SYNC_DAILY_OCR_PAGE_LIMIT", 5000),
   monthly: monthlyLimit(),
-  perFile: positiveInt("SL_SYNC_MAX_FILE_OCR_PAGES", 200),
+  perFile: positiveInt("SL_SYNC_MAX_FILE_OCR_PAGES", 500),
   attempts: positiveInt("SL_SYNC_MAX_FILE_ATTEMPTS", 2),
+  totalAttempts: positiveInt("SL_SYNC_MAX_FILE_TOTAL_ATTEMPTS", 2),
 });
 
 function monthlyLimit(): number {
@@ -89,6 +97,54 @@ function storage(): { container: ContainerClient; ledgerName: string } {
     container: service.getContainerClient(containerName),
     ledgerName: `budget-${hash(endpoint.toLowerCase()).slice(0, 24)}.json`,
   };
+}
+
+function fileAttemptId(file: SlSyncFileIdentity): string {
+  return hash([
+    process.env.AZURE_SEARCH_INDEX_NAME?.trim() ?? "",
+    file.sourceSite,
+    file.driveId,
+    file.itemId,
+    file.contentTag ?? "",
+  ].join("|"));
+}
+
+// Read the shared attempt ledger before selecting a batch. Exhausted files
+// must not keep occupying its first slots on every timer run.
+export async function getSlSyncExcludedCandidatePositions(
+  files: SlSyncFileIdentity[]
+): Promise<Set<number>> {
+  if (files.length === 0) return new Set();
+  try {
+    const max = limits();
+    return await withLedger((ledger) => {
+      const excluded = new Set<number>();
+      files.forEach((file, position) => {
+        const attempt = ledger.attempts[fileAttemptId(file)];
+        if (!attempt) return;
+        const oversized = attempt.blockedPageLimit !== undefined &&
+          attempt.blockedPageLimit >= max.perFile;
+        const budget = attempt.deferredBudget;
+        const deferred = budget !== undefined &&
+          (budget.reason === "daily_page_limit"
+            ? budget.period === ledger.day && max.daily <= budget.limit
+            : budget.period === ledger.month && max.monthly <= budget.limit);
+        const exhausted = attempt.pages !== undefined &&
+          attempt.count >= max.attempts &&
+          (attempt.pages > SL_SYNC_CONTINUING_RETRY_MAX_PAGES || attempt.day === ledger.day);
+        const cumulativeExhausted =
+          (attempt.totalCount ?? attempt.count) >= max.totalAttempts;
+        if (attempt.succeeded || oversized || deferred || exhausted || cumulativeExhausted) {
+          excluded.add(position);
+        }
+      });
+      return excluded;
+    });
+  } catch (error) {
+    if (error instanceof SlSyncGuardBlockedError) throw error;
+    console.error("[SL sync guard] Could not read attempt ledger:", error);
+    throw new SlSyncGuardBlockedError("budget_store_unavailable");
+  }
 }
 
 async function withLedger<T>(change: (ledger: SlSyncLedger) => Promise<T> | T): Promise<T> {
@@ -215,25 +271,37 @@ export async function claimSlSyncFile(params: {
   const max = limits();
   // A successful production index must not suppress the TestSite index: they
   // share the page budget, but each needs its own file-version attempt record.
-  const id = hash([
-    process.env.AZURE_SEARCH_INDEX_NAME?.trim() ?? "",
-    params.sourceSite,
-    params.driveId,
-    params.itemId,
-    params.contentTag ?? "",
-  ].join("|"));
+  const id = fileAttemptId(params);
   try {
-    return await withLedger((ledger) => {
+    const reason = await withLedger((ledger) => {
       const pause = slSyncPauseReason();
       if (pause) throw new SlSyncGuardBlockedError(pause);
       const reason = reserveSlSyncBudget(ledger, id, pages, max, new Date());
-      if (reason) throw new SlSyncGuardBlockedError(reason);
-      console.log(`[SL sync guard] reserved ${pages} pages; daily=${ledger.dailyPages}/${max.daily} monthly=${ledger.monthlyPages}/${max.monthly}`);
-      return id;
+      if (!reason) {
+        console.log(`[SL sync guard] reserved ${pages} pages; daily=${ledger.dailyPages}/${max.daily} monthly=${ledger.monthlyPages}/${max.monthly}`);
+      }
+      return reason;
     });
+    if (reason) throw new SlSyncGuardBlockedError(reason);
+    return id;
   } catch (error) {
     if (error instanceof SlSyncGuardBlockedError) throw error;
     console.error("[SL sync guard] Persistent budget unavailable:", error);
+    throw new SlSyncGuardBlockedError("budget_store_unavailable");
+  }
+}
+
+export async function recordSlSyncFilePreOcrFailure(file: SlSyncFileIdentity): Promise<{ count: number; limit: number }> {
+  const id = fileAttemptId(file);
+  try {
+    const max = limits();
+    const count = await withLedger((ledger) =>
+      recordPreOcrFailure(ledger, id, max, new Date())
+    );
+    return { count, limit: max.totalAttempts };
+  } catch (error) {
+    if (error instanceof SlSyncGuardBlockedError) throw error;
+    console.error("[SL sync guard] Could not record pre-OCR failure:", error);
     throw new SlSyncGuardBlockedError("budget_store_unavailable");
   }
 }
