@@ -148,7 +148,14 @@ export const ChatApiRAG = async (props: {
   console.log("[RAG-EXT] deptLower =", deptLower);
   console.log("[RAG-EXT] userHash =", userHash ? "***" : "(none)");
 
-  const baseFilter = `(chatThreadId eq '${odataEscape(chatThread.id)}' or isSlDoc eq true)`;
+  // A question about an uploaded attachment must search this thread first.
+  // Otherwise unrelated SharePoint chunks can occupy all eight result slots.
+  const threadFilter = `chatThreadId eq '${odataEscape(chatThread.id)}'`;
+  const refersToAttachment =
+    /(?:\u6dfb\u4ed8|\u3053\u306ePDF|\u3053\u306e\u8cc7\u6599|\u3053\u306e\u30d5\u30a1\u30a4\u30eb|\u30a2\u30c3\u30d7\u30ed\u30fc\u30c9\u3057\u305f)/i.test(userMessage);
+  const baseFilter = refersToAttachment
+    ? threadFilter
+    : `(${threadFilter} or isSlDoc eq true)`;
   const inferredTarget = inferSlSearchTarget(userMessage);
   const initialTargetFilter = buildSlSearchTargetFilter(inferredTarget);
   const initialSearchText = stripSlSearchTargetTerms(userMessage, inferredTarget);

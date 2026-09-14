@@ -21,9 +21,13 @@ type SyncRow = {
   error?: string;
   skipped?: string;
   urlUpdated?: number;
+  newIndexed?: number;
+  newSkipped?: number;
+  newGuardBlocked?: number;
   reindexCandidates?: number;
   reindexed?: number;
   reindexFailed?: number;
+  reindexGuardBlocked?: number;
 };
 
 export const ChatHeader: FC<Props> = (props) => {
@@ -49,6 +53,16 @@ export const ChatHeader: FC<Props> = (props) => {
 
       const data = await res.json();
       if (data.ok) {
+        if (data.skipped) {
+          setSyncResult(data.skipped === "scheduled_pause"
+            ? "同期停止中：停止時刻を過ぎています（Index処理なし）"
+            : `同期設定エラー：${data.skipped}（Index処理なし）`);
+          return;
+        }
+        if (!data.results || typeof data.results !== "object") {
+          setSyncResult("エラー：同期結果がありません");
+          return;
+        }
         const allRows = Object.entries(data.results as Record<string, SyncRow>);
         const errorDepts = allRows
           .filter(([, row]) => row.error)
@@ -80,8 +94,21 @@ export const ChatHeader: FC<Props> = (props) => {
           (sum, row) => sum + (row.reindexFailed ?? 0),
           0
         );
+        const newIndexed = okRows.reduce(
+          (sum, row) => sum + (row.newIndexed ?? 0),
+          0
+        );
+        const guardBlocked = okRows.reduce(
+          (sum, row) => sum + (row.newGuardBlocked ?? 0) + (row.reindexGuardBlocked ?? 0),
+          0
+        );
+        const newSkipped = okRows.reduce(
+          (sum, row) => sum + (row.newSkipped ?? 0),
+          0
+        );
 
         const parts = [
+          `新規Index:${newIndexed}件`,
           `更新:${updated}件`,
           `削除:${deleted}件`,
           `再Index:${reindexed}件`,
@@ -89,6 +116,12 @@ export const ChatHeader: FC<Props> = (props) => {
         ];
         if (reindexFailed > 0) {
           parts.push(`再Index失敗:${reindexFailed}件`);
+        }
+        if (guardBlocked > 0) {
+          parts.push(`費用上限で保留:${guardBlocked}件`);
+        }
+        if (newSkipped > guardBlocked) {
+          parts.push(`新規スキップ:${newSkipped - guardBlocked}件`);
         }
         if (errorDepts.length > 0) {
           parts.push(`エラー:${errorDepts.join(",")}`);
@@ -105,7 +138,7 @@ export const ChatHeader: FC<Props> = (props) => {
       setSyncResult(`エラー: ${e.message}`);
     } finally {
       setSyncing(false);
-      setTimeout(() => setSyncResult(null), 5000);
+      setTimeout(() => setSyncResult(null), 15000);
     }
   };
 
