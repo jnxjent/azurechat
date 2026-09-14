@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BlobServiceClient, type ContainerClient } from "@azure/storage-blob";
 import { extractWordText } from "./document-extract";
-import { recordSlSyncPreOcrFailure as recordPreOcrFailure, reserveSlSyncBudget, rolloverSlSyncLedger, SL_SYNC_CONTINUING_RETRY_MAX_PAGES, type SlSyncLedger } from "./sl-sync-budget";
+import { recordSlSyncExcelLimit, recordSlSyncPreOcrFailure as recordPreOcrFailure, reserveSlSyncBudget, rolloverSlSyncLedger, SL_SYNC_CONTINUING_RETRY_MAX_PAGES, type SlSyncLedger, type SlSyncAttempt } from "./sl-sync-budget";
 
 export class SlSyncGuardBlockedError extends Error {
   constructor(public readonly reason: string) {
@@ -28,6 +28,63 @@ const positiveInt = (name: string, fallback: number) => {
   }
   return value;
 };
+
+type ExcelMetric = NonNullable<SlSyncAttempt["blockedExcelLimit"]>["metric"];
+const isExcel = (fileName: string) => /\.(xlsx|xlsm|xls)$/i.test(fileName);
+const excelLimits = () => ({
+  source_bytes: positiveInt("SL_SYNC_MAX_EXCEL_SOURCE_BYTES", 5 * 1024 * 1024),
+  xml_bytes: positiveInt("SL_SYNC_MAX_EXCEL_XML_BYTES", 20 * 1024 * 1024),
+  chunks: positiveInt("SL_SYNC_MAX_EXCEL_CHUNKS", 300),
+});
+
+async function excelXmlBytes(buffer: ArrayBuffer): Promise<number> {
+  let zip: import("jszip");
+  try {
+    const jszip = await import("jszip");
+    zip = await (jszip.default ?? jszip).loadAsync(Buffer.from(buffer));
+  } catch {
+    throw new SlSyncGuardBlockedError("excel_zip_invalid");
+  }
+  let total = 0;
+  for (const [path, entry] of Object.entries(zip.files)) {
+    if (!/^xl\/(sharedStrings\.xml|worksheets\/[^/]+\.xml)$/i.test(path)) continue;
+    const size = (entry as typeof entry & { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
+    if (!Number.isSafeInteger(size) || size === undefined || size < 0) {
+      throw new SlSyncGuardBlockedError("excel_zip_size_unknown");
+    }
+    total += size;
+    if (!Number.isSafeInteger(total)) throw new SlSyncGuardBlockedError("excel_zip_size_unknown");
+  }
+  return total;
+}
+
+async function blockExcelLimit(
+  file: SlSyncFileIdentity,
+  fileName: string,
+  metric: ExcelMetric,
+  measured: number,
+  limit: number
+): Promise<never> {
+  try {
+    await withLedger((ledger) => {
+      recordSlSyncExcelLimit(ledger, fileAttemptId(file), metric, measured, limit, new Date());
+    });
+  } catch (error) {
+    console.error("[SL sync guard] Could not record Excel limit:", error);
+    throw new SlSyncGuardBlockedError("budget_store_unavailable");
+  }
+  console.error(`[SL sync guard] Skipped Excel ${fileName}: ${metric}=${measured} limit=${limit}`);
+  throw new SlSyncGuardBlockedError(`excel_${metric}_limit`);
+}
+
+export async function enforceSlSyncExcelChunkLimit(
+  file: SlSyncFileIdentity & { fileName: string },
+  chunks: number
+): Promise<void> {
+  if (!isExcel(file.fileName)) return;
+  const limit = excelLimits().chunks;
+  if (chunks > limit) await blockExcelLimit(file, file.fileName, "chunks", chunks, limit);
+}
 
 // August 2026: 112,629 processed pages cost JPY 30,190. Reserve headroom
 // below that pre-incident monthly usage; this is a page cap, not a yen cap.
@@ -124,6 +181,9 @@ export async function getSlSyncExcludedCandidatePositions(
         if (!attempt) return;
         const oversized = attempt.blockedPageLimit !== undefined &&
           attempt.blockedPageLimit >= max.perFile;
+        const excelBlocked = attempt.blockedExcelLimit;
+        const oversizedExcel = excelBlocked !== undefined &&
+          excelBlocked.measured > excelLimits()[excelBlocked.metric];
         const budget = attempt.deferredBudget;
         const deferred = budget !== undefined &&
           (budget.reason === "daily_page_limit"
@@ -134,7 +194,7 @@ export async function getSlSyncExcludedCandidatePositions(
           (attempt.pages > SL_SYNC_CONTINUING_RETRY_MAX_PAGES || attempt.day === ledger.day);
         const cumulativeExhausted =
           (attempt.totalCount ?? attempt.count) >= max.totalAttempts;
-        if (attempt.succeeded || oversized || deferred || exhausted || cumulativeExhausted) {
+        if (attempt.succeeded || oversized || oversizedExcel || deferred || exhausted || cumulativeExhausted) {
           excluded.add(position);
         }
       });
@@ -261,6 +321,18 @@ export async function claimSlSyncFile(params: {
 }): Promise<string> {
   const pause = slSyncPauseReason();
   if (pause) throw new SlSyncGuardBlockedError(pause);
+  if (isExcel(params.fileName)) {
+    const excelMax = excelLimits();
+    if (params.buffer.byteLength > excelMax.source_bytes) {
+      await blockExcelLimit(params, params.fileName, "source_bytes", params.buffer.byteLength, excelMax.source_bytes);
+    }
+    if (/\.(xlsx|xlsm)$/i.test(params.fileName)) {
+      const xmlBytes = await excelXmlBytes(params.buffer);
+      if (xmlBytes > excelMax.xml_bytes) {
+        await blockExcelLimit(params, params.fileName, "xml_bytes", xmlBytes, excelMax.xml_bytes);
+      }
+    }
+  }
   let pages: number;
   try {
     pages = await estimatePages(params.buffer, params.fileName);

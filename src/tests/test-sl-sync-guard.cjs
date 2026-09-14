@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const Module = require("node:module");
 const ts = require("typescript");
+const JSZip = require("jszip");
 
 function loadTs(file, dependencies = {}) {
   const sourcePath = path.join(__dirname, "..", "lib", file);
@@ -201,6 +202,52 @@ async function main() {
   process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "600";
   assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([pdf("oversized", 600)])], [],
     "raising the page limit must release an oversized PDF");
+
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-excel.test/";
+  process.env.SL_SYNC_MAX_EXCEL_SOURCE_BYTES = "10000";
+  process.env.SL_SYNC_MAX_EXCEL_XML_BYTES = "100";
+  process.env.SL_SYNC_MAX_EXCEL_CHUNKS = "2";
+  const bigXml = new JSZip();
+  bigXml.file("xl/worksheets/sheet1.xml", "x".repeat(101));
+  const largeXlsx = { ...file("large-xlsx"), fileName: "large.xlsx",
+    buffer: await bigXml.generateAsync({ type: "nodebuffer" }) };
+  await assert.rejects(guard.claimSlSyncFile(largeXlsx), blocked("excel_xml_bytes_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([largeXlsx, file("next")])], [0],
+    "an oversized XLSX must release its batch slot without embedding");
+  await assert.rejects(guard.claimSlSyncFile({ ...largeXlsx, itemId: "large-xlsm", fileName: "large.xlsm" }),
+    blocked("excel_xml_bytes_limit"));
+  process.env.SL_SYNC_MAX_EXCEL_XML_BYTES = "101";
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([largeXlsx])], [],
+    "raising the XML limit must allow the same file version");
+
+  process.env.SL_SYNC_MAX_EXCEL_SOURCE_BYTES = "100";
+  const largeXls = { ...file("large-xls"), fileName: "large.xls", buffer: Buffer.alloc(101) };
+  await assert.rejects(guard.claimSlSyncFile(largeXls), blocked("excel_source_bytes_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([largeXls])], [0],
+    "an oversized XLS must be excluded before parsing");
+  process.env.SL_SYNC_MAX_EXCEL_SOURCE_BYTES = "102";
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([largeXls])], []);
+
+  const manyChunks = { ...file("many-chunks"), fileName: "many.xls", buffer: Buffer.alloc(10) };
+  await guard.claimSlSyncFile(manyChunks);
+  await assert.rejects(guard.enforceSlSyncExcelChunkLimit(manyChunks, 3), blocked("excel_chunks_limit"));
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([manyChunks])], [0],
+    "an Excel file with too many chunks must be excluded before embedding");
+  process.env.SL_SYNC_MAX_EXCEL_CHUNKS = "3";
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([manyChunks])], [],
+    "raising the chunk limit must release the file");
+  assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([
+    { ...manyChunks, contentTag: "v2" },
+  ])], [], "a changed Excel file version may be inspected again");
+
+  const actualExcel = process.env.SL_SYNC_EXCEL_TEST_FILE;
+  if (actualExcel) {
+    process.env.SL_SYNC_MAX_EXCEL_SOURCE_BYTES = String(5 * 1024 * 1024);
+    process.env.SL_SYNC_MAX_EXCEL_XML_BYTES = String(20 * 1024 * 1024);
+    const realFile = { ...file("real-excel"), fileName: "test2.xlsx", buffer: fs.readFileSync(actualExcel) };
+    await assert.rejects(guard.claimSlSyncFile(realFile), blocked("excel_xml_bytes_limit"));
+    assert.deepEqual([...await guard.getSlSyncExcludedCandidatePositions([realFile])], [0]);
+  }
 
   process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "bad";
   await assert.rejects(guard.claimSlSyncFile(file("invalid")), blocked("invalid_sl_sync_daily_ocr_page_limit"));

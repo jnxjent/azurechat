@@ -8,12 +8,38 @@ export type SlSyncAttempt = {
   pages?: number;
   day?: string;
   blockedPageLimit?: number;
+  blockedExcelLimit?: {
+    metric: "source_bytes" | "xml_bytes" | "chunks";
+    measured: number;
+    limit: number;
+  };
   deferredBudget?: {
     reason: "daily_page_limit" | "monthly_page_limit";
     period: string;
     limit: number;
   };
 };
+
+export function recordSlSyncExcelLimit(
+  ledger: SlSyncLedger,
+  id: string,
+  metric: NonNullable<SlSyncAttempt["blockedExcelLimit"]>["metric"],
+  measured: number,
+  limit: number,
+  now: Date
+): void {
+  const previous = ledger.attempts[id];
+  ledger.attempts[id] = {
+    count: previous?.count ?? 0,
+    totalCount: previous?.totalCount ?? previous?.count ?? 0,
+    succeeded: false,
+    updatedAt: now.toISOString(),
+    pages: previous?.pages,
+    day: previous?.day,
+    blockedExcelLimit: { metric, measured, limit },
+  };
+}
+
 export type SlSyncLedger = {
   version: 1;
   day: string;

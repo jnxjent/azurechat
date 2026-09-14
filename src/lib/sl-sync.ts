@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
 import { OpenAIEmbeddingInstance } from "@/features/common/services/openai";
 import { extractIndexDocumentFromBuffer } from "./document-extract";
-import { claimSlSyncFile, getSlSyncExcludedCandidatePositions, markSlSyncFileIndexed, recordSlSyncFilePreOcrFailure, SlSyncGuardBlockedError } from "./sl-sync-guard";
+import { claimSlSyncFile, enforceSlSyncExcelChunkLimit, getSlSyncExcludedCandidatePositions, markSlSyncFileIndexed, recordSlSyncFilePreOcrFailure, SlSyncGuardBlockedError } from "./sl-sync-guard";
 
 export type SpFileItem = {
   id: string;
@@ -1168,6 +1168,13 @@ async function indexNewSpFiles(params: {
 
       const extractedDocument = await extractIndexDocumentFromBuffer(buffer, item.name);
       const allChunks = extractedDocument.chunks;
+      await enforceSlSyncExcelChunkLimit({
+        sourceSite: item.sourceSiteUrl || siteUrl,
+        driveId,
+        itemId: item.id,
+        contentTag: item.contentTag,
+        fileName: item.name,
+      }, allChunks.length);
       if (allChunks.length === 0) {
         console.error(`[SL sync] No text extracted from ${item.name}; this OCR attempt failed`);
         skipped++;
@@ -1272,7 +1279,9 @@ async function indexNewSpFiles(params: {
       const pageCountFailed = e instanceof SlSyncGuardBlockedError &&
         (e.reason === "page_count_unknown" ||
           e.reason.endsWith("_page_count_unknown") ||
-          e.reason === "unsupported_page_count");
+          e.reason === "unsupported_page_count" ||
+          e.reason === "excel_zip_invalid" ||
+          e.reason === "excel_zip_size_unknown");
       if (!ocrClaimed && (!downloaded || pageCountFailed)) {
         try {
           const attempt = await recordSlSyncFilePreOcrFailure({
@@ -1287,7 +1296,8 @@ async function indexNewSpFiles(params: {
         }
       }
       if (e instanceof SlSyncGuardBlockedError) {
-        const log = e.reason === "file_page_limit" || e.reason === "attempt_limit" || e.reason === "total_attempt_limit"
+        const log = e.reason === "file_page_limit" || e.reason === "attempt_limit" || e.reason === "total_attempt_limit" ||
+          e.reason.startsWith("excel_") && e.reason.endsWith("_limit")
           ? console.error : console.warn;
         log(`[SL sync guard] Deferred ${item.name}: ${e.reason}`);
         skipped++;
