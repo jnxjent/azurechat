@@ -20,6 +20,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { options as authOptions } from "@/features/auth-page/auth-api";
 import { runSlSync } from "@/lib/sl-sync";
+import { slSyncPauseReason } from "@/lib/sl-sync-guard";
 
 // -------------------------------------------------------
 // Optional endpoint guard
@@ -102,9 +103,16 @@ export async function POST(req: NextRequest) {
   try {
     await requireSyncKey(req);
 
-    const accessToken = await getAppOnlyAccessToken();
+    const pause = slSyncPauseReason();
+    if (pause) {
+      console.warn(`[SL sync-check] skipped: ${pause}`);
+      // Keep the normal response shape for browser tabs that still run an
+      // older client bundle and read data.results unconditionally.
+      return NextResponse.json({ ok: true, skipped: pause, results: {} });
+    }
 
     const url = new URL(req.url);
+    const accessToken = await getAppOnlyAccessToken();
     const apply = url.searchParams.get("apply") === "true";
     // SL_SYNC_DISABLED=true で新規インデックス化を完全停止できるキルスイッチ
     const syncDisabled = process.env.SL_SYNC_DISABLED === "true";

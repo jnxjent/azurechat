@@ -1,0 +1,173 @@
+// Exercises the production guard and its Blob ledger without Azure, Graph, or OCR calls.
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const Module = require("node:module");
+const ts = require("typescript");
+
+function loadTs(file, dependencies = {}) {
+  const sourcePath = path.join(__dirname, "..", "lib", file);
+  const compiled = ts.transpileModule(fs.readFileSync(sourcePath, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    fileName: sourcePath,
+  });
+  const loaded = new Module(sourcePath, module);
+  loaded.filename = sourcePath;
+  loaded.paths = Module._nodeModulePaths(path.dirname(sourcePath));
+  const originalRequire = loaded.require.bind(loaded);
+  loaded.require = (name) => Object.hasOwn(dependencies, name)
+    ? dependencies[name] : originalRequire(name);
+  loaded._compile(compiled.outputText, sourcePath);
+  return loaded.exports;
+}
+
+const blobs = new Map();
+let revision = 0;
+const missing = () => Object.assign(new Error("Blob not found"), { statusCode: 404 });
+const conflict = () => Object.assign(new Error("Blob conflict"), { statusCode: 409 });
+
+function blobClient(name) {
+  return {
+    async getProperties() {
+      const blob = blobs.get(name);
+      if (!blob) throw missing();
+      return { etag: blob.etag };
+    },
+    async downloadToBuffer() {
+      const blob = blobs.get(name);
+      if (!blob) throw missing();
+      return blob.data;
+    },
+    async uploadData(data, options = {}) {
+      const previous = blobs.get(name);
+      if (options.conditions?.ifNoneMatch === "*" && previous) throw conflict();
+      if (options.conditions?.ifMatch && previous?.etag !== options.conditions.ifMatch) {
+        throw conflict();
+      }
+      const etag = String(++revision);
+      blobs.set(name, { data: Buffer.from(data), etag, leased: previous?.leased ?? false });
+      return { etag };
+    },
+    getBlobLeaseClient() {
+      return {
+        async acquireLease() {
+          const blob = blobs.get(name);
+          if (blob.leased) throw conflict();
+          blob.leased = true;
+        },
+        async releaseLease() { blobs.get(name).leased = false; },
+      };
+    },
+  };
+}
+
+const fakeStorage = {
+  BlobServiceClient: {
+    fromConnectionString(connection) {
+      assert.equal(connection, "mock-storage");
+      return {
+        getContainerClient(container) {
+          assert.equal(container, "sl-sync-guard");
+          return {
+            async createIfNotExists() {},
+            getBlockBlobClient: blobClient,
+          };
+        },
+      };
+    },
+  },
+};
+
+const budget = loadTs("sl-sync-budget.ts");
+const guard = loadTs("sl-sync-guard.ts", {
+  "@azure/storage-blob": fakeStorage,
+  "./document-extract": { extractWordText: async () => [] },
+  "./sl-sync-budget": budget,
+});
+
+const file = (itemId) => ({
+  sourceSite: "https://example.test/sharepoint",
+  driveId: "drive",
+  itemId,
+  contentTag: "v1",
+  fileName: "test.png",
+  buffer: new ArrayBuffer(0),
+});
+const blocked = (reason) => (error) => {
+  assert.equal(error?.reason, reason);
+  return true;
+};
+
+async function main() {
+  const monthParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit",
+  }).formatToParts(new Date());
+  const currentMonth = `${monthParts.find((part) => part.type === "year").value}-${monthParts.find((part) => part.type === "month").value}`;
+  process.env.SL_SYNC_GUARD_STORAGE_CONNECTION_STRING = "mock-storage";
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-one.test/";
+  process.env.AZURE_SEARCH_INDEX_NAME = "dl_index_phase15";
+  process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "10";
+  process.env.SL_SYNC_MONTHLY_OCR_PAGE_LIMIT = "100";
+  process.env.SL_SYNC_TEMPORARY_LIMIT_MONTH = currentMonth;
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "4";
+  process.env.SL_SYNC_INITIAL_MONTHLY_OCR_PAGES = "2";
+  process.env.SL_SYNC_MAX_FILE_OCR_PAGES = "200";
+  process.env.SL_SYNC_MAX_FILE_ATTEMPTS = "2";
+  delete process.env.SL_SYNC_PAUSE_AT;
+
+  const prodId = await guard.claimSlSyncFile(file("same"));
+  process.env.AZURE_SEARCH_INDEX_NAME = "dl_index_phase15_test";
+  const testId = await guard.claimSlSyncFile(file("same"));
+  assert.notEqual(prodId, testId, "each Search index needs its own attempt record");
+  await assert.rejects(guard.claimSlSyncFile(file("extra")), blocked("monthly_page_limit"));
+  const ledger = [...blobs.entries()].find(([name]) => name.endsWith(".json"));
+  assert.equal(JSON.parse(ledger[1].data).monthlyPages, 4, "both sites share one page budget");
+
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-two.test/";
+  process.env.SL_SYNC_INITIAL_MONTHLY_OCR_PAGES = "0";
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "100";
+  const retryId = await guard.claimSlSyncFile(file("retry"));
+  assert.equal(retryId, await guard.claimSlSyncFile(file("retry")));
+  await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("attempt_limit"));
+  await guard.markSlSyncFileIndexed(retryId);
+  await assert.rejects(guard.claimSlSyncFile(file("retry")), blocked("already_indexed_this_version"));
+
+  process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "bad";
+  await assert.rejects(guard.claimSlSyncFile(file("invalid")), blocked("invalid_sl_sync_daily_ocr_page_limit"));
+  process.env.SL_SYNC_DAILY_OCR_PAGE_LIMIT = "10";
+  process.env.SL_SYNC_PAUSE_AT = "2026-09-21T00:00:00+09:00";
+  assert.equal(guard.slSyncPauseReason(new Date("2026-09-20T14:59:59Z")), null);
+  assert.equal(guard.slSyncPauseReason(new Date("2026-09-20T15:00:00Z")), "scheduled_pause");
+  process.env.SL_SYNC_PAUSE_AT = "2026-09-13T00:00:00+09:00";
+  await assert.rejects(guard.claimSlSyncFile(file("paused")), blocked("scheduled_pause"));
+  process.env.SL_SYNC_PAUSE_AT = "2026-09-21";
+  assert.equal(guard.slSyncPauseReason(), "invalid_pause_at");
+  delete process.env.SL_SYNC_PAUSE_AT;
+
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-three.test/";
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "1";
+  const results = await Promise.allSettled([
+    guard.claimSlSyncFile(file("concurrent-a")),
+    guard.claimSlSyncFile(file("concurrent-b")),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(results.find((result) => result.status === "rejected").reason.reason, "monthly_page_limit");
+
+  // A temporary limit for another month must not replace the normal limit.
+  const [year, month] = currentMonth.split("-").map(Number);
+  process.env.SL_SYNC_TEMPORARY_LIMIT_MONTH = new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 7);
+  process.env.SL_SYNC_MONTHLY_OCR_PAGE_LIMIT = "2";
+  process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT = "100";
+  process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = "https://mock-di-four.test/";
+  await guard.claimSlSyncFile(file("normal-a"));
+  await guard.claimSlSyncFile(file("normal-b"));
+  await assert.rejects(guard.claimSlSyncFile(file("normal-c")), blocked("monthly_page_limit"));
+
+  delete process.env.SL_SYNC_TEMPORARY_MONTHLY_OCR_PAGE_LIMIT;
+  await assert.rejects(guard.claimSlSyncFile(file("invalid-override")), blocked("invalid_temporary_monthly_limit"));
+
+  console.log("SL sync guard local tests passed (no Azure or OCR calls)");
+}
+
+main().catch((error) => { console.error(error); process.exitCode = 1; });

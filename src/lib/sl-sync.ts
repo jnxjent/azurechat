@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import { getAllowedDepts, getDeptConfig } from "@/lib/sl-dept";
 import { OpenAIEmbeddingInstance } from "@/features/common/services/openai";
 import { extractIndexDocumentFromBuffer } from "./document-extract";
+import { claimSlSyncFile, markSlSyncFileIndexed, SlSyncGuardBlockedError } from "./sl-sync-guard";
 
 export type SpFileItem = {
   id: string;
@@ -23,10 +24,12 @@ export type SlSyncDeptResult = {
   urlUpdated?: number;
   newIndexed?: number;
   newSkipped?: number;
+  newGuardBlocked?: number;
   reindexCandidates?: number;
   reindexCandidateNames?: string[];
   reindexed?: number;
   reindexFailed?: number;
+  reindexGuardBlocked?: number;
   unindexedCount?: number;
   skipped?: string;
   error?: string;
@@ -1096,7 +1099,7 @@ async function indexNewSpFiles(params: {
   hasRelativePath?: boolean;
   hasChangeTrackingFields?: boolean;
   hasPageMetadataFields?: boolean;
-}): Promise<{ indexed: number; skipped: number }> {
+}): Promise<{ indexed: number; skipped: number; guardBlocked: number }> {
   const {
     accessToken,
     dept,
@@ -1112,7 +1115,7 @@ async function indexNewSpFiles(params: {
   } = params;
 
   const batch = unindexedItems.slice(0, batchSize);
-  if (batch.length === 0) return { indexed: 0, skipped: 0 };
+  if (batch.length === 0) return { indexed: 0, skipped: 0, guardBlocked: 0 };
 
   const siteId = await resolveSiteId(accessToken, siteUrl);
   const driveId = await resolveDriveId(accessToken, siteId, driveName);
@@ -1120,12 +1123,23 @@ async function indexNewSpFiles(params: {
 
   let indexed = 0;
   let skipped = 0;
+  let guardBlocked = 0;
 
   for (const item of batch) {
     try {
       console.log(`[SL sync] Indexing new SP file: ${item.name} (id=${item.id})`);
 
       const buffer = await downloadSpFile(accessToken, driveId, item.id);
+
+      // Reserve the OCR cost and this file-version attempt before extraction.
+      const guardId = await claimSlSyncFile({
+        sourceSite: item.sourceSiteUrl || siteUrl,
+        driveId,
+        itemId: item.id,
+        contentTag: item.contentTag,
+        fileName: item.name,
+        buffer,
+      });
 
       const extractedDocument = await extractIndexDocumentFromBuffer(buffer, item.name);
       const allChunks = extractedDocument.chunks;
@@ -1217,11 +1231,22 @@ async function indexNewSpFiles(params: {
       }
 
       await addNewIndexDocs(docsToIndex);
+      try {
+        await markSlSyncFileIndexed(guardId);
+      } catch (guardError) {
+        console.error(`[SL sync guard] Could not mark ${item.name} as indexed:`, guardError);
+      }
       indexed++;
       console.log(
         `[SL sync] Indexed ${item.name}: scope=${effectiveScope} chunks=${allChunks.length} embeddingDim=${firstEmbeddingDim}`
       );
     } catch (e) {
+      if (e instanceof SlSyncGuardBlockedError) {
+        console.warn(`[SL sync guard] Deferred ${item.name}: ${e.reason}`);
+        skipped++;
+        guardBlocked++;
+        continue;
+      }
       console.error(`[SL sync] Failed to index ${item.name}:`, e);
       // sentinel エントリを登録して次回Syncで再キューされないようにする
       try {
@@ -1262,7 +1287,7 @@ async function indexNewSpFiles(params: {
     }
   }
 
-  return { indexed, skipped };
+  return { indexed, skipped, guardBlocked };
 }
 
 function findReindexCandidates(
@@ -1338,10 +1363,11 @@ async function reindexSpFiles(params: {
   hasRelativePath: boolean;
   hasChangeTrackingFields: boolean;
   hasPageMetadataFields: boolean;
-}): Promise<{ reindexed: number; failed: number }> {
+}): Promise<{ reindexed: number; failed: number; guardBlocked: number }> {
   const batch = params.candidates.slice(0, params.batchSize);
   let reindexed = 0;
   let failed = 0;
+  let guardBlocked = 0;
 
   for (const candidate of batch) {
     console.log(
@@ -1362,7 +1388,8 @@ async function reindexSpFiles(params: {
     });
 
     if (result.indexed !== 1) {
-      failed++;
+      if (result.guardBlocked) guardBlocked++;
+      else failed++;
       continue;
     }
 
@@ -1371,7 +1398,7 @@ async function reindexSpFiles(params: {
     reindexed++;
   }
 
-  return { reindexed, failed };
+  return { reindexed, failed, guardBlocked };
 }
 
 async function updateIndexDocs(
@@ -1637,7 +1664,7 @@ export async function runSlSync({
           `[SL sync] dept=${dept} unindexedSPFiles=${unindexed.length} apply=${apply}`
         );
         if (apply && unindexed.length > 0) {
-          const { indexed, skipped } = await indexNewSpFiles({
+          const { indexed, skipped, guardBlocked } = await indexNewSpFiles({
             accessToken,
             dept,
             siteUrl,
@@ -1652,6 +1679,7 @@ export async function runSlSync({
           });
           deptResult.newIndexed = indexed;
           deptResult.newSkipped = skipped;
+          deptResult.newGuardBlocked = guardBlocked;
         } else {
           deptResult.unindexedCount = unindexed.length;
         }
@@ -1781,7 +1809,7 @@ export async function runSlSync({
             `[SL sync] global_common unindexedSPFiles=${gcUnindexed.length} apply=${apply}`
           );
           if (apply && gcUnindexed.length > 0) {
-            const { indexed, skipped } = await indexNewSpFiles({
+            const { indexed, skipped, guardBlocked } = await indexNewSpFiles({
               accessToken,
               dept: "common",
               siteUrl: globalCommon.siteUrl,
@@ -1796,6 +1824,7 @@ export async function runSlSync({
             });
             gcResult.newIndexed = indexed;
             gcResult.newSkipped = skipped;
+            gcResult.newGuardBlocked = guardBlocked;
           } else {
             gcResult.unindexedCount = gcUnindexed.length;
           }
@@ -1858,6 +1887,8 @@ export async function runSlSync({
           (resultRow.reindexed ?? 0) + reindexResult.reindexed;
         resultRow.reindexFailed =
           (resultRow.reindexFailed ?? 0) + reindexResult.failed;
+        resultRow.reindexGuardBlocked =
+          (resultRow.reindexGuardBlocked ?? 0) + reindexResult.guardBlocked;
       }
     } catch (error) {
       console.error(
