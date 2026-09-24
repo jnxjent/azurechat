@@ -150,6 +150,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     message: props.message,
     isSalesforceAllowed: salesforceAllowed,
     hasSalesforceExtension,
+    defaultToSalesforce: hasSalesforceExtension,
   });
   const executionChatThread: ChatThreadModel =
     salesforceRouting.route === "salesforce" || !hasSalesforceExtension

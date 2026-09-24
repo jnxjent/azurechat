@@ -28,8 +28,9 @@ const access = loadTypeScriptModule(
 );
 
 const cases = [
-  ["こんにちは", true, "normal"],
-  ["大映産業の住所は？", true, "normal"],
+  ["こんにちは", true, "salesforce"],
+  ["大映産業の住所は？", true, "salesforce"],
+  ["私の部下が最近活動していない取引先は？", true, "salesforce"],
   ["Salesforceによれば、大映産業の住所は？", true, "salesforce"],
   ["セールスフォースで大映産業を調べて", true, "salesforce"],
   ["SFによれば、大映産業の住所を教えて", true, "salesforce"],
@@ -37,9 +38,9 @@ const cases = [
   ["Salesforceから取引先情報を取得して", true, "salesforce"],
   ["セールスフォース上の情報を確認して", true, "salesforce"],
   ["Salesforceで日栄産業の住所は？", true, "salesforce"],
-  ["おすすめのSF映画は？", true, "normal"],
-  ["SF小説を書いて", true, "normal"],
-  ["おすすめのＳＦ映画は？", true, "normal"],
+  ["SharePointから就業規則を探して", true, "knowledge"],
+  ["AI Searchで安全規程を検索して", true, "knowledge"],
+  ["Azure AI Searchから社内文書を探して", true, "knowledge"],
   ["Salesforceとは？", true, "knowledge"],
   ["Salesforceの使い方を教えて", true, "knowledge"],
   ["Salesforceでエラーが出たときのQAは？", true, "knowledge"],
@@ -54,6 +55,7 @@ for (const [message, allowed, expectedRoute] of cases) {
     message,
     isSalesforceAllowed: allowed,
     hasSalesforceExtension: true,
+    defaultToSalesforce: true,
   });
   assert.equal(result.route, expectedRoute, `${message}: ${result.route}`);
 }
@@ -65,6 +67,35 @@ assert.equal(
     hasSalesforceExtension: false,
   }).route,
   "normal"
+);
+assert.equal(
+  routing.resolveSalesforceRoute({
+    message: "こんにちは",
+    isSalesforceAllowed: true,
+    hasSalesforceExtension: true,
+    defaultToSalesforce: false,
+  }).route,
+  "normal",
+  "Teams and other configured-only callers must not default every message to Salesforce"
+);
+assert.equal(
+  routing.resolveSalesforceRoute({
+    message: "Salesforceで日栄産業を調べて",
+    isSalesforceAllowed: true,
+    hasSalesforceExtension: true,
+    defaultToSalesforce: false,
+  }).route,
+  "salesforce",
+  "Explicit Salesforce requests must continue to work outside extension-default chats"
+);
+assert.equal(
+  routing.resolveSalesforceRoute({
+    message: "私の部下が最近活動していない取引先は？",
+    isSalesforceAllowed: false,
+    hasSalesforceExtension: true,
+    defaultToSalesforce: true,
+  }).route,
+  "denied"
 );
 assert.equal(
   access.isSalesforceAllowedEmail(
@@ -119,4 +150,4 @@ assert.doesNotMatch(
   /firstEmail\(\s*props\.activity\.from\?\.properties/
 );
 
-console.log(`Salesforce routing tests passed (${cases.length + 14} assertions).`);
+console.log(`Salesforce routing tests passed (${cases.length + 17} assertions).`);
