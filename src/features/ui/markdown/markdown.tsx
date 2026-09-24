@@ -8,6 +8,7 @@ import { MarkdownProvider } from "./markdown-context";
 import { Paragraph } from "./paragraph";
 import {
   CITATION_MARKUP_RE,
+  normalizeExternalLinkUrl,
   parseCitationItems,
   removeOpenAIInternalCitationMarkup,
 } from "./citation-markup";
@@ -208,7 +209,7 @@ export const Markdown: FC<Props> = (props) => {
     <MarkdownProvider onCitationClick={props.onCitationClick}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        urlTransform={(url) => url}
+        urlTransform={normalizeExternalLinkUrl}
         components={{
           a: ({ ...linkProps }) => {
             const href = String((linkProps as any).href || "");

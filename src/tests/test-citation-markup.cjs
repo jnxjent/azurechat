@@ -26,6 +26,7 @@ loaded.paths = Module._nodeModulePaths(path.dirname(sourcePath));
 loaded._compile(compiled.outputText, sourcePath);
 
 const {
+  normalizeExternalLinkUrl,
   removeCitationMarkup,
   removeOpenAIInternalCitationMarkup,
 } = loaded.exports;
@@ -66,4 +67,24 @@ assert.equal(
   "server normalization must remove both citation formats"
 );
 
-console.log("Citation markup regression tests: 5 assertions passed");
+assert.equal(
+  normalizeExternalLinkUrl(
+    "https://d0o000000t45deas--fullsand.lightning.force.com/lightning/r/Opportunity/006A7000002nBHGIA2/view"
+  ),
+  "https://d0o000000t45deas--fullsand.sandbox.lightning.force.com/lightning/r/Opportunity/006A7000002nBHGIA2/view",
+  "a Salesforce Sandbox enhanced-domain URL must recover a missing .sandbox label"
+);
+assert.equal(
+  normalizeExternalLinkUrl(
+    "https://d0o000000t45deas--fullsand.sandbox.lightning.force.com/lightning/r/Opportunity/006RA00000d6fI9YAI/view"
+  ),
+  "https://d0o000000t45deas--fullsand.sandbox.lightning.force.com/lightning/r/Opportunity/006RA00000d6fI9YAI/view",
+  "an already-correct Salesforce Sandbox URL must remain unchanged"
+);
+assert.equal(
+  normalizeExternalLinkUrl("https://example.com/path"),
+  "https://example.com/path",
+  "non-Salesforce links must remain unchanged"
+);
+
+console.log("Citation and external-link regression tests: 8 assertions passed");

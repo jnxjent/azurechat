@@ -14,6 +14,14 @@ export const CITATION_MARKUP_RE =
 const OPENAI_INTERNAL_CITATION_RE =
   /(?:file)?cite[^\r\n]*(?:|$)/gi;
 
+/** Repair a Salesforce Sandbox enhanced-domain URL when only `.sandbox` was dropped. */
+export function normalizeExternalLinkUrl(url: string): string {
+  return String(url ?? "").replace(
+    /^(https:\/\/[^./]+--[^./]+)\.lightning\.force\.com(?=\/|$)/i,
+    "$1.sandbox.lightning.force.com"
+  );
+}
+
 export function removeOpenAIInternalCitationMarkup(text: string): string {
   return text
     .replace(OPENAI_INTERNAL_CITATION_RE, "")
