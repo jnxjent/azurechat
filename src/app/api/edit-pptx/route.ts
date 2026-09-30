@@ -1496,6 +1496,52 @@ async function runPythonTranslatePdfToPptx(
   }
 }
 
+async function runPythonTranslateWordToWord(
+  inputBuffer: Buffer,
+  threadId: string,
+  sourceUrl?: string,
+  hintFileName?: string
+) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-word-translate-"));
+  const inputPath = path.join(tempDir, "input.docx");
+  const outputPath = path.join(tempDir, "output.docx");
+  const scriptPath = path.join(
+    path.dirname(await resolveTranslatePdfToPptxScriptPath()),
+    "word_translate_to_word.py"
+  );
+  const pyEnv = process.platform !== "win32"
+    ? {
+        ...process.env,
+        PYTHONPATH: `/home/site/python-packages${process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""}`,
+        LD_LIBRARY_PATH: `/home/site/python-packages${process.env.LD_LIBRARY_PATH ? `:${process.env.LD_LIBRARY_PATH}` : ""}`,
+      }
+    : process.env;
+  try {
+    await fs.writeFile(inputPath, inputBuffer);
+    const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(
+      pythonBin,
+      [scriptPath, "--input", inputPath, "--output", outputPath, "--target-language", "en"],
+      { env: pyEnv, timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 }
+    );
+    if (stderr?.trim()) console.warn("[word-translate] python stderr:", stderr.trim());
+    const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
+    const outputBuffer = await fs.readFile(outputPath);
+    const fileName = buildOutputFileName(hintFileName || sourceUrl, "_英訳版.docx");
+    const blobName = `${threadId || uniqueId()}_translated_${uniqueId()}.docx`;
+    const downloadUrl = await uploadWordToBlob(outputBuffer, blobName, fileName);
+    await saveWordPointer(threadId, blobName, fileName, false);
+    return {
+      downloadUrl,
+      fileName,
+      translatedParagraphs: Number(pythonResult.translatedParagraphs ?? 0),
+      targetLanguage: "en",
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function resolveConvertPdfScriptPath(): Promise<string> {
   const candidates = [
     path.join(process.cwd(), "src", "scripts", "pdf_to_excel.py"),
@@ -2681,7 +2727,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, ...result });
     }
 
-    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "translate_pdf_to_pptx" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
+    if (!fileUrl?.trim() || (!instruction?.trim() && action !== "pdf_to_excel" && action !== "pdf_to_word" && action !== "translate_pdf_to_pptx" && action !== "translate_word_to_word" && action !== "extract_pptx_summary" && action !== "apply_pptx_plan")) {
       return NextResponse.json(
         { ok: false, error: "fileUrl and instruction are required" },
         { status: 400 }
@@ -2739,6 +2785,20 @@ export async function POST(req: NextRequest) {
         outputBaseName
       );
       console.log("[pdf-translate] result:", JSON.stringify(result));
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    if (action === "translate_word_to_word") {
+      if (ext !== ".docx") {
+        return NextResponse.json(
+          { ok: false, error: "翻訳対象はWord（.docx）ファイルを指定してください。" },
+          { status: 400 }
+        );
+      }
+      const wordBuffer = await downloadBlob(fileUrl, threadId);
+      const result = await runPythonTranslateWordToWord(
+        wordBuffer, threadId, fileUrl, outputBaseName
+      );
       return NextResponse.json({ ok: true, ...result });
     }
 
