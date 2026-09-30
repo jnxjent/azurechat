@@ -406,7 +406,17 @@ function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
     return `PDFの日本語を${languageNames[request.targetLanguage]}へ翻訳し、編集可能なPowerPointを作成します。完了までしばらくお待ちください。`;
   }
   if (request.action === "translate_word_to_word") {
-    return "Wordの日本語を英語に翻訳します。完了までしばらくお待ちください。";
+    const languageNames = {
+      en: "英語",
+      pt: "ポルトガル語",
+      vi: "ベトナム語",
+      id: "インドネシア語",
+      "zh-CN": "中国語（簡体字）",
+      ko: "韓国語",
+      es: "スペイン語",
+      fil: "タガログ語",
+    } as const;
+    return `Wordの日本語を${languageNames[request.targetLanguage]}に翻訳します。完了までしばらくお待ちください。`;
   }
   return `Excelの「${
     request.targetSheets.join(", ") || "指定シート"

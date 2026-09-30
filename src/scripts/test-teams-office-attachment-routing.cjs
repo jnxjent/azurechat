@@ -329,6 +329,13 @@ const wordTranslation = parseTeamsOfficeRequest(
 );
 assert.equal(wordTranslation?.action, "translate_word_to_word");
 assert.notEqual(wordTranslation?.action, "translate_pdf_to_pptx");
+assert.equal(wordTranslation?.targetLanguage, "en");
+
+const chineseWordTranslation = parseTeamsOfficeRequest(
+  "添付Wordを中国語に翻訳して\n添付ファイル: 報告書.docx"
+);
+assert.equal(chineseWordTranslation?.action, "translate_word_to_word");
+assert.equal(chineseWordTranslation?.targetLanguage, "zh-CN");
 
 for (const [languageName, languageCode] of [
   ["英語", "en"],
@@ -346,6 +353,23 @@ for (const [languageName, languageCode] of [
     )?.targetLanguage,
     languageCode
   );
+}
+
+for (const [languageName, languageCode] of [
+  ["英語", "en"],
+  ["ポルトガル語", "pt"],
+  ["ベトナム語", "vi"],
+  ["インドネシア語", "id"],
+  ["中国語", "zh-CN"],
+  ["韓国語", "ko"],
+  ["スペイン語", "es"],
+  ["タガログ語", "fil"],
+]) {
+  const request = parseTeamsOfficeRequest(
+    `添付Wordを${languageName}に翻訳して\n添付ファイル: guide.docx`
+  );
+  assert.equal(request?.action, "translate_word_to_word");
+  assert.equal(request?.targetLanguage, languageCode);
 }
 
 function loadTypeScriptModule(relativePath, mocks = {}) {
@@ -576,12 +600,14 @@ async function testWordTranslationExecution() {
   const requests = [];
   global.fetch = async (_url, init) => {
     requests.push(JSON.parse(init.body));
+    const targetLanguage = requests.at(-1).targetLanguage;
+    const languageSuffix = targetLanguage === "zh-CN" ? "中国語版" : "英訳版";
     return {
       ok: true,
       status: 200,
       json: async () => ({
-        downloadUrl: "https://example.test/report-en.docx",
-        fileName: "報告書_英訳版.docx",
+        downloadUrl: `https://example.test/report-${targetLanguage}.docx`,
+        fileName: `報告書_${languageSuffix}.docx`,
       }),
     };
   };
@@ -594,8 +620,20 @@ async function testWordTranslationExecution() {
     assert.equal(requests[0].action, "translate_word_to_word");
     assert.equal(requests[0].fileUrl, source.url);
     assert.equal(requests[0].outputBaseName, source.fileName);
+    assert.equal(requests[0].targetLanguage, "en");
     assert.match(reply, /報告書_英訳版\.docx/);
     assert.match(reply, /https:\/\/example\.test\/report-en\.docx/);
+
+    const chineseReply = await executeTeamsOfficeRequest({
+      request: chineseWordTranslation,
+      conversationId: "word-translation-test-conversation",
+      uploadedFiles: [source],
+    });
+    assert.equal(requests[1].action, "translate_word_to_word");
+    assert.equal(requests[1].targetLanguage, "zh-CN");
+    assert.match(chineseReply, /中国語（簡体字）/);
+    assert.match(chineseReply, /報告書_中国語版\.docx/);
+    assert.match(chineseReply, /https:\/\/example\.test\/report-zh-CN\.docx/);
   } finally {
     global.fetch = originalFetch;
   }

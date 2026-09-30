@@ -32,17 +32,27 @@ STORY_PART = re.compile(
     r"word/(?:document|header\d+|footer\d+|footnotes|endnotes|comments)\.xml$"
 )
 MAX_BATCH_CHARS = 8000
-TRANSLATED_FONT = "Times New Roman"
 TRANSLATED_SIZE_HALF_POINTS = "22"
+JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+WORD_TRANSLATION_FONTS = {
+    "en": "Times New Roman",
+    "pt": "Arial",
+    "vi": "Arial",
+    "id": "Arial",
+    "zh-CN": "Microsoft YaHei",
+    "ko": "Malgun Gothic",
+    "es": "Arial",
+    "fil": "Arial",
+}
 
 
-def apply_english_font(properties: etree._Element) -> None:
+def apply_translation_font(properties: etree._Element, font_name: str) -> None:
     fonts = properties.find(RUN_FONTS)
     if fonts is None:
         fonts = etree.Element(RUN_FONTS)
         properties.insert(0, fonts)
     for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
-        fonts.set(f"{{{WORD_NS}}}{attribute}", TRANSLATED_FONT)
+        fonts.set(f"{{{WORD_NS}}}{attribute}", font_name)
     for tag in (FONT_SIZE, COMPLEX_FONT_SIZE):
         size = properties.find(tag)
         if size is None:
@@ -50,7 +60,7 @@ def apply_english_font(properties: etree._Element) -> None:
         size.set(f"{{{WORD_NS}}}val", TRANSLATED_SIZE_HALF_POINTS)
 
 
-def format_translated_run(text_node: etree._Element) -> None:
+def format_translated_run(text_node: etree._Element, font_name: str) -> None:
     run = next((parent for parent in text_node.iterancestors() if parent.tag == RUN), None)
     if run is None:
         return
@@ -58,10 +68,10 @@ def format_translated_run(text_node: etree._Element) -> None:
     if properties is None:
         properties = etree.Element(RUN_PROPS)
         run.insert(0, properties)
-    apply_english_font(properties)
+    apply_translation_font(properties, font_name)
 
 
-def update_default_font(styles: etree._Element) -> None:
+def update_default_font(styles: etree._Element, font_name: str) -> None:
     defaults = styles.find(f"{{{WORD_NS}}}docDefaults")
     if defaults is None:
         defaults = etree.Element(f"{{{WORD_NS}}}docDefaults")
@@ -72,14 +82,14 @@ def update_default_font(styles: etree._Element) -> None:
     properties = run_default.find(RUN_PROPS)
     if properties is None:
         properties = etree.SubElement(run_default, RUN_PROPS)
-    apply_english_font(properties)
+    apply_translation_font(properties, font_name)
     for style in styles.iter(f"{{{WORD_NS}}}style"):
         if style.get(f"{{{WORD_NS}}}styleId") != "Normal":
             continue
         properties = style.find(RUN_PROPS)
         if properties is None:
             properties = etree.SubElement(style, RUN_PROPS)
-        apply_english_font(properties)
+        apply_translation_font(properties, font_name)
         break
 
 
@@ -95,6 +105,7 @@ def paragraph_text_nodes(paragraph: etree._Element) -> list[etree._Element]:
 
 def translate_docx(input_path: Path, output_path: Path, target_language: str) -> dict:
     language = TARGET_LANGUAGES[target_language]
+    font_name = WORD_TRANSLATION_FONTS[target_language]
     roots: dict[str, etree._Element] = {}
     parts: dict[str, tuple[str, list[etree._Element]]] = {}
     items: list[SimpleNamespace] = []
@@ -136,12 +147,19 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                 translated.update(_translate_batch(missing, language))
             for item in batch:
                 text = translated.get(item.id, "").strip()
-                if not text or JAPANESE_RE.search(text):
-                    raise RuntimeError(f"段落 {item.id} の英訳が完了しませんでした。")
+                has_untranslated_japanese = (
+                    JAPANESE_KANA_RE.search(text)
+                    if target_language == "zh-CN"
+                    else JAPANESE_RE.search(text)
+                )
+                if not text or has_untranslated_japanese:
+                    raise RuntimeError(
+                        f"段落 {item.id} の{language.japanese_name}翻訳が完了しませんでした。"
+                    )
                 name, nodes = parts[item.id]
                 nodes[0].text = text
                 nodes[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                format_translated_run(nodes[0])
+                format_translated_run(nodes[0], font_name)
                 for node in nodes[1:]:
                     node.text = ""
                 changed_parts.add(name)
@@ -151,7 +169,7 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                 source.read("word/styles.xml"),
                 etree.XMLParser(resolve_entities=False, no_network=True),
             )
-            update_default_font(styles)
+            update_default_font(styles, font_name)
             roots["word/styles.xml"] = styles
             changed_parts.add("word/styles.xml")
 
@@ -164,14 +182,21 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                     )
                 output.writestr(info, data)
 
-    return {"translatedParagraphs": len(items), "targetLanguage": target_language}
+    return {
+        "translatedParagraphs": len(items),
+        "targetLanguage": target_language,
+        "targetLanguageName": language.japanese_name,
+        "fontName": font_name,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--target-language", choices=["en"], default="en")
+    parser.add_argument(
+        "--target-language", choices=list(TARGET_LANGUAGES), default="en"
+    )
     args = parser.parse_args()
     print(json.dumps(translate_docx(args.input, args.output, args.target_language)))
 
