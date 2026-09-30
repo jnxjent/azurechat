@@ -36,6 +36,10 @@ TRANSLATED_SIZE_HALF_POINTS = "22"
 JAPANESE_KANA_RE = re.compile(
     r"[\u3041-\u3096\u3099-\u309f\u30a1-\u30fa\u30fc-\u30ff\u31f0-\u31ff]"
 )
+JAPANESE_TEXT_RE = re.compile(
+    r"[\u3041-\u3096\u3099-\u309f\u30a1-\u30fa\u30fc-\u30ff"
+    r"\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
+)
 WORD_TRANSLATION_FONTS = {
     "en": "Times New Roman",
     "pt": "Arial",
@@ -151,7 +155,7 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                     has_untranslated_japanese = (
                         JAPANESE_KANA_RE.search(text)
                         if target_language == "zh-CN"
-                        else JAPANESE_RE.search(text)
+                        else JAPANESE_TEXT_RE.search(text)
                     )
                     if not text or has_untranslated_japanese:
                         retry_items.append(item)
@@ -168,7 +172,7 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                 has_untranslated_japanese = (
                     JAPANESE_KANA_RE.search(text)
                     if target_language == "zh-CN"
-                    else JAPANESE_RE.search(text)
+                    else JAPANESE_TEXT_RE.search(text)
                 )
                 if not text or has_untranslated_japanese:
                     raise RuntimeError(
