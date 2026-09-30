@@ -260,7 +260,6 @@ def _translate_batch(
                 "content": json.dumps({"items": items}, ensure_ascii=False),
             },
         ],
-        "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
     request = urllib.request.Request(
