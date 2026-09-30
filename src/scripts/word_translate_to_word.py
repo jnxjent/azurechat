@@ -33,7 +33,9 @@ STORY_PART = re.compile(
 )
 MAX_BATCH_CHARS = 8000
 TRANSLATED_SIZE_HALF_POINTS = "22"
-JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+JAPANESE_KANA_RE = re.compile(
+    r"[\u3041-\u3096\u3099-\u309f\u30a1-\u30fa\u30fc-\u30ff\u31f0-\u31ff]"
+)
 WORD_TRANSLATION_FONTS = {
     "en": "Times New Roman",
     "pt": "Arial",
