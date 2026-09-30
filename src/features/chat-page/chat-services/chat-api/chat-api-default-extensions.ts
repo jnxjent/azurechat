@@ -52,6 +52,7 @@ import {
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
 import { resolveWordEditInstruction } from "./word-edit-instruction";
+import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
 
 import {
   buildSendOptionsFromMode,
@@ -2132,8 +2133,29 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) =>
-        await executeEditWord(args, props.chatThread, props.userMessage),
+      function: async (args: any) => {
+        const suppliedFileUrl = String(args?.fileUrl ?? "").trim();
+        const hasWordSource = /\.docx($|\?)/i.test(suppliedFileUrl) ||
+          (!suppliedFileUrl &&
+            Boolean(await resolveLatestDocxFromPointer(props.chatThread.id)));
+        const translationLanguage = detectWholeWordTranslationLanguage(
+          props.userMessage,
+          hasWordSource
+        );
+        if (translationLanguage) {
+          console.log(
+            `[edit_word] rerouting whole-document translation to translate_word_to_word target=${translationLanguage}`
+          );
+          return executeTranslateWordToWord(
+            {
+              fileUrl: args?.fileUrl,
+              targetLanguage: translationLanguage,
+            },
+            props.chatThread
+          );
+        }
+        return executeEditWord(args, props.chatThread, props.userMessage);
+      },
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
