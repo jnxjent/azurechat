@@ -23,10 +23,64 @@ from pdf_translate_to_pptx import (
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 PARAGRAPH = f"{{{WORD_NS}}}p"
 TEXT = f"{{{WORD_NS}}}t"
+RUN = f"{{{WORD_NS}}}r"
+RUN_PROPS = f"{{{WORD_NS}}}rPr"
+RUN_FONTS = f"{{{WORD_NS}}}rFonts"
+FONT_SIZE = f"{{{WORD_NS}}}sz"
+COMPLEX_FONT_SIZE = f"{{{WORD_NS}}}szCs"
 STORY_PART = re.compile(
     r"word/(?:document|header\d+|footer\d+|footnotes|endnotes|comments)\.xml$"
 )
 MAX_BATCH_CHARS = 8000
+TRANSLATED_FONT = "Times New Roman"
+TRANSLATED_SIZE_HALF_POINTS = "22"
+
+
+def apply_english_font(properties: etree._Element) -> None:
+    fonts = properties.find(RUN_FONTS)
+    if fonts is None:
+        fonts = etree.Element(RUN_FONTS)
+        properties.insert(0, fonts)
+    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+        fonts.set(f"{{{WORD_NS}}}{attribute}", TRANSLATED_FONT)
+    for tag in (FONT_SIZE, COMPLEX_FONT_SIZE):
+        size = properties.find(tag)
+        if size is None:
+            size = etree.SubElement(properties, tag)
+        size.set(f"{{{WORD_NS}}}val", TRANSLATED_SIZE_HALF_POINTS)
+
+
+def format_translated_run(text_node: etree._Element) -> None:
+    run = next((parent for parent in text_node.iterancestors() if parent.tag == RUN), None)
+    if run is None:
+        return
+    properties = run.find(RUN_PROPS)
+    if properties is None:
+        properties = etree.Element(RUN_PROPS)
+        run.insert(0, properties)
+    apply_english_font(properties)
+
+
+def update_default_font(styles: etree._Element) -> None:
+    defaults = styles.find(f"{{{WORD_NS}}}docDefaults")
+    if defaults is None:
+        defaults = etree.Element(f"{{{WORD_NS}}}docDefaults")
+        styles.insert(0, defaults)
+    run_default = defaults.find(f"{{{WORD_NS}}}rPrDefault")
+    if run_default is None:
+        run_default = etree.SubElement(defaults, f"{{{WORD_NS}}}rPrDefault")
+    properties = run_default.find(RUN_PROPS)
+    if properties is None:
+        properties = etree.SubElement(run_default, RUN_PROPS)
+    apply_english_font(properties)
+    for style in styles.iter(f"{{{WORD_NS}}}style"):
+        if style.get(f"{{{WORD_NS}}}styleId") != "Normal":
+            continue
+        properties = style.find(RUN_PROPS)
+        if properties is None:
+            properties = etree.SubElement(style, RUN_PROPS)
+        apply_english_font(properties)
+        break
 
 
 def paragraph_text_nodes(paragraph: etree._Element) -> list[etree._Element]:
@@ -87,9 +141,19 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                 name, nodes = parts[item.id]
                 nodes[0].text = text
                 nodes[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                format_translated_run(nodes[0])
                 for node in nodes[1:]:
                     node.text = ""
                 changed_parts.add(name)
+
+        if "word/styles.xml" in source.namelist():
+            styles = etree.fromstring(
+                source.read("word/styles.xml"),
+                etree.XMLParser(resolve_entities=False, no_network=True),
+            )
+            update_default_font(styles)
+            roots["word/styles.xml"] = styles
+            changed_parts.add("word/styles.xml")
 
         with ZipFile(output_path, "w") as output:
             for info in source.infolist():
