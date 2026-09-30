@@ -324,6 +324,12 @@ const portugueseTranslation = parseTeamsOfficeRequest(
 assert.equal(portugueseTranslation?.action, "translate_pdf_to_pptx");
 assert.equal(portugueseTranslation?.targetLanguage, "pt");
 
+const wordTranslation = parseTeamsOfficeRequest(
+  "添付を英訳して\n添付ファイル: 報告書.docx"
+);
+assert.equal(wordTranslation?.action, "translate_word_to_word");
+assert.notEqual(wordTranslation?.action, "translate_pdf_to_pptx");
+
 for (const [languageName, languageCode] of [
   ["英語", "en"],
   ["ポルトガル語", "pt"],
@@ -558,6 +564,43 @@ async function testPdfTranslationExecutionAndFollowup() {
   }
 }
 
+async function testWordTranslationExecution() {
+  const source = {
+    extension: "docx",
+    fileName: "報告書.docx",
+    savedAt: Date.now(),
+    size: 100,
+    url: "https://example.test/report.docx?sig=test",
+  };
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        downloadUrl: "https://example.test/report-en.docx",
+        fileName: "報告書_英訳版.docx",
+      }),
+    };
+  };
+  try {
+    const reply = await executeTeamsOfficeRequest({
+      request: wordTranslation,
+      conversationId: "word-translation-test-conversation",
+      uploadedFiles: [source],
+    });
+    assert.equal(requests[0].action, "translate_word_to_word");
+    assert.equal(requests[0].fileUrl, source.url);
+    assert.equal(requests[0].outputBaseName, source.fileName);
+    assert.match(reply, /報告書_英訳版\.docx/);
+    assert.match(reply, /https:\/\/example\.test\/report-en\.docx/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function testWebGroundedPptAndLogoFollowup() {
   const conversationId = "web-ppt-logo-test-conversation";
   const requests = [];
@@ -735,6 +778,7 @@ async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
 }
 
 testPdfTranslationExecutionAndFollowup()
+  .then(testWordTranslationExecution)
   .then(testWebGroundedPptAndLogoFollowup)
   .then(testExecutiveSharePointPptRenderingOptions)
   .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)

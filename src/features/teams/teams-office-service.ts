@@ -70,6 +70,7 @@ function parsePdfTranslationRequest(
   message: string,
   attachedFileQuery: string | null
 ): Extract<TeamsOfficeRequest, { action: "translate_pdf_to_pptx" }> | null {
+  if (/\.docx$/i.test(attachedFileQuery ?? "")) return null;
   const targetLanguage =
     PDF_TRANSLATION_LANGUAGE_PATTERNS.find(([, pattern]) =>
       pattern.test(message)
@@ -112,6 +113,18 @@ function parsePdfTranslationRequest(
   };
 }
 
+function parseWordTranslationRequest(
+  message: string,
+  attachedFileQuery: string | null
+): Extract<TeamsOfficeRequest, { action: "translate_word_to_word" }> | null {
+  if (!/\.docx$/i.test(attachedFileQuery ?? "")) return null;
+  const requestText = message.split(/\n添付ファイル\s*[:：]/)[0];
+  if (!/(英訳|英語.{0,12}(?:翻訳|訳|にして)|(?:翻訳|訳).{0,12}英語)/i.test(requestText)) {
+    return null;
+  }
+  return { action: "translate_word_to_word" };
+}
+
 export type TeamsOfficeRequest =
   | {
       action: "pdf_to_excel";
@@ -132,6 +145,7 @@ export type TeamsOfficeRequest =
       fileQuery?: string;
       targetLanguage: PdfTranslationLanguage;
     }
+  | { action: "translate_word_to_word" }
   | {
       action: "refine_excel_sheets";
       targetSheets: string[];
@@ -200,6 +214,11 @@ export function parseTeamsOfficeRequest(
   const normalized = message.trim().normalize("NFKC");
   const attachedFileQuery = extractAttachedFileQuery(normalized);
   const hasAttachedFileMarker = Boolean(attachedFileQuery);
+  const wordTranslationRequest = parseWordTranslationRequest(
+    normalized,
+    attachedFileQuery
+  );
+  if (wordTranslationRequest) return wordTranslationRequest;
   const pdfTranslationRequest = parsePdfTranslationRequest(
     normalized,
     attachedFileQuery
@@ -497,6 +516,13 @@ export async function executeTeamsOfficeRequest(props: {
   if (props.request.action === "translate_pdf_to_pptx") {
     return translateTeamsPdfToPowerPoint({
       request: props.request,
+      threadId: teamsThreadId,
+      uploadedFiles: props.uploadedFiles,
+    });
+  }
+
+  if (props.request.action === "translate_word_to_word") {
+    return translateTeamsWordToWord({
       threadId: teamsThreadId,
       uploadedFiles: props.uploadedFiles,
     });
@@ -1114,6 +1140,44 @@ async function translateTeamsPdfToPowerPoint(props: {
   return `PDFの日本語を${languageName}へ翻訳し、編集可能なPowerPointを作成しました。${detail}\n\n📊 [${escapeMarkdownLinkText(
     outputName
   )}](${result.downloadUrl})`;
+}
+
+async function translateTeamsWordToWord(props: {
+  threadId: string;
+  uploadedFiles?: TeamsStoredFile[];
+}): Promise<string> {
+  const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["docx"]);
+  if (uploaded.error) return uploaded.error;
+  const source = uploaded.file ?? (await readWordPointer(props.threadId));
+  if (!source?.url) {
+    return "翻訳対象のWordが見つかりません。このTeams会話でWord（.docx）を添付してください。";
+  }
+
+  const response = await fetch(`${getOfficeApiBaseUrl()}/api/edit-pptx`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileUrl: source.url,
+      instruction: "",
+      threadId: props.threadId,
+      action: "translate_word_to_word",
+      outputBaseName: source.fileName,
+    }),
+  });
+  const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok || result.ok === false || typeof result.downloadUrl !== "string") {
+    return `Wordの英訳に失敗しました。\n\n${String(result.error ?? `HTTP ${response.status}`)}`;
+  }
+
+  const outputName = typeof result.fileName === "string"
+    ? result.fileName
+    : `${source.fileName.replace(/\.docx$/i, "")}_英訳版.docx`;
+  await saveWordPointer(props.threadId, {
+    url: result.downloadUrl,
+    fileName: outputName,
+    savedAt: Date.now(),
+  });
+  return `Wordの日本語を英語に翻訳しました。\n\n📄 [${escapeMarkdownLinkText(outputName)}](${result.downloadUrl})`;
 }
 
 async function editLatestTeamsOfficeFile(props: {

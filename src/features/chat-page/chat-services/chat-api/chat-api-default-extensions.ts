@@ -2161,6 +2161,34 @@ export const GetDefaultExtensions = async (props: {
     },
   });
 
+  defaultExtensions.push({
+    type: "function",
+    function: {
+      function: async (args: any) =>
+        await executeTranslateWordToWord(args, props.chatThread),
+      parse: (input: string) => JSON.parse(input),
+      parameters: {
+        type: "object",
+        properties: {
+          fileUrl: {
+            type: "string",
+            description: "このスレッドでアップロードしたWord（.docx）のURL。省略時は最新のWordを使用。",
+          },
+          fileQuery: {
+            type: "string",
+            description: "SharePoint/SLにあるWord（.docx）のファイル名。fileUrlとは併用しない。",
+          },
+        },
+        required: [],
+      },
+      description:
+        "元の画像とWord構造を残し、Word（.docx）内の日本語を英語に翻訳したWordを作成する。" +
+        "Wordが添付されていれば『添付を英訳して』という短い依頼にも使用する。PDFには使用しない。" +
+        "downloadUrlはUIがダウンロードボタンで表示するため、回答でURLを再掲しない。",
+      name: "translate_word_to_word",
+    },
+  });
+
   // ★ アップロードされた PDF ファイルを Word に変換するツール
   defaultExtensions.push({
     type: "function",
@@ -9200,6 +9228,66 @@ async function executeTranslatePdfToPptx(
         "PDF翻訳PPTXの作成中にエラーが発生しました: " +
         String(error?.message ?? error),
     };
+  }
+}
+
+async function executeTranslateWordToWord(
+  args: { fileUrl?: string; fileQuery?: string },
+  chatThread: ChatThreadModel
+) {
+  let { fileUrl, fileQuery } = args ?? {};
+  let sourceFileName: string | undefined;
+  if (fileQuery?.trim() && !fileUrl?.trim()) {
+    const spResult = await resolveSpFileToSasUrl(
+      fileQuery, /\.docx$/i, chatThread, "translate_word_to_word"
+    );
+    if ("error" in spResult || "multipleFiles" in spResult) return spResult;
+    fileUrl = spResult.resolvedUrl;
+    sourceFileName = spResult.fileName;
+  }
+  if (!fileUrl?.trim()) {
+    fileUrl = (await resolveLatestDocxUrlFromThread(chatThread.id)) ?? "";
+  }
+  if (!fileUrl || !/^https?:\/\//i.test(fileUrl) || !/\.docx($|\?)/i.test(fileUrl)) {
+    return { error: "翻訳対象のWord（.docx）が見つかりませんでした。" };
+  }
+
+  const baseUrl = (
+    process.env.NEXTAUTH_URL ||
+    (process.env.WEBSITE_HOSTNAME
+      ? `https://${process.env.WEBSITE_HOSTNAME}`
+      : "http://localhost:3000")
+  ).replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${baseUrl}/api/edit-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileUrl,
+        instruction: "",
+        threadId: chatThread.id,
+        action: "translate_word_to_word",
+        outputBaseName: sourceFileName,
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      console.error("[translate_word_to_word] route failed:", res.status, detail);
+      return { error: `Word英訳に失敗しました: HTTP ${res.status}` };
+    }
+    const result = await res.json();
+    if (!result?.downloadUrl) {
+      return { error: "英訳版WordのダウンロードURLを取得できませんでした。" };
+    }
+    return {
+      downloadUrl: result.downloadUrl,
+      fileName: result.fileName,
+      translatedParagraphs: result.translatedParagraphs,
+      message: "日本語を英訳したWordを作成しました。",
+    };
+  } catch (error: any) {
+    console.error("[translate_word_to_word] error:", error);
+    return { error: "Word英訳中にエラーが発生しました: " + String(error?.message ?? error) };
   }
 }
 

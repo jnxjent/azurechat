@@ -405,6 +405,9 @@ function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
     } as const;
     return `PDFの日本語を${languageNames[request.targetLanguage]}へ翻訳し、編集可能なPowerPointを作成します。完了までしばらくお待ちください。`;
   }
+  if (request.action === "translate_word_to_word") {
+    return "Wordの日本語を英語に翻訳します。完了までしばらくお待ちください。";
+  }
   return `Excelの「${
     request.targetSheets.join(", ") || "指定シート"
   }」を再変換します。完了までしばらくお待ちください。`;
