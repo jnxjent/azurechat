@@ -142,9 +142,25 @@ def translate_docx(input_path: Path, output_path: Path, target_language: str) ->
                 batch.append(pending.popleft())
                 batch_chars += len(next_item.source)
             translated = _translate_batch(batch, language)
-            missing = [item for item in batch if not translated.get(item.id, "").strip()]
-            if missing:
-                translated.update(_translate_batch(missing, language))
+            for retry_number in range(1, 3):
+                retry_items = []
+                for item in batch:
+                    text = translated.get(item.id, "").strip()
+                    has_untranslated_japanese = (
+                        JAPANESE_KANA_RE.search(text)
+                        if target_language == "zh-CN"
+                        else JAPANESE_RE.search(text)
+                    )
+                    if not text or has_untranslated_japanese:
+                        retry_items.append(item)
+                if not retry_items:
+                    break
+                print(
+                    f"[word-translate] retry {retry_number} for paragraphs: "
+                    + ", ".join(item.id for item in retry_items[:10]),
+                    file=sys.stderr,
+                )
+                translated.update(_translate_batch(retry_items, language))
             for item in batch:
                 text = translated.get(item.id, "").strip()
                 has_untranslated_japanese = (
