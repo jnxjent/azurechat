@@ -1398,6 +1398,19 @@ const PDF_TRANSLATION_LANGUAGES = {
 
 type PdfTranslationLanguage = keyof typeof PDF_TRANSLATION_LANGUAGES;
 
+const WORD_TRANSLATION_LANGUAGES = {
+  en: { japaneseName: "英語", outputSuffix: "_英訳版.docx" },
+  pt: { japaneseName: "ポルトガル語", outputSuffix: "_ポルトガル語版.docx" },
+  vi: { japaneseName: "ベトナム語", outputSuffix: "_ベトナム語版.docx" },
+  id: { japaneseName: "インドネシア語", outputSuffix: "_インドネシア語版.docx" },
+  "zh-CN": { japaneseName: "中国語（簡体字）", outputSuffix: "_中国語版.docx" },
+  ko: { japaneseName: "韓国語", outputSuffix: "_韓国語版.docx" },
+  es: { japaneseName: "スペイン語", outputSuffix: "_スペイン語版.docx" },
+  fil: { japaneseName: "タガログ語", outputSuffix: "_タガログ語版.docx" },
+} as const;
+
+type WordTranslationLanguage = keyof typeof WORD_TRANSLATION_LANGUAGES;
+
 function resolvePdfTranslationLanguage(
   value: unknown
 ): PdfTranslationLanguage | null {
@@ -1407,6 +1420,19 @@ function resolvePdfTranslationLanguage(
     Object.prototype.hasOwnProperty.call(PDF_TRANSLATION_LANGUAGES, value)
   ) {
     return value as PdfTranslationLanguage;
+  }
+  return null;
+}
+
+function resolveWordTranslationLanguage(
+  value: unknown
+): WordTranslationLanguage | null {
+  if (value === undefined || value === null || value === "") return "en";
+  if (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(WORD_TRANSLATION_LANGUAGES, value)
+  ) {
+    return value as WordTranslationLanguage;
   }
   return null;
 }
@@ -1499,6 +1525,7 @@ async function runPythonTranslatePdfToPptx(
 async function runPythonTranslateWordToWord(
   inputBuffer: Buffer,
   threadId: string,
+  targetLanguage: WordTranslationLanguage,
   sourceUrl?: string,
   hintFileName?: string
 ) {
@@ -1521,13 +1548,17 @@ async function runPythonTranslateWordToWord(
     const pythonBin = process.platform === "win32" ? "python" : "python3";
     const { stdout, stderr } = await execFileAsync(
       pythonBin,
-      [scriptPath, "--input", inputPath, "--output", outputPath, "--target-language", "en"],
+      [scriptPath, "--input", inputPath, "--output", outputPath, "--target-language", targetLanguage],
       { env: pyEnv, timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 }
     );
     if (stderr?.trim()) console.warn("[word-translate] python stderr:", stderr.trim());
     const pythonResult = stdout?.trim() ? JSON.parse(stdout.trim()) : {};
     const outputBuffer = await fs.readFile(outputPath);
-    const fileName = buildOutputFileName(hintFileName || sourceUrl, "_英訳版.docx");
+    const language = WORD_TRANSLATION_LANGUAGES[targetLanguage];
+    const fileName = buildOutputFileName(
+      hintFileName || sourceUrl,
+      language.outputSuffix
+    );
     const blobName = `${threadId || uniqueId()}_translated_${uniqueId()}.docx`;
     const downloadUrl = await uploadWordToBlob(outputBuffer, blobName, fileName);
     await saveWordPointer(threadId, blobName, fileName, false);
@@ -1535,7 +1566,8 @@ async function runPythonTranslateWordToWord(
       downloadUrl,
       fileName,
       translatedParagraphs: Number(pythonResult.translatedParagraphs ?? 0),
-      targetLanguage: "en",
+      targetLanguage,
+      targetLanguageName: language.japaneseName,
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -2795,9 +2827,25 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
+      const resolvedTargetLanguage =
+        resolveWordTranslationLanguage(targetLanguage);
+      if (!resolvedTargetLanguage) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error:
+              "対応していない翻訳先言語です。en, pt, vi, id, zh-CN, ko, es, fil のいずれかを指定してください。",
+          },
+          { status: 400 }
+        );
+      }
       const wordBuffer = await downloadBlob(fileUrl, threadId);
       const result = await runPythonTranslateWordToWord(
-        wordBuffer, threadId, fileUrl, outputBaseName
+        wordBuffer,
+        threadId,
+        resolvedTargetLanguage,
+        fileUrl,
+        outputBaseName
       );
       return NextResponse.json({ ok: true, ...result });
     }

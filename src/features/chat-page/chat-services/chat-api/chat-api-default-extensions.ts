@@ -52,6 +52,7 @@ import {
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
 import { resolveWordEditInstruction } from "./word-edit-instruction";
+import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
 
 import {
   buildSendOptionsFromMode,
@@ -2132,8 +2133,29 @@ export const GetDefaultExtensions = async (props: {
   defaultExtensions.push({
     type: "function",
     function: {
-      function: async (args: any) =>
-        await executeEditWord(args, props.chatThread, props.userMessage),
+      function: async (args: any) => {
+        const suppliedFileUrl = String(args?.fileUrl ?? "").trim();
+        const hasWordSource = /\.docx($|\?)/i.test(suppliedFileUrl) ||
+          (!suppliedFileUrl &&
+            Boolean(await resolveLatestDocxFromPointer(props.chatThread.id)));
+        const translationLanguage = detectWholeWordTranslationLanguage(
+          props.userMessage,
+          hasWordSource
+        );
+        if (translationLanguage) {
+          console.log(
+            `[edit_word] rerouting whole-document translation to translate_word_to_word target=${translationLanguage}`
+          );
+          return executeTranslateWordToWord(
+            {
+              fileUrl: args?.fileUrl,
+              targetLanguage: translationLanguage,
+            },
+            props.chatThread
+          );
+        }
+        return executeEditWord(args, props.chatThread, props.userMessage);
+      },
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -2178,12 +2200,20 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             description: "SharePoint/SLにあるWord（.docx）のファイル名。fileUrlとは併用しない。",
           },
+          targetLanguage: {
+            type: "string",
+            enum: ["en", "pt", "vi", "id", "zh-CN", "ko", "es", "fil"],
+            default: "en",
+            description:
+              "翻訳先言語。en=英語、pt=ポルトガル語、vi=ベトナム語、id=インドネシア語、zh-CN=中国語（簡体字）、ko=韓国語、es=スペイン語、fil=タガログ語。ユーザーが指定した言語を設定し、省略時はen。",
+          },
         },
         required: [],
       },
       description:
-        "元の画像とWord構造を残し、Word（.docx）内の日本語を英語に翻訳したWordを作成する。" +
-        "Wordが添付されていれば『添付を英訳して』という短い依頼にも使用する。PDFには使用しない。" +
+        "元の画像とWord構造を残し、Word（.docx）内の日本語を指定言語に翻訳したWordを作成する。" +
+        "対応言語は英語、ポルトガル語、ベトナム語、インドネシア語、中国語（簡体字）、韓国語、スペイン語、タガログ語。" +
+        "Wordが添付されていれば『添付を英訳して』『添付を中国語に翻訳して』などの依頼に使用する。PDFには使用しない。" +
         "downloadUrlはUIがダウンロードボタンで表示するため、回答でURLを再掲しない。",
       name: "translate_word_to_word",
     },
@@ -9232,10 +9262,25 @@ async function executeTranslatePdfToPptx(
 }
 
 async function executeTranslateWordToWord(
-  args: { fileUrl?: string; fileQuery?: string },
+  args: {
+    fileUrl?: string;
+    fileQuery?: string;
+    targetLanguage?: PdfTranslationLanguage;
+  },
   chatThread: ChatThreadModel
 ) {
   let { fileUrl, fileQuery } = args ?? {};
+  const targetLanguage = args?.targetLanguage ?? "en";
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      PDF_TRANSLATION_LANGUAGE_NAMES,
+      targetLanguage
+    )
+  ) {
+    return { error: "対応していないWord翻訳先言語です。" };
+  }
+  const targetLanguageName =
+    PDF_TRANSLATION_LANGUAGE_NAMES[targetLanguage];
   let sourceFileName: string | undefined;
   if (fileQuery?.trim() && !fileUrl?.trim()) {
     const spResult = await resolveSpFileToSasUrl(
@@ -9268,26 +9313,33 @@ async function executeTranslateWordToWord(
         threadId: chatThread.id,
         action: "translate_word_to_word",
         outputBaseName: sourceFileName,
+        targetLanguage,
       }),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       console.error("[translate_word_to_word] route failed:", res.status, detail);
-      return { error: `Word英訳に失敗しました: HTTP ${res.status}` };
+      return { error: `Wordの${targetLanguageName}翻訳に失敗しました: HTTP ${res.status}` };
     }
     const result = await res.json();
     if (!result?.downloadUrl) {
-      return { error: "英訳版WordのダウンロードURLを取得できませんでした。" };
+      return { error: `${targetLanguageName}翻訳版WordのダウンロードURLを取得できませんでした。` };
     }
     return {
       downloadUrl: result.downloadUrl,
       fileName: result.fileName,
       translatedParagraphs: result.translatedParagraphs,
-      message: "日本語を英訳したWordを作成しました。",
+      targetLanguage: result.targetLanguage ?? targetLanguage,
+      targetLanguageName: result.targetLanguageName ?? targetLanguageName,
+      message: `日本語を${targetLanguageName}に翻訳したWordを作成しました。`,
     };
   } catch (error: any) {
     console.error("[translate_word_to_word] error:", error);
-    return { error: "Word英訳中にエラーが発生しました: " + String(error?.message ?? error) };
+    return {
+      error:
+        `Wordの${targetLanguageName}翻訳中にエラーが発生しました: ` +
+        String(error?.message ?? error),
+    };
   }
 }
 
