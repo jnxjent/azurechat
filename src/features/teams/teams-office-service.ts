@@ -257,6 +257,8 @@ export function parseTeamsOfficeRequest(
       normalized
     );
   const hasPptColorTopic = /(色味|配色|カラー|色)/i.test(normalized);
+  const isNewPptRequest = isNewPptCreationRequest(normalized);
+  const isShortColorReply = normalized.length <= 60 && !/(ロゴ|logo|画像|写真|表紙|サイズ|大き|小さ|拡大|縮小)/i.test(normalized);
   const asksForPptColorHelp =
     hasPptEditingContext &&
     hasPptColorTopic &&
@@ -265,15 +267,15 @@ export function parseTeamsOfficeRequest(
     ) ||
       (/(変えたい|変更したい)/i.test(normalized) &&
         !resolvePptxPaletteInstruction(normalized)));
-  if (asksForPptColorHelp) {
+  if (asksForPptColorHelp && !isNewPptRequest) {
     return { action: "ppt_color_help" };
   }
 
   const asksForPptAssetInsertion =
-    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換)/i.test(
+    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換|大き|小さ|拡大|縮小)/i.test(
       normalized
     ) ||
-    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
+    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換|大き|小さ|拡大|縮小).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
       normalized
     );
   const asksForWholeDeckPptEdit =
@@ -286,7 +288,7 @@ export function parseTeamsOfficeRequest(
   if (
     hasPptEditingContext &&
     (asksForPptAssetInsertion || asksForWholeDeckPptEdit) &&
-    !isNewPptCreationRequest(normalized) &&
+    !isNewPptRequest &&
     !/(新規|一から|ゼロから).{0,12}(?:作成|生成|作って)/i.test(normalized)
   ) {
     return {
@@ -300,7 +302,7 @@ export function parseTeamsOfficeRequest(
   const asksForPptColorEdit =
     hasPptEditingContext &&
     hasPptColorTopic &&
-    /(変更|変え|替え|にして|統一|基調)/i.test(normalized);
+    /(?:色味|配色|カラー|色)[^。！？!?.\n]{0,24}(?:変更|変え|替え|にして|統一|基調)|(?:変更|変え|替え|統一)[^。！？!?.\n]{0,16}(?:色味|配色|カラー|色)/i.test(normalized);
   const selectsListedPptColor =
     /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-6１-６]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
       normalized
@@ -313,15 +315,18 @@ export function parseTeamsOfficeRequest(
       normalized
     );
   const selectsResolvedPptColor =
+    isShortColorReply &&
     Boolean(resolvePptxPaletteInstruction(normalized)) &&
     /(?:で|に|へ|変更|変えて|お願いします|お願い|にして)[。.!！]?$/i.test(
       normalized
     );
   if (
-    asksForPptColorEdit ||
-    selectsListedPptColor ||
-    selectsNamedPptColor ||
-    selectsResolvedPptColor
+    !isNewPptRequest && (
+      asksForPptColorEdit ||
+      selectsListedPptColor ||
+      (isShortColorReply && selectsNamedPptColor) ||
+      selectsResolvedPptColor
+    )
   ) {
     return { action: "edit_latest_ppt_color", instruction: normalized };
   }

@@ -47,10 +47,7 @@ function loadOfficeService() {
       };
     }
     if (request === "@/features/pptx/palette") {
-      return {
-        pptxPaletteListText: () => "",
-        resolvePptxPaletteInstruction: () => null,
-      };
+      return loadTypeScriptModule("features/pptx/palette.ts", {});
     }
     if (request === "@/features/auth-page/helpers") {
       return { hashValue: (value) => value };
@@ -472,6 +469,15 @@ assert.equal(
   parseTeamsOfficeRequest("P2のタイトルだけを英語に変更して")?.action,
   "edit_latest_ppt"
 );
+
+const salesWithLargerLogo = '当社㈱ミダックホールディングスは産業廃棄物一貫処理会社です。初回客先訪問用の営業資料を8枚のスライドで作成してください（PPTで出力してください）。色は、さわやかなGreen系で。内容はHPから入手してください。添付Logoを各スライドの右上に配置してください。表紙も同様。但し、少しLogoを大きめにして。';
+assert.equal(parseTeamsOfficeRequest(salesWithLargerLogo)?.action, 'create_ppt');
+assert.equal(parseTeamsOfficeRequest(salesWithLargerLogo + '\n添付ファイル: logo.png')?.action, 'create_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTのロゴを大きめにして。色はGreenで')?.action, 'edit_latest_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTのロゴを小さくして。色は深緑でお願いします')?.action, 'edit_latest_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTの色をGreenにして')?.action, 'edit_latest_ppt_color');
+assert.equal(parseTeamsOfficeRequest('Greenでお願いします')?.action, 'edit_latest_ppt_color');
+assert.equal(parseTeamsOfficeRequest('深緑のPPTを8枚で作成してください')?.action, 'create_ppt');
 
 const webPptRequest = parseTeamsOfficeRequest(
   "ミダックホールディングスの初回訪問用営業資料を12枚でPPT作成してください。会社概要は公式HPを参考にしてください"
