@@ -51,6 +51,7 @@ import {
   sanitizeImageLocationForLog,
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
+import { isCompanyProfileContent, PPT_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
 import { resolveWordEditInstruction } from "./word-edit-instruction";
 import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
 
@@ -4718,12 +4719,7 @@ function detectCompanyProfileMode(
     userMessage ?? "",
     ...slides.flatMap((slide) => [slide.title, ...(slide.bullets ?? [])]),
   ].join(" ").toLowerCase();
-  const requestsWebsiteEnrichment =
-    /(?:会社案内|会社概要|企業情報|会社情報).{0,40}(?:hp|ホームページ|web|ウェブ|公式サイト).{0,40}(?:参考|参照|調べ|埋め|補完)/i.test(text) ||
-    /(?:hp|ホームページ|web|ウェブ|公式サイト).{0,40}(?:参考|参照|調べ|会社案内|会社概要|企業情報|会社情報|内容を埋め)/i.test(text);
-  // "機能紹介資料" は製品機能紹介であり会社紹介ではないため除外
-  const hasProfile = /会社紹介|(?<!機能)紹介資料|company profile|初回訪問|初回営業/.test(text);
-  return requestsWebsiteEnrichment || (hasProfile && slides.length <= 16);
+  return isCompanyProfileContent(text, slides.length);
 }
 
 const TITLE_SUFFIXES =
@@ -4827,7 +4823,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
   const slides = await planCompanyProfileSlides(
     props.title,
     brief,
-    props.userPrompt,
+    `${props.userPrompt}\n${PPT_PRODUCTION_INSTRUCTION}`,
     props.designInstruction,
     targetTotalSlides - 1,
     seedSlides,
@@ -4841,7 +4837,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
   );
   return {
     companyName,
-    slides,
+    slides: removePptProductionNotes(slides),
     targetTotalSlides,
     sourceEvidence,
     sourceUrls: evidence.sourceUrls,
@@ -5053,6 +5049,8 @@ async function executeCreatePptx(
   imageAttachmentUrls?: string[]
 ) {
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
+  const requestedPalette = resolvePptxPaletteInstruction(userMessage ?? "");
+  const effectivePalette = requestedPalette?.paletteKey ?? palette;
   const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
   const effectiveFontFace = hasExplicitFontRequest && fontFace?.trim() ? fontFace.trim() : "Meiryo";
 
@@ -5266,7 +5264,7 @@ async function executeCreatePptx(
       body: JSON.stringify({
         title,
         ...(logoDataUrl ? { logoDataUrl } : {}),
-        slides: (finalSlides ?? []).map((s) => ({
+        slides: removePptProductionNotes(finalSlides ?? []).map((s) => ({
           title: s.title,
           bullets: Array.isArray(s.bullets) ? s.bullets : [],
           ...(s.layoutType    ? { layoutType: s.layoutType }       : {}),
@@ -5298,7 +5296,7 @@ async function executeCreatePptx(
         deckPreferences,
         fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
         promptIntent,
-        ...(palette ? { palette } : {}),
+        ...(effectivePalette ? { palette: effectivePalette } : {}),
       }),
     });
 

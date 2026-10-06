@@ -129,6 +129,7 @@ function loadOfficeService() {
     }
     if (request === "./teams-ppt-plan-service") {
       return {
+        buildTeamsPptRenderingOptions: (...args) => buildTeamsPptRenderingOptions(...args),
         createTeamsPptPlan: async (props) => {
           pptPlanInputs.push(props);
           const isExecutiveSharePointDeck = /経営層|DX_AI活動報告/.test(
@@ -395,7 +396,7 @@ function loadTypeScriptModule(relativePath, mocks = {}) {
   loaded.require = (request) =>
     Object.prototype.hasOwnProperty.call(mocks, request)
       ? mocks[request]
-      : originalRequire(request);
+      : request.startsWith("@/") ? loadTypeScriptModule(request.slice(2) + ".ts", mocks) : originalRequire(request);
   loaded._compile(javascript, fileName);
   return loaded.exports;
 }
@@ -682,17 +683,19 @@ async function testWebGroundedPptAndLogoFollowup() {
 
   try {
     const createReply = await executeTeamsOfficeRequest({
-      request: webPptRequest,
+      request: { ...webPptRequest, prompt: `${webPptRequest.prompt} 色は、さわやかなGreen系で。` },
       conversationId,
       uploadedFiles: [],
     });
     assert.match(createReply, /Officeファイルを作成しました/);
     assert.match(createReply, /https:\/\/www\.midac\.jp\/company\//);
-    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, webPptRequest.prompt);
+    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, `${webPptRequest.prompt} 色は、さわやかなGreen系で。`);
     assert.equal(sharedCompanyPlanInputs.at(-1).contentModelSource, "api");
     assert.equal(requests[0].body.slides.length, 11);
     assert.equal(requests[0].body.targetTotalSlides, 12);
     assert.equal(requests[0].body.promptIntent.documentPurpose, "company-intro");
+    assert.equal(requests[0].body.palette, "forest_amber");
+    assert.match(requests[0].body.designInstruction, /forest_amber/);
 
     const logo = {
       extension: "png",

@@ -202,6 +202,13 @@ async function main() {
 const routing = load('features/pptx/output-intent.ts');
 const salesPrompt = '当社㈱ミダックホールディングスは産業廃棄物一貫処理会社です。初回客先訪問用の営業資料を8枚のスライドで作成してください（PPTで出力してください）。色は、さわやかなGreen系で。内容はHPから入手してください。添付会社Logoを各スライドの右上に配置してください。';
 assert(routing.isNewPptCreationRequest(salesPrompt));
+assert(routing.isCompanyProfileContent(salesPrompt, 7));
+assert(routing.requestsOfficialWebsiteContent('内容はHPから入手してください'));
+assert(!routing.isCompanyProfileContent('AzureChatの機能紹介資料を作成してください', 7));
+const rendering = load('features/teams/teams-ppt-plan-service.ts').buildTeamsPptRenderingOptions(salesPrompt, '営業資料');
+assert.equal(rendering.palette, 'forest_amber');
+assert(!rendering.designInstruction.includes('ネイビー'));
+assert.deepEqual(routing.removePptProductionNotes([{title:'事業内容',bullets:['一貫処理会社です。','右上に添付ロゴ「midac_logo_16.png」を配置']}]), [{title:'事業内容',bullets:['一貫処理会社です。']}]);
 for (const counts of [{imageCount:1,documentCount:0},{imageCount:0,documentCount:1},{imageCount:1,documentCount:1}]) {
   assert.equal(routing.resolveOfficeChatRoute({explicitPptRequest:routing.isExplicitPptOutputRequest(salesPrompt),requiredTools:false,...counts}), 'extensions');
 }

@@ -1,5 +1,5 @@
 import "server-only";
-import { isNewPptCreationRequest, pdfPptConversionMode } from "@/features/pptx/output-intent";
+import { isNewPptCreationRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
 
 import { createHash, randomUUID } from "crypto";
 import {
@@ -22,6 +22,7 @@ import {
 import {
   createTeamsPptCardEdits,
   createTeamsPptPlan,
+  buildTeamsPptRenderingOptions,
   type TeamsPptExtractedSlide,
 } from "./teams-ppt-plan-service";
 import {
@@ -1978,6 +1979,7 @@ async function createDirectOfficeFile(props: {
         userPrompt: props.prompt,
         contentModelSource: "api",
       });
+      const renderingOptions = buildTeamsPptRenderingOptions(props.prompt, props.title);
       if (
         companyPlan.slides.length !==
         companyPlan.targetTotalSlides - 1
@@ -1995,7 +1997,9 @@ async function createDirectOfficeFile(props: {
         slides: companyPlan.slides,
         threadId: props.threadId,
         targetTotalSlides: companyPlan.targetTotalSlides,
-        deckPreferences: {},
+        deckPreferences: renderingOptions.deckPreferences,
+        palette: renderingOptions.palette,
+        designInstruction: renderingOptions.designInstruction,
         promptIntent: companyPlan.promptIntent,
         fileBaseName: sanitizeOfficeBaseName(props.title),
       });
@@ -2047,7 +2051,7 @@ function companyProfileSourceName(url: string): string {
 }
 
 function requestsWebGroundedPpt(prompt: string): boolean {
-  return /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
+  return requestsOfficialWebsiteContent(prompt) || /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
     prompt.normalize("NFKC")
   );
 }
