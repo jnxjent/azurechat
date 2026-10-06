@@ -1,6 +1,7 @@
 // src/features/chat-page/chat-services/chat-api/chat-api-default-extensions.ts
 "use server";
 import "server-only";
+import { extractPresentationCompanyName, assertCompanyIdentity, isCompanySearchResult } from "@/features/pptx/company-identity";
 
 import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
 import { OpenAIDALLEInstance, OpenAIInstance, OpenAIPptInstance } from "@/features/common/services/openai";
@@ -2613,6 +2614,12 @@ type BraveWebEvidence = {
 };
 
 async function collectWebEvidence(query: string, preferredCompanyName = ""): Promise<BraveWebEvidence> {
+  const suppliedUrl = query.match(/https?:\/\/[^\s、。]+/i)?.[0];
+  if (suppliedUrl) {
+    const page = await fetchPageText(suppliedUrl, 12000);
+    if (!isCompanySearchResult(preferredCompanyName, page, "")) return { snippets: "", pages: "", sourceUrls: [] };
+    return { snippets: "", pages: `SOURCE_URL: ${suppliedUrl}\n${page}`, sourceUrls: [suppliedUrl], officialDomain: new URL(suppliedUrl).hostname.replace(/^www\./, "") };
+  }
   const apiKey = process.env.BRAVE_SUBSCRIPTION_TOKEN;
   if (!apiKey) return { snippets: "", pages: "", sourceUrls: [] };
 
@@ -2632,22 +2639,8 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
   }
 
   const results: Array<{ title?: string; description?: string; extra_snippets?: string[]; url?: string }> =
-    braveData?.web?.results ?? [];
+    (braveData?.web?.results ?? []).filter((r: any) => isCompanySearchResult(preferredCompanyName, r.title ?? "", r.description ?? ""));
 
-  const snippets = results
-    .slice(0, 8)
-    .map((r) => {
-      const extras = (r.extra_snippets ?? []).slice(0, 3).join(" ");
-      return `【${r.title ?? ""}】${r.description ?? ""} ${extras}`.trim();
-    })
-    .filter(Boolean)
-    .join("\n")
-    .slice(0, 4000);
-
-  const companyKey = preferredCompanyName
-    .replace(/(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))/g, "")
-    .replace(/[\s　・]/g, "")
-    .toLowerCase();
   const resultHostname = (url: string): string => {
     try {
       return new URL(url).hostname.replace(/^www\./, "").toLowerCase();
@@ -2659,10 +2652,7 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
     .map((result, index) => {
       const url = result.url ?? "";
       const hostname = resultHostname(url);
-      const compactText = `${result.title ?? ""}${result.description ?? ""}`
-        .replace(/[\s　・]/g, "")
-        .toLowerCase();
-      const companyMatch = companyKey.length >= 3 && compactText.includes(companyKey);
+      const companyMatch = isCompanySearchResult(preferredCompanyName, result.title ?? "", result.description ?? "");
       const officialPage = /\/(?:company|business|overview|about|profile|permission)(?:\/|\.|$)/i.test(url);
       const excludedHost = /(?:wikipedia|facebook|instagram|x\.com|youtube|linkedin|nikkei|prtimes)/i.test(hostname);
       const score = (companyMatch ? 5 : 0) + (officialPage ? 3 : 0) + Math.max(0, 3 - index) - (excludedHost ? 20 : 0);
@@ -2676,15 +2666,24 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
         .map((result) => result.url ?? "")
         .filter((url) => url.startsWith("http") && resultHostname(url) === officialDomain)
     : [];
-  const candidateUrls = Array.from(new Set([
-    ...officialUrls,
-    ...results.slice(0, 6).map((result) => result.url ?? "").filter((url) => url.startsWith("http")),
-  ])).slice(0, 6);
+  const candidateUrls = Array.from(new Set(officialUrls)).slice(0, 6);
+
+  const snippets = results.filter(r => officialDomain && resultHostname(r.url ?? "") === officialDomain)
+    .slice(0, 8)
+    .map((r) => {
+      const extras = (r.extra_snippets ?? []).slice(0, 3).join(" ");
+      return `【${r.title ?? ""}】${r.description ?? ""} ${extras}`.trim();
+    })
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 4000);
+
+
 
   const pageTexts = await Promise.allSettled(
     candidateUrls.map(async (url) => {
       const text = await fetchPageText(url, 3500);
-      return text ? `SOURCE_URL: ${url}\n${text}` : "";
+      return isCompanySearchResult(preferredCompanyName, text, "") ? `SOURCE_URL: ${url}\n${text}` : "";
     })
   );
 
@@ -2698,7 +2697,7 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
     `[collectWebEvidence] query="${query}" officialDomain=${officialDomain ?? "none"} ` +
     `urls=${candidateUrls.length} snippets=${snippets.length}c pages=${pages.length}c`
   );
-  return { snippets, pages, sourceUrls: candidateUrls, officialDomain };
+  return { snippets, pages, sourceUrls: candidateUrls.filter(url => pages.includes(`SOURCE_URL: ${url}\n`)), officialDomain };
 }
 
 // ---- LLM事実抽出 ----
@@ -2925,7 +2924,7 @@ Rules:
     }
     const parsed = JSON.parse(match[0]);
     const brief: CompanyBrief = {
-      companyName: parsed.companyName || companyName,
+      companyName: typeof parsed.companyName === "string" ? parsed.companyName : "",
       audience: parsed.audience || audience,
       purpose: parsed.purpose || purpose,
       companyOverview: parsed.companyOverview || "",
@@ -4726,24 +4725,7 @@ const TITLE_SUFFIXES =
   /[\s　]*(会社紹介|紹介資料|営業資料|提案資料|提案書|会社概要|初回訪問(?:用|向け)?|COMPANY\s*PROFILE|Company\s*Profile|プロフィール|Profile)/gi;
 
 function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
-  const explicit = `${userMessage} ${title}`.match(
-    /(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))\s*([ァ-ヶー一-龠A-Za-z0-9・]{2,30}?)(?=という|の(?:HP|ホームページ|Web|ウェブ|公式サイト)|[、。\s]|$)/i
-  )?.[1];
-  if (explicit) return explicit.trim();
-
-  const cleaned = title
-    .replace(/（[^）]*）|\([^)]*\)/g, "")
-    .replace(/^(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))\s*/, "")
-    .replace(/(?:お客様向け|顧客向け|営業員向け|初回訪問向け).*/, "")
-    .replace(TITLE_SUFFIXES, "")
-    .trim();
-
-  const quoted = cleaned.match(/[「『"']([^」』"']{2,20})[」』"']/)?.[1];
-  if (quoted) return quoted;
-
-  // 株式会社などのプレフィックスを除去してから先頭語を返す
-  const noPrefix = cleaned.replace(/^(株式会社|有限会社|合同会社|（株）|\(株\))\s*/, "");
-  return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
+  return extractPresentationCompanyName(title, userMessage);
 }
 
 export type SharedCompanyProfileSeedSlide = {
@@ -4799,12 +4781,15 @@ export async function createSharedCompanyProfilePptPlan(props: {
     props.title,
     props.userPrompt
   );
+  if (!companyName) throw new Error("対象の会社名を特定できませんでした。会社名と公式URLを教えてください。");
   const query = companyName
     ? `${companyName} 公式サイト 会社概要 事業内容 強み 許可 拠点 グループ会社`
     : `${props.title} 会社概要 事業内容`;
   console.log("[shared-company-profile] collectWebEvidence:", query);
 
-  const evidence = await collectWebEvidence(query, companyName);
+  const explicitUrl = props.userPrompt.match(/https?:\/\/[^\s、。]+/i)?.[0];
+  const evidence = await collectWebEvidence(explicitUrl ?? query, companyName);
+  if (!evidence.officialDomain || !evidence.pages.trim()) throw new Error("対象会社の公式サイト情報を確認できませんでした。対象会社の公式URLを教えてください。");
   const sourceEvidence = [evidence.snippets, evidence.pages]
     .filter(Boolean)
     .join("\n\n");
@@ -4815,6 +4800,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
     evidence,
     props.contentModelSource
   );
+  assertCompanyIdentity(companyName, brief.companyName);
   const requestedTotal =
     props.targetTotalSlides ??
     extractRequestedTotalSlideCount(props.userPrompt) ??
@@ -5137,12 +5123,17 @@ async function executeCreatePptx(
     }
   } else if (companyProfileMode) {
     // AzureChat/Teams 共通の公式サイト会社紹介パイプラインを使用する。
-    const companyPlan = await createSharedCompanyProfilePptPlan({
+    let companyPlan;
+    try {
+      companyPlan = await createSharedCompanyProfilePptPlan({
       title,
       userPrompt: userMessage ?? "",
       designInstruction,
       seedSlides: slides,
     });
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "会社情報を確認できませんでした。公式URLを教えてください。" };
+    }
     storySourceEvidence = companyPlan.sourceEvidence;
     if (companyPlan.slides.length > 0) {
       finalSlides = companyPlan.slides;

@@ -1974,11 +1974,17 @@ async function createDirectOfficeFile(props: {
         userPrompt: props.prompt,
       })
     ) {
-      const companyPlan = await createSharedCompanyProfilePptPlan({
-        title: props.title,
-        userPrompt: props.prompt,
-        contentModelSource: "api",
-      });
+      let companyPlan;
+      try {
+        companyPlan = await createSharedCompanyProfilePptPlan({
+          title: props.title,
+          userPrompt: props.prompt,
+          contentModelSource: "api",
+        });
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "会社情報を確認できませんでした。公式URLを教えてください。" };
+      }
+      const companyTitle = props.title.includes(companyPlan.companyName) ? props.title : `${companyPlan.companyName} ${props.title}`;
       const renderingOptions = buildTeamsPptRenderingOptions(props.prompt, props.title);
       if (
         companyPlan.slides.length !==
@@ -1992,7 +1998,7 @@ async function createDirectOfficeFile(props: {
         };
       }
       const generated = await postOfficeGenerationApi("/api/gen-pptx", {
-        title: props.title,
+        title: companyTitle,
         logoDataUrl: props.logoDataUrl,
         slides: companyPlan.slides,
         threadId: props.threadId,
@@ -2001,7 +2007,7 @@ async function createDirectOfficeFile(props: {
         palette: renderingOptions.palette,
         designInstruction: renderingOptions.designInstruction,
         promptIntent: companyPlan.promptIntent,
-        fileBaseName: sanitizeOfficeBaseName(props.title),
+        fileBaseName: sanitizeOfficeBaseName(companyTitle),
       });
       return {
         ...generated,
@@ -2189,6 +2195,7 @@ async function postOfficeGenerationApi(
   }
 
   const result = (await response.json()) as Record<string, unknown>;
+  console.log("[teams-office] generation API returned", { endpoint, status: response.status, hasDownloadUrl: typeof result.downloadUrl === "string" });
   if (typeof result.downloadUrl !== "string") {
     return { error: "ダウンロードURLが取得できませんでした。" };
   }

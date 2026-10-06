@@ -249,7 +249,9 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
           uploadedFiles,
           userEmail,
         });
+        console.log("[teams-office] sending completion reply");
         await send(officeReply);
+        console.log("[teams-office] completion reply sent");
         await recordCompletedTeamsTurn({
           conversationId,
           activityId,

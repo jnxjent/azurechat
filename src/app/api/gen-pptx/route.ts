@@ -1834,6 +1834,7 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+  console.log("[pptx-pointer] start");
   const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
   const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   if (!acc || !key || !threadId?.trim()) return;
@@ -1843,12 +1844,14 @@ async function savePptxPointer(threadId: string, blobName: string, fileName: str
   );
   const containerClient = blobServiceClient.getContainerClient("pptx");
   await containerClient.createIfNotExists({ access: "blob" });
+  console.log("[pptx-pointer] container ready");
   await containerClient
     .getBlockBlobClient(`thread-${threadId}-pptx-pointer.json`)
     .uploadData(
       Buffer.from(JSON.stringify({ containerName: "pptx", blobName, fileName, savedAt: new Date().toISOString() })),
       { blobHTTPHeaders: { blobContentType: "application/json" } }
     );
+  console.log("[pptx-pointer] saved");
 }
 
 const W = 13.33;
@@ -6266,6 +6269,7 @@ export async function POST(req: NextRequest) {
       }
 
       const marked = await markPptxAsOurs(blobKey, _deckId);
+      console.log("[gen-pptx] metadata marked", { marked });
       if (!marked) {
         console.error(`[gen-pptx] markPptxAsOurs failed for blobKey=${blobKey} — aborting pointer update`);
         return NextResponse.json({ ok: false, error: "PPTXメタデータのマーク付与に失敗しました。再度お試しください。" }, { status: 500 });
