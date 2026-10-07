@@ -247,8 +247,10 @@ async function main() {
   ];
   const repaired = await sharp(await eraseTextRegions(colourSource, boxes)).removeAlpha().raw().toBuffer();
   const rgbAt = (x, y) => Array.from(repaired.subarray((y * 400 + x) * 3, (y * 400 + x) * 3 + 3));
-  assert.deepEqual(rgbAt(50, 60), [255, 255, 255], 'white area must not acquire green');
-  assert.deepEqual(rgbAt(50, 175), [255, 81, 0], 'white glyphs must restore orange');
+  // Background clustering averages antialiasing; platform rasterisers can
+  // differ by a few channel levels while preserving the intended fill.
+  assert(rgbAt(50, 60).every(v => v >= 250), 'white area must not acquire green');
+  assert(rgbAt(50, 175).every((v, c) => Math.abs(v - [255, 81, 0][c]) <= 3), 'white glyphs must restore orange');
   assert.deepEqual(rgbAt(4, 60), [7, 85, 43], 'original green frame must survive');
   // Small accident labels have several orange shades, none of which alone
   // reaches the solid-background threshold; neighbouring green must stay out.
