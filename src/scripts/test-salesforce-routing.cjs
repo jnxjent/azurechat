@@ -27,6 +27,32 @@ const access = loadTypeScriptModule(
   "features/common/services/salesforce-access.ts"
 );
 
+const teamsReportCases = [
+  ["Salesforceの日報から、私の部下の最近の活動を分析して", "salesforce"],
+  ["Salesforceの日報から、私の部下の先週の日報内容をまとめて", "salesforce"],
+  ["SFで私の部下の最近の活動を分析して", "salesforce"],
+  ["セールスフォースの日報を要約して", "salesforce"],
+  ["私の部下の昨日の日報内容をまとめて", "normal"],
+  ["私の部下の先週の日報内容をまとめて", "normal"],
+  ["私の部下の最近の活動を分析して", "normal"],
+  ["私の部下の最近の日報は？", "normal"],
+  ["Salesforceの日報をSharePointから検索して分析して", "knowledge"],
+  ["SharePointの部下の日報内容をまとめて", "knowledge"],
+  ["部下の日報の操作方法を教えて", "normal"],
+  ["最近の活動を分析する機能の概要は？", "normal"],
+  ["部下との面談内容をまとめて", "normal"],
+];
+for (const [message, expected] of teamsReportCases) {
+  const input = { message, isSalesforceAllowed: true,
+    hasSalesforceExtension: true, defaultToSalesforce: false };
+  assert.equal(routing.resolveSalesforceRoute(input).route, expected, message);
+  if (expected === "salesforce") {
+    assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
+    assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
+    assert.equal(routing.buildSalesforceGatewayQuery(message), message.normalize("NFKC").replace(/^(?:Salesforceの|SFで|セールスフォースの)/, ""));
+  }
+}
+
 const cases = [
   ["こんにちは", true, "salesforce"],
   ["大映産業の住所は？", true, "salesforce"],
@@ -150,4 +176,4 @@ assert.doesNotMatch(
   /firstEmail\(\s*props\.activity\.from\?\.properties/
 );
 
-console.log(`Salesforce routing tests passed (${cases.length + 17} assertions).`);
+console.log(`Salesforce routing tests passed (${cases.length + 17 + teamsReportCases.length + 12} assertions).`);
