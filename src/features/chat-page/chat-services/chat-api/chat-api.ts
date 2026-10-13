@@ -24,10 +24,10 @@ import {
   AddExtensionToChatThread,
   EnsureChatThreadOperation,
 } from "../chat-thread-service";
-import { LoadLatestImageAttachment } from "../chat-image-service";
+import { LoadLatestImageAttachment, UploadImageToStore } from "../chat-image-service";
 import { LoadPendingPptxEdit } from "../pptx-pending-edit-service";
 import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
-import { isExplicitPptOutputRequest, isNewPptCreationRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
+import { isExplicitPptOutputRequest, isNewPptCreationRequest, isImagePptConversionRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -252,6 +252,25 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     history.push({ role: "system", content: `現在の会話に添付されたPDFです。利用者の添付画像という表現はこのPDFを指します。convert_doc_to_pptxへ渡してください。\n${sources.join("\n\n")}` });
     console.log("[PPT attachment] PDF conversion sources resolved", { count: sources.length });
   }
+  const imageConversionCandidates = imageAttachmentUrls.length ? imageAttachmentUrls : storedImageAttachment
+    ? [`data:${storedImageAttachment.contentType};base64,${storedImageAttachment.buffer.toString("base64")}`] : [];
+  const attachedImageConversion = !attachedPdfConversion && !pptxAssetPlacementRequest &&
+    isImagePptConversionRequest(props.message) && imageConversionCandidates.length > 0;
+  if (attachedImageConversion) {
+    const imageConversionSources = await Promise.all(imageConversionCandidates.map(async (source, index) => {
+      if (!source.startsWith("data:")) return source;
+      const match = source.match(/^data:image\/(?:png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\r\n]+)$/);
+      if (!match) throw new Error("添付画像の形式が不正です。PNG・JPEG・WEBPを使用してください。");
+      const name = `ppt-source-${Date.now()}-${index}.png`;
+      const uploaded = await UploadImageToStore(currentChatThread.id, name, Buffer.from(match[1], "base64"));
+      if (uploaded.status !== "OK") throw new Error("PowerPoint変換用の画像を保存できませんでした。");
+      const sas = await GenerateSasUrl("images", `${currentChatThread.id}/${name}`);
+      if (sas.status !== "OK") throw new Error("添付画像のURLを取得できませんでした。");
+      return sas.response;
+    }));
+    history.push({ role: "system", content: `添付画像そのものをPowerPointへ変換する依頼です。convert_doc_to_pptxを使い、mode=faithfulで画像を残し文字を編集可能にしてください。\n${imageConversionSources.map(url => `file_url: ${url}`).join("\n\n")}` });
+  }
+
 
   // 2ターン目以降の「候補2に変更して」などでも、同じAgentセッションを継続する。
   if (
@@ -311,7 +330,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
         userMessage: props.message,
         history,
         extensions: extension,
-        requiredToolName: (attachedPdfConversion ? "convert_doc_to_pptx" : newPptRequest ? "create_pptx" : requiredImageToolName),
+        requiredToolName: (attachedPdfConversion || attachedImageConversion ? "convert_doc_to_pptx" : newPptRequest ? "create_pptx" : requiredImageToolName),
         loginEmail: user.email,
         salesforceRouting,
         signal,

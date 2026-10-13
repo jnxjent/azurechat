@@ -32,10 +32,16 @@ export function isExplicitPptOutputRequest(message: string): boolean {
 }
 
 export function isNewPptCreationRequest(message: string): boolean {
+  if (isImagePptConversionRequest(message)) return false;
   return isExplicitPptOutputRequest(message) &&
     !/(?:PDF|添付ファイル).{0,20}(?:PPT|PowerPoint|変換|にして)/i.test(message) &&
     /作成|生成|作って|create/i.test(message) &&
     !/(?:既存|先ほど|直前|出力した|作成した|今の|このPPT).{0,20}(?:編集|変更|修正)/i.test(message);
+}
+
+export function isImagePptConversionRequest(message: string): boolean {
+  return isExplicitPptOutputRequest(message) && /png|jpe?g|webp|画像|ポスター|スクリーンショット/i.test(message) &&
+    /変換|にして|スライド化|復元|編集可能/i.test(message) && !/参考|(?:ロゴ|logo).{0,30}(?:右上|挿入|追加|配置|差し替)/i.test(message);
 }
 
 export function pdfPptConversionMode(message: string): "faithful" | "redesign" {

@@ -94,7 +94,7 @@ async function recognizeWithVisionLayout(visionUrl: string): Promise<EditablePdf
       messages: [{ role: "user", content: [
         { type: "text", text: `画像を編集可能なPowerPointへ復元するためのOCRと文字位置の解析をしてください。要約・加筆・言い換えは禁止。読める文字を正確に転記してください。JSONだけ返す:
 {"backgroundColor":"FFFFFF","texts":[{"text":"原文","x":0.1,"y":0.1,"w":0.8,"h":0.1,"color":"123456","fontSize":0.04,"bold":false,"align":"left"}]}
-座標と寸法は画像全体を1とした比率（小数3桁まで）。x,y,w,hは文字のインクをちょうど囲む矩形。fontSizeは1行の文字の高さ/画像高さ。textsは見出し・段落・表のセル・図のラベルを別々にし、改行を保存。写真内やロゴ内の文字は転記しない（画像として残す）。文字が1つもなければtextsは空配列。backgroundColorはページ余白に近い単色。${feedback ? `前回の解析の問題: ${feedback}。原画像を再確認し、指定したJSON形式で修正してください。` : ""}` },
+座標と寸法は画像全体を1とした比率（小数3桁まで）。x,y,w,hは文字のインクをちょうど囲む矩形。fontSizeは1行の文字の高さ/画像高さ。textsは見出し・段落・表のセル・図のラベルを別々にし、改行を保存。写真内やロゴマーク自体の文字は転記しない（画像として残す）。ページ最下部も必ず確認し、会社名・担当者名・運行管理者・電話・内線などの連絡先欄は、ロゴの隣でも通常の文字として転記する。文字が1つもなければtextsは空配列。backgroundColorはページ余白に近い単色。${feedback ? `前回の解析の問題: ${feedback}。原画像を再確認し、指定したJSON形式で修正してください。` : ""}` },
         { type: "image_url", image_url: { url: visionUrl, detail: "high" } },
       ] }],
     });
@@ -179,6 +179,12 @@ async function readLinesWithDocumentIntelligence(png: Buffer): Promise<OcrLine[]
       for (const line of page.lines ?? []) {
         if (!line.content.trim() || !line.polygon?.length) continue;
         const box = toBox(line.polygon);
+        // Letter spacing in contact footers must not split a role/name into
+        // separate glyphs that the logo filter can mistake for a brand mark.
+        if (box.y >= .8 && /運行管理者|管理責任者|担当者|連絡先|内線|電話|株式会社|ホールディングス|[（(]株[）)]/.test(line.content.replace(/\s/g, ""))) {
+          result.push({ text: line.content.trim(), ...box });
+          continue;
+        }
         // DI sometimes joins a heading and a logo on the same baseline into one line.
         // Split at wide gaps between words so each part can be judged on its own.
         const lineOffset = line.spans?.[0]?.offset;
@@ -299,6 +305,12 @@ async function sampleColors(png: Buffer, boxes: SourceBox[]): Promise<{ backgrou
   return { background: hex(median(border)), colors: measured.map(m => m.color), multiColor: measured.map(m => m.multiColor) };
 }
 
+export function isContactFooterText(line: { text: string; y: number }, lines: Array<{ text: string; y: number }>): boolean {
+  const contactLabel = /運行管理者|管理責任者|担当者|連絡先|内線|電話|TEL\s*[:：]/i;
+  return line.y >= .8 && (contactLabel.test(line.text.replace(/\s/g, "")) ||
+    (/[一-鿿ぁ-ゖァ-ヺ]/.test(line.text) && lines.some(other => other.y >= .8 && contactLabel.test(other.text.replace(/\s/g, "")))));
+}
+
 async function recognizeWithDocumentIntelligence(dataUrl: string, visionUrl: string): Promise<EditablePdfLayout> {
   const source = Buffer.from(dataUrl.split(",")[1] ?? "", "base64");
   const lines = await readLinesWithDocumentIntelligence(Buffer.from(visionUrl.split(",")[1] ?? "", "base64"));
@@ -308,7 +320,7 @@ async function recognizeWithDocumentIntelligence(dataUrl: string, visionUrl: str
   const merged = lines.map((line, i) => ({
     ...line, ...corrected[i], color: colors[i],
     // Vision's logo judgement varies between runs, so multi-hue Latin-only marks (logos) are also kept as image.
-    keep: corrected[i].keep && !(multiColor[i] > MULTI_COLOR_LOGO && !/[　-鿿＀-￯]/.test(line.text)),
+    keep: isContactFooterText(line, lines) || (corrected[i].keep && !(multiColor[i] > MULTI_COLOR_LOGO && !/[　-鿿＀-￯]/.test(line.text))),
   }));
   const excluded = merged.filter(line => !line.keep).map(line => line.text);
   if (excluded.length) console.info("[PDF editable layout] kept as image (logo/photo text)", { excluded });

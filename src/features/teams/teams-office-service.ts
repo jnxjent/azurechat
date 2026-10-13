@@ -1,5 +1,5 @@
 import "server-only";
-import { isNewPptCreationRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
+import { isNewPptCreationRequest, isImagePptConversionRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
 
 import { createHash, randomUUID } from "crypto";
 import {
@@ -449,7 +449,7 @@ export function parseTeamsOfficeRequest(
     };
   }
 
-  if (asksForPowerPoint && asksForConversion && hasPdfSource) {
+  if (asksForPowerPoint && asksForConversion && (hasPdfSource || isImagePptConversionRequest(normalized))) {
     const fileQuery =
       attachedFileQuery ||
       extractQuotedFileQuery(normalized) ||
@@ -820,7 +820,7 @@ export async function executeTeamsOfficeRequest(props: {
   }
 
   if (props.request.action === "pdf_to_ppt") {
-    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf", "png", "jpg", "jpeg", "webp"]);
     if (uploaded.error) return uploaded.error;
     if (uploaded.file) {
       const result = await convertPdfToPowerPoint({
@@ -837,9 +837,9 @@ export async function executeTeamsOfficeRequest(props: {
       const outputName =
         typeof result.fileName === "string"
           ? result.fileName
-          : uploaded.file.fileName.replace(/\.pdf$/i, ".pptx");
+          : uploaded.file.fileName.replace(/\.(pdf|png|jpe?g|webp)$/i, ".pptx");
       await savePptxResult(teamsThreadId, result, outputName);
-      return `添付PDFをPowerPointへ変換しました。${props.request.mode === "faithful" ? "元の図・写真を切り出し、文字を編集可能なテキストとして配置しています。" : ""}\n\n📊 [${escapeMarkdownLinkText(
+      return `添付ファイルをPowerPointへ変換しました。${props.request.mode === "faithful" ? "元の図・写真を残し、文字を編集可能なテキストとして配置しています。" : ""}\n\n📊 [${escapeMarkdownLinkText(
         outputName
       )}](${String(result.downloadUrl)})`;
     }
@@ -1926,7 +1926,7 @@ async function convertPdfToPowerPoint(props: {
     props.fileName.replace(/\.pdf$/i, "") ||
     "プレゼンテーション";
   const fileBaseName = props.fileName
-    .replace(/\.pdf$/i, "")
+    .replace(/\.(pdf|png|jpe?g|webp)$/i, "")
     .replace(/[\\/:*?"<>|]/g, "")
     .trim()
     .slice(0, 40);

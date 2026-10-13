@@ -316,6 +316,11 @@ assert.equal(
   "pdf_to_ppt"
 );
 
+const pngConversion = parseTeamsOfficeRequest('添付PNGを画像はそのままで文字を編集可能なPPTに変換して\n添付ファイル: poster.png');
+assert.equal(pngConversion?.action, 'pdf_to_ppt');
+assert.equal(pngConversion?.fileQuery, 'poster.png');
+assert.equal(pngConversion?.mode, 'faithful');
+
 const chineseTranslation = parseTeamsOfficeRequest(
   "添付PDFの日本語を中国語に翻訳して\n添付ファイル: ごみ分別.pdf"
 );
@@ -830,12 +835,45 @@ async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
   }
 }
 
+async function testNewDeckWithLogoAndFaithfulPdf() {
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (url, init) => {
+    if (!init?.body) return { ok: true, arrayBuffer: async () => Buffer.from('logo-test-bytes') };
+    const body = JSON.parse(init.body); requests.push({url: String(url), body});
+    return { ok: true, json: async () => String(url).endsWith('/api/analyze-doc-vision')
+      ? {ok:true,totalPages:1,slides:[{title:'page',bullets:[],sourceImageDataUrl:'data:image/png;base64,AAAA',sourceWidth:300,sourceHeight:400}]}
+      : {downloadUrl:'https://example.test/new.pptx',fileName:'new.pptx'} };
+  };
+  try {
+    const logo = {extension:'png',fileName:'logo.png',savedAt:Date.now(),size:20,url:'https://example.test/logo.png'};
+    const request = parseTeamsOfficeRequest('会社紹介を8枚のPPTで作成して。添付Logoを各スライドの右上に配置して\n添付ファイル: logo.png');
+    assert.equal(request.action,'create_ppt');
+    await executeTeamsOfficeRequest({request,conversationId:'new-logo',uploadedFiles:[logo]});
+    assert.match(requests.at(-1).body.logoDataUrl,/^data:image\/png;base64,/);
+    requests.length=0;
+    const pdf = {extension:'pdf',fileName:'source.pdf',savedAt:Date.now(),size:100,url:'https://example.test/source.pdf'};
+    await executeTeamsOfficeRequest({request:{action:'pdf_to_ppt',fileQuery:'source.pdf',mode:'faithful'},conversationId:'pdf-faithful',uploadedFiles:[pdf]});
+    assert.equal(requests[0].body.mode,'faithful');
+    assert.equal(requests[1].body.slides[0].sourceWidth,300);
+    assert.equal(requests[1].body.slides[0].sourceImageDataUrl,'data:image/png;base64,AAAA');
+    requests.length = 0;
+    const png = { extension:'png', fileName:'poster.png', savedAt:Date.now(), size:100, url:'https://example.test/poster.png' };
+    const pngResult = await executeTeamsOfficeRequest({ request:pngConversion, conversationId:'png-faithful', uploadedFiles:[png] });
+    assert.equal(requests[0].body.fileUrl, png.url);
+    assert.equal(requests[0].body.mode, 'faithful');
+    assert.equal(requests[1].body.slides[0].sourceImageDataUrl, 'data:image/png;base64,AAAA');
+    assert.match(pngResult, /PowerPointへ変換しました/);
+  } finally { global.fetch=originalFetch; }
+}
+
 testPdfTranslationExecutionAndFollowup()
   .then(testWordTranslationExecution)
   .then(testWebGroundedPptAndLogoFollowup)
   .then(testExecutiveSharePointPptRenderingOptions)
   .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
   .then(testNumberedExcelCandidateSelection)
+  .then(testNewDeckWithLogoAndFaithfulPdf)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })

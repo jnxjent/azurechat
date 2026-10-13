@@ -41,7 +41,7 @@ async function main() {
   global.fetch = async (url, init) => String(url).startsWith('https://local.test/') ? new Response(pdf) : realFetch(url, init);
   console.log('Vision deployment:', process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME, '/ Document Intelligence:', Boolean(process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT));
   const started = Date.now();
-  const result = await load('app/api/analyze-doc-vision/handler.ts').analyzeDocVision('https://local.test/source.pdf', 30, 'faithful');
+  const result = await load('app/api/analyze-doc-vision/handler.ts').analyzeDocVision(`https://local.test/source${path.extname(pdfPath)}`, 30, 'faithful');
   assert(result.ok, result.error);
   console.log(`analyzed ${result.slides.length} slide(s) in ${Math.round((Date.now() - started) / 1000)}s`);
   fs.writeFileSync(path.join(outDir, 'layouts.json'), JSON.stringify(result.slides.map(s => s.editableLayout), null, 1));

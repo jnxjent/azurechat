@@ -47,6 +47,9 @@ function load(relative) {
   cache.set(filename, mod.exports); return mod.exports;
 }
 const intent = load('features/pptx/output-intent.ts');
+assert(intent.isImagePptConversionRequest('添付PNGを画像はそのままで文字を編集可能なPPTに変換して'));
+assert(!intent.isImagePptConversionRequest('添付ロゴ画像を参考に会社紹介のPPTを作成して'));
+assert(!intent.isNewPptCreationRequest('この画像を編集可能なPPTに変換して'));
 const prompt = '当社㈱ミダックホールディングスは産業廃棄物一貫処理会社です。初回客先訪問用の営業資料を8枚のスライドで作成してください（PPTで出力してください）。色は、さわやかなGreen系で。内容はHPから入手してください。添付会社Logoを各スライドの右上には①してください。';
 assert(intent.isNewPptCreationRequest(prompt));
 assert(!intent.isNewPptCreationRequest('既存のPPTを修正してください'));
@@ -141,6 +144,16 @@ async function main() {
   assert.deepEqual(di.texts.map(t => t.text), ['会社概要', '従業員数', '億頼にお応えします。']);
   assert.equal(di.texts[0].bold, true);
   assert(Math.abs(di.texts[0].x - 150 / 1600) < 1e-6 && Math.abs(di.texts[0].w - 215 / 1600) < 1e-6);
+
+  // A widely spaced contact footer stays in one editable line even if Vision
+  // labels both its company name and contact information as logo text.
+  diLines = [
+    { text: '（株）テストホールディングス', y0: 1080, y1: 1110, words: [['（株）テストホールディングス', 150, 900]] },
+    { text: '運行管理者：テスト（内線：1234）', y0: 1120, y1: 1150, words: [['運', 150, 175], ['行', 250, 275], ['管理者：テスト（内線：1234）', 350, 1200]] },
+  ];
+  visionQueue.push(reply({ lines: [{ i: 0, text: diLines[0].text, keep: false }, { i: 1, text: diLines[1].text, keep: false }] }));
+  assert.deepEqual((await recognize(data)).texts.map(t => t.text), diLines.map(line => line.text));
+  assert(!layoutModule.isContactFooterText({ text: '写真の看板', y: .2 }, [{ text: '内線：1234', y: .95 }]));
 
   // Even when Vision calls a multi-colour Latin mark ordinary text, it stays in the image; plain Latin text stays editable.
   const branded = createCanvas(400, 300), bctx = branded.getContext('2d');
