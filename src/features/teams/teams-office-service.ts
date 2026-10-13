@@ -1,4 +1,5 @@
 import "server-only";
+import { isNewPptCreationRequest, pdfPptConversionMode } from "@/features/pptx/output-intent";
 
 import { createHash, randomUUID } from "crypto";
 import {
@@ -284,6 +285,7 @@ export function parseTeamsOfficeRequest(
   if (
     hasPptEditingContext &&
     (asksForPptAssetInsertion || asksForWholeDeckPptEdit) &&
+    !isNewPptCreationRequest(normalized) &&
     !/(新規|一から|ゼロから).{0,12}(?:作成|生成|作って)/i.test(normalized)
   ) {
     return {
@@ -395,7 +397,7 @@ export function parseTeamsOfficeRequest(
   ) {
     return { action: "edit_latest_word", instruction: normalized };
   }
-  const asksForConversion = /(変換|出力|作成|にして|して)/i.test(normalized);
+  const asksForConversion = /(変換|出力|作成|にして|して|化)/i.test(normalized);
   const hasPdfSource =
     /(sharepoint|\bsp\b|\bsl\b|pdf)/i.test(normalized);
   const asksForFullPdfSummary =
@@ -451,9 +453,7 @@ export function parseTeamsOfficeRequest(
     return {
       action: "pdf_to_ppt",
       fileQuery,
-      mode: /(そのまま|忠実|原本|レイアウト維持)/i.test(normalized)
-        ? "faithful"
-        : "redesign",
+      mode: pdfPptConversionMode(normalized),
     };
   }
 
@@ -666,11 +666,19 @@ export async function executeTeamsOfficeRequest(props: {
         return "公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。Brave Searchの設定と検索結果を確認してください。";
       }
     }
+    let logoDataUrl: string | undefined;
+    if (props.request.action === "create_ppt" && /ロゴ|logo/i.test(props.request.prompt)) {
+      const image = selectUploadedOfficeFile(props.uploadedFiles, ["png", "jpg", "jpeg", "webp"]);
+      if (image.error) return image.error;
+      if (!image.file) return "ロゴ画像を添付してから再度作成してください。";
+      logoDataUrl = await loadTeamsImageAsDataUrl(image.file);
+    }
     const result = await createDirectOfficeFile({
       action: props.request.action,
       prompt: props.request.prompt,
       title: props.request.title,
       threadId: teamsThreadId,
+      logoDataUrl,
       ...(webContext ? { referenceContext: webContext } : {}),
     });
 
@@ -825,7 +833,7 @@ export async function executeTeamsOfficeRequest(props: {
           ? result.fileName
           : uploaded.file.fileName.replace(/\.pdf$/i, ".pptx");
       await savePptxResult(teamsThreadId, result, outputName);
-      return `添付PDFをPowerPointへ変換しました。\n\n📊 [${escapeMarkdownLinkText(
+      return `添付PDFをPowerPointへ変換しました。${props.request.mode === "faithful" ? "元の図・写真を切り出し、文字を編集可能なテキストとして配置しています。" : ""}\n\n📊 [${escapeMarkdownLinkText(
         outputName
       )}](${String(result.downloadUrl)})`;
     }
@@ -1956,6 +1964,7 @@ async function createDirectOfficeFile(props: {
   title: string;
   threadId: string;
   referenceContext?: string;
+  logoDataUrl?: string;
 }): Promise<Record<string, unknown>> {
   if (props.action === "create_ppt") {
     if (
@@ -1982,6 +1991,7 @@ async function createDirectOfficeFile(props: {
       }
       const generated = await postOfficeGenerationApi("/api/gen-pptx", {
         title: props.title,
+        logoDataUrl: props.logoDataUrl,
         slides: companyPlan.slides,
         threadId: props.threadId,
         targetTotalSlides: companyPlan.targetTotalSlides,
@@ -2003,6 +2013,7 @@ async function createDirectOfficeFile(props: {
     });
     return postOfficeGenerationApi("/api/gen-pptx", {
       title: plan.title,
+      logoDataUrl: props.logoDataUrl,
       slides: plan.slides,
       threadId: props.threadId,
       ...(plan.targetTotalSlides
@@ -2798,10 +2809,31 @@ function extractUnquotedFileQuery(
     ),
   ];
 
+  // "SharePointの" etc. sits directly in front of the name with no space in Japanese.
+  const stripLocation = (value: string) =>
+    value
+      .replace(/^(?:sharepoint|sp|sl)(?:上|内)?(?:にある|の)?/i, "")
+      .replace(/^(?:ファイル|資料)\s*[:：]?/, "")
+      .trim();
+  // "このPDF" / "添付のPDF" refer to an attachment, not to a SharePoint file name.
+  const isUsableName = (value: string) =>
+    Boolean(value) &&
+    !/^(?:この|その|あの|添付|上記|先ほど|さっき|今)(?:の)?(?:ファイル|資料)?$/.test(value);
+
+  // A name written with its extension is the most reliable, wherever the PPT wording follows.
+  const named = message.match(/([^\s「」『』"“”、。,，]+?\.(?:pdf|docx))(?![a-z0-9])/i)?.[1];
+  if (named && isUsableName(stripLocation(named))) return stripLocation(named);
+
   for (const pattern of patterns) {
     const match = message.match(pattern)?.[1]?.trim();
     if (match) return match;
   }
+
+  // "会社営業資料画像のPDFを…" / "会社営業資料画像 PDFを…"
+  const beforeType = message.match(
+    /([^\s「」『』"“”、。,，]+?)\s*の?\s*(?:pdf|word|docx)\s*(?:ファイル)?\s*を/i
+  )?.[1];
+  if (beforeType && isUsableName(stripLocation(beforeType))) return stripLocation(beforeType);
   return null;
 }
 

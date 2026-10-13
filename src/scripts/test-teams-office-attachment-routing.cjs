@@ -205,6 +205,12 @@ function loadOfficeService() {
     if (request === "./teams-word-proofread-service") {
       return {};
     }
+    if (request === "@/features/pptx/output-intent") {
+      const intentPath = path.resolve("features/pptx/output-intent.ts");
+      const intent = new Module(intentPath, module);
+      intent._compile(ts.transpileModule(fs.readFileSync(intentPath, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, intentPath);
+      return intent.exports;
+    }
     return originalRequire(request);
   };
   loaded._compile(javascript, fileName);

@@ -1,10 +1,12 @@
+import { recognizeEditablePdfLayout, type EditablePdfLayout } from "@/features/pptx/pdf-editable-layout";
+import { findPdfPagePanels } from "@/features/pptx/pdf-page-panels";
 import { BlobServiceClient } from "@azure/storage-blob";
 import { OpenAIVisionInstance } from "@/features/common/services/openai";
 
 const MAX_PAGES = 30;
-const PDF_RENDER_SCALE = 1.75;
-const VISION_DETAIL: "low" | "high" | "auto" = "auto";
-const VISION_MAX_COMPLETION_TOKENS = 1800;
+const PDF_RENDER_SCALE = 2.5;
+const VISION_DETAIL: "low" | "high" | "auto" = "high";
+const VISION_MAX_COMPLETION_TOKENS = 6000;
 const VISION_MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1500;
 
@@ -58,6 +60,10 @@ export type AnalyzeDocVisionResponse = {
   slides?: Array<{
     title: string;
     bullets: string[];
+    sourceImageDataUrl?: string;
+    sourceWidth?: number;
+    sourceHeight?: number;
+    editableLayout?: EditablePdfLayout;
     layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
     tableRows?: string[][];
     columns?: Array<{ header: string; bullets: string[] }>;
@@ -215,8 +221,8 @@ async function analyzePageWithVision(
           await new Promise((resolve) => setTimeout(resolve, RETRY_BASE_DELAY_MS * attempt));
           continue;
         }
-        console.warn(`[analyze-doc-vision] page ${pageIndex + 1} still truncated after ${VISION_MAX_RETRIES} attempts, using partial extraction`);
-        return extractPartialSlide(text, pageIndex);
+        console.warn(`[analyze-doc-vision] page ${pageIndex + 1} still truncated after ${VISION_MAX_RETRIES} attempts`);
+        throw new Error(`ページ${pageIndex + 1}の解析が途中で切れました。原稿保持モードで再変換してください。`);
       }
 
       let parsed: Record<string, unknown>;
@@ -228,8 +234,8 @@ async function analyzePageWithVision(
           await new Promise((resolve) => setTimeout(resolve, RETRY_BASE_DELAY_MS * attempt));
           continue;
         }
-        console.warn(`[analyze-doc-vision] page ${pageIndex + 1} parse failed after all retries, using partial extraction`);
-        return extractPartialSlide(text, pageIndex);
+        console.warn(`[analyze-doc-vision] page ${pageIndex + 1} parse failed after all retries`);
+        throw new Error(`ページ${pageIndex + 1}の解析結果が不正です。原稿保持モードで再変換してください。`);
       }
 
       const VALID_LAYOUTS = ["title", "bullets", "table", "multi-column", "diagram", "conversation"] as const;
@@ -417,7 +423,8 @@ async function analyzePageWithVision(
 async function renderPdfPages(
   pdfBuffer: Buffer,
   maxPages: number,
-  onPage: (base64Image: string, pageIndex: number, totalPages: number) => Promise<void>
+  onPage: (base64Image: string, pageIndex: number, totalPages: number, width: number, height: number) => Promise<void>,
+  preserveLayout = false
 ): Promise<number> {
   /* eslint-disable */
   const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
@@ -483,7 +490,16 @@ async function renderPdfPages(
 
         const pngBuffer = canvas.toBuffer("image/png");
         console.log(`[analyze-doc-vision] page ${i} rendered (${pngBuffer.length} bytes), calling Vision API`);
-        await onPage(pngBuffer.toString("base64"), i - 1, totalPages);
+        const panels = preserveLayout
+          ? findPdfPagePanels(context.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height)
+          : [{ x: 0, y: 0, width: canvas.width, height: canvas.height }];
+        for (const panel of panels) {
+          const crop = NodeCanvasFactory.create(panel.width, panel.height);
+          try {
+            crop.context.drawImage(canvas, panel.x, panel.y, panel.width, panel.height, 0, 0, panel.width, panel.height);
+            await onPage(crop.canvas.toBuffer("image/png").toString("base64"), i - 1, totalPages, panel.width, panel.height);
+          } finally { NodeCanvasFactory.destroy(crop); }
+        }
         console.log(`[analyze-doc-vision] page ${i} Vision API done`);
       } finally {
         page.cleanup();
@@ -605,6 +621,10 @@ export async function analyzeDocVision(
   const slides: Array<{
     title: string;
     bullets: string[];
+    sourceImageDataUrl?: string;
+    sourceWidth?: number;
+    sourceHeight?: number;
+    editableLayout?: EditablePdfLayout;
     layoutType?: "title" | "bullets" | "table" | "multi-column" | "diagram" | "conversation";
     tableRows?: string[][];
     columns?: Array<{ header: string; bullets: string[] }>;
@@ -619,7 +639,13 @@ export async function analyzeDocVision(
     totalPages = await renderPdfPages(
       buffer,
       maxPages,
-      async (base64Image, pageIndex, pageCount) => {
+      async (base64Image, pageIndex, pageCount, width, height) => {
+        if (mode !== "redesign") {
+          const sourceImageDataUrl = `data:image/png;base64,${base64Image}`;
+          const editableLayout = await recognizeEditablePdfLayout(sourceImageDataUrl);
+          slides.push({ title: `ページ ${pageIndex + 1}`, bullets: [], sourceImageDataUrl, sourceWidth: width, sourceHeight: height, editableLayout });
+          return;
+        }
         const result = await analyzePageWithVision(base64Image, pageIndex, pageCount, mode);
         slides.push({
           title: result.slideTitle,
@@ -632,11 +658,19 @@ export async function analyzeDocVision(
           conversationStyle: result.conversationStyle,
           conversationTurns: result.conversationTurns,
         });
-      }
+      },
+      mode !== "redesign"
     );
     console.log("[analyze-doc-vision] PDF pages analyzed:", totalPages);
   } else if (mimeType === "image") {
     totalPages = 1;
+    if (mode !== "redesign") {
+      const sharp = (await import("sharp")).default;
+      const { data, info } = await sharp(buffer).png().toBuffer({ resolveWithObject: true });
+      const sourceImageDataUrl = `data:image/png;base64,${data.toString("base64")}`;
+      const editableLayout = await recognizeEditablePdfLayout(sourceImageDataUrl);
+      return { ok: true, totalPages, slides: [{ title: "ページ 1", bullets: [], sourceImageDataUrl, sourceWidth: info.width, sourceHeight: info.height, editableLayout }] };
+    }
     const result = await analyzePageWithVision(imageBufferToBase64(buffer), 0, 1, mode);
     slides.push({
       title: result.slideTitle,

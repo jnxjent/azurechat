@@ -1480,7 +1480,7 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) =>
-        await executeCreatePptx(args, props.chatThread, props.userMessage),
+        await executeCreatePptx(args, props.chatThread, props.userMessage, props.imageAttachmentUrls),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1739,7 +1739,7 @@ export const GetDefaultExtensions = async (props: {
             description:
               "変換モード。'faithful'=忠実変換（元ページ数維持・自動タイトルスライドなし・デザインAI最小化）。" +
               "「そのまま」「忠実に」「原本に近く」「ページ数を変えずに」などの場合は 'faithful' を指定。" +
-              "デフォルトは 'redesign'（デザイン自動改善）。",
+              "既定はfaithful（元の図・写真・配置を保持し、文字は編集可能なテキストボックスに変換）。「文字を編集可能に」だけならfaithful。内容の再構成・要約やデザイン変更を明示された場合だけredesign。",
           },
         },
         required: [],
@@ -1775,7 +1775,7 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             enum: ["faithful", "redesign"],
             description:
-              "変換モード。'faithful'=忠実変換（ページ数維持）。'redesign'=デザイン自動改善（デフォルト）。",
+              "既定はfaithful（元の図・写真・配置を保持し、文字は編集可能なテキストボックスに変換）。「文字を編集可能に」だけならfaithful。内容の再構成・要約やデザイン変更を明示された場合だけredesign。",
           },
         },
         required: ["fileQuery"],
@@ -5049,7 +5049,8 @@ async function executeCreatePptx(
     palette?: string;
   },
   chatThread: ChatThreadModel,
-  userMessage?: string
+  userMessage?: string,
+  imageAttachmentUrls?: string[]
 ) {
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
   const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
@@ -5248,11 +5249,23 @@ async function executeCreatePptx(
   ).replace(/\/+$/, "");
 
   try {
+    let logoDataUrl = /ロゴ|logo/i.test(userMessage ?? "")
+      ? (imageAttachmentUrls?.[0] || await resolveLatestStoredImageDataUrl(chatThread.id))
+      : undefined;
+    if (logoDataUrl && /^https?:\/\//i.test(logoDataUrl)) {
+      const imageResponse = await fetch(logoDataUrl, { signal: AbortSignal.timeout(15_000) });
+      if (!imageResponse.ok) return { error: "添付ロゴの読み込みに失敗しました。" };
+      const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
+      if (imageBytes.length > 15 * 1024 * 1024) return { error: "添付ロゴは15MB以下にしてください。" };
+      logoDataUrl = `data:image/png;base64,${(await sharp(imageBytes).png().toBuffer()).toString("base64")}`;
+    }
+    if (/ロゴ|logo/i.test(userMessage ?? "") && !logoDataUrl) return { error: "ロゴ画像を添付してから再度作成してください。" };
     const res = await fetch(`${baseUrl}/api/gen-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         title,
+        ...(logoDataUrl ? { logoDataUrl } : {}),
         slides: (finalSlides ?? []).map((s) => ({
           title: s.title,
           bullets: Array.isArray(s.bullets) ? s.bullets : [],
@@ -5326,7 +5339,8 @@ async function executeConvertDocToPptx(
   chatThread: ChatThreadModel,
   userMessage?: string
 ) {
-  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages, mode } = args ?? {};
+  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages } = args ?? {};
+  const mode = args?.mode === "redesign" ? "redesign" : "faithful";
   const sourceFileUrls = Array.from(
     new Set(
       [fileUrl, ...(Array.isArray(fileUrls) ? fileUrls : [])]
@@ -5589,7 +5603,9 @@ async function executeConvertDocToPptx(
       fileName: pptxResult.fileName,
       displayName: generatePptxDisplayName(title),
       totalPages,
-      message: `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
+      message: mode === "faithful"
+        ? `${totalPages}ページから${slides.length}枚のPowerPointを作成しました。元の図・写真を切り出し、文字を編集可能なテキストとして配置しています。`
+        : `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
     };
   } catch (e: any) {
     console.error("[convert_doc_to_pptx] error:", e);

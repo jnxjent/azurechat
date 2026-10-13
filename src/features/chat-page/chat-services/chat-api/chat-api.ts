@@ -6,6 +6,7 @@ import "server-only";
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
 
 import { getCurrentUser } from "@/features/auth-page/helpers";
+import { GenerateSasUrl } from "@/features/common/services/azure-storage";
 import { isSalesforceAllowedEmail } from "@/features/common/services/salesforce-access";
 import {
   resolveSalesforceRoute,
@@ -26,6 +27,7 @@ import {
 import { LoadLatestImageAttachment } from "../chat-image-service";
 import { LoadPendingPptxEdit } from "../pptx-pending-edit-service";
 import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
+import { isExplicitPptOutputRequest, isNewPptCreationRequest } from "@/features/pptx/output-intent";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -186,7 +188,9 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     imageAttachmentUrls.length +
     (storedImageAttachment ? 1 : 0) +
     (referencesSharePointImage ? 1 : 0);
-  const pptxAssetPlacementRequest = isPptxAssetPlacementRequest(props.message);
+  const newPptRequest = isNewPptCreationRequest(props.message);
+  const explicitPptRequest = isExplicitPptOutputRequest(props.message);
+  const pptxAssetPlacementRequest = !newPptRequest && isPptxAssetPlacementRequest(props.message);
   const accentReplyText = props.message.trim();
   const mayBePendingPptxAccentReply =
     accentReplyText.length <= 100 &&
@@ -201,7 +205,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     ? "edit_pptx"
     : pptxAssetPlacementRequest
     ? "edit_pptx"
-    : resolveRequiredImageToolName(
+    : explicitPptRequest ? undefined : resolveRequiredImageToolName(
         props.message,
         imageAttachmentCountForRouting
       );
@@ -234,6 +238,20 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
       mode: resolvedMode,
     }),
   ]);
+  const attachedPdfConversion = explicitPptRequest && !newPptRequest &&
+    /添付|アップロード|PDF|この画像|このファイル/i.test(props.message) &&
+    !/参考|追記|拡充|肉付け/i.test(props.message) &&
+    docs.some(doc => /\.pdf$/i.test(doc.name));
+  if (attachedPdfConversion) {
+    const pdfDocs = docs.filter(doc => /\.pdf$/i.test(doc.name));
+    const sources = await Promise.all(pdfDocs.map(async doc => {
+      const sas = await GenerateSasUrl("dl-link", `${currentChatThread.id}/${doc.name}`);
+      if (sas.status !== "OK") throw new Error("添付PDFのURLを取得できませんでした。");
+      return `file_name: ${doc.name}\nfile_url: ${sas.response}`;
+    }));
+    history.push({ role: "system", content: `現在の会話に添付されたPDFです。利用者の添付画像という表現はこのPDFを指します。convert_doc_to_pptxへ渡してください。\n${sources.join("\n\n")}` });
+    console.log("[PPT attachment] PDF conversion sources resolved", { count: sources.length });
+  }
 
   // 2ターン目以降の「候補2に変更して」などでも、同じAgentセッションを継続する。
   if (
@@ -298,7 +316,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
         userMessage: props.message,
         history,
         extensions: extension,
-        requiredToolName: requiredImageToolName,
+        requiredToolName: (attachedPdfConversion ? "convert_doc_to_pptx" : newPptRequest ? "create_pptx" : requiredImageToolName),
         loginEmail: user.email,
         salesforceRouting,
         signal,
