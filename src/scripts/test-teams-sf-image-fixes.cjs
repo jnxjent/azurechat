@@ -29,6 +29,9 @@ async function main() {
   const truck = '産業廃棄物収取運搬車（パッカー車）を以下でデザインして。\n白基調で、荷台に社名として、Midacと入れて';
   assert.equal(intent.isTeamsImageGenerationRequest(truck), true);
   assert.equal(intent.isTeamsImageGenerationRequest('猫の絵を描いて'), true);
+  assert.equal(intent.isTeamsImageGenerationRequest(logoRequest), true);
+  assert.equal(intent.isTeamsImageEditRequest(logoRequest), true);
+  assert.equal(intent.isTeamsImageEditRequest('白い車の絵を描いて、Midacと入れて'), false);
   for (const text of ['画像生成用プロンプトを考えて', 'PPTのデザインを変更して', '画像の生成方法を教えて', '社内の日報を検索して']) {
     assert.equal(intent.isTeamsImageGenerationRequest(text), false);
   }
@@ -37,7 +40,15 @@ async function main() {
   assert.equal(routing.resolveSalesforceRoute({ ...access, message: '私の部下の最近の日報を挙げて' }).route, 'normal');
   assert.equal(routing.resolveSalesforceRoute({ ...access, message: 'SFで私の部下の最近の日報を挙げて' }).route, 'salesforce');
   assert.equal(routing.resolveSalesforceRoute({ ...access, isSalesforceAllowed: false, message: 'Salesforceで日報を一覧表示して' }).route, 'denied');
-  let imageCalls = 0, signedPath;
+  let imageCalls = 0, editCalls = 0;
+  const signedPaths = [];
+  const thread = `teams-${require('crypto').createHash('sha256').update('A').digest('hex').slice(0, 32)}`;
+  const baseBytes = Buffer.from('original truck');
+  const logoBytes = Buffer.from('attached MIDAC logo');
+  const sharpMock = buffer => ({ rotate() { return this; }, png() { return this; },
+    resize() { return this; }, jpeg() { return this; }, toBuffer: async () => buffer });
+  let missingBase = false;
+  process.env.AZURE_STORAGE_ACCOUNT_NAME = 'teststore';
   const service = load('features/teams/teams-image-service.ts', {
     '@/features/chat-page/chat-services/chat-api/image/image-generation-service': {
       generateStoredChatImage: async (args) => {
@@ -49,19 +60,57 @@ async function main() {
       },
     },
     '@/features/common/services/azure-storage': {
-      GenerateSasUrl: async (container, blob) => {
-        assert.equal(container, 'images'); signedPath = blob;
-        return { status: 'OK', response: 'https://blob.example/generated.png?sig=test' };
+      GenerateSasUrl: async (container, blob, type) => {
+        assert.equal(container, 'images'); signedPaths.push([blob, type]);
+        return { status: 'OK', response: `https://blob.example/${blob}?sig=test` };
+      },
+      UploadBlob: async (container, name, buffer, returnName, type) => {
+        assert.equal(type, 'image/jpeg'); return { status: 'OK' };
+      },
+      GetBlob: async (container, name) => {
+        assert.equal(container, 'dl-link');
+        assert.ok(name.startsWith(`teams-upload/${thread}/`));
+        return { status: 'OK', response: (async function* () { yield logoBytes; })() };
       },
     },
+    '@/features/chat-page/chat-services/chat-image-service': {
+      GetImageFromStore: async () => missingBase ? { status: 'NOT_FOUND' } :
+        { status: 'OK', response: (async function* () { yield baseBytes; })() },
+      UploadImageToStore: async () => ({ status: 'OK' }),
+    },
+    '@/features/chat-page/chat-services/chat-api/image/image-intent': image,
+    './teams-image-intent': intent,
+    '@/features/common/services/openai': { OpenAIDALLEInstance: () => ({ images: { edit: async input => {
+      editCalls++;
+      assert.equal(input.image.length, 2);
+      assert.ok(input.image[0].equals(baseBytes));
+      assert.ok(input.image[1].equals(logoBytes));
+      assert.match(input.prompt, /形・配色・文字・綴り/);
+      return { data: [{ b64_json: Buffer.from('edited truck').toString('base64') }] };
+    } } }) },
+    '@/features/common/util': { uniqueId: () => 'edited' },
+    openai: { toFile: async buffer => buffer },
+    sharp: { default: sharpMock },
   });
   const props = { message: truck, conversationId: 'A', activityId: 'event1' };
   const [first, duplicate] = await Promise.all([service.createTeamsImageReply(props), service.createTeamsImageReply(props)]);
   assert.equal(imageCalls, 1);
   assert.equal(first, duplicate);
-  assert.equal(signedPath, `teams-${require('crypto').createHash('sha256').update('A').digest('hex').slice(0, 32)}/generated.png`);
-  assert.match(first, /blob\.example/);
-  assert.doesNotMatch(first, /ac\.example/);
+  assert.equal(first.attachments[0].contentType, 'image/jpeg');
+  assert.match(first.attachments[0].contentUrl, /preview\.jpg/);
+  assert.ok(signedPaths.some(([blob, type]) => blob === `${thread}/generated.png` && type === 'image/png'));
+  assert.match(first.text, /blob\.example/);
+  assert.doesNotMatch(first.text, /ac\.example/);
+  const uploadedFiles = [{ extension: 'png', fileName: 'logo.png', size: logoBytes.length,
+    savedAt: Date.now(), url: `https://teststore.blob.core.windows.net/dl-link/teams-upload/${thread}/logo.png?sig=test` }];
+  const edited = await service.createTeamsImageReply({ ...props, activityId: 'edit1', message: logoRequest, uploadedFiles });
+  assert.equal(editCalls, 1);
+  assert.equal(imageCalls, 1, 'edit must not call fresh generation');
+  assert.match(edited.text, /編集/);
+  assert.match(await service.createTeamsImageReply({ ...props, activityId: 'edit2', message: logoRequest }), /再添付/);
+  missingBase = true;
+  assert.match(await service.createTeamsImageReply({ ...props, activityId: 'edit3', message: logoRequest, uploadedFiles }), /編集対象/);
+  assert.equal(editCalls, 1);
 
   let receivedUrl, receivedHeaders, summary;
   const sf = load('features/teams/teams-salesforce-service.ts', {

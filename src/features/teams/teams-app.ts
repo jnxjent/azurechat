@@ -264,7 +264,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
 
       if (isTeamsImageGenerationRequest(messageText)) {
         await send("画像を生成します。完了までしばらくお待ちください。");
-        await send(await createTeamsImageReply({ message: messageText, conversationId, activityId }));
+        await send(await createTeamsImageReply({ message: messageText, conversationId, activityId, uploadedFiles }));
         await recordCompletedTeamsTurn({ conversationId, activityId, teamsUserId });
         return;
       }
