@@ -13,7 +13,7 @@ function load(file, mocks = {}, globals = {}) {
     if (name === 'server-only') return {};
     if (name in mocks) return mocks[name];
     return require(name);
-  }, process, console, Buffer, AbortSignal, URL, ...globals });
+  }, process, console, Buffer, AbortSignal, URL, URLSearchParams, ...globals });
   return exports;
 }
 
@@ -49,6 +49,33 @@ async function main() {
     resize() { return this; }, jpeg() { return this; }, toBuffer: async () => buffer });
   let missingBase = false;
   process.env.AZURE_STORAGE_ACCOUNT_NAME = 'teststore';
+  process.env.NEXTAUTH_SECRET = 'test-image-signing-key';
+  process.env.NEXTAUTH_URL = 'https://testsite.example';
+  const imageUrl = load('features/teams/teams-image-url.ts');
+  const previewUrl = new URL(imageUrl.buildTeamsImagePreviewUrl(thread, 'generated.png.preview.jpg'));
+  assert.equal(previewUrl.hostname, 'testsite.example');
+  assert.equal(imageUrl.validateTeamsImagePreviewUrl(previewUrl.searchParams).threadId, thread);
+  const tampered = new URL(previewUrl); tampered.searchParams.set('file', 'other.png.preview.jpg');
+  assert.equal(imageUrl.validateTeamsImagePreviewUrl(tampered.searchParams), null);
+  const expired = new URL(previewUrl); expired.searchParams.set('expires', '1000000000');
+  assert.equal(imageUrl.validateTeamsImagePreviewUrl(expired.searchParams), null);
+  assert.equal(imageUrl.validateTeamsImagePreviewUrl(new URLSearchParams()), null);
+  assert.throws(() => imageUrl.buildTeamsImagePreviewUrl(thread, '../../private.json'));
+  let previewReads = 0;
+  const previewRoute = load('app/api/teams/images/route.ts', {
+    '@/features/teams/teams-image-url': imageUrl,
+    '@/features/chat-page/chat-services/chat-image-service': {
+      GetImageFromStore: async () => {
+        previewReads++;
+        return { status: 'OK', response: (async function* () { yield Buffer.from([255,216,255]); })() };
+      },
+    },
+  }, { Response, URLSearchParams });
+  assert.equal((await previewRoute.GET({ url: tampered.toString() })).status, 403);
+  assert.equal(previewReads, 0, 'invalid signatures must not read storage');
+  const previewResponse = await previewRoute.GET({ url: previewUrl.toString() });
+  assert.equal(previewResponse.status, 200);
+  assert.equal(previewResponse.headers.get('content-type'), 'image/jpeg');
   const service = load('features/teams/teams-image-service.ts', {
     '@/features/chat-page/chat-services/chat-api/image/image-generation-service': {
       generateStoredChatImage: async (args) => {
@@ -80,6 +107,7 @@ async function main() {
     },
     '@/features/chat-page/chat-services/chat-api/image/image-intent': image,
     './teams-image-intent': intent,
+    './teams-image-url': imageUrl,
     '@/features/common/services/openai': { OpenAIDALLEInstance: () => ({ images: { edit: async input => {
       editCalls++;
       assert.equal(input.image.length, 2);

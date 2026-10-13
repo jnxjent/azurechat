@@ -5,6 +5,7 @@ import { GenerateSasUrl, GetBlob, UploadBlob } from "@/features/common/services/
 import { GetImageFromStore, UploadImageToStore } from "@/features/chat-page/chat-services/chat-image-service";
 import { buildFaithfulImagePrompt } from "@/features/chat-page/chat-services/chat-api/image/image-intent";
 import { isTeamsImageEditRequest } from "./teams-image-intent";
+import { buildTeamsImagePreviewUrl } from "./teams-image-url";
 import { OpenAIDALLEInstance } from "@/features/common/services/openai";
 import { uniqueId } from "@/features/common/util";
 import { toFile } from "openai";
@@ -102,15 +103,13 @@ async function generate(props: { message: string; conversationId: string; upload
     if (preview.length > 1024 * 1024) throw new Error("Image preview too large");
     const previewPath = `${threadId}/${fileName}.preview.jpg`;
     if ((await UploadBlob("images", previewPath, preview, false, "image/jpeg")).status !== "OK") throw new Error("Preview storage failed");
-    const [signed, original] = await Promise.all([
-      GenerateSasUrl("images", previewPath, "image/jpeg"),
-      GenerateSasUrl("images", `${threadId}/${fileName}`, "image/png"),
-    ]);
-    if (signed.status !== "OK" || original.status !== "OK") throw new Error("Image URL signing failed");
+    const previewUrl = buildTeamsImagePreviewUrl(threadId, `${fileName}.preview.jpg`);
+    const original = await GenerateSasUrl("images", `${threadId}/${fileName}`, "image/png");
+    if (original.status !== "OK") throw new Error("Image URL signing failed");
     return {
       type: "message",
       text: `画像を${editing ? "編集" : "生成"}しました。\n\n[画像を開く](${original.response})`,
-      attachments: [{ contentType: "image/jpeg", contentUrl: signed.response, name: "generated-image.jpg" }],
+      attachments: [{ contentType: "image/jpeg", contentUrl: previewUrl, name: "generated-image.jpg" }],
     };
   } catch (error) {
     const failure = error as { name?: string; status?: number; code?: string };
