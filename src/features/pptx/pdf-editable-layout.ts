@@ -1,9 +1,11 @@
 import sharp from "sharp";
 import { DocumentIntelligenceInstance } from "@/features/common/services/document-intelligence";
-import { OpenAIVisionInstance } from "@/features/common/services/openai";
+import { OpenAIVisionInstance, OpenAIPptVisionInstance } from "@/features/common/services/openai";
+import { sourceFontFace } from "@/features/pptx/source-typography";
+import { matchSourceFonts } from "@/features/pptx/source-font-match";
 
 export type SourceBox = { x: number; y: number; w: number; h: number };
-export type EditablePdfText = SourceBox & { text: string; color: string; fontSize: number; bold?: boolean; align?: "left" | "center" | "right" };
+export type EditablePdfText = SourceBox & { text: string; color: string; fontSize: number; fontFace?: string; bold?: boolean; italic?: boolean; align?: "left" | "center" | "right" };
 export type EditablePdfLayout = {
   backgroundColor: string;
   texts: EditablePdfText[];
@@ -48,7 +50,7 @@ export function normalizeEditablePdfLayout(raw: any): NormalizedEditablePdfLayou
     const size = Number(t.fontSize);
     // Missing font size can be inferred from the detected text box and line count.
     const fontSize = Number.isFinite(size) && size > 0 && size <= .3 ? size : bounds.h / Math.max(1, t.text.split("\n").length) * .7;
-    texts.push({ ...bounds, text: t.text, color: color(t.color, "222222"), fontSize, bold: t.bold === true,
+    texts.push({ ...bounds, text: t.text, color: color(t.color, "222222"), fontSize, fontFace: sourceFontFace(t.fontFace ?? t.fontStyle), bold: t.bold === true, italic: t.italic === true,
       align: (["left", "center", "right"].includes(t.align) ? t.align : "left") as "left" | "center" | "right" });
   });
   return { layout: { backgroundColor: color(raw?.backgroundColor, "FFFFFF"), texts }, issues };
@@ -60,10 +62,10 @@ function isTransient(error: any): boolean {
     /ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|timeout|fetch failed/i.test(String(error?.message ?? error));
 }
 
-async function createWithRetry(params: any) {
+async function createWithRetry(params: any, usePptVision = false) {
   for (let retry = 1; ; retry++) {
     try {
-      return await OpenAIVisionInstance().chat.completions.create(params);
+      return await (usePptVision ? OpenAIPptVisionInstance() : OpenAIVisionInstance()).chat.completions.create(params);
     } catch (error) {
       if (!isTransient(error) || retry >= MAX_TRANSIENT_RETRIES) throw error;
       console.warn("[PDF editable layout] transient Vision error, retrying", { retry, status: (error as any)?.status });
@@ -93,7 +95,8 @@ async function recognizeWithVisionLayout(visionUrl: string): Promise<EditablePdf
       max_completion_tokens: 16000,
       messages: [{ role: "user", content: [
         { type: "text", text: `画像を編集可能なPowerPointへ復元するためのOCRと文字位置の解析をしてください。要約・加筆・言い換えは禁止。読める文字を正確に転記してください。JSONだけ返す:
-{"backgroundColor":"FFFFFF","texts":[{"text":"原文","x":0.1,"y":0.1,"w":0.8,"h":0.1,"color":"123456","fontSize":0.04,"bold":false,"align":"left"}]}
+{"backgroundColor":"FFFFFF","texts":[{"text":"原文","x":0.1,"y":0.1,"w":0.8,"h":0.1,"color":"123456","fontSize":0.04,"fontStyle":"gothic","bold":false,"italic":false,"align":"left"}]}
+各行の元の書体・太さを保持する。fontStyleはgothic（日本語ゴシック）、mincho（明朝）、rounded（丸ゴシック）、sans（欧文サンセリフ）、serif（欧文セリフ）。重い見出しはbold=true、斜体はitalic=true。
 座標と寸法は画像全体を1とした比率（小数3桁まで）。x,y,w,hは文字のインクをちょうど囲む矩形。fontSizeは1行の文字の高さ/画像高さ。textsは見出し・段落・表のセル・図のラベルを別々にし、改行を保存。写真内やロゴマーク自体の文字は転記しない（画像として残す）。ページ最下部も必ず確認し、会社名・担当者名・運行管理者・電話・内線などの連絡先欄は、ロゴの隣でも通常の文字として転記する。文字が1つもなければtextsは空配列。backgroundColorはページ余白に近い単色。${feedback ? `前回の解析の問題: ${feedback}。原画像を再確認し、指定したJSON形式で修正してください。` : ""}` },
         { type: "image_url", image_url: { url: visionUrl, detail: "high" } },
       ] }],
@@ -134,13 +137,6 @@ async function recognizeWithVisionLayout(visionUrl: string): Promise<EditablePdf
 }
 
 type OcrLine = SourceBox & { text: string };
-
-/** Width of a line in em: full-width CJK glyphs are 1em, Latin/digits about half. */
-function textWidthEm(text: string): number {
-  let em = 0;
-  for (const ch of text) em += /\s/.test(ch) ? .3 : /[　-鿿＀-￯]/.test(ch) ? 1 : .55;
-  return Math.max(1, em);
-}
 
 /**
  * True for a fix of a few misread glyphs (e.g. 従業員敗→従業員数). Rewrites, drops and
@@ -186,7 +182,9 @@ async function readLinesWithDocumentIntelligence(png: Buffer): Promise<OcrLine[]
           continue;
         }
         // DI sometimes joins a heading and a logo on the same baseline into one line.
-        // Split at wide gaps between words so each part can be judged on its own.
+        // Split only at column-sized gaps. Japanese tracking and OCR word
+        // polygons can leave gaps as wide as a glyph; splitting there drops
+        // unrecognised characters between word spans and changes fonts mid-line.
         const lineOffset = line.spans?.[0]?.offset;
         const words = typeof line.words === "function" && lineOffset !== undefined
           ? Array.from(line.words()).filter(word => word.polygon?.length).map(word => ({ ...toBox(word.polygon!), offset: word.span.offset, length: word.span.length }))
@@ -196,7 +194,7 @@ async function readLinesWithDocumentIntelligence(png: Buffer): Promise<OcrLine[]
         const wordHeight = words.map(w => w.h).sort((a, b) => a - b)[words.length >> 1] ?? box.h;
         for (const word of words.sort((a, b) => a.x - b.x)) {
           const last = segments[segments.length - 1]?.slice(-1)[0];
-          if (last && (word.x - (last.x + last.w)) * pw > wordHeight * ph * .8) segments.push([word]);
+          if (last && (word.x - (last.x + last.w)) * pw > wordHeight * ph * 2) segments.push([word]);
           else if (last) segments[segments.length - 1].push(word);
           else segments.push([word]);
         }
@@ -225,22 +223,48 @@ async function readLinesWithDocumentIntelligence(png: Buffer): Promise<OcrLine[]
  * characters and marks text that belongs to a logo or photo. Corrections that
  * replace most of the characters are rejected so the model cannot rewrite text.
  */
-async function correctOcrLines(visionUrl: string, lines: OcrLine[]): Promise<Array<{ text: string; keep: boolean; bold: boolean }>> {
-  const result = lines.map(line => ({ text: line.text, keep: true, bold: false }));
+async function correctOcrLines(visionUrl: string, lines: OcrLine[]): Promise<Array<{ text: string; keep: boolean; bold: boolean; italic: boolean; fontFace: string }>> {
+  const result = lines.map(line => ({ text: line.text, keep: true, bold: false, italic: false, fontFace: "Meiryo" }));
+  const typographyDeployment = process.env.AZURE_OPENAI_PPT_VISION_DEPLOYMENT_NAME?.trim();
+  // Enlarged per-line references prevent tiny body type from being mistaken for
+  // regular weight when the full page is resized by Vision.
+  const source = Buffer.from(visionUrl.split(",")[1], "base64");
+  const { width = 1, height = 1 } = await sharp(source).metadata();
+  const fontSheets: string[] = [];
+  for (let start = 0; start < Math.min(lines.length, 72); start += 12) {
+    const group = lines.slice(start, start + 12);
+    const overlays: Array<{ input: Buffer; top: number; left: number }> = [];
+    for (let index = 0; index < group.length; index++) {
+      const line = group[index];
+      const left = Math.max(0, Math.floor(line.x * width)), top = Math.max(0, Math.floor(line.y * height));
+      const cropW = Math.max(1, Math.min(width - left, Math.ceil(line.w * width)));
+      const cropH = Math.max(1, Math.min(height - top, Math.ceil(line.h * height)));
+      const crop = await sharp(source).extract({ left, top, width: cropW, height: cropH })
+        .resize(1480, 64, { fit: "inside" }).png().toBuffer();
+      overlays.push({ input: crop, left: 100, top: index * 80 + 8 });
+      const label = Buffer.from(`<svg width="90" height="80"><text x="8" y="48" font-size="28">${start + index}</text></svg>`);
+      overlays.push({ input: label, left: 0, top: index * 80 });
+    }
+    const sheet = await sharp({ create: { width: 1600, height: group.length * 80, channels: 3, background: "white" } }).composite(overlays).png().toBuffer();
+    fontSheets.push(`data:image/png;base64,${sheet.toString("base64")}`);
+  }
   for (let attempt = 1; attempt <= 2; attempt++) try {
     const response = await createWithRetry({
-      model: process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME!,
+      model: typographyDeployment || process.env.AZURE_OPENAI_VISION_API_DEPLOYMENT_NAME!,
       response_format: { type: "json_object" },
       reasoning_effort: "low",
       max_completion_tokens: 8000,
       messages: [{ role: "user", content: [
         { type: "text", text: `画像のOCR結果を画像と照合して校正してください。各行について、画像と違う誤認識の文字だけを直してください。要約・加筆・言い換え・行の統合や分割は禁止。keep=falseはロゴマークの文字と、写真に写り込んだ看板・ラベル等の文字だけ。写真や図に重ねたキャプション・見出し・ページ番号は通常の文字なのでkeep=true。太字ならbold=true。JSONだけ返す:
-{"lines":[{"i":0,"text":"校正後の文字","keep":true,"bold":false}]}
+{"lines":[{"i":0,"text":"校正後の文字","keep":true,"bold":false,"italic":false,"fontStyle":"gothic"}]}
+各行の元画像の書体と太さも判定する。fontStyleはgothic（日本語ゴシック）、mincho（明朝）、rounded（丸ゴシック）、sans（欧文サンセリフ）、serif（欧文セリフ）。大見出しの重い字形はbold=true。斜体ならitalic=true。OCRの行ごとに判定し、全行を同じ書体にしない。
+2枚目以降は行番号付きの拡大画像です。書体・太さの判定はこの拡大画像の実際の線を優先してください。本文・フッターも見出しと同じように太いなら必ずbold=true。本文だから通常の太さと推測しない。行番号は原文に含めない。
 OCR結果:
 ${JSON.stringify(lines.map((line, i) => ({ i, text: line.text })))}` },
         { type: "image_url", image_url: { url: visionUrl, detail: "high" } },
+        ...fontSheets.map(url => ({ type: "image_url" as const, image_url: { url, detail: "high" as const } })),
       ] }],
-    });
+    }, Boolean(typographyDeployment));
     const parsed = JSON.parse(response.choices[0]?.message?.content || "{}");
     if (!Array.isArray(parsed?.lines)) throw new Error("linesがありません");
     for (const item of parsed.lines) {
@@ -248,6 +272,8 @@ ${JSON.stringify(lines.map((line, i) => ({ i, text: line.text })))}` },
       if (!Number.isInteger(i) || !result[i]) continue;
       if (item.keep === false) result[i].keep = false;
       result[i].bold = item.bold === true;
+      result[i].italic = item.italic === true;
+      result[i].fontFace = sourceFontFace(item.fontStyle);
       const text = typeof item.text === "string" ? item.text.trim() : "";
       if (text && text !== lines[i].text) {
         if (isMisreadCorrection(lines[i].text, text)) result[i].text = text;
@@ -314,7 +340,6 @@ export function isContactFooterText(line: { text: string; y: number }, lines: Ar
 async function recognizeWithDocumentIntelligence(dataUrl: string, visionUrl: string): Promise<EditablePdfLayout> {
   const source = Buffer.from(dataUrl.split(",")[1] ?? "", "base64");
   const lines = await readLinesWithDocumentIntelligence(Buffer.from(visionUrl.split(",")[1] ?? "", "base64"));
-  const { width = 1, height = 1 } = await sharp(source).metadata();
   const corrected = lines.length ? await correctOcrLines(visionUrl, lines) : [];
   const { background, colors, multiColor } = await sampleColors(source, lines);
   const merged = lines.map((line, i) => ({
@@ -327,10 +352,9 @@ async function recognizeWithDocumentIntelligence(dataUrl: string, visionUrl: str
   return {
     backgroundColor: background,
     texts: merged.filter(line => line.keep).map(line => {
-      // A CJK line's glyph height is close to its font size; also keep the line within its box width.
-      const byWidth = line.w * width / textWidthEm(line.text) / height;
+      // Font size is fitted from actual glyph metrics when writing the slide.
       return { x: line.x, y: line.y, w: line.w, h: line.h, text: line.text, color: line.color,
-        fontSize: Math.min(line.h * .95, byWidth), bold: line.bold, align: "left" as const };
+        fontSize: line.h, fontFace: line.fontFace, bold: line.bold, italic: line.italic, align: "left" as const };
     }),
   };
 }
@@ -339,10 +363,12 @@ export async function recognizeEditablePdfLayout(dataUrl: string): Promise<Edita
   const visionUrl = await enlargeForVision(dataUrl);
   if (process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT && process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY) {
     try {
-      return await recognizeWithDocumentIntelligence(dataUrl, visionUrl);
+      const layout = await recognizeWithDocumentIntelligence(dataUrl, visionUrl);
+      return { ...layout, texts: await matchSourceFonts(Buffer.from(dataUrl.split(",")[1], "base64"), layout.texts) };
     } catch (error) {
       console.warn("[PDF editable layout] Document Intelligence failed; using Vision layout", { reason: (error as Error).message });
     }
   }
-  return await recognizeWithVisionLayout(visionUrl);
+  const layout = await recognizeWithVisionLayout(visionUrl);
+  return { ...layout, texts: await matchSourceFonts(Buffer.from(dataUrl.split(",")[1], "base64"), layout.texts) };
 }

@@ -27,7 +27,7 @@ import {
 import { LoadLatestImageAttachment, UploadImageToStore } from "../chat-image-service";
 import { LoadPendingPptxEdit } from "../pptx-pending-edit-service";
 import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
-import { isExplicitPptOutputRequest, isNewPptCreationRequest, isImagePptConversionRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
+import { isExplicitPptOutputRequest, isNewPptCreationRequest, isAttachedPptConversionRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -181,7 +181,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     );
   const referencesSharePointImage = isSharePointImageRequest(props.message);
   const storedImageAttachment =
-    imageAttachmentUrls.length === 0 && referencesAnAttachedImage
+    imageAttachmentUrls.length === 0 && (referencesAnAttachedImage || isAttachedPptConversionRequest(props.message))
       ? await LoadLatestImageAttachment(currentChatThread.id)
       : null;
   const imageAttachmentCountForRouting =
@@ -252,10 +252,19 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     history.push({ role: "system", content: `現在の会話に添付されたPDFです。利用者の添付画像という表現はこのPDFを指します。convert_doc_to_pptxへ渡してください。\n${sources.join("\n\n")}` });
     console.log("[PPT attachment] PDF conversion sources resolved", { count: sources.length });
   }
-  const imageConversionCandidates = imageAttachmentUrls.length ? imageAttachmentUrls : storedImageAttachment
+  let imageConversionCandidates = imageAttachmentUrls.length ? imageAttachmentUrls : storedImageAttachment
     ? [`data:${storedImageAttachment.contentType};base64,${storedImageAttachment.buffer.toString("base64")}`] : [];
+  // UploadDocument also retains source image files. Use them even when the short-lived
+  // image-reference metadata has expired or was consumed by an earlier image tool.
+  if (!imageConversionCandidates.length && !attachedPdfConversion && isAttachedPptConversionRequest(props.message)) {
+    imageConversionCandidates = await Promise.all(docs.filter(doc => /\.(?:png|jpe?g|webp)$/i.test(doc.name)).map(async doc => {
+      const sas = await GenerateSasUrl("dl-link", `${currentChatThread.id}/${doc.name}`);
+      if (sas.status !== "OK") throw new Error("添付画像のURLを取得できませんでした。");
+      return sas.response;
+    }));
+  }
   const attachedImageConversion = !attachedPdfConversion && !pptxAssetPlacementRequest &&
-    isImagePptConversionRequest(props.message) && imageConversionCandidates.length > 0;
+    isAttachedPptConversionRequest(props.message) && imageConversionCandidates.length > 0;
   if (attachedImageConversion) {
     const imageConversionSources = await Promise.all(imageConversionCandidates.map(async (source, index) => {
       if (!source.startsWith("data:")) return source;

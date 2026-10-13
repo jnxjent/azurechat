@@ -11,6 +11,7 @@ import { FormEvent } from "react";
 import { proxy, useSnapshot } from "valtio";
 import { RevalidateCache } from "../common/navigation-helpers";
 import { InputImageStore } from "../ui/chat/chat-input-area/input-image-store";
+import { prepareImageFormData, readImageFormData } from "../ui/chat/chat-input-area/image-form-data";
 import { textToSpeechStore } from "./chat-input/speech/use-text-to-speech";
 import { ResetInputRows } from "./chat-input/use-chat-input-dynamic-height";
 import {
@@ -133,7 +134,8 @@ class ChatState {
     this.updateAutoScroll(true);
     this.loading = "loading";
 
-    const multimodalImage = formData.get("image-base64") as unknown as string;
+    const multimodalImage = await readImageFormData(formData);
+    prepareImageFormData(formData);
 
     const newUserMessage: ChatMessageModel = {
       id: uniqueId(),
