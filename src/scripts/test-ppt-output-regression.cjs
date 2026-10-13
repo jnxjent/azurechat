@@ -199,4 +199,11 @@ async function main() {
   assert.equal(visionQueue.length, 0, 'every scripted Vision response was consumed');
   console.log('PPT output regression checks passed (service doubles; run scripts/verify-pdf-editable-ppt-real.cjs for the real PDF + Vision check)');
 }
+const routing = load('features/pptx/output-intent.ts');
+const salesPrompt = '当社㈱ミダックホールディングスは産業廃棄物一貫処理会社です。初回客先訪問用の営業資料を8枚のスライドで作成してください（PPTで出力してください）。色は、さわやかなGreen系で。内容はHPから入手してください。添付会社Logoを各スライドの右上に配置してください。';
+assert(routing.isNewPptCreationRequest(salesPrompt));
+for (const counts of [{imageCount:1,documentCount:0},{imageCount:0,documentCount:1},{imageCount:1,documentCount:1}]) {
+  assert.equal(routing.resolveOfficeChatRoute({explicitPptRequest:routing.isExplicitPptOutputRequest(salesPrompt),requiredTools:false,...counts}), 'extensions');
+}
+assert.equal(routing.resolveOfficeChatRoute({explicitPptRequest:false,requiredTools:false,imageCount:1,documentCount:0}), 'multimodal');
 main().catch(e => {console.error(e);process.exitCode=1;});

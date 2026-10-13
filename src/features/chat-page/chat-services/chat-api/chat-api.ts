@@ -27,7 +27,7 @@ import {
 import { LoadLatestImageAttachment } from "../chat-image-service";
 import { LoadPendingPptxEdit } from "../pptx-pending-edit-service";
 import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
-import { isExplicitPptOutputRequest, isNewPptCreationRequest } from "@/features/pptx/output-intent";
+import { isExplicitPptOutputRequest, isNewPptCreationRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -270,18 +270,13 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   currentChatThread.personaMessage = `${CHAT_DEFAULT_SYSTEM_PROMPT} \n\n ${currentChatThread.personaMessage}`;
   executionChatThread.personaMessage = currentChatThread.personaMessage;
 
-  let chatType: ChatTypes = "extensions";
-  if (salesforceRouting.route !== "normal") {
-    chatType = "extensions";
-  } else if (shouldUseImageEditTools) {
-    chatType = "extensions";
-  } else if (imageAttachmentUrls.length > 0) {
-    chatType = "multimodal";
-  } else if (docs.length > 0) {
-    chatType = "chat-with-file";
-  } else if (extension.length > 0) {
-    chatType = "extensions";
-  }
+  const chatType: ChatTypes = resolveOfficeChatRoute({
+    explicitPptRequest,
+    requiredTools: salesforceRouting.route !== "normal" || shouldUseImageEditTools,
+    imageCount: imageAttachmentUrls.length,
+    documentCount: docs.length,
+  });
+  console.log("[Office route]", { chatType, explicitPptRequest, newPptRequest, imageCount: imageAttachmentUrls.length, documentCount: docs.length });
 
   await CreateChatMessage({
     name: user.name,

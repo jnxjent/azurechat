@@ -1,4 +1,11 @@
 /** Explicit Office output takes precedence over raster image composition. */
+export function resolveOfficeChatRoute(input: { explicitPptRequest: boolean; requiredTools: boolean; imageCount: number; documentCount: number }): "extensions" | "multimodal" | "chat-with-file" {
+  if (input.explicitPptRequest || input.requiredTools) return "extensions";
+  if (input.imageCount > 0) return "multimodal";
+  if (input.documentCount > 0) return "chat-with-file";
+  return "extensions";
+}
+
 export function isExplicitPptOutputRequest(message: string): boolean {
   const value = message.normalize("NFKC");
   return /(?:\bpptx?\b|powerpoint|パワーポイント)/i.test(value) &&
