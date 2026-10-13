@@ -6,6 +6,7 @@ import "server-only";
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
 
 import { getCurrentUser } from "@/features/auth-page/helpers";
+import { GenerateSasUrl } from "@/features/common/services/azure-storage";
 import { isSalesforceAllowedEmail } from "@/features/common/services/salesforce-access";
 import {
   resolveSalesforceRoute,
@@ -23,9 +24,10 @@ import {
   AddExtensionToChatThread,
   EnsureChatThreadOperation,
 } from "../chat-thread-service";
-import { LoadLatestImageAttachment } from "../chat-image-service";
+import { LoadLatestImageAttachment, UploadImageToStore } from "../chat-image-service";
 import { LoadPendingPptxEdit } from "../pptx-pending-edit-service";
 import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
+import { isExplicitPptOutputRequest, isNewPptCreationRequest, isAttachedPptConversionRequest, resolveOfficeChatRoute } from "@/features/pptx/output-intent";
 import { ChatThreadModel, UserPrompt } from "../models";
 import { mapOpenAIChatMessages } from "../utils";
 import { GetDefaultExtensions } from "./chat-api-default-extensions";
@@ -33,6 +35,7 @@ import { GetDynamicExtensions } from "./chat-api-dynamic-extensions";
 import { ChatApiExtensions } from "./chat-api-extension";
 import { ChatApiMultimodal } from "./chat-api-multimodal";
 import {
+  isPptxAssetPlacementRequest,
   isSharePointImageRequest,
   resolveRequiredImageToolName,
 } from "./image/image-intent";
@@ -67,34 +70,6 @@ function normalizeImageAttachments(value: unknown): string[] {
   }
   const single = String(value ?? "").trim();
   return single ? [single] : [];
-}
-
-/**
- * A logo/image attached for an existing deck is a PowerPoint asset, not a
- * request to compose a new raster image with GPT Image.
- */
-function isPptxAssetPlacementRequest(message: string): boolean {
-  const value = String(message ?? "");
-  const asksToReplaceLogoWithAttachment =
-    /^(?=[\s\S]*(?:ロゴ|logo))(?=[\s\S]*(?:添付|アップロード|attachment))(?=[\s\S]*(?:差し替|差替|置き換|交換|replace|swap))[\s\S]*$/i.test(
-      value
-    );
-  const referencesExistingDeck =
-    /(?:添付|上記|この|今の|先ほど|さきほど|出力した|生成した|作成した|既存の).{0,16}(?:PPTX?|PowerPoint|スライド|資料)/i.test(
-      value
-    ) ||
-    /(?:PPTX?|PowerPoint|スライド|資料).{0,16}(?:編集|修正|変更|追加)/i.test(
-      value
-    );
-  const asksForAssetPlacement =
-    /(?:ロゴ|logo|添付画像|画像).{0,20}(?:入れ|挿入|配置|載せ|追加|右肩|表紙|フロント)/i.test(
-      value
-    ) ||
-    /(?:入れ|挿入|配置|載せ|追加).{0,20}(?:ロゴ|logo|添付画像)/i.test(
-      value
-    );
-  return asksToReplaceLogoWithAttachment ||
-    (referencesExistingDeck && asksForAssetPlacement);
 }
 
 /** ★最小ガード：直前 assistant.tool_calls に紐付かない tool を history から除外 */
@@ -150,6 +125,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     message: props.message,
     isSalesforceAllowed: salesforceAllowed,
     hasSalesforceExtension,
+    defaultToSalesforce: hasSalesforceExtension,
   });
   const executionChatThread: ChatThreadModel =
     salesforceRouting.route === "salesforce" || !hasSalesforceExtension
@@ -178,14 +154,16 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     );
   const referencesSharePointImage = isSharePointImageRequest(props.message);
   const storedImageAttachment =
-    imageAttachmentUrls.length === 0 && referencesAnAttachedImage
+    imageAttachmentUrls.length === 0 && (referencesAnAttachedImage || isAttachedPptConversionRequest(props.message))
       ? await LoadLatestImageAttachment(currentChatThread.id)
       : null;
   const imageAttachmentCountForRouting =
     imageAttachmentUrls.length +
     (storedImageAttachment ? 1 : 0) +
     (referencesSharePointImage ? 1 : 0);
-  const pptxAssetPlacementRequest = isPptxAssetPlacementRequest(props.message);
+  const newPptRequest = isNewPptCreationRequest(props.message);
+  const explicitPptRequest = isExplicitPptOutputRequest(props.message);
+  const pptxAssetPlacementRequest = !newPptRequest && isPptxAssetPlacementRequest(props.message);
   const accentReplyText = props.message.trim();
   const mayBePendingPptxAccentReply =
     accentReplyText.length <= 100 &&
@@ -200,7 +178,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
     ? "edit_pptx"
     : pptxAssetPlacementRequest
     ? "edit_pptx"
-    : resolveRequiredImageToolName(
+    : explicitPptRequest ? undefined : resolveRequiredImageToolName(
         props.message,
         imageAttachmentCountForRouting
       );
@@ -233,6 +211,48 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
       mode: resolvedMode,
     }),
   ]);
+  const attachedPdfConversion = explicitPptRequest && !newPptRequest &&
+    /添付|アップロード|PDF|この画像|このファイル/i.test(props.message) &&
+    !/参考|追記|拡充|肉付け/i.test(props.message) &&
+    docs.some(doc => /\.pdf$/i.test(doc.name));
+  if (attachedPdfConversion) {
+    const pdfDocs = docs.filter(doc => /\.pdf$/i.test(doc.name));
+    const sources = await Promise.all(pdfDocs.map(async doc => {
+      const sas = await GenerateSasUrl("dl-link", `${currentChatThread.id}/${doc.name}`);
+      if (sas.status !== "OK") throw new Error("添付PDFのURLを取得できませんでした。");
+      return `file_name: ${doc.name}\nfile_url: ${sas.response}`;
+    }));
+    history.push({ role: "system", content: `現在の会話に添付されたPDFです。利用者の添付画像という表現はこのPDFを指します。convert_doc_to_pptxへ渡してください。\n${sources.join("\n\n")}` });
+    console.log("[PPT attachment] PDF conversion sources resolved", { count: sources.length });
+  }
+  let imageConversionCandidates = imageAttachmentUrls.length ? imageAttachmentUrls : storedImageAttachment
+    ? [`data:${storedImageAttachment.contentType};base64,${storedImageAttachment.buffer.toString("base64")}`] : [];
+  // UploadDocument also retains source image files. Use them even when the short-lived
+  // image-reference metadata has expired or was consumed by an earlier image tool.
+  if (!imageConversionCandidates.length && !attachedPdfConversion && isAttachedPptConversionRequest(props.message)) {
+    imageConversionCandidates = await Promise.all(docs.filter(doc => /\.(?:png|jpe?g|webp)$/i.test(doc.name)).map(async doc => {
+      const sas = await GenerateSasUrl("dl-link", `${currentChatThread.id}/${doc.name}`);
+      if (sas.status !== "OK") throw new Error("添付画像のURLを取得できませんでした。");
+      return sas.response;
+    }));
+  }
+  const attachedImageConversion = !attachedPdfConversion && !pptxAssetPlacementRequest &&
+    isAttachedPptConversionRequest(props.message) && imageConversionCandidates.length > 0;
+  if (attachedImageConversion) {
+    const imageConversionSources = await Promise.all(imageConversionCandidates.map(async (source, index) => {
+      if (!source.startsWith("data:")) return source;
+      const match = source.match(/^data:image\/(?:png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\r\n]+)$/);
+      if (!match) throw new Error("添付画像の形式が不正です。PNG・JPEG・WEBPを使用してください。");
+      const name = `ppt-source-${Date.now()}-${index}.png`;
+      const uploaded = await UploadImageToStore(currentChatThread.id, name, Buffer.from(match[1], "base64"));
+      if (uploaded.status !== "OK") throw new Error("PowerPoint変換用の画像を保存できませんでした。");
+      const sas = await GenerateSasUrl("images", `${currentChatThread.id}/${name}`);
+      if (sas.status !== "OK") throw new Error("添付画像のURLを取得できませんでした。");
+      return sas.response;
+    }));
+    history.push({ role: "system", content: `添付画像そのものをPowerPointへ変換する依頼です。convert_doc_to_pptxを使い、mode=faithfulで画像を残し文字を編集可能にしてください。\n${imageConversionSources.map(url => `file_url: ${url}`).join("\n\n")}` });
+  }
+
 
   // 2ターン目以降の「候補2に変更して」などでも、同じAgentセッションを継続する。
   if (
@@ -251,18 +271,13 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   currentChatThread.personaMessage = `${CHAT_DEFAULT_SYSTEM_PROMPT} \n\n ${currentChatThread.personaMessage}`;
   executionChatThread.personaMessage = currentChatThread.personaMessage;
 
-  let chatType: ChatTypes = "extensions";
-  if (salesforceRouting.route !== "normal") {
-    chatType = "extensions";
-  } else if (shouldUseImageEditTools) {
-    chatType = "extensions";
-  } else if (imageAttachmentUrls.length > 0) {
-    chatType = "multimodal";
-  } else if (docs.length > 0) {
-    chatType = "chat-with-file";
-  } else if (extension.length > 0) {
-    chatType = "extensions";
-  }
+  const chatType: ChatTypes = resolveOfficeChatRoute({
+    explicitPptRequest,
+    requiredTools: salesforceRouting.route !== "normal" || shouldUseImageEditTools,
+    imageCount: imageAttachmentUrls.length,
+    documentCount: docs.length,
+  });
+  console.log("[Office route]", { chatType, explicitPptRequest, newPptRequest, imageCount: imageAttachmentUrls.length, documentCount: docs.length });
 
   await CreateChatMessage({
     name: user.name,
@@ -297,7 +312,7 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
         userMessage: props.message,
         history,
         extensions: extension,
-        requiredToolName: requiredImageToolName,
+        requiredToolName: (attachedPdfConversion || attachedImageConversion ? "convert_doc_to_pptx" : newPptRequest ? "create_pptx" : requiredImageToolName),
         loginEmail: user.email,
         salesforceRouting,
         signal,

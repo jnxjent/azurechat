@@ -1,8 +1,10 @@
-﻿export const runtime = "nodejs";
+export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import PptxGenJS from "pptxgenjs";
 import JSZip from "jszip";
+import { addLogoToPptx } from "@/features/pptx/logo-overlay";
+import { createPdfImageDeck } from "@/features/pptx/pdf-image-deck";
 import {
   BlobServiceClient,
 } from "@azure/storage-blob";
@@ -1832,6 +1834,7 @@ async function uploadPptxToBlob(buffer: Buffer, blobKey: string, displayFileName
 }
 
 async function savePptxPointer(threadId: string, blobName: string, fileName: string): Promise<void> {
+  console.log("[pptx-pointer] start");
   const acc = (process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "").trim();
   const key = (process.env.AZURE_STORAGE_ACCOUNT_KEY ?? "").trim();
   if (!acc || !key || !threadId?.trim()) return;
@@ -1841,12 +1844,14 @@ async function savePptxPointer(threadId: string, blobName: string, fileName: str
   );
   const containerClient = blobServiceClient.getContainerClient("pptx");
   await containerClient.createIfNotExists({ access: "blob" });
+  console.log("[pptx-pointer] container ready");
   await containerClient
     .getBlockBlobClient(`thread-${threadId}-pptx-pointer.json`)
     .uploadData(
       Buffer.from(JSON.stringify({ containerName: "pptx", blobName, fileName, savedAt: new Date().toISOString() })),
       { blobHTTPHeaders: { blobContentType: "application/json" } }
     );
+  console.log("[pptx-pointer] saved");
 }
 
 const W = 13.33;
@@ -5317,6 +5322,17 @@ async function handleRerenderFromDeckSpec(body: {
 export async function POST(req: NextRequest) {
   try {
     const rawBody = await req.json();
+    if (Array.isArray(rawBody.slides) && rawBody.slides.some((s: any) => s.sourceImageDataUrl)) {
+      let buffer = await createPdfImageDeck(rawBody.slides);
+      if (rawBody.logoDataUrl) buffer = await addLogoToPptx(buffer, rawBody.logoDataUrl);
+      const base = String(rawBody.fileBaseName || "PDF変換").replace(/[\\/:*?"<>|]/g, "").slice(0, 40);
+      const fileName = `${base}.pptx`;
+      const blobKey = `${base}_${uniqueId().slice(0, 8)}.pptx`;
+      const downloadUrl = await uploadPptxToBlob(buffer, blobKey, fileName);
+      if (rawBody.threadId) await savePptxPointer(rawBody.threadId, blobKey, fileName);
+      return NextResponse.json({ downloadUrl, fileName, totalSlides: rawBody.slides.length,
+        message: "元の図・写真を保持し、文字を編集可能なテキストとして変換しました。" });
+    }
     // DeckSpec TypeScript再描画リクエストは早期ディスパッチ（LLM不使用）
     if ((rawBody as any).action === "rerender_from_deckspec") {
       return handleRerenderFromDeckSpec(rawBody as Parameters<typeof handleRerenderFromDeckSpec>[0]);
@@ -6138,6 +6154,7 @@ export async function POST(req: NextRequest) {
       : (threadId ?? uniqueId());
     const displayFileName = `${safeBase}.pptx`;
     const blobKey = `${safeBase}_${uniqueId().slice(0, 8)}.pptx`;
+    if (typeof rawBody.logoDataUrl === "string") buffer = await addLogoToPptx(buffer, rawBody.logoDataUrl);
     const downloadUrl = await uploadPptxToBlob(buffer, blobKey, displayFileName);
 
     // ── DeckSpec 構築（Vision完了後の最終スライドから生成） ────────────────────────
@@ -6252,6 +6269,7 @@ export async function POST(req: NextRequest) {
       }
 
       const marked = await markPptxAsOurs(blobKey, _deckId);
+      console.log("[gen-pptx] metadata marked", { marked });
       if (!marked) {
         console.error(`[gen-pptx] markPptxAsOurs failed for blobKey=${blobKey} — aborting pointer update`);
         return NextResponse.json({ ok: false, error: "PPTXメタデータのマーク付与に失敗しました。再度お試しください。" }, { status: 500 });

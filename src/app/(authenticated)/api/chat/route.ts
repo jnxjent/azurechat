@@ -1,6 +1,7 @@
 // src/app/(authenticated)/api/chat/route.ts
 import { ChatAPIEntry } from "@/features/chat-page/chat-services/chat-api/chat-api";
 import { UserPrompt } from "@/features/chat-page/chat-services/models";
+import { readImageFormData } from "@/features/ui/chat/chat-input-area/image-form-data";
 
 export const runtime = "nodejs";
 // Synchronous SharePoint PDF Map/Reduce PoC. The hosting/front-door timeout
@@ -33,7 +34,7 @@ export async function POST(req: Request) {
 
   // 本文（JSON文字列）
   const content = formData.get("content");
-  const multimodalImage = formData.get("image-base64");
+  const multimodalImage = await readImageFormData(formData);
   const uiThinkingMode = formData.get("thinkingMode") as ThinkingModeUI | null;
 
   if (typeof content !== "string") {

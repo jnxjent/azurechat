@@ -1,4 +1,5 @@
 import "server-only";
+import { isNewPptCreationRequest, isImagePptConversionRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
 
 import { createHash, randomUUID } from "crypto";
 import {
@@ -21,6 +22,7 @@ import {
 import {
   createTeamsPptCardEdits,
   createTeamsPptPlan,
+  buildTeamsPptRenderingOptions,
   type TeamsPptExtractedSlide,
 } from "./teams-ppt-plan-service";
 import {
@@ -255,6 +257,8 @@ export function parseTeamsOfficeRequest(
       normalized
     );
   const hasPptColorTopic = /(色味|配色|カラー|色)/i.test(normalized);
+  const isNewPptRequest = isNewPptCreationRequest(normalized);
+  const isShortColorReply = normalized.length <= 60 && !/(ロゴ|logo|画像|写真|表紙|サイズ|大き|小さ|拡大|縮小)/i.test(normalized);
   const asksForPptColorHelp =
     hasPptEditingContext &&
     hasPptColorTopic &&
@@ -263,15 +267,15 @@ export function parseTeamsOfficeRequest(
     ) ||
       (/(変えたい|変更したい)/i.test(normalized) &&
         !resolvePptxPaletteInstruction(normalized)));
-  if (asksForPptColorHelp) {
+  if (asksForPptColorHelp && !isNewPptRequest) {
     return { action: "ppt_color_help" };
   }
 
   const asksForPptAssetInsertion =
-    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換)/i.test(
+    /(?:ロゴ|logo|画像|写真).{0,32}(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換|大き|小さ|拡大|縮小)/i.test(
       normalized
     ) ||
-    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
+    /(?:入れ|挿入|配置|載せ|追加|貼り|使って|差し替|置換|交換|大き|小さ|拡大|縮小).{0,32}(?:ロゴ|logo|画像|写真)/i.test(
       normalized
     );
   const asksForWholeDeckPptEdit =
@@ -284,6 +288,7 @@ export function parseTeamsOfficeRequest(
   if (
     hasPptEditingContext &&
     (asksForPptAssetInsertion || asksForWholeDeckPptEdit) &&
+    !isNewPptRequest &&
     !/(新規|一から|ゼロから).{0,12}(?:作成|生成|作って)/i.test(normalized)
   ) {
     return {
@@ -297,7 +302,7 @@ export function parseTeamsOfficeRequest(
   const asksForPptColorEdit =
     hasPptEditingContext &&
     hasPptColorTopic &&
-    /(変更|変え|替え|にして|統一|基調)/i.test(normalized);
+    /(?:色味|配色|カラー|色)[^。！？!?.\n]{0,24}(?:変更|変え|替え|にして|統一|基調)|(?:変更|変え|替え|統一)[^。！？!?.\n]{0,16}(?:色味|配色|カラー|色)/i.test(normalized);
   const selectsListedPptColor =
     /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-6１-６]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
       normalized
@@ -310,15 +315,18 @@ export function parseTeamsOfficeRequest(
       normalized
     );
   const selectsResolvedPptColor =
+    isShortColorReply &&
     Boolean(resolvePptxPaletteInstruction(normalized)) &&
     /(?:で|に|へ|変更|変えて|お願いします|お願い|にして)[。.!！]?$/i.test(
       normalized
     );
   if (
-    asksForPptColorEdit ||
-    selectsListedPptColor ||
-    selectsNamedPptColor ||
-    selectsResolvedPptColor
+    !isNewPptRequest && (
+      asksForPptColorEdit ||
+      selectsListedPptColor ||
+      (isShortColorReply && selectsNamedPptColor) ||
+      selectsResolvedPptColor
+    )
   ) {
     return { action: "edit_latest_ppt_color", instruction: normalized };
   }
@@ -395,7 +403,7 @@ export function parseTeamsOfficeRequest(
   ) {
     return { action: "edit_latest_word", instruction: normalized };
   }
-  const asksForConversion = /(変換|出力|作成|にして|して)/i.test(normalized);
+  const asksForConversion = /(変換|出力|作成|にして|して|化)/i.test(normalized);
   const hasPdfSource =
     /(sharepoint|\bsp\b|\bsl\b|pdf)/i.test(normalized);
   const asksForFullPdfSummary =
@@ -441,7 +449,7 @@ export function parseTeamsOfficeRequest(
     };
   }
 
-  if (asksForPowerPoint && asksForConversion && hasPdfSource) {
+  if (asksForPowerPoint && asksForConversion && (hasPdfSource || isImagePptConversionRequest(normalized))) {
     const fileQuery =
       attachedFileQuery ||
       extractQuotedFileQuery(normalized) ||
@@ -451,9 +459,7 @@ export function parseTeamsOfficeRequest(
     return {
       action: "pdf_to_ppt",
       fileQuery,
-      mode: /(そのまま|忠実|原本|レイアウト維持)/i.test(normalized)
-        ? "faithful"
-        : "redesign",
+      mode: pdfPptConversionMode(normalized),
     };
   }
 
@@ -666,11 +672,19 @@ export async function executeTeamsOfficeRequest(props: {
         return "公式Web情報を取得できなかったため、事実未確認のPowerPointは作成しませんでした。Brave Searchの設定と検索結果を確認してください。";
       }
     }
+    let logoDataUrl: string | undefined;
+    if (props.request.action === "create_ppt" && /ロゴ|logo/i.test(props.request.prompt)) {
+      const image = selectUploadedOfficeFile(props.uploadedFiles, ["png", "jpg", "jpeg", "webp"]);
+      if (image.error) return image.error;
+      if (!image.file) return "ロゴ画像を添付してから再度作成してください。";
+      logoDataUrl = await loadTeamsImageAsDataUrl(image.file);
+    }
     const result = await createDirectOfficeFile({
       action: props.request.action,
       prompt: props.request.prompt,
       title: props.request.title,
       threadId: teamsThreadId,
+      logoDataUrl,
       ...(webContext ? { referenceContext: webContext } : {}),
     });
 
@@ -806,7 +820,7 @@ export async function executeTeamsOfficeRequest(props: {
   }
 
   if (props.request.action === "pdf_to_ppt") {
-    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf"]);
+    const uploaded = selectUploadedOfficeFile(props.uploadedFiles, ["pdf", "png", "jpg", "jpeg", "webp"]);
     if (uploaded.error) return uploaded.error;
     if (uploaded.file) {
       const result = await convertPdfToPowerPoint({
@@ -823,9 +837,9 @@ export async function executeTeamsOfficeRequest(props: {
       const outputName =
         typeof result.fileName === "string"
           ? result.fileName
-          : uploaded.file.fileName.replace(/\.pdf$/i, ".pptx");
+          : uploaded.file.fileName.replace(/\.(pdf|png|jpe?g|webp)$/i, ".pptx");
       await savePptxResult(teamsThreadId, result, outputName);
-      return `添付PDFをPowerPointへ変換しました。\n\n📊 [${escapeMarkdownLinkText(
+      return `添付ファイルをPowerPointへ変換しました。${props.request.mode === "faithful" ? "元の図・写真を残し、文字を編集可能なテキストとして配置しています。" : ""}\n\n📊 [${escapeMarkdownLinkText(
         outputName
       )}](${String(result.downloadUrl)})`;
     }
@@ -1912,7 +1926,7 @@ async function convertPdfToPowerPoint(props: {
     props.fileName.replace(/\.pdf$/i, "") ||
     "プレゼンテーション";
   const fileBaseName = props.fileName
-    .replace(/\.pdf$/i, "")
+    .replace(/\.(pdf|png|jpe?g|webp)$/i, "")
     .replace(/[\\/:*?"<>|]/g, "")
     .trim()
     .slice(0, 40);
@@ -1956,6 +1970,7 @@ async function createDirectOfficeFile(props: {
   title: string;
   threadId: string;
   referenceContext?: string;
+  logoDataUrl?: string;
 }): Promise<Record<string, unknown>> {
   if (props.action === "create_ppt") {
     if (
@@ -1964,11 +1979,18 @@ async function createDirectOfficeFile(props: {
         userPrompt: props.prompt,
       })
     ) {
-      const companyPlan = await createSharedCompanyProfilePptPlan({
-        title: props.title,
-        userPrompt: props.prompt,
-        contentModelSource: "api",
-      });
+      let companyPlan;
+      try {
+        companyPlan = await createSharedCompanyProfilePptPlan({
+          title: props.title,
+          userPrompt: props.prompt,
+          contentModelSource: "api",
+        });
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "会社情報を確認できませんでした。公式URLを教えてください。" };
+      }
+      const companyTitle = props.title.includes(companyPlan.companyName) ? props.title : `${companyPlan.companyName} ${props.title}`;
+      const renderingOptions = buildTeamsPptRenderingOptions(props.prompt, props.title);
       if (
         companyPlan.slides.length !==
         companyPlan.targetTotalSlides - 1
@@ -1981,13 +2003,16 @@ async function createDirectOfficeFile(props: {
         };
       }
       const generated = await postOfficeGenerationApi("/api/gen-pptx", {
-        title: props.title,
+        title: companyTitle,
+        logoDataUrl: props.logoDataUrl,
         slides: companyPlan.slides,
         threadId: props.threadId,
         targetTotalSlides: companyPlan.targetTotalSlides,
-        deckPreferences: {},
+        deckPreferences: renderingOptions.deckPreferences,
+        palette: renderingOptions.palette,
+        designInstruction: renderingOptions.designInstruction,
         promptIntent: companyPlan.promptIntent,
-        fileBaseName: sanitizeOfficeBaseName(props.title),
+        fileBaseName: sanitizeOfficeBaseName(companyTitle),
       });
       return {
         ...generated,
@@ -2003,6 +2028,7 @@ async function createDirectOfficeFile(props: {
     });
     return postOfficeGenerationApi("/api/gen-pptx", {
       title: plan.title,
+      logoDataUrl: props.logoDataUrl,
       slides: plan.slides,
       threadId: props.threadId,
       ...(plan.targetTotalSlides
@@ -2036,7 +2062,7 @@ function companyProfileSourceName(url: string): string {
 }
 
 function requestsWebGroundedPpt(prompt: string): boolean {
-  return /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
+  return requestsOfficialWebsiteContent(prompt) || /(?:公式\s*(?:HP|ホームページ|サイト)|(?:HP|ホームページ|Web|ウェブ|インターネット).{0,20}(?:参考|参照|調べ|検索|情報))/i.test(
     prompt.normalize("NFKC")
   );
 }
@@ -2174,6 +2200,7 @@ async function postOfficeGenerationApi(
   }
 
   const result = (await response.json()) as Record<string, unknown>;
+  console.log("[teams-office] generation API returned", { endpoint, status: response.status, hasDownloadUrl: typeof result.downloadUrl === "string" });
   if (typeof result.downloadUrl !== "string") {
     return { error: "ダウンロードURLが取得できませんでした。" };
   }
@@ -2798,10 +2825,31 @@ function extractUnquotedFileQuery(
     ),
   ];
 
+  // "SharePointの" etc. sits directly in front of the name with no space in Japanese.
+  const stripLocation = (value: string) =>
+    value
+      .replace(/^(?:sharepoint|sp|sl)(?:上|内)?(?:にある|の)?/i, "")
+      .replace(/^(?:ファイル|資料)\s*[:：]?/, "")
+      .trim();
+  // "このPDF" / "添付のPDF" refer to an attachment, not to a SharePoint file name.
+  const isUsableName = (value: string) =>
+    Boolean(value) &&
+    !/^(?:この|その|あの|添付|上記|先ほど|さっき|今)(?:の)?(?:ファイル|資料)?$/.test(value);
+
+  // A name written with its extension is the most reliable, wherever the PPT wording follows.
+  const named = message.match(/([^\s「」『』"“”、。,，]+?\.(?:pdf|docx))(?![a-z0-9])/i)?.[1];
+  if (named && isUsableName(stripLocation(named))) return stripLocation(named);
+
   for (const pattern of patterns) {
     const match = message.match(pattern)?.[1]?.trim();
     if (match) return match;
   }
+
+  // "会社営業資料画像のPDFを…" / "会社営業資料画像 PDFを…"
+  const beforeType = message.match(
+    /([^\s「」『』"“”、。,，]+?)\s*の?\s*(?:pdf|word|docx)\s*(?:ファイル)?\s*を/i
+  )?.[1];
+  if (beforeType && isUsableName(stripLocation(beforeType))) return stripLocation(beforeType);
   return null;
 }
 

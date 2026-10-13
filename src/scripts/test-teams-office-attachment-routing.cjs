@@ -47,10 +47,7 @@ function loadOfficeService() {
       };
     }
     if (request === "@/features/pptx/palette") {
-      return {
-        pptxPaletteListText: () => "",
-        resolvePptxPaletteInstruction: () => null,
-      };
+      return loadTypeScriptModule("features/pptx/palette.ts", {});
     }
     if (request === "@/features/auth-page/helpers") {
       return { hashValue: (value) => value };
@@ -129,6 +126,7 @@ function loadOfficeService() {
     }
     if (request === "./teams-ppt-plan-service") {
       return {
+        buildTeamsPptRenderingOptions: (...args) => buildTeamsPptRenderingOptions(...args),
         createTeamsPptPlan: async (props) => {
           pptPlanInputs.push(props);
           const isExecutiveSharePointDeck = /経営層|DX_AI活動報告/.test(
@@ -204,6 +202,12 @@ function loadOfficeService() {
     }
     if (request === "./teams-word-proofread-service") {
       return {};
+    }
+    if (request === "@/features/pptx/output-intent") {
+      const intentPath = path.resolve("features/pptx/output-intent.ts");
+      const intent = new Module(intentPath, module);
+      intent._compile(ts.transpileModule(fs.readFileSync(intentPath, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, intentPath);
+      return intent.exports;
     }
     return originalRequire(request);
   };
@@ -312,6 +316,11 @@ assert.equal(
   "pdf_to_ppt"
 );
 
+const pngConversion = parseTeamsOfficeRequest('添付PNGを画像はそのままで文字を編集可能なPPTに変換して\n添付ファイル: poster.png');
+assert.equal(pngConversion?.action, 'pdf_to_ppt');
+assert.equal(pngConversion?.fileQuery, 'poster.png');
+assert.equal(pngConversion?.mode, 'faithful');
+
 const chineseTranslation = parseTeamsOfficeRequest(
   "添付PDFの日本語を中国語に翻訳して\n添付ファイル: ごみ分別.pdf"
 );
@@ -389,7 +398,7 @@ function loadTypeScriptModule(relativePath, mocks = {}) {
   loaded.require = (request) =>
     Object.prototype.hasOwnProperty.call(mocks, request)
       ? mocks[request]
-      : originalRequire(request);
+      : request.startsWith("@/") ? loadTypeScriptModule(request.slice(2) + ".ts", mocks) : originalRequire(request);
   loaded._compile(javascript, fileName);
   return loaded.exports;
 }
@@ -465,6 +474,15 @@ assert.equal(
   parseTeamsOfficeRequest("P2のタイトルだけを英語に変更して")?.action,
   "edit_latest_ppt"
 );
+
+const salesWithLargerLogo = '当社㈱ミダックホールディングスは産業廃棄物一貫処理会社です。初回客先訪問用の営業資料を8枚のスライドで作成してください（PPTで出力してください）。色は、さわやかなGreen系で。内容はHPから入手してください。添付Logoを各スライドの右上に配置してください。表紙も同様。但し、少しLogoを大きめにして。';
+assert.equal(parseTeamsOfficeRequest(salesWithLargerLogo)?.action, 'create_ppt');
+assert.equal(parseTeamsOfficeRequest(salesWithLargerLogo + '\n添付ファイル: logo.png')?.action, 'create_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTのロゴを大きめにして。色はGreenで')?.action, 'edit_latest_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTのロゴを小さくして。色は深緑でお願いします')?.action, 'edit_latest_ppt');
+assert.equal(parseTeamsOfficeRequest('このPPTの色をGreenにして')?.action, 'edit_latest_ppt_color');
+assert.equal(parseTeamsOfficeRequest('Greenでお願いします')?.action, 'edit_latest_ppt_color');
+assert.equal(parseTeamsOfficeRequest('深緑のPPTを8枚で作成してください')?.action, 'create_ppt');
 
 const webPptRequest = parseTeamsOfficeRequest(
   "ミダックホールディングスの初回訪問用営業資料を12枚でPPT作成してください。会社概要は公式HPを参考にしてください"
@@ -676,17 +694,19 @@ async function testWebGroundedPptAndLogoFollowup() {
 
   try {
     const createReply = await executeTeamsOfficeRequest({
-      request: webPptRequest,
+      request: { ...webPptRequest, prompt: `${webPptRequest.prompt} 色は、さわやかなGreen系で。` },
       conversationId,
       uploadedFiles: [],
     });
     assert.match(createReply, /Officeファイルを作成しました/);
     assert.match(createReply, /https:\/\/www\.midac\.jp\/company\//);
-    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, webPptRequest.prompt);
+    assert.equal(sharedCompanyPlanInputs.at(-1).userPrompt, `${webPptRequest.prompt} 色は、さわやかなGreen系で。`);
     assert.equal(sharedCompanyPlanInputs.at(-1).contentModelSource, "api");
     assert.equal(requests[0].body.slides.length, 11);
     assert.equal(requests[0].body.targetTotalSlides, 12);
     assert.equal(requests[0].body.promptIntent.documentPurpose, "company-intro");
+    assert.equal(requests[0].body.palette, "forest_amber");
+    assert.match(requests[0].body.designInstruction, /forest_amber/);
 
     const logo = {
       extension: "png",
@@ -815,12 +835,45 @@ async function testLocalPdfSummaryUsesSlLocalDefaultEmail() {
   }
 }
 
+async function testNewDeckWithLogoAndFaithfulPdf() {
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (url, init) => {
+    if (!init?.body) return { ok: true, arrayBuffer: async () => Buffer.from('logo-test-bytes') };
+    const body = JSON.parse(init.body); requests.push({url: String(url), body});
+    return { ok: true, json: async () => String(url).endsWith('/api/analyze-doc-vision')
+      ? {ok:true,totalPages:1,slides:[{title:'page',bullets:[],sourceImageDataUrl:'data:image/png;base64,AAAA',sourceWidth:300,sourceHeight:400}]}
+      : {downloadUrl:'https://example.test/new.pptx',fileName:'new.pptx'} };
+  };
+  try {
+    const logo = {extension:'png',fileName:'logo.png',savedAt:Date.now(),size:20,url:'https://example.test/logo.png'};
+    const request = parseTeamsOfficeRequest('会社紹介を8枚のPPTで作成して。添付Logoを各スライドの右上に配置して\n添付ファイル: logo.png');
+    assert.equal(request.action,'create_ppt');
+    await executeTeamsOfficeRequest({request,conversationId:'new-logo',uploadedFiles:[logo]});
+    assert.match(requests.at(-1).body.logoDataUrl,/^data:image\/png;base64,/);
+    requests.length=0;
+    const pdf = {extension:'pdf',fileName:'source.pdf',savedAt:Date.now(),size:100,url:'https://example.test/source.pdf'};
+    await executeTeamsOfficeRequest({request:{action:'pdf_to_ppt',fileQuery:'source.pdf',mode:'faithful'},conversationId:'pdf-faithful',uploadedFiles:[pdf]});
+    assert.equal(requests[0].body.mode,'faithful');
+    assert.equal(requests[1].body.slides[0].sourceWidth,300);
+    assert.equal(requests[1].body.slides[0].sourceImageDataUrl,'data:image/png;base64,AAAA');
+    requests.length = 0;
+    const png = { extension:'png', fileName:'poster.png', savedAt:Date.now(), size:100, url:'https://example.test/poster.png' };
+    const pngResult = await executeTeamsOfficeRequest({ request:pngConversion, conversationId:'png-faithful', uploadedFiles:[png] });
+    assert.equal(requests[0].body.fileUrl, png.url);
+    assert.equal(requests[0].body.mode, 'faithful');
+    assert.equal(requests[1].body.slides[0].sourceImageDataUrl, 'data:image/png;base64,AAAA');
+    assert.match(pngResult, /PowerPointへ変換しました/);
+  } finally { global.fetch=originalFetch; }
+}
+
 testPdfTranslationExecutionAndFollowup()
   .then(testWordTranslationExecution)
   .then(testWebGroundedPptAndLogoFollowup)
   .then(testExecutiveSharePointPptRenderingOptions)
   .then(testLocalPdfSummaryUsesSlLocalDefaultEmail)
   .then(testNumberedExcelCandidateSelection)
+  .then(testNewDeckWithLogoAndFaithfulPdf)
   .then(() => {
     console.log("Teams Office attachment routing tests passed.");
   })

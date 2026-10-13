@@ -21,14 +21,17 @@ export const UploadBlob = async (
   containerName: string,
   blobName: string,
   blobData: Buffer,
-  returnName: boolean = false
+  returnName: boolean = false,
+  contentType?: string
 ): Promise<ServerActionResponse<string>> => {
   const blobServiceClient = InitBlobServiceClient();
 
   const containerClient = blobServiceClient.getContainerClient(containerName);
   const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
-  const response = await blockBlobClient.uploadData(blobData);
+  const response = await blockBlobClient.uploadData(blobData, contentType
+    ? { blobHTTPHeaders: { blobContentType: contentType } }
+    : undefined);
 
   // Check for upload success
   if (response.errorCode !== undefined) {
@@ -49,7 +52,8 @@ export const UploadBlob = async (
 
 export const GenerateSasUrl = async (
   containerName: string,
-  blobPath: string
+  blobPath: string,
+  contentType?: string
 ): Promise<ServerActionResponse<string>> => {
   try {
     const blockBlobClient = InitBlobServiceClient()
@@ -58,6 +62,7 @@ export const GenerateSasUrl = async (
     const sasUrl = await blockBlobClient.generateSasUrl({
       expiresOn: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       permissions: BlobSASPermissions.parse("r"),
+      ...(contentType ? { contentType } : {}),
     });
     return { status: "OK", response: sasUrl };
   } catch (e) {

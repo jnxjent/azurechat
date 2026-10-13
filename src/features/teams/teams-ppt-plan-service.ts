@@ -1,4 +1,6 @@
 import "server-only";
+import { resolvePptxPaletteInstruction } from "@/features/pptx/palette";
+import { PPT_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
 
 import { OpenAIPptInstance } from "@/features/common/services/openai";
 
@@ -81,7 +83,7 @@ export type TeamsPptRenderingOptions = {
       maxAccentIntensity: "low" | "medium" | "high";
     };
   };
-  palette: "navy_orange";
+  palette: string;
 };
 
 export type TeamsPptExtractedSlide = {
@@ -118,6 +120,7 @@ export async function createTeamsPptPlan(props: {
         role: "system",
         content: [
           "You create concise Japanese presentation outlines.",
+          PPT_PRODUCTION_INSTRUCTION,
           "Return JSON only with this schema:",
           '{"title":"資料タイトル","slides":[{"title":"スライドタイトル","bullets":["要点"],"layoutType":"bullets|multi-column|metric-cards|stat_callouts|card_grid|process-cards|timeline|roadmap|editorial_statement|closing","columns":[{"header":"列見出し","bullets":["要点"]}],"metrics":[{"label":"指標","value":"43","unit":"%","note":"補足"}],"statCallouts":[{"value":"43","unit":"%","label":"利用率","note":"補足"}],"cards":[{"iconKey":"gear","heading":"見出し","body":"本文"}],"steps":[{"title":"段階","body":"説明","iconKey":"gear"}],"benefits":["効果"],"subtitle":"補足"}]}',
           "The slides array must contain body slides only. Do not include a title/cover slide because the rendering API adds it automatically.",
@@ -189,7 +192,7 @@ export async function createTeamsPptPlan(props: {
       typeof parsed.title === "string" && parsed.title.trim()
         ? parsed.title.trim()
         : props.title,
-    slides,
+    slides: removePptProductionNotes(slides),
     ...(targetTotalSlides ? { targetTotalSlides } : {}),
     ...buildTeamsPptRenderingOptions(props.prompt, props.title),
   };
@@ -200,6 +203,7 @@ export function buildTeamsPptRenderingOptions(
   title: string
 ): TeamsPptRenderingOptions {
   const text = `${title} ${prompt}`.normalize("NFKC").toLowerCase();
+  const requestedPalette = resolvePptxPaletteInstruction(prompt);
   const has = (...words: string[]) => words.some((word) => text.includes(word));
 
   const audience: TeamsPptRenderingOptions["promptIntent"]["audience"] = has(
@@ -238,7 +242,7 @@ export function buildTeamsPptRenderingOptions(
     audience === "executive"
       ? "経営層が短時間で判断できる、洗練されたコーポレート資料にする。"
       : "読み手が短時間で要点を把握できる、洗練されたコーポレート資料にする。",
-    "白を基調にネイビーと控えめなオレンジを使い、余白と視覚的階層を確保する。",
+    requestedPalette ? `利用者が指定した配色（${requestedPalette.paletteKey ?? requestedPalette.accentColor}）を優先し、余白と視覚的階層を確保する。` : "白を基調にネイビーと控えめなオレンジを使い、余白と視覚的階層を確保する。",
     "1スライド1メッセージとし、長文箇条書きの反復を避け、KPI、カード、比較、プロセス、ロードマップを内容に応じて使い分ける。",
     "文字切れ、過度な縮小、グラフの長い軸ラベルを避ける。",
   ].join(" ");
@@ -270,7 +274,7 @@ export function buildTeamsPptRenderingOptions(
         maxAccentIntensity: "medium",
       },
     },
-    palette: "navy_orange",
+    palette: requestedPalette?.paletteKey ?? "navy_orange",
   };
 }
 

@@ -1,6 +1,7 @@
 // src/features/chat-page/chat-services/chat-api/chat-api-default-extensions.ts
 "use server";
 import "server-only";
+import { extractPresentationCompanyName, assertCompanyIdentity, isCompanySearchResult } from "@/features/pptx/company-identity";
 
 import { DownloadBlobAsText, GenerateSasUrl, UploadBlob } from "@/features/common/services/azure-storage";
 import { OpenAIDALLEInstance, OpenAIInstance, OpenAIPptInstance } from "@/features/common/services/openai";
@@ -51,6 +52,8 @@ import {
   sanitizeImageLocationForLog,
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
+import { generateStoredChatImage } from "./image/image-generation-service";
+import { isCompanyProfileContent, PPT_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
 import { resolveWordEditInstruction } from "./word-edit-instruction";
 import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
 
@@ -1480,7 +1483,7 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) =>
-        await executeCreatePptx(args, props.chatThread, props.userMessage),
+        await executeCreatePptx(args, props.chatThread, props.userMessage, props.imageAttachmentUrls),
       parse: (input: string) => JSON.parse(input),
       parameters: {
         type: "object",
@@ -1739,7 +1742,7 @@ export const GetDefaultExtensions = async (props: {
             description:
               "変換モード。'faithful'=忠実変換（元ページ数維持・自動タイトルスライドなし・デザインAI最小化）。" +
               "「そのまま」「忠実に」「原本に近く」「ページ数を変えずに」などの場合は 'faithful' を指定。" +
-              "デフォルトは 'redesign'（デザイン自動改善）。",
+              "既定はfaithful（元の図・写真・配置を保持し、文字は編集可能なテキストボックスに変換）。「文字を編集可能に」だけならfaithful。内容の再構成・要約やデザイン変更を明示された場合だけredesign。",
           },
         },
         required: [],
@@ -1775,7 +1778,7 @@ export const GetDefaultExtensions = async (props: {
             type: "string",
             enum: ["faithful", "redesign"],
             description:
-              "変換モード。'faithful'=忠実変換（ページ数維持）。'redesign'=デザイン自動改善（デフォルト）。",
+              "既定はfaithful（元の図・写真・配置を保持し、文字は編集可能なテキストボックスに変換）。「文字を編集可能に」だけならfaithful。内容の再構成・要約やデザイン変更を明示された場合だけredesign。",
           },
         },
         required: ["fileQuery"],
@@ -2612,6 +2615,12 @@ type BraveWebEvidence = {
 };
 
 async function collectWebEvidence(query: string, preferredCompanyName = ""): Promise<BraveWebEvidence> {
+  const suppliedUrl = query.match(/https?:\/\/[^\s、。]+/i)?.[0];
+  if (suppliedUrl) {
+    const page = await fetchPageText(suppliedUrl, 12000);
+    if (!isCompanySearchResult(preferredCompanyName, page, "")) return { snippets: "", pages: "", sourceUrls: [] };
+    return { snippets: "", pages: `SOURCE_URL: ${suppliedUrl}\n${page}`, sourceUrls: [suppliedUrl], officialDomain: new URL(suppliedUrl).hostname.replace(/^www\./, "") };
+  }
   const apiKey = process.env.BRAVE_SUBSCRIPTION_TOKEN;
   if (!apiKey) return { snippets: "", pages: "", sourceUrls: [] };
 
@@ -2631,22 +2640,8 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
   }
 
   const results: Array<{ title?: string; description?: string; extra_snippets?: string[]; url?: string }> =
-    braveData?.web?.results ?? [];
+    (braveData?.web?.results ?? []).filter((r: any) => isCompanySearchResult(preferredCompanyName, r.title ?? "", r.description ?? ""));
 
-  const snippets = results
-    .slice(0, 8)
-    .map((r) => {
-      const extras = (r.extra_snippets ?? []).slice(0, 3).join(" ");
-      return `【${r.title ?? ""}】${r.description ?? ""} ${extras}`.trim();
-    })
-    .filter(Boolean)
-    .join("\n")
-    .slice(0, 4000);
-
-  const companyKey = preferredCompanyName
-    .replace(/(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))/g, "")
-    .replace(/[\s　・]/g, "")
-    .toLowerCase();
   const resultHostname = (url: string): string => {
     try {
       return new URL(url).hostname.replace(/^www\./, "").toLowerCase();
@@ -2658,10 +2653,7 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
     .map((result, index) => {
       const url = result.url ?? "";
       const hostname = resultHostname(url);
-      const compactText = `${result.title ?? ""}${result.description ?? ""}`
-        .replace(/[\s　・]/g, "")
-        .toLowerCase();
-      const companyMatch = companyKey.length >= 3 && compactText.includes(companyKey);
+      const companyMatch = isCompanySearchResult(preferredCompanyName, result.title ?? "", result.description ?? "");
       const officialPage = /\/(?:company|business|overview|about|profile|permission)(?:\/|\.|$)/i.test(url);
       const excludedHost = /(?:wikipedia|facebook|instagram|x\.com|youtube|linkedin|nikkei|prtimes)/i.test(hostname);
       const score = (companyMatch ? 5 : 0) + (officialPage ? 3 : 0) + Math.max(0, 3 - index) - (excludedHost ? 20 : 0);
@@ -2675,15 +2667,24 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
         .map((result) => result.url ?? "")
         .filter((url) => url.startsWith("http") && resultHostname(url) === officialDomain)
     : [];
-  const candidateUrls = Array.from(new Set([
-    ...officialUrls,
-    ...results.slice(0, 6).map((result) => result.url ?? "").filter((url) => url.startsWith("http")),
-  ])).slice(0, 6);
+  const candidateUrls = Array.from(new Set(officialUrls)).slice(0, 6);
+
+  const snippets = results.filter(r => officialDomain && resultHostname(r.url ?? "") === officialDomain)
+    .slice(0, 8)
+    .map((r) => {
+      const extras = (r.extra_snippets ?? []).slice(0, 3).join(" ");
+      return `【${r.title ?? ""}】${r.description ?? ""} ${extras}`.trim();
+    })
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 4000);
+
+
 
   const pageTexts = await Promise.allSettled(
     candidateUrls.map(async (url) => {
       const text = await fetchPageText(url, 3500);
-      return text ? `SOURCE_URL: ${url}\n${text}` : "";
+      return isCompanySearchResult(preferredCompanyName, text, "") ? `SOURCE_URL: ${url}\n${text}` : "";
     })
   );
 
@@ -2697,7 +2698,7 @@ async function collectWebEvidence(query: string, preferredCompanyName = ""): Pro
     `[collectWebEvidence] query="${query}" officialDomain=${officialDomain ?? "none"} ` +
     `urls=${candidateUrls.length} snippets=${snippets.length}c pages=${pages.length}c`
   );
-  return { snippets, pages, sourceUrls: candidateUrls, officialDomain };
+  return { snippets, pages, sourceUrls: candidateUrls.filter(url => pages.includes(`SOURCE_URL: ${url}\n`)), officialDomain };
 }
 
 // ---- LLM事実抽出 ----
@@ -2924,7 +2925,7 @@ Rules:
     }
     const parsed = JSON.parse(match[0]);
     const brief: CompanyBrief = {
-      companyName: parsed.companyName || companyName,
+      companyName: typeof parsed.companyName === "string" ? parsed.companyName : "",
       audience: parsed.audience || audience,
       purpose: parsed.purpose || purpose,
       companyOverview: parsed.companyOverview || "",
@@ -4718,36 +4719,14 @@ function detectCompanyProfileMode(
     userMessage ?? "",
     ...slides.flatMap((slide) => [slide.title, ...(slide.bullets ?? [])]),
   ].join(" ").toLowerCase();
-  const requestsWebsiteEnrichment =
-    /(?:会社案内|会社概要|企業情報|会社情報).{0,40}(?:hp|ホームページ|web|ウェブ|公式サイト).{0,40}(?:参考|参照|調べ|埋め|補完)/i.test(text) ||
-    /(?:hp|ホームページ|web|ウェブ|公式サイト).{0,40}(?:参考|参照|調べ|会社案内|会社概要|企業情報|会社情報|内容を埋め)/i.test(text);
-  // "機能紹介資料" は製品機能紹介であり会社紹介ではないため除外
-  const hasProfile = /会社紹介|(?<!機能)紹介資料|company profile|初回訪問|初回営業/.test(text);
-  return requestsWebsiteEnrichment || (hasProfile && slides.length <= 16);
+  return isCompanyProfileContent(text, slides.length);
 }
 
 const TITLE_SUFFIXES =
   /[\s　]*(会社紹介|紹介資料|営業資料|提案資料|提案書|会社概要|初回訪問(?:用|向け)?|COMPANY\s*PROFILE|Company\s*Profile|プロフィール|Profile)/gi;
 
 function extractCompanyNameFromTitle(title: string, userMessage = ""): string {
-  const explicit = `${userMessage} ${title}`.match(
-    /(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))\s*([ァ-ヶー一-龠A-Za-z0-9・]{2,30}?)(?=という|の(?:HP|ホームページ|Web|ウェブ|公式サイト)|[、。\s]|$)/i
-  )?.[1];
-  if (explicit) return explicit.trim();
-
-  const cleaned = title
-    .replace(/（[^）]*）|\([^)]*\)/g, "")
-    .replace(/^(?:株式会社|有限会社|合同会社|㈱|（株）|\(株\))\s*/, "")
-    .replace(/(?:お客様向け|顧客向け|営業員向け|初回訪問向け).*/, "")
-    .replace(TITLE_SUFFIXES, "")
-    .trim();
-
-  const quoted = cleaned.match(/[「『"']([^」』"']{2,20})[」』"']/)?.[1];
-  if (quoted) return quoted;
-
-  // 株式会社などのプレフィックスを除去してから先頭語を返す
-  const noPrefix = cleaned.replace(/^(株式会社|有限会社|合同会社|（株）|\(株\))\s*/, "");
-  return (noPrefix.split(/[\s　]/)[0] ?? cleaned).slice(0, 20);
+  return extractPresentationCompanyName(title, userMessage);
 }
 
 export type SharedCompanyProfileSeedSlide = {
@@ -4803,12 +4782,15 @@ export async function createSharedCompanyProfilePptPlan(props: {
     props.title,
     props.userPrompt
   );
+  if (!companyName) throw new Error("対象の会社名を特定できませんでした。会社名と公式URLを教えてください。");
   const query = companyName
     ? `${companyName} 公式サイト 会社概要 事業内容 強み 許可 拠点 グループ会社`
     : `${props.title} 会社概要 事業内容`;
   console.log("[shared-company-profile] collectWebEvidence:", query);
 
-  const evidence = await collectWebEvidence(query, companyName);
+  const explicitUrl = props.userPrompt.match(/https?:\/\/[^\s、。]+/i)?.[0];
+  const evidence = await collectWebEvidence(explicitUrl ?? query, companyName);
+  if (!evidence.officialDomain || !evidence.pages.trim()) throw new Error("対象会社の公式サイト情報を確認できませんでした。対象会社の公式URLを教えてください。");
   const sourceEvidence = [evidence.snippets, evidence.pages]
     .filter(Boolean)
     .join("\n\n");
@@ -4819,6 +4801,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
     evidence,
     props.contentModelSource
   );
+  assertCompanyIdentity(companyName, brief.companyName);
   const requestedTotal =
     props.targetTotalSlides ??
     extractRequestedTotalSlideCount(props.userPrompt) ??
@@ -4827,7 +4810,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
   const slides = await planCompanyProfileSlides(
     props.title,
     brief,
-    props.userPrompt,
+    `${props.userPrompt}\n${PPT_PRODUCTION_INSTRUCTION}`,
     props.designInstruction,
     targetTotalSlides - 1,
     seedSlides,
@@ -4841,7 +4824,7 @@ export async function createSharedCompanyProfilePptPlan(props: {
   );
   return {
     companyName,
-    slides,
+    slides: removePptProductionNotes(slides),
     targetTotalSlides,
     sourceEvidence,
     sourceUrls: evidence.sourceUrls,
@@ -5049,9 +5032,12 @@ async function executeCreatePptx(
     palette?: string;
   },
   chatThread: ChatThreadModel,
-  userMessage?: string
+  userMessage?: string,
+  imageAttachmentUrls?: string[]
 ) {
   const { title, slides, proposalMode, fontFace, designInstruction, palette } = args ?? {};
+  const requestedPalette = resolvePptxPaletteInstruction(userMessage ?? "");
+  const effectivePalette = requestedPalette?.paletteKey ?? palette;
   const hasExplicitFontRequest = /(?:フォント|font|メイリオ|meiryo|游ゴシック|yu\s*gothic|游明朝|yu\s*mincho|arial)/i.test(userMessage ?? "");
   const effectiveFontFace = hasExplicitFontRequest && fontFace?.trim() ? fontFace.trim() : "Meiryo";
 
@@ -5138,12 +5124,17 @@ async function executeCreatePptx(
     }
   } else if (companyProfileMode) {
     // AzureChat/Teams 共通の公式サイト会社紹介パイプラインを使用する。
-    const companyPlan = await createSharedCompanyProfilePptPlan({
+    let companyPlan;
+    try {
+      companyPlan = await createSharedCompanyProfilePptPlan({
       title,
       userPrompt: userMessage ?? "",
       designInstruction,
       seedSlides: slides,
     });
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "会社情報を確認できませんでした。公式URLを教えてください。" };
+    }
     storySourceEvidence = companyPlan.sourceEvidence;
     if (companyPlan.slides.length > 0) {
       finalSlides = companyPlan.slides;
@@ -5248,12 +5239,24 @@ async function executeCreatePptx(
   ).replace(/\/+$/, "");
 
   try {
+    let logoDataUrl = /ロゴ|logo/i.test(userMessage ?? "")
+      ? (imageAttachmentUrls?.[0] || await resolveLatestStoredImageDataUrl(chatThread.id))
+      : undefined;
+    if (logoDataUrl && /^https?:\/\//i.test(logoDataUrl)) {
+      const imageResponse = await fetch(logoDataUrl, { signal: AbortSignal.timeout(15_000) });
+      if (!imageResponse.ok) return { error: "添付ロゴの読み込みに失敗しました。" };
+      const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
+      if (imageBytes.length > 15 * 1024 * 1024) return { error: "添付ロゴは15MB以下にしてください。" };
+      logoDataUrl = `data:image/png;base64,${(await sharp(imageBytes).png().toBuffer()).toString("base64")}`;
+    }
+    if (/ロゴ|logo/i.test(userMessage ?? "") && !logoDataUrl) return { error: "ロゴ画像を添付してから再度作成してください。" };
     const res = await fetch(`${baseUrl}/api/gen-pptx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         title,
-        slides: (finalSlides ?? []).map((s) => ({
+        ...(logoDataUrl ? { logoDataUrl } : {}),
+        slides: removePptProductionNotes(finalSlides ?? []).map((s) => ({
           title: s.title,
           bullets: Array.isArray(s.bullets) ? s.bullets : [],
           ...(s.layoutType    ? { layoutType: s.layoutType }       : {}),
@@ -5285,7 +5288,7 @@ async function executeCreatePptx(
         deckPreferences,
         fileBaseName: generatePptxDisplayName(title).replace(/\.pptx$/i, ""),
         promptIntent,
-        ...(palette ? { palette } : {}),
+        ...(effectivePalette ? { palette: effectivePalette } : {}),
       }),
     });
 
@@ -5326,7 +5329,8 @@ async function executeConvertDocToPptx(
   chatThread: ChatThreadModel,
   userMessage?: string
 ) {
-  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages, mode } = args ?? {};
+  const { fileUrl, fileUrls, presentationTitle, fontFace, designInstruction, maxPages } = args ?? {};
+  const mode = args?.mode === "redesign" ? "redesign" : "faithful";
   const sourceFileUrls = Array.from(
     new Set(
       [fileUrl, ...(Array.isArray(fileUrls) ? fileUrls : [])]
@@ -5589,7 +5593,9 @@ async function executeConvertDocToPptx(
       fileName: pptxResult.fileName,
       displayName: generatePptxDisplayName(title),
       totalPages,
-      message: `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
+      message: mode === "faithful"
+        ? `${totalPages}ページから${slides.length}枚のPowerPointを作成しました。元の図・写真を切り出し、文字を編集可能なテキストとして配置しています。`
+        : `${totalPages}ページをVision APIで解析し、PowerPointファイルを生成しました。`,
     };
   } catch (e: any) {
     console.error("[convert_doc_to_pptx] error:", e);
@@ -9918,68 +9924,14 @@ async function executeCreateImage(
   chatThread: ChatThreadModel,
   userMessage: string,
   signal?: AbortSignal,
-  modeOpts?: {
-    reasoning_effort?: "low" | "medium" | "high";
-    temperature?: number;
-  }
+  modeOpts?: { reasoning_effort?: "low" | "medium" | "high"; temperature?: number }
 ) {
-  const prompt = buildFaithfulImagePrompt(
-    userMessage,
-    args?.prompt || "",
-    "generate"
-  );
-
-  console.log("createImage called with prompt:", prompt);
-
-  if (!prompt) return "No prompt provided";
-  if (prompt.length > 32000)
-    return "Prompt is too long, it must be 32000 characters or fewer";
-
-  const openAI = OpenAIDALLEInstance();
-  const quality = normalizeGptImageQuality(args?.quality);
-
-  console.log("createImage resolved options:", {
-    size: normalizeGptImageSize(args?.size),
-    quality,
+  const result = await generateStoredChatImage({
+    ...args, threadId: chatThread.id, userMessage, signal,
   });
-
-  let response;
-  try {
-    response = await openAI.images.generate(
-      {
-        model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
-        prompt,
-        size: normalizeGptImageSize(args?.size),
-        quality,
-      },
-      { signal }
-    );
-  } catch (error) {
-    console.error("🔴 error while calling Azure image gen:\n", error);
-    return { error: "There was an error creating the image: " + error };
-  }
-
-  if (!response.data?.[0]?.b64_json) {
-    return { error: "Invalid API response: no b64_json." };
-  }
-
-  try {
-    const imageName = `${uniqueId()}.png`;
-    const buffer = Buffer.from(response.data[0].b64_json, "base64");
-
-    await UploadImageToStore(chatThread.id, imageName, buffer);
-    await UploadImageToStore(chatThread.id, "__base__.png", buffer);
-    await UploadImageToStore(chatThread.id, "__latest__.png", buffer);
-
-    lastTextLayoutByThread.delete(chatThread.id);
-    console.log("🗑️ Cleared text layout for thread:", chatThread.id);
-
-    const baseImageUrl = buildExternalImageUrl(chatThread.id, imageName);
-    return { revised_prompt: prompt, url: baseImageUrl };
-  } catch (error) {
-    console.error("🔴 error while storing image:\n", error);
-    return { error: "There was an error storing the image: " + error };
-  }
+  if ("error" in result) return result;
+  lastTextLayoutByThread.delete(chatThread.id);
+  return { revised_prompt: result.revised_prompt, url: buildExternalImageUrl(chatThread.id, result.fileName) };
 }
 
 async function readStoredImageBuffer(

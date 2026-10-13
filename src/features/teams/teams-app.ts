@@ -3,6 +3,8 @@ import "server-only";
 import { App } from "@microsoft/teams.apps";
 import { NextHttpAdapter } from "./next-http-adapter";
 import { createTeamsChatReply } from "./teams-chat-service";
+import { isTeamsImageGenerationRequest } from "./teams-image-intent";
+import { createTeamsImageReply } from "./teams-image-service";
 import { isTeamsSearchConfigured } from "./teams-search-service";
 import { isTeamsBraveSearchConfigured } from "./teams-brave-search-service";
 import {
@@ -249,12 +251,21 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
           uploadedFiles,
           userEmail,
         });
+        console.log("[teams-office] sending completion reply");
         await send(officeReply);
+        console.log("[teams-office] completion reply sent");
         await recordCompletedTeamsTurn({
           conversationId,
           activityId,
           teamsUserId,
         });
+        return;
+      }
+
+      if (isTeamsImageGenerationRequest(messageText)) {
+        await send("画像を生成します。完了までしばらくお待ちください。");
+        await send(await createTeamsImageReply({ message: messageText, conversationId, activityId, uploadedFiles }));
+        await recordCompletedTeamsTurn({ conversationId, activityId, teamsUserId });
         return;
       }
 

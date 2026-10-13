@@ -13,6 +13,12 @@ export interface SalesforceRoutingInput {
   message: string;
   isSalesforceAllowed: boolean;
   hasSalesforceExtension: boolean;
+  /**
+   * Salesforce extension chats use Salesforce as their default data source.
+   * Keep this explicit so callers such as Teams do not route every message to
+   * Salesforce merely because the integration is configured.
+   */
+  defaultToSalesforce?: boolean;
 }
 
 export interface SalesforceRoutingResult {
@@ -21,13 +27,13 @@ export interface SalesforceRoutingResult {
 }
 
 const KNOWLEDGE_SOURCE_PATTERN =
-  /(?:share\s*point|シェアポイント|社内(?:資料|文書|情報|データ|ナレッジ)|マニュアル|手順書|Q\s*&\s*A|\bQA\b|個人(?:ファイル|フォルダ(?:ー)?)|部署共通|部門共通|全社共通|全社共有)/i;
+  /(?:share\s*point|シェアポイント|(?:azure\s*)?ai\s*search|AI検索|検索インデックス|社内(?:資料|文書|情報|データ|ナレッジ)|マニュアル|手順書|Q\s*&\s*A|\bQA\b|個人(?:ファイル|フォルダ(?:ー)?)|部署共通|部門共通|全社共通|全社共有)/i;
 
 const SALESFORCE_KNOWLEDGE_PATTERN =
   /(?:使い方|操作方法|利用方法|何ができ|機能|概要|とは|マニュアル|手順|申請|障害|不具合|エラー|トラブル|Q\s*&\s*A|\bQA\b|ヘルプ|社内資料)/i;
 
 const SALESFORCE_DATA_ACTION_PATTERN =
-  /(?:調べ|検索|探し|探す|確認|取得|参照|見せ|表示|一覧|抽出|教えて|何件|件数|集計)/i;
+  /(?:調べ|検索|探し|探す|確認|取得|参照|見せ|表示|一覧|挙げ|あげて|列挙|抽出|教えて|何件|件数|集計|分析|要約|まとめ|傾向|助言)/i;
 
 const SALESFORCE_RECORD_PATTERN =
   /(?:取引先|顧客|商談|案件|日報|活動報告|売上|担当者|責任者|レコード|データ|情報)/i;
@@ -107,12 +113,16 @@ export function resolveSalesforceRoute(
     return { intent, route: "knowledge" };
   }
 
-  if (intent === "salesforce_data" && !input.isSalesforceAllowed) {
+  const shouldUseSalesforce =
+    intent === "salesforce_data" ||
+    (input.defaultToSalesforce === true && input.hasSalesforceExtension);
+
+  if (shouldUseSalesforce && !input.isSalesforceAllowed) {
     return { intent, route: "denied" };
   }
 
   if (
-    intent === "salesforce_data" &&
+    shouldUseSalesforce &&
     input.isSalesforceAllowed &&
     input.hasSalesforceExtension
   ) {
