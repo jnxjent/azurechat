@@ -2,12 +2,24 @@ import { GlobalFonts } from "@napi-rs/canvas";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
-/** Use the bundled Japanese font on Linux as well as installed Windows fonts. */
+let sourceFontsRegistered = false;
+
+/** Register real regular/bold faces; a variable font's default may be Thin. */
 export function registerSourceFonts(): void {
-  if (GlobalFonts.families.some(f => f.family === "Noto Sans JP")) return;
+  if (sourceFontsRegistered) return;
+  for (const root of [process.cwd(), path.resolve(process.cwd(), "..")]) {
+    const regular = path.join(root, "public", "fonts", "NotoSansJP-Text-Regular.ttf");
+    const bold = path.join(root, "public", "fonts", "NotoSansJP-Text-Bold.ttf");
+    if (existsSync(regular) && existsSync(bold)) {
+      const regularKey = GlobalFonts.registerFromPath(regular, "Noto Sans JP");
+      const boldKey = GlobalFonts.registerFromPath(bold, "Noto Sans JP");
+      if (regularKey && boldKey) { sourceFontsRegistered = true; return; }
+    }
+  }
+  if (GlobalFonts.families.some(f => f.family === "Noto Sans JP")) { sourceFontsRegistered = true; return; }
   for (const root of [process.cwd(), path.resolve(process.cwd(), "..")]) {
     const file = path.join(root, "public", "fonts", "NotoSansJP-Regular.ttf");
-    if (existsSync(file) && GlobalFonts.registerFromPath(file, "Noto Sans JP")) return;
+    if (existsSync(file) && GlobalFonts.registerFromPath(file, "Noto Sans JP")) { sourceFontsRegistered = true; return; }
   }
 }
 
