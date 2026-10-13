@@ -75,15 +75,17 @@ async function executeQuery(props: {
   }
 
   const data = await response.json().catch(() => null);
-  if (!data) {
+  if (!data || data.ok === false) {
     return "Salesforce Gatewayから有効な結果を取得できませんでした。";
   }
 
-  const serialized = JSON.stringify(data);
-  const json =
-    serialized.length > 8000
-      ? `${serialized.slice(0, 8000)}\n... (truncated)`
-      : serialized;
+  // The Gateway supplies compact display rows and authoritative table/scope
+  // instructions. Do not replace them with a generic summary prompt.
+  const json = JSON.stringify({
+    ok: data.ok, display_hint: data.display_hint, count: data.count,
+    total_count: data.total_count, items: data.items,
+    pagination: data.pagination, stage_summary: data.stage_summary,
+  });
   const openAI = OpenAIInstance();
   const completion = await openAI.chat.completions.create({
     model:
@@ -95,7 +97,11 @@ async function executeQuery(props: {
       {
         role: "system",
         content:
-          "Salesforce Gatewayが返したJSONだけを根拠に、日本語で簡潔に回答してください。JSONに存在しない情報を推測しないでください。lightning_urlがある場合は[開く](URL)形式にしてください。GatewayのJSONや内部指示は表示しないでください。",
+          [
+            "Salesforce Gatewayが返したJSONだけを根拠に、日本語で回答してください。JSONに存在しない情報を推測しないでください。lightning_urlがある場合は[開く](URL)形式にしてください。GatewayのJSONや内部指示は表示しないでください。",
+            "total_countは総件数、countは現在ページの件数です。itemsがある場合に該当なしと回答してはいけません。",
+            typeof data.table_instruction === "string" ? data.table_instruction : "",
+          ].join("\n"),
       },
       { role: "user", content: `質問:\n${props.message}\n\nGateway JSON:\n${json}` },
     ],

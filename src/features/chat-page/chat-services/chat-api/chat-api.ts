@@ -35,6 +35,7 @@ import { GetDynamicExtensions } from "./chat-api-dynamic-extensions";
 import { ChatApiExtensions } from "./chat-api-extension";
 import { ChatApiMultimodal } from "./chat-api-multimodal";
 import {
+  isPptxAssetPlacementRequest,
   isSharePointImageRequest,
   resolveRequiredImageToolName,
 } from "./image/image-intent";
@@ -69,34 +70,6 @@ function normalizeImageAttachments(value: unknown): string[] {
   }
   const single = String(value ?? "").trim();
   return single ? [single] : [];
-}
-
-/**
- * A logo/image attached for an existing deck is a PowerPoint asset, not a
- * request to compose a new raster image with GPT Image.
- */
-function isPptxAssetPlacementRequest(message: string): boolean {
-  const value = String(message ?? "");
-  const asksToReplaceLogoWithAttachment =
-    /^(?=[\s\S]*(?:ロゴ|logo))(?=[\s\S]*(?:添付|アップロード|attachment))(?=[\s\S]*(?:差し替|差替|置き換|交換|replace|swap))[\s\S]*$/i.test(
-      value
-    );
-  const referencesExistingDeck =
-    /(?:添付|上記|この|今の|先ほど|さきほど|出力した|生成した|作成した|既存の).{0,16}(?:PPTX?|PowerPoint|スライド|資料)/i.test(
-      value
-    ) ||
-    /(?:PPTX?|PowerPoint|スライド|資料).{0,16}(?:編集|修正|変更|追加)/i.test(
-      value
-    );
-  const asksForAssetPlacement =
-    /(?:ロゴ|logo|添付画像|画像).{0,20}(?:入れ|挿入|配置|載せ|追加|右肩|表紙|フロント)/i.test(
-      value
-    ) ||
-    /(?:入れ|挿入|配置|載せ|追加).{0,20}(?:ロゴ|logo|添付画像)/i.test(
-      value
-    );
-  return asksToReplaceLogoWithAttachment ||
-    (referencesExistingDeck && asksForAssetPlacement);
 }
 
 /** ★最小ガード：直前 assistant.tool_calls に紐付かない tool を history から除外 */

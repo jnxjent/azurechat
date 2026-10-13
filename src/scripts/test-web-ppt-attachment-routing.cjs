@@ -34,6 +34,7 @@ function load(relative) {
   const original = mod.require.bind(mod);
   mod.require = name => {
     if (name === 'server-only') return {};
+    if (name === './image/image-intent') return load('features/chat-page/chat-services/chat-api/image/image-intent.ts');
     if (name === '@/features/pptx/output-intent') return load('features/pptx/output-intent.ts');
     if (name === '@/features/pptx/palette') return { resolvePptxPaletteInstruction: () => null };
     if (name.startsWith('@/') || name.startsWith('../') || name.startsWith('./')) return services;
@@ -73,6 +74,10 @@ async function main() {
   assert.equal(captured.requiredToolName, undefined, 'no source must not fabricate conversion');
   await run('添付を参考に営業用PPTを作成して');
   assert.equal(captured.requiredToolName, 'create_pptx');
+  await run('今出した廃棄物処理車の荷台の「Midac」という文字を添付Logoに差し替えて絵を出して', 'data:image/png;base64,aW1hZ2U=');
+  assert.equal(captured.requiredToolName, 'edit_existing_image');
+  await run('今のPPTのロゴを添付Logoに差し替えて', 'data:image/png;base64,aW1hZ2U=');
+  assert.equal(captured.requiredToolName, 'edit_pptx');
   console.log('Web PPT attachment routing passed (actual ChatAPIEntry, storage/model doubles).');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

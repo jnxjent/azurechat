@@ -394,8 +394,8 @@ const chatApiSource = fs.readFileSync(
   "features/chat-page/chat-services/chat-api/chat-api.ts",
   "utf8"
 );
-assert.ok(chatApiSource.includes("asksToReplaceLogoWithAttachment"));
-assert.ok(chatApiSource.includes("差し替"));
+assert.equal(intent.isPptxAssetPlacementRequest("今出した廃棄物処理車の文字を添付Logoに差し替えて絵を出して"), false);
+assert.equal(intent.isPptxAssetPlacementRequest("今のPPTのロゴを添付Logoに差し替えて"), true);
 assert.ok(imageExtensions.includes("hasReplacementAction"));
 assert.ok(imageExtensions.includes("needsAttachedImage"));
 assert.ok(imageExtensions.includes("resolveLatestStoredImageDataUrl(props.chatThread.id)"));

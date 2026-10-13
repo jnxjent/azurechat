@@ -9,6 +9,15 @@ const TEXT_ADD_ACTION_PATTERN =
 
 const QUOTED_TEXT_PATTERN = /[「『“"]\s*[^」』”"]+\s*[」』”"]/;
 
+/** Asset replacement alone must never force a raster-image request into PPT. */
+export function isPptxAssetPlacementRequest(message: string): boolean {
+  const value = String(message ?? "");
+  const hasDeckContext = /(?:\bPPTX?\b|PowerPoint|パワーポイント|スライド|プレゼン|資料)/i.test(value);
+  const hasAsset = /(?:ロゴ|logo|画像|写真|マーク)/i.test(value);
+  const hasPlacement = /(?:差し替|差替|置き換|置換|交換|入れ|挿入|配置|載せ|追加|貼|replace|swap)/i.test(value);
+  return hasDeckContext && hasAsset && hasPlacement;
+}
+
 /** チャット添付のdata URLを画像編集APIへ渡せるバイト列に戻す。 */
 export function decodeChatImageDataUrl(value: string): Buffer | null {
   const match = String(value ?? "").match(

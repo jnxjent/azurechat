@@ -52,6 +52,7 @@ import {
   sanitizeImageLocationForLog,
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
+import { generateStoredChatImage } from "./image/image-generation-service";
 import { isCompanyProfileContent, PPT_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
 import { resolveWordEditInstruction } from "./word-edit-instruction";
 import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
@@ -9923,68 +9924,14 @@ async function executeCreateImage(
   chatThread: ChatThreadModel,
   userMessage: string,
   signal?: AbortSignal,
-  modeOpts?: {
-    reasoning_effort?: "low" | "medium" | "high";
-    temperature?: number;
-  }
+  modeOpts?: { reasoning_effort?: "low" | "medium" | "high"; temperature?: number }
 ) {
-  const prompt = buildFaithfulImagePrompt(
-    userMessage,
-    args?.prompt || "",
-    "generate"
-  );
-
-  console.log("createImage called with prompt:", prompt);
-
-  if (!prompt) return "No prompt provided";
-  if (prompt.length > 32000)
-    return "Prompt is too long, it must be 32000 characters or fewer";
-
-  const openAI = OpenAIDALLEInstance();
-  const quality = normalizeGptImageQuality(args?.quality);
-
-  console.log("createImage resolved options:", {
-    size: normalizeGptImageSize(args?.size),
-    quality,
+  const result = await generateStoredChatImage({
+    ...args, threadId: chatThread.id, userMessage, signal,
   });
-
-  let response;
-  try {
-    response = await openAI.images.generate(
-      {
-        model: process.env.AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME!,
-        prompt,
-        size: normalizeGptImageSize(args?.size),
-        quality,
-      },
-      { signal }
-    );
-  } catch (error) {
-    console.error("🔴 error while calling Azure image gen:\n", error);
-    return { error: "There was an error creating the image: " + error };
-  }
-
-  if (!response.data?.[0]?.b64_json) {
-    return { error: "Invalid API response: no b64_json." };
-  }
-
-  try {
-    const imageName = `${uniqueId()}.png`;
-    const buffer = Buffer.from(response.data[0].b64_json, "base64");
-
-    await UploadImageToStore(chatThread.id, imageName, buffer);
-    await UploadImageToStore(chatThread.id, "__base__.png", buffer);
-    await UploadImageToStore(chatThread.id, "__latest__.png", buffer);
-
-    lastTextLayoutByThread.delete(chatThread.id);
-    console.log("🗑️ Cleared text layout for thread:", chatThread.id);
-
-    const baseImageUrl = buildExternalImageUrl(chatThread.id, imageName);
-    return { revised_prompt: prompt, url: baseImageUrl };
-  } catch (error) {
-    console.error("🔴 error while storing image:\n", error);
-    return { error: "There was an error storing the image: " + error };
-  }
+  if ("error" in result) return result;
+  lastTextLayoutByThread.delete(chatThread.id);
+  return { revised_prompt: result.revised_prompt, url: buildExternalImageUrl(chatThread.id, result.fileName) };
 }
 
 async function readStoredImageBuffer(
