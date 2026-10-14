@@ -28,6 +28,12 @@ const access = loadTypeScriptModule(
 );
 
 const teamsReportCases = [
+  ["SalesforceでJ＆T環境の進行中の商談を出してください", "salesforce"],
+  ["SalesforceでJ＆T環境の成約した商談を出してください", "salesforce"],
+  ["SalesforceでJ＆T環境の失注した商談を出してください", "salesforce"],
+  ["SFでJ＆T環境の商談を出して", "salesforce"],
+  ["商談を出してください", "normal"],
+  ["Salesforceの操作手順を出してください", "knowledge"],
   ["Salesforceの日報から、私の部下の最近の活動を分析して", "salesforce"],
   ["Salesforceの日報から、私の部下の先週の日報内容をまとめて", "salesforce"],
   ["SFで私の部下の最近の活動を分析して", "salesforce"],
@@ -49,9 +55,32 @@ for (const [message, expected] of teamsReportCases) {
   if (expected === "salesforce") {
     assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
     assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
-    assert.equal(routing.buildSalesforceGatewayQuery(message), message.normalize("NFKC").replace(/^(?:Salesforceの|SFで|セールスフォースの)/, ""));
+    assert.equal(routing.buildSalesforceGatewayQuery(message), message.replace(/^(?:Salesforce(?:の|で)|SFで|セールスフォースの)/, ""));
   }
 }
+
+// Source instructions must route to Salesforce and be removed from the payload
+// without changing the account name or bypassing access checks.
+for (const prefix of ["Salesforceをみて", "Salesforceを見て", "Salesforceを参照して", "SFをみて", "セールスフォースを見て", "Salesforceから", "Salesforceのデータから", "Salesforceの情報をもとに", "Salesforceの情報を基に", "SFのデータから", "セールスフォースの情報をもとに"]) {
+  const query = "J＆T環境の進行中の商談を出して";
+  const message = `${prefix}、${query}`;
+  const input = { message, isSalesforceAllowed: true, hasSalesforceExtension: true, defaultToSalesforce: false };
+  assert.equal(routing.resolveSalesforceRoute(input).route, "salesforce", message);
+  assert.equal(routing.buildSalesforceGatewayQuery(message), query, message);
+  assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
+  assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
+}
+assert.equal(routing.buildSalesforceGatewayQuery("Salesforceをみて、J＆T環境㈱の商談を挙げて"), "J＆T環境㈱の商談を挙げて");
+assert.equal(routing.classifySalesforceIntent("Salesforceをみて、操作手順を教えて"), "knowledge_search");
+assert.equal(routing.classifySalesforceIntent("SF映画をみて、感想を出して"), "normal");
+for (const status of ["進行中の", "成約した", "失注した"]) {
+  const query = `J＆T環境㈱の${status}商談を出して`;
+  const message = `Salesforceの情報をもとに、${query}`;
+  assert.equal(routing.classifySalesforceIntent(message), "salesforce_data");
+  assert.equal(routing.buildSalesforceGatewayQuery(message), query);
+}
+assert.equal(routing.classifySalesforceIntent("SalesforceのデータからSharePointの社内資料を検索して"), "knowledge_search");
+assert.equal(routing.classifySalesforceIntent("Salesforceの情報をもとに、操作手順を教えて"), "knowledge_search");
 
 const cases = [
   ["こんにちは", true, "salesforce"],
@@ -141,7 +170,7 @@ assert.equal(
 );
 assert.equal(
   routing.buildSalesforceGatewayQuery("Salesforceによれば、大映産業の住所は？"),
-  "大映産業の住所は?"
+  "大映産業の住所は？"
 );
 assert.equal(
   routing.buildSalesforceGatewayQuery(
@@ -149,6 +178,19 @@ assert.equal(
   ),
   "日栄産業株式会社の住所を教えて"
 );
+
+const preservedQueryCases = [
+  ["J＆T環境㈱で進行中の商談を挙げて", "J＆T環境㈱で進行中の商談を挙げて"],
+  ["SalesforceでJ＆T環境㈱で進行中の商談を挙げて", "J＆T環境㈱で進行中の商談を挙げて"],
+  ["取引先名が「J＆T環境」の未完了の商談を一覧にしてください。", "取引先名が「J＆T環境」の未完了の商談を一覧にしてください。"],
+  ["ＳＦ連携でJ＆T環境㈱の商談を調べて", "J＆T環境㈱の商談を調べて"],
+  ["ＳａｌｅｓｆｏｒｃｅでJ＆T環境㈱の商談を調べて", "J＆T環境㈱の商談を調べて"],
+  ["SalesforceでＡ＆Ｂ産業を調べて", "取引先のＡ＆Ｂ産業について教えて"],
+  ["SalesforceでJ&T環境(株)の商談を調べて", "J&T環境(株)の商談を調べて"],
+];
+for (const [message, expected] of preservedQueryCases) {
+  assert.strictEqual(routing.buildSalesforceGatewayQuery(message), expected, message);
+}
 
 const webEntrySource = fs.readFileSync(
   "features/chat-page/chat-services/chat-api/chat-api.ts",

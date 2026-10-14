@@ -33,7 +33,7 @@ const SALESFORCE_KNOWLEDGE_PATTERN =
   /(?:使い方|操作方法|利用方法|何ができ|機能|概要|とは|マニュアル|手順|申請|障害|不具合|エラー|トラブル|Q\s*&\s*A|\bQA\b|ヘルプ|社内資料)/i;
 
 const SALESFORCE_DATA_ACTION_PATTERN =
-  /(?:調べ|検索|探し|探す|確認|取得|参照|見せ|表示|一覧|挙げ|あげて|列挙|抽出|教えて|何件|件数|集計|分析|要約|まとめ|傾向|助言)/i;
+  /(?:調べ|検索|探し|探す|確認|取得|参照|見せ|表示|一覧|挙げ|あげて|列挙|抽出|出して|教えて|何件|件数|集計|分析|要約|まとめ|傾向|助言)/i;
 
 const SALESFORCE_RECORD_PATTERN =
   /(?:取引先|顧客|商談|案件|日報|活動報告|売上|担当者|責任者|レコード|データ|情報)/i;
@@ -49,7 +49,7 @@ function normalizeMessage(message: string): string {
  */
 function containsSalesforceMarker(message: string): boolean {
   if (/salesforce|セールスフォース/i.test(message)) return true;
-  return /(?:^|[\s、。,.!！?？「」『』（）()])SF(?=$|[\s、。,.!！?？「」『』（）()]|によ|で|から|上|内|連携)/i.test(
+  return /(?:^|[\s、。,.!！?？「」『』（）()])SF(?=$|[\s、。,.!！?？「」『』（）()]|によ|で|から|上|内|連携|を(?:みて|見て|参照して)|の(?:データ|情報))/i.test(
     message
   );
 }
@@ -77,10 +77,10 @@ export function classifySalesforceIntent(message: string): SalesforceIntent {
     /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:によれば)/i.test(normalized);
 
   const explicitlyNamesSalesforceAsSource =
-    /(?:salesforce|セールスフォース)(?:で|から|上|内|連携で)/i.test(
+    /(?:salesforce|セールスフォース)(?:で|から|上|内|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に))/i.test(
       normalized
     ) ||
-    /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:で|から|上|内|連携で)/i.test(
+    /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:で|から|上|内|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に))/i.test(
       normalized
     );
 
@@ -144,19 +144,19 @@ const COMPANY_NAME_SUFFIX_PATTERN =
  * field.
  */
 export function buildSalesforceGatewayQuery(message: string): string {
-  const normalized = normalizeMessage(message);
-  const withoutSourcePrefix = normalized.replace(
-    /^(?:salesforce|セールスフォース|SF)(?:によれば|連携で|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
+  // Normalize only for classification; preserve record names in the payload.
+  const withoutSourcePrefix = String(message ?? "").trim().replace(
+    /^(?:salesforce|ｓａｌｅｓｆｏｒｃｅ|セールスフォース|SF|ｓｆ)(?:によれば|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に)|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
     ""
   );
-  if (EXPLICIT_SALESFORCE_OBJECT_PATTERN.test(withoutSourcePrefix)) {
+  if (EXPLICIT_SALESFORCE_OBJECT_PATTERN.test(normalizeMessage(withoutSourcePrefix))) {
     return withoutSourcePrefix;
   }
   const match = withoutSourcePrefix.match(
     /^(.{2,60}?)を(?:調べて|検索して|探して|確認して)(?:ください|下さい)?[。.!！?？]*$/
   );
   const companyName = match?.[1]?.trim() ?? "";
-  if (!companyName || !COMPANY_NAME_SUFFIX_PATTERN.test(companyName)) {
+  if (!companyName || !COMPANY_NAME_SUFFIX_PATTERN.test(normalizeMessage(companyName))) {
     return withoutSourcePrefix;
   }
 
