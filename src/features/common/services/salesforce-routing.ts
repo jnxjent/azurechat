@@ -144,19 +144,19 @@ const COMPANY_NAME_SUFFIX_PATTERN =
  * field.
  */
 export function buildSalesforceGatewayQuery(message: string): string {
-  const normalized = normalizeMessage(message);
-  const withoutSourcePrefix = normalized.replace(
-    /^(?:salesforce|セールスフォース|SF)(?:によれば|連携で|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
+  // Normalize only for classification; preserve record names in the payload.
+  const withoutSourcePrefix = String(message ?? "").trim().replace(
+    /^(?:salesforce|ｓａｌｅｓｆｏｒｃｅ|セールスフォース|SF|ｓｆ)(?:によれば|連携で|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
     ""
   );
-  if (EXPLICIT_SALESFORCE_OBJECT_PATTERN.test(withoutSourcePrefix)) {
+  if (EXPLICIT_SALESFORCE_OBJECT_PATTERN.test(normalizeMessage(withoutSourcePrefix))) {
     return withoutSourcePrefix;
   }
   const match = withoutSourcePrefix.match(
     /^(.{2,60}?)を(?:調べて|検索して|探して|確認して)(?:ください|下さい)?[。.!！?？]*$/
   );
   const companyName = match?.[1]?.trim() ?? "";
-  if (!companyName || !COMPANY_NAME_SUFFIX_PATTERN.test(companyName)) {
+  if (!companyName || !COMPANY_NAME_SUFFIX_PATTERN.test(normalizeMessage(companyName))) {
     return withoutSourcePrefix;
   }
 

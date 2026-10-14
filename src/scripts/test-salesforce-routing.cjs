@@ -49,7 +49,7 @@ for (const [message, expected] of teamsReportCases) {
   if (expected === "salesforce") {
     assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
     assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
-    assert.equal(routing.buildSalesforceGatewayQuery(message), message.normalize("NFKC").replace(/^(?:Salesforceの|SFで|セールスフォースの)/, ""));
+    assert.equal(routing.buildSalesforceGatewayQuery(message), message.replace(/^(?:Salesforceの|SFで|セールスフォースの)/, ""));
   }
 }
 
@@ -141,7 +141,7 @@ assert.equal(
 );
 assert.equal(
   routing.buildSalesforceGatewayQuery("Salesforceによれば、大映産業の住所は？"),
-  "大映産業の住所は?"
+  "大映産業の住所は？"
 );
 assert.equal(
   routing.buildSalesforceGatewayQuery(
@@ -149,6 +149,19 @@ assert.equal(
   ),
   "日栄産業株式会社の住所を教えて"
 );
+
+const preservedQueryCases = [
+  ["J＆T環境㈱で進行中の商談を挙げて", "J＆T環境㈱で進行中の商談を挙げて"],
+  ["SalesforceでJ＆T環境㈱で進行中の商談を挙げて", "J＆T環境㈱で進行中の商談を挙げて"],
+  ["取引先名が「J＆T環境」の未完了の商談を一覧にしてください。", "取引先名が「J＆T環境」の未完了の商談を一覧にしてください。"],
+  ["ＳＦ連携でJ＆T環境㈱の商談を調べて", "J＆T環境㈱の商談を調べて"],
+  ["ＳａｌｅｓｆｏｒｃｅでJ＆T環境㈱の商談を調べて", "J＆T環境㈱の商談を調べて"],
+  ["SalesforceでＡ＆Ｂ産業を調べて", "取引先のＡ＆Ｂ産業について教えて"],
+  ["SalesforceでJ&T環境(株)の商談を調べて", "J&T環境(株)の商談を調べて"],
+];
+for (const [message, expected] of preservedQueryCases) {
+  assert.strictEqual(routing.buildSalesforceGatewayQuery(message), expected, message);
+}
 
 const webEntrySource = fs.readFileSync(
   "features/chat-page/chat-services/chat-api/chat-api.ts",
