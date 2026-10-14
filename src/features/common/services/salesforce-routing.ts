@@ -49,7 +49,7 @@ function normalizeMessage(message: string): string {
  */
 function containsSalesforceMarker(message: string): boolean {
   if (/salesforce|セールスフォース/i.test(message)) return true;
-  return /(?:^|[\s、。,.!！?？「」『』（）()])SF(?=$|[\s、。,.!！?？「」『』（）()]|によ|で|から|上|内|連携)/i.test(
+  return /(?:^|[\s、。,.!！?？「」『』（）()])SF(?=$|[\s、。,.!！?？「」『』（）()]|によ|で|から|上|内|連携|を(?:みて|見て|参照して)|の(?:データ|情報))/i.test(
     message
   );
 }
@@ -77,10 +77,10 @@ export function classifySalesforceIntent(message: string): SalesforceIntent {
     /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:によれば)/i.test(normalized);
 
   const explicitlyNamesSalesforceAsSource =
-    /(?:salesforce|セールスフォース)(?:で|から|上|内|連携で)/i.test(
+    /(?:salesforce|セールスフォース)(?:で|から|上|内|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に))/i.test(
       normalized
     ) ||
-    /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:で|から|上|内|連携で)/i.test(
+    /(?:^|[\s、。,.!！?？「」『』（）()])SF(?:で|から|上|内|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に))/i.test(
       normalized
     );
 
@@ -146,7 +146,7 @@ const COMPANY_NAME_SUFFIX_PATTERN =
 export function buildSalesforceGatewayQuery(message: string): string {
   // Normalize only for classification; preserve record names in the payload.
   const withoutSourcePrefix = String(message ?? "").trim().replace(
-    /^(?:salesforce|ｓａｌｅｓｆｏｒｃｅ|セールスフォース|SF|ｓｆ)(?:によれば|連携で|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
+    /^(?:salesforce|ｓａｌｅｓｆｏｒｃｅ|セールスフォース|SF|ｓｆ)(?:によれば|連携で|を(?:みて|見て|参照して)|の(?:データ|情報)(?:から|を(?:もと|元|基)に)|で|から|上(?:の|で)|内(?:の|で)|の)?[\s、,:：]*/i,
     ""
   );
   if (EXPLICIT_SALESFORCE_OBJECT_PATTERN.test(normalizeMessage(withoutSourcePrefix))) {

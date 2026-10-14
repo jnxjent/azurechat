@@ -59,6 +59,29 @@ for (const [message, expected] of teamsReportCases) {
   }
 }
 
+// Source instructions must route to Salesforce and be removed from the payload
+// without changing the account name or bypassing access checks.
+for (const prefix of ["Salesforceをみて", "Salesforceを見て", "Salesforceを参照して", "SFをみて", "セールスフォースを見て", "Salesforceから", "Salesforceのデータから", "Salesforceの情報をもとに", "Salesforceの情報を基に", "SFのデータから", "セールスフォースの情報をもとに"]) {
+  const query = "J＆T環境の進行中の商談を出して";
+  const message = `${prefix}、${query}`;
+  const input = { message, isSalesforceAllowed: true, hasSalesforceExtension: true, defaultToSalesforce: false };
+  assert.equal(routing.resolveSalesforceRoute(input).route, "salesforce", message);
+  assert.equal(routing.buildSalesforceGatewayQuery(message), query, message);
+  assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
+  assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
+}
+assert.equal(routing.buildSalesforceGatewayQuery("Salesforceをみて、J＆T環境㈱の商談を挙げて"), "J＆T環境㈱の商談を挙げて");
+assert.equal(routing.classifySalesforceIntent("Salesforceをみて、操作手順を教えて"), "knowledge_search");
+assert.equal(routing.classifySalesforceIntent("SF映画をみて、感想を出して"), "normal");
+for (const status of ["進行中の", "成約した", "失注した"]) {
+  const query = `J＆T環境㈱の${status}商談を出して`;
+  const message = `Salesforceの情報をもとに、${query}`;
+  assert.equal(routing.classifySalesforceIntent(message), "salesforce_data");
+  assert.equal(routing.buildSalesforceGatewayQuery(message), query);
+}
+assert.equal(routing.classifySalesforceIntent("SalesforceのデータからSharePointの社内資料を検索して"), "knowledge_search");
+assert.equal(routing.classifySalesforceIntent("Salesforceの情報をもとに、操作手順を教えて"), "knowledge_search");
+
 const cases = [
   ["こんにちは", true, "salesforce"],
   ["大映産業の住所は？", true, "salesforce"],
