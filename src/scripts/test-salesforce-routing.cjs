@@ -28,6 +28,12 @@ const access = loadTypeScriptModule(
 );
 
 const teamsReportCases = [
+  ["SalesforceでJ＆T環境の進行中の商談を出してください", "salesforce"],
+  ["SalesforceでJ＆T環境の成約した商談を出してください", "salesforce"],
+  ["SalesforceでJ＆T環境の失注した商談を出してください", "salesforce"],
+  ["SFでJ＆T環境の商談を出して", "salesforce"],
+  ["商談を出してください", "normal"],
+  ["Salesforceの操作手順を出してください", "knowledge"],
   ["Salesforceの日報から、私の部下の最近の活動を分析して", "salesforce"],
   ["Salesforceの日報から、私の部下の先週の日報内容をまとめて", "salesforce"],
   ["SFで私の部下の最近の活動を分析して", "salesforce"],
@@ -49,7 +55,7 @@ for (const [message, expected] of teamsReportCases) {
   if (expected === "salesforce") {
     assert.equal(routing.resolveSalesforceRoute({ ...input, isSalesforceAllowed: false }).route, "denied");
     assert.equal(routing.resolveSalesforceRoute({ ...input, hasSalesforceExtension: false }).route, "normal");
-    assert.equal(routing.buildSalesforceGatewayQuery(message), message.replace(/^(?:Salesforceの|SFで|セールスフォースの)/, ""));
+    assert.equal(routing.buildSalesforceGatewayQuery(message), message.replace(/^(?:Salesforce(?:の|で)|SFで|セールスフォースの)/, ""));
   }
 }
 
