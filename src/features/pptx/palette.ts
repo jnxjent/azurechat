@@ -23,13 +23,15 @@ export const PPTX_NAMED_PALETTES: Record<string, NamedPaletteBase> = {
     labelJa:"チャコール×テラコッタ", shortDesc:"炭色×煉瓦色", mood:"重厚・実直・安定", recommendedFor:"建設・土木・インフラ" },
   coral_orange:   { main:"183F34", accent:"E07038", accent_light:"FCEADE", main_light:"E1EDE6", text_muted:"5B6E62",
     labelJa:"深緑×コーラルオレンジ", shortDesc:"深緑×珊瑚橙", mood:"活力・誠実・フレッシュ", recommendedFor:"産廃・環境サービス・営業資料（暖色系）" },
+  blue_sky: { main:"2463A6", accent:"66B5E8", accent_light:"EAF5FC", main_light:"E1EDF8", text_muted:"576F86",
+    labelJa:"ブルー×スカイブルー", shortDesc:"青×明るい水色", mood:"爽やか・明快・信頼", recommendedFor:"比較表・業務報告・説明資料（青系）" },
 };
 
 // 色パレット一覧テキスト（ユーザー向けメッセージ用）
 export function pptxPaletteListText(): string {
   return PPTX_PALETTE_KEYS.map((k, i) => {
     const m = PPTX_NAMED_PALETTES[k];
-    return `${i + 1}. **${m.labelJa}**（${m.mood}）：${m.recommendedFor}`;
+    return `${i + 1}. **${m.shortDesc}（${m.labelJa}）**（${m.mood}）：${m.recommendedFor}`;
   }).join("\n");
 }
 
@@ -66,7 +68,7 @@ export function isPptxWhiteBaseRequest(s: string): boolean {
   );
 }
 
-// 判定順: ①複合パレット名明示 → ②基本色明示 → ③日本語複合名 → ④英語ID → ⑤個別KW → ⑥数字参照(1〜6) → ⑦基本色
+// 判定順: ①複合パレット名明示 → ②基本色明示 → ③日本語複合名 → ④英語ID → ⑤個別KW → ⑥数字参照(1〜7) → ⑦基本色
 export function resolvePptxPaletteInstruction(s: string): PaletteResolution | null {
   const t = s.toLowerCase();
 
@@ -90,14 +92,16 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
   if (isExplicitTarget("深緑.{0,4}アンバー|forest.amber|フォレスト.{0,4}アンバー"))                                          return paletteOf("forest_amber");
   if (isExplicitTarget("ネイビー.{0,4}オレンジ|navy.orange"))                                                                 return paletteOf("navy_orange");
   if (isExplicitTarget("チャコール.{0,4}テラコッタ|charcoal.terra"))                                                          return paletteOf("charcoal_terra");
+  if (isExplicitTarget("ブルー.{0,4}スカイブルー|blue.sky|青.{0,4}水色")) return paletteOf("blue_sky");
+  if (isExplicitTarget("青緑|ティール|teal|コーラル|coral")) return paletteOf("teal_coral");
 
   // ② 基本色の変更先明示（複合名より後に評価 → コーラルオレンジが①で捕捉済みなのでオレンジ単体に安全にマッチ）
   // 赤・緑・紺はパレット全体を返す（単色だと色体系が崩れるため）
-  // 青はパレット候補がなく単色指定（navy_orange は紺ベースで「青系」とは別）
+  // 青は紺系とは分け、blue_sky パレットを適用する。
   if (isExplicitTarget("赤|赤系|赤色|赤のトーン|レッド|red")) return paletteOf("burgundy_gold");
   if (isExplicitTarget("緑|緑系|グリーン|green"))             return paletteOf("forest_amber");
   if (isExplicitTarget("紺|ネイビー|navy"))                    return paletteOf("navy_orange");
-  if (isExplicitTarget("青|青系|ブルー|blue"))  return { accentColor: "2F5597" };
+  if (isExplicitTarget("青|青系|ブルー|blue"))  return paletteOf("blue_sky");
   if (isExplicitTarget("紫|パープル|purple"))   return { accentColor: "7030A0" };
   if (isExplicitTarget("オレンジ|orange|橙"))   return { accentColor: "C55A11" };
   if (isExplicitTarget("黄|イエロー|yellow"))   return { accentColor: "BF9000" };
@@ -107,7 +111,8 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
   let key: string | null = null;
 
   // 日本語複合名（最優先: navy_orange が navy 単体に誤マッチしないよう）
-  if      (/(ネイビー.{0,2}オレンジ|ネイビーオレンジ)/.test(s))           key = "navy_orange";
+  if (/ブルー.{0,4}スカイブルー|blue.sky|青.{0,4}水色/.test(t)) key = "blue_sky";
+  else if (/(ネイビー.{0,2}オレンジ|ネイビーオレンジ)/.test(s))           key = "navy_orange";
   else if (/(深緑.{0,2}アンバー|深緑アンバー|フォレスト.{0,2}アンバー)/.test(s)) key = "forest_amber";
   else if (/(バーガンディ.{0,2}ゴールド|バーガンディゴールド|ワインレッド.{0,2}ゴールド)/.test(s)) key = "burgundy_gold";
   else if (/(ティール.{0,2}コーラル|ティールコーラル|青緑.{0,2}コーラル)/.test(s)) key = "teal_coral";
@@ -135,12 +140,12 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
 
   // 数字参照: "1で"/"2で"... → palette by index (色名未検出時のみ)
   // 候補を個別評価し、ページ番号文脈・箇条書き/項目数文脈は除外
-  const barePaletteNumber = s.trim().match(/^([1-6１２３４５６])(?:番)?$/);
+  const barePaletteNumber = s.trim().match(/^([1-7１２３４５６７])(?:番)?$/);
   if (barePaletteNumber) {
     const digit = barePaletteNumber[1];
-    const number = digit >= "1" && digit <= "6"
+    const number = digit >= "1" && digit <= "7"
       ? Number(digit)
-      : "１２３４５６".indexOf(digit) + 1;
+      : "１２３４５６７".indexOf(digit) + 1;
     const paletteKey = PPTX_PALETTE_KEYS[number - 1];
     if (paletteKey) {
       const palette = buildPaletteFromKey(paletteKey)!;
@@ -153,7 +158,7 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
   }
 
   let paletteNumMatch: RegExpMatchArray | null = null;
-  const paletteNumberRe = /([1-6１-６])番?[でに]/g;
+  const paletteNumberRe = /([1-7１-７])番?[でに]/g;
   let m: RegExpExecArray | null;
   while ((m = paletteNumberRe.exec(s)) !== null) {
     const before = s.slice(Math.max(0, m.index - 12), m.index);
@@ -169,7 +174,7 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
   }
   if (paletteNumMatch) {
     const d = paletteNumMatch[1];
-    const n = d >= "1" && d <= "6" ? parseInt(d) : "１２３４５６".indexOf(d) + 1;
+    const n = d >= "1" && d <= "7" ? parseInt(d) : "１２３４５６７".indexOf(d) + 1;
     const paletteKey = PPTX_PALETTE_KEYS[n - 1];
     if (paletteKey) {
       const palette = buildPaletteFromKey(paletteKey)!;
@@ -183,8 +188,8 @@ export function resolvePptxPaletteInstruction(s: string): PaletteResolution | nu
     const palette = buildPaletteFromKey("burgundy_gold")!;
     return { paletteKey: "burgundy_gold", palette, accentColor: PPTX_NAMED_PALETTES["burgundy_gold"].main };
   }
-  if (/(青|blue)/.test(t))             return { accentColor: "2F5597" };
-  if (/(緑|green)/.test(t))            return { accentColor: "548235" };
+  if (/(青|ブルー|水色|blue)/.test(t)) return paletteOf("blue_sky");
+  if (/(緑|グリーン|green)/.test(t)) return paletteOf("forest_amber");
   if (/(紫|purple)/.test(t))           return { accentColor: "7030A0" };
   if (/(オレンジ|orange|橙)/.test(t)) return { accentColor: "C55A11" };
   if (/(黄|yellow)/.test(t))           return { accentColor: "BF9000" };

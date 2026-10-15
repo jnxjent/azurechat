@@ -1,4 +1,5 @@
 import "server-only";
+import { isExcelTableToSlideRequest } from "@/features/pptx/output-intent";
 
 import { App } from "@microsoft/teams.apps";
 import { NextHttpAdapter } from "./next-http-adapter";
@@ -131,7 +132,7 @@ async function createTeamsRuntime(): Promise<TeamsRuntime> {
         if (uploadedFiles.length > 0) {
           await registerTeamsUploadedOfficeFiles(teamsThreadId, uploadedFiles);
           await send(buildTeamsFileReceivedMessage(uploadedFiles));
-        } else if (text && referencesTeamsUpload(text)) {
+        } else if (text && (referencesTeamsUpload(text) || isExcelTableToSlideRequest(text))) {
           uploadedFiles = await readLatestTeamsFiles(teamsThreadId);
         }
       } catch (error) {
@@ -359,6 +360,9 @@ async function recordCompletedTeamsTurn(props: {
 }
 
 function buildOfficeStartMessage(request: TeamsOfficeRequest): string {
+  if (request.action === "excel_table_slide") {
+    return "添付Excelの表をPowerPointスライド1枚に清書します。";
+  }
   if (request.action === "ppt_color_help") {
     return "利用可能なPowerPointの色パターンを確認します。";
   }

@@ -5,6 +5,7 @@ import PptxGenJS from "pptxgenjs";
 import JSZip from "jszip";
 import { addLogoToPptx } from "@/features/pptx/logo-overlay";
 import { createPdfImageDeck } from "@/features/pptx/pdf-image-deck";
+import { renderExcelTableSlide } from "@/features/pptx/excel-table-slide";
 import {
   BlobServiceClient,
 } from "@azure/storage-blob";
@@ -5332,6 +5333,18 @@ export async function POST(req: NextRequest) {
       if (rawBody.threadId) await savePptxPointer(rawBody.threadId, blobKey, fileName);
       return NextResponse.json({ downloadUrl, fileName, totalSlides: rawBody.slides.length,
         message: "元の図・写真を保持し、文字を編集可能なテキストとして変換しました。" });
+    }
+    // Excelの比較表を1枚のスライドへ清書（LLM・表紙・デザインAIを使わない）
+    if (rawBody.action === "excel_table_slide" && rawBody.table) {
+      // This renderer already emits East Asian font declarations. The legacy
+      // patch removes required theme ea elements when latin has extra attributes.
+      const buffer = await renderExcelTableSlide(rawBody.table, rawBody.fontFace || "Meiryo", rawBody.palette);
+      const base = String(rawBody.fileBaseName || rawBody.table.title || "表スライド").replace(/[\\/:*?"<>|]/g, "").slice(0, 40);
+      const fileName = `${base}.pptx`;
+      const blobKey = `${base}_${uniqueId().slice(0, 8)}.pptx`;
+      const downloadUrl = await uploadPptxToBlob(buffer, blobKey, fileName);
+      if (rawBody.threadId) await savePptxPointer(rawBody.threadId, blobKey, fileName);
+      return NextResponse.json({ downloadUrl, fileName, totalSlides: 1 });
     }
     // DeckSpec TypeScript再描画リクエストは早期ディスパッチ（LLM不使用）
     if ((rawBody as any).action === "rerender_from_deckspec") {
