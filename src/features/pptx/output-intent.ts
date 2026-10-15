@@ -51,6 +51,16 @@ export function isImagePptConversionRequest(message: string): boolean {
     /変換|にして|スライド化|復元|編集可能/i.test(message) && !/参考|(?:ロゴ|logo).{0,30}(?:右上|挿入|追加|配置|差し替)/i.test(message);
 }
 
+export function isExcelTableToSlideRequest(message: string): boolean {
+  const value = message.normalize("NFKC");
+  return /(?:\bpptx?\b|\bpptx?(?=\d+\s*枚)|powerpoint|パワーポイント|パワポ|スライド)/i.test(value) &&
+    /にして|変換|作成|作って|生成|化して|まとめて/.test(value) &&
+    /1\s*枚|一枚|見栄え|みばえ|綺麗|きれい|キレイ|見やす|体裁|清書|整えて|おしゃれ|かっこ(?:よ|い)|格好(?:よ|い)/.test(value) &&
+    !/(?:[2-9]|[1-9]\d|二|三|四|五|六|七|八|九|十)\s*枚/.test(value) &&
+    !/編集|修正|変更|フォント|ロゴ|カード|翻訳|追加|削除|グラフ|チャート|参考|拡充|追記|肉付け|PDF|画像|Word|ワード/i.test(value) &&
+    !/(?:この|その|先ほど|さっき|前の|今の|作成した|出力した)\s*(?:PPT|パワポ|パワーポイント|スライド)/i.test(value);
+}
+
 export function pdfPptConversionMode(message: string): "faithful" | "redesign" {
   // "編集可能" alone is served by faithful mode (source images kept, text editable).
   return /再構成|リデザイン|デザイン.{0,8}(?:改善|変更)|要約|redesign/i.test(message)

@@ -1,5 +1,6 @@
 import "server-only";
-import { isNewPptCreationRequest, isImagePptConversionRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
+import { parseExcelTable, layoutExcelTableSlide } from "@/features/pptx/excel-table-slide";
+import { isNewPptCreationRequest, isImagePptConversionRequest, isExcelTableToSlideRequest, pdfPptConversionMode, requestsOfficialWebsiteContent } from "@/features/pptx/output-intent";
 
 import { createHash, randomUUID } from "crypto";
 import {
@@ -134,6 +135,7 @@ function parseWordTranslationRequest(
 }
 
 export type TeamsOfficeRequest =
+  | { action: "excel_table_slide"; paletteKey?: string }
   | {
       action: "pdf_to_excel";
       fileQuery: string;
@@ -222,6 +224,9 @@ export type TeamsOfficeRequest =
 export function parseTeamsOfficeRequest(
   message: string
 ): TeamsOfficeRequest | null {
+  if (isExcelTableToSlideRequest(message) && /\.(?:xlsx|xlsm|xls)$/i.test(extractAttachedFileQuery(message) ?? "")) {
+    return { action: "excel_table_slide", paletteKey: resolvePptxPaletteInstruction(message)?.paletteKey };
+  }
   const normalized = message.trim().normalize("NFKC");
   const attachedFileQuery = extractAttachedFileQuery(normalized);
   const hasAttachedFileMarker = Boolean(attachedFileQuery);
@@ -304,7 +309,7 @@ export function parseTeamsOfficeRequest(
     hasPptColorTopic &&
     /(?:色味|配色|カラー|色)[^。！？!?.\n]{0,24}(?:変更|変え|替え|にして|統一|基調)|(?:変更|変え|替え|統一)[^。！？!?.\n]{0,16}(?:色味|配色|カラー|色)/i.test(normalized);
   const selectsListedPptColor =
-    /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-6１-６]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
+    /^(?:(?:では|じゃあ|それでは|やはり|やっぱり|改めて|ok)[、,，\s]*)?[1-7１-７]\s*(?:番)?(?:で|に)(?:お願いします|お願い|変更して|変更|変えて|して|します)?[。.!！]?$/i.test(
       normalized
     );
   const selectsNamedPptColor =
@@ -520,6 +525,30 @@ export async function executeTeamsOfficeRequest(props: {
 }): Promise<string> {
   const teamsThreadId = buildTeamsThreadId(props.conversationId);
 
+  if (props.request.action === "excel_table_slide") {
+    const source = selectUploadedOfficeFile(props.uploadedFiles, ["xlsx", "xlsm", "xls"]);
+    if (source.error) return source.error;
+    if (!source.file) return "変換するExcelを1件添付してください。";
+    try {
+      const response = await fetch(source.file.url, { signal: AbortSignal.timeout(30_000) });
+      if (!response.ok) return `Excelの取得に失敗しました（HTTP ${response.status}）。`;
+      const baseName = source.file.fileName.replace(/\.(?:xlsx|xlsm|xls)$/i, "");
+      const table = parseExcelTable(Buffer.from(await response.arrayBuffer()), baseName);
+      if (!table) return "Excelから表（見出し行＋6列・15項目以内）を読み取れませんでした。";
+      if (!layoutExcelTableSlide(table)) return "表がスライド1枚に収まりません。項目を減らすか、複数枚での作成を指定してください。";
+      const result = await postOfficeGenerationApi("/api/gen-pptx", {
+        action: "excel_table_slide", table, threadId: teamsThreadId, fileBaseName: baseName, palette: props.request.paletteKey,
+      });
+      if (typeof result.downloadUrl !== "string") return "PowerPointのダウンロードリンクを取得できませんでした。";
+      const fileName = typeof result.fileName === "string" ? result.fileName : `${baseName}.pptx`;
+      await savePptxResult(teamsThreadId, result, fileName);
+      return `Excelの表をスライド1枚に清書しました。\n\n[${escapeMarkdownLinkText(fileName)}](${result.downloadUrl})`;
+    } catch (error) {
+      console.error("[teams-excel-table-slide] failed", error);
+      return "ExcelからPowerPointを生成できませんでした。ファイルの内容と接続を確認してください。";
+    }
+  }
+
   if (props.request.action === "summarize_sp_pdf_to_word") {
     return summarizeTeamsSharePointPdfToWord({
       request: props.request,
@@ -554,7 +583,7 @@ export async function executeTeamsOfficeRequest(props: {
 
   if (props.request.action === "ppt_color_help") {
     return [
-      "PowerPointでは、次の6種類の色パレットを選べます。",
+      "PowerPointでは、次の色パレットを選べます。色の言葉でも配色名でも指定できます。",
       "",
       pptxPaletteListText(),
       "",
@@ -2703,7 +2732,7 @@ function extractAttachedFileQuery(message: string): string | null {
   return (
     message
       .match(
-        /添付ファイル\s*[:：]\s*([^\n、]+?\.(?:pdf|docx|xlsx|pptx|png|jpe?g|webp))(?=\s|$|、)/i
+        /添付ファイル\s*[:：]\s*([^\n、]+?\.(?:pdf|docx|xlsx|xlsm|xls|pptx|png|jpe?g|webp))(?=\s|$|、)/i
       )?.[1]
       ?.trim() ?? null
   );

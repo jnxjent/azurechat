@@ -46,6 +46,11 @@ function loadOfficeService() {
         },
       };
     }
+    if (request === "@/features/pptx/excel-table-slide") {
+      return loadTypeScriptModule("features/pptx/excel-table-slide.ts", {
+        "@/features/pptx/palette": loadTypeScriptModule("features/pptx/palette.ts", {}),
+      });
+    }
     if (request === "@/features/pptx/palette") {
       return loadTypeScriptModule("features/pptx/palette.ts", {});
     }
