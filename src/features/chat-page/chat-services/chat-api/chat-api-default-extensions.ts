@@ -20,6 +20,8 @@ import {
   SavePendingPptxEdit,
 } from "../pptx-pending-edit-service";
 import { FindTopChatMessagesForCurrentUser } from "../chat-message-service";
+import { detectPptxStructureEdit } from "@/features/pptx/structure-edit-intent";
+import { executePptxStructureEdit } from "@/features/pptx/structure-edit-service";
 import { FindAllChatDocuments } from "../chat-document-service";
 import { ChatThreadModel } from "../models";
 import { BlobServiceClient } from "@azure/storage-blob";
@@ -54,7 +56,9 @@ import {
 } from "./image/image-intent";
 import { normalizeGptImageQuality } from "./image/image-quality";
 import { generateStoredChatImage } from "./image/image-generation-service";
-import { isCompanyProfileContent, isExcelTableToSlideRequest, PPT_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
+import { isCompanyProfileContent, isExcelTableToSlideRequest, PPT_PRODUCTION_INSTRUCTION as PPT_BASE_PRODUCTION_INSTRUCTION, removePptProductionNotes } from "@/features/pptx/output-intent";
+import { PPT_VISUAL_COMPOSITION_RULES } from "@/features/pptx/visual-composition";
+const PPT_PRODUCTION_INSTRUCTION = PPT_BASE_PRODUCTION_INSTRUCTION + "\n" + PPT_VISUAL_COMPOSITION_RULES;
 import { resolveWordEditInstruction } from "./word-edit-instruction";
 import { detectWholeWordTranslationLanguage } from "./word-translation-intent";
 
@@ -1819,12 +1823,18 @@ export const GetDefaultExtensions = async (props: {
     type: "function",
     function: {
       function: async (args: any) => {
+        // Structural intent belongs to the user's current request. A model may
+        // embellish instruction with images from an earlier deck description;
+        // do not require an attachment (or forward those invented edits) here.
+        const originalStructureRequest = String(props.userMessage ?? "").trim();
+        const structureOnly = Boolean(detectPptxStructureEdit(originalStructureRequest)) &&
+          !hasExplicitPptxImageInsertRequest(originalStructureRequest);
         const imageIntentText = [props.userMessage, args?.instruction]
           .map((value) => String(value ?? "").trim())
           .filter(Boolean)
           .join("\n");
         const needsAttachedImage =
-          hasExplicitPptxImageInsertRequest(imageIntentText);
+          !structureOnly && hasExplicitPptxImageInsertRequest(imageIntentText);
         let resolvedImageUrl = resolvePptxEditImageSource(
           args?.imageUrl,
           props.imageAttachmentUrls
@@ -1845,6 +1855,7 @@ export const GetDefaultExtensions = async (props: {
         return await executeEditPptx(
           {
             ...args,
+            ...(structureOnly ? { instruction: originalStructureRequest } : {}),
             fileUrl:
               String(args?.fileUrl ?? "").trim() ||
               (await resolveLatestPptxInfoFromThread(props.chatThread.id))?.url ||
@@ -7193,6 +7204,20 @@ async function executeEditPptx(
   // ── レイアウト変換リクエスト検出（Bullet型→Box/カード型を誤って bullet_add に流さない）────
   // 色変更のみの場合は layout_regen に入れない（過去文脈の「カード」等を拾って誤判定されるため）
   // 「箇条書き」「bullet」だけでは layout_regen に入れない（reference copy と混同するため）
+  const structureIntent = resumedPendingEdit ? null : detectPptxStructureEdit(currentEditIntentText);
+  if (structureIntent) {
+    console.log(`[edit_pptx] structure route kind=${structureIntent.kind}`);
+    return executePptxStructureEdit({
+      intent: structureIntent,
+      instruction: userIntentText,
+      fileUrl,
+      threadId: chatThread.id,
+      baseUrl,
+      outputBaseName,
+    });
+  }
+
+
   const referenceCopyPages = extractReferenceCopyPages(userIntentText);
   // 「カードをN枚に」「カードをN個に」はカード数調整（layout変換ではない）
   // hasLayoutIntent のカード + に パターンが誤マッチするため先にガードする

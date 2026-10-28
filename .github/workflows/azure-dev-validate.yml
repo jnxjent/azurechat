@@ -43,6 +43,11 @@ jobs:
           # startup.sh を含める（LibreOffice / Python packages インストール用）
           cp ./startup.sh ./site-deploy/startup.sh
 
+          # Include the structural PPT editor (resolved dynamically at runtime).
+          mkdir -p ./site-deploy/src/scripts
+          cp -f ./src/scripts/pptx_structure_edit.py ./site-deploy/src/scripts/pptx_structure_edit.py
+          test -s ./site-deploy/src/scripts/pptx_structure_edit.py
+
       # ✅★追加: テストサイト互換（FONTCONFIG_FILE / XDG_CACHE_HOME）用に同梱
       - name: 🈶 Include fonts.conf + font-cache (+ jp fonts)
         run: |

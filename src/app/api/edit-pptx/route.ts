@@ -654,6 +654,7 @@ async function savePptxPointer(threadId: string, blobName: string, fileName: str
 }
 
 import { loadDeckSpecForUrl } from "@/lib/deck-spec-storage";
+import { sanitizePptxStructureOps } from "@/features/pptx/structure-edit-intent";
 import type { DeckSpec } from "@/types/deck-spec";
 
 // Word ポインター保存（次回 edit_word 呼び出しで修正済みファイルを参照できるよう）
@@ -2317,12 +2318,12 @@ async function generateDalleImage(prompt: string): Promise<Buffer | null> {
   }
 }
 
-async function resolveEditPptxScriptPath(): Promise<string> {
+async function resolveEditPptxScriptPath(scriptName = "edit_pptx.py"): Promise<string> {
   const candidates = [
-    path.join(process.cwd(), "src", "scripts", "edit_pptx.py"),
-    path.join(process.cwd(), "scripts", "edit_pptx.py"),
-    "/home/site/wwwroot/src/scripts/edit_pptx.py",
-    "/home/site/wwwroot/scripts/edit_pptx.py",
+    path.join(process.cwd(), "src", "scripts", scriptName),
+    path.join(process.cwd(), "scripts", scriptName),
+    `/home/site/wwwroot/src/scripts/${scriptName}`,
+    `/home/site/wwwroot/scripts/${scriptName}`,
   ];
 
   for (const candidate of candidates) {
@@ -2334,7 +2335,7 @@ async function resolveEditPptxScriptPath(): Promise<string> {
     }
   }
 
-  throw new Error(`edit_pptx.py not found. Checked: ${candidates.join(", ")}`);
+  throw new Error(`${scriptName} not found. Checked: ${candidates.join(", ")}`);
 }
 
 function decodeImageDataUrl(value: string): Buffer | null {
@@ -2479,13 +2480,13 @@ async function runPythonEdit(
   plan: EditPlan,
   _threadId: string,
   fileBaseName?: string,
-  options?: { skipPptxPointer?: boolean }
+  options?: { skipPptxPointer?: boolean; scriptName?: string }
 ) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "azurechat-pptx-"));
   const inputPath = path.join(tempDir, "input.pptx");
   const outputPath = path.join(tempDir, "output.pptx");
   const planPath = path.join(tempDir, "plan.json");
-  const scriptPath = await resolveEditPptxScriptPath();
+  const scriptPath = await resolveEditPptxScriptPath(options?.scriptName);
 
   try {
     await fs.writeFile(inputPath, inputBuffer);
@@ -2726,7 +2727,7 @@ async function runVisionReviewAfterEdit(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName, targetLanguage, imageDataUrl } = body as {
+    const { fileUrl, instruction, threadId, action, mode, previousChartEdits, outputBaseName, plan: incomingPlan, trackChanges, excelFileUrl, targetSheets, outputFileName, skipPptxPointer, targetItemCount: bodyTargetItemCount, originalFileName: bodyOriginalFileName, targetLanguage, imageDataUrl, structureOps } = body as {
       fileUrl: string;
       instruction: string;
       threadId: string;
@@ -2745,6 +2746,7 @@ export async function POST(req: NextRequest) {
       originalFileName?: string;
       targetLanguage?: string;
       imageDataUrl?: string;
+      structureOps?: unknown;
     };
     const isInternalPptxBatch = req.headers.get("x-azurechat-internal-pptx-batch") === "1";
 
@@ -2856,6 +2858,37 @@ export async function POST(req: NextRequest) {
       const slides = await extractSlidesStructured(pptxBuffer);
       console.log(`[extract_pptx_summary] extracted ${slides.length} slides`);
       return NextResponse.json({ ok: true, slides, totalSlides: slides.length });
+    }
+
+    if (action === "pptx_structure_edit") {
+      const ops = sanitizePptxStructureOps(structureOps);
+      if (!ops.length) {
+        return NextResponse.json({ ok: false, error: "structureOps is required" }, { status: 400 });
+      }
+      const pptxBuffer = await downloadBlob(fileUrl, threadId);
+      let result: Awaited<ReturnType<typeof runPythonEdit>>;
+      try {
+        result = await runPythonEdit(pptxBuffer, { ops } as unknown as EditPlan, threadId, outputBaseName ?? "スライド編集", { scriptName: "pptx_structure_edit.py" });
+      } catch (e) {
+        // The script reports expected refusals as {"ok":false,"error"} on stdout.
+        let error = "スライドの編集に失敗しました。";
+        try { error = String(JSON.parse(String((e as { stdout?: string }).stdout ?? "")).error ?? error); } catch { /* keep generic */ }
+        console.warn("[pptx_structure_edit] failed:", error.slice(0, 120));
+        return NextResponse.json({ ok: false, error });
+      }
+      console.log(`[pptx_structure_edit] ops=${ops.map((op) => op.type).join(",")} totalSlides=${result.totalSlides} changedSlides=${result.changedSlides}`);
+      let visualWarnings: string[] | undefined;
+      if (process.env.PPTX_EDIT_VISION_REVIEW_ENABLED === "true" && result.changedSlideIndices.length > 0) {
+        const baseUrl = (
+          process.env.NEXTAUTH_URL ||
+          (process.env.WEBSITE_HOSTNAME ? `https://${process.env.WEBSITE_HOSTNAME}` : "http://localhost:3000")
+        ).replace(/\/+$/, "");
+        const warnings = await runVisionReviewAfterEdit(result.outputBuffer, result.changedSlideIndices, baseUrl);
+        if (warnings.length > 0) visualWarnings = warnings;
+      }
+      const { outputBuffer: _structureBuf, ...structureResult } = result;
+      void _structureBuf;
+      return NextResponse.json({ ok: true, ...structureResult, ...(visualWarnings ? { visualWarnings } : {}) });
     }
 
     // EditPlan を直接受け取って既存PPTXに適用（replaceText のみ・レイアウト再生成なし）

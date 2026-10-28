@@ -1,6 +1,7 @@
 // src/features/chat-page/chat-services/chat-api/chat-api.ts
 "use server";
 import "server-only";
+import { isPptxStructureEditRequest } from "@/features/pptx/structure-edit-intent";
 
 // ★ SF拡張の Extension ID（環境変数化）
 const SF_EXTENSION_ID = process.env.SF_EXTENSION_ID || "";
@@ -174,9 +175,10 @@ export const ChatAPIEntry = async (props: UserPrompt, signal: AbortSignal) => {
   const pendingPptxEdit = mayBePendingPptxAccentReply
     ? await LoadPendingPptxEdit(currentChatThread.id).catch(() => null)
     : null;
+  const pptxStructureEditRequest = !newPptRequest && isPptxStructureEditRequest(props.message);
   const requiredImageToolName = pendingPptxEdit
     ? "edit_pptx"
-    : pptxAssetPlacementRequest
+    : pptxAssetPlacementRequest || pptxStructureEditRequest
     ? "edit_pptx"
     : explicitPptRequest ? undefined : resolveRequiredImageToolName(
         props.message,

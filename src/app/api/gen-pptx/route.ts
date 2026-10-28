@@ -6,6 +6,8 @@ import JSZip from "jszip";
 import { addLogoToPptx } from "@/features/pptx/logo-overlay";
 import { createPdfImageDeck } from "@/features/pptx/pdf-image-deck";
 import { renderExcelTableSlide } from "@/features/pptx/excel-table-slide";
+import { buildVisualComposition } from "@/features/pptx/visual-composition";
+import { drawVisualComposition } from "@/features/pptx/visual-composition-renderer";
 import {
   BlobServiceClient,
 } from "@azure/storage-blob";
@@ -3214,6 +3216,21 @@ function buildTableSlide(
   // tableRows が不十分なら bullets にフォールバック
   if (!slide.tableRows || slide.tableRows.length < 2) {
     buildBulletsSlide(pptx, slide, theme, visual, null, faithfulMode);
+    return;
+  }
+
+  const composition = !faithfulMode && buildVisualComposition(slide.title, slide.tableRows[0], slide.tableRows.slice(1));
+  if (composition) {
+    const s = pptx.addSlide();
+    s.background = { color: theme.palette.canvas };
+    addHeaderBand(s, slide.title, theme);
+    const notes = [slide.subtitle, ...(slide.bullets ?? [])].filter(Boolean).join("\n");
+    drawVisualComposition(s, composition, {x:.5,y:1.55,w:12.33,h:notes ? 4.25 : 5.1,
+      primary:theme.palette.accentA,accent:theme.palette.accentB,text:theme.palette.bodyText,
+      muted:theme.palette.mutedText,border:theme.palette.border,canvas:theme.palette.canvas,fontFace:theme.fontFace,
+      iconUri: label => {const key=resolveStepIconKey(label);return key ? STEP_ICON_URIS[key] : null;}});
+    if (notes) s.addText(notes, {x:.5,y:6,w:12.33,h:.8,fontFace:theme.fontFace,fontSize:12,color:theme.palette.mutedText,fit:"shrink",margin:0});
+    addChrome(s, theme);
     return;
   }
 
