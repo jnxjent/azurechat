@@ -51,6 +51,10 @@ function buildToolResultFallbackContent(toolResults: string[]): string {
     }
     const downloadUrl =
       typeof parsed.downloadUrl === "string" ? parsed.downloadUrl : "";
+    if (downloadUrl && parsed.integration === "pptx_structure_edit") {
+      const message = typeof parsed.message === "string" ? parsed.message : "スライドを編集しました。";
+      return `${message}\n\n[編集したPowerPointをダウンロード](${downloadUrl})`;
+    }
     if (downloadUrl) {
       return `ファイルの処理が完了しました。\n\n[ファイルを開く](${downloadUrl})`;
     }
@@ -179,7 +183,7 @@ export const OpenAIStream = (props: {
       // （revalidate 後の props.messages でも tool メッセージが残るようにするため）
       const pendingToolResults: string[] = [];
 
-      const finalizeStream = async (content: string) => {
+      const finalizeStream = async (content: string, emitBeforePersistence = false) => {
         if (finalized) return;
         finalized = true;
 
@@ -196,6 +200,9 @@ export const OpenAIStream = (props: {
           );
         }
 
+        if (emitBeforePersistence) {
+          streamResponse("finalContent", JSON.stringify({ type: "finalContent", response: repairedContent }));
+        }
         try {
           // tool results を assistant より先に保存することで
           // revalidate 後の props.messages でも messages[index-1] が tool になる
@@ -223,7 +230,7 @@ export const OpenAIStream = (props: {
             type: "finalContent",
             response: repairedContent,
           };
-          streamResponse(response.type, JSON.stringify(response));
+          if (!emitBeforePersistence) streamResponse(response.type, JSON.stringify(response));
           closeController();
         }
       };
@@ -269,12 +276,23 @@ export const OpenAIStream = (props: {
             };
 
             streamResponse(response.type, JSON.stringify(response));
+            // Structural edits already have a verified completion message and file.
+            // Deliver these directly; a second model response may be empty.
+            try {
+              const result = JSON.parse(payload);
+              if (result?.integration === "pptx_structure_edit" && typeof result.downloadUrl === "string") {
+                console.log("[open-ai-stream] finalizing pptx structure result");
+                void finalizeStream(buildToolResultFallbackContent([payload]), true).then(() => runner.abort());
+                return;
+              }
+            } catch { /* Other tool results keep their existing behavior. */ }
           } catch (e) {
             console.log("⚠️ functionCallResult mapping error:", e);
           }
         })
         // 🔹 通常のコンテンツ delta
         .on("content", () => {
+          if (finalized) return;
           const completion = runner.currentChatCompletionSnapshot;
           if (completion) {
             const response: AzureChatCompletion = {
